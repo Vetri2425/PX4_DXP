@@ -122,6 +122,29 @@ Running log of all work. Each entry: what built, what fixed, what's next, time s
 
 ---
 
+## 2026-05-20 — Phase 2 Prep (1 session)
+
+### Built
+- OFFBOARD audit complete (Kiro Opus): 3 firmware bugs found, 4 patches specified
+- MAVROS2-only architecture decision finalized (DDS shelved)
+- Full stack license audit: all permissive, zero GPL contamination
+- Architecture docs committed: MAVROS2_ONLY_DECISION.md, LICENSE_AUDIT.md, KIRO_OPUS_OFFBOARD_AUDIT_PROMPT.md
+- CubeOrangePlus port map verified from param files (TELEM2 free for future DDS)
+
+### Fixed
+- Identified OFFBOARD bug #1: velocity sign lost (`velocity.norm()` always positive, can't reverse)
+- Identified OFFBOARD bug #2: North-snap at zero velocity (`atan2f(0,0)=0`, rover yaws to North on stop)
+- Identified OFFBOARD bug #3: latent runaway on OFFBOARD exit (cached position setpoint never NaN-invalidated)
+- Identified OFFBOARD bug #4: no was_armed guard in RoverDifferential (one-cycle motor linger on disarm)
+- Corrected #18346 analysis: POSCTL fallback goes through manualPositionMode (reads RC stick = zero → safe stop), NOT goToPositionMode. Bug is latent, not active.
+
+### Next
+- Set FCU safety params (COM_OBL_RC_ACT=5, COM_OF_LOSS_T=0.3, COM_RCL_EXCEPT=4, RD_TANK_MODE=0)
+- Apply firmware patches P1-P4 to PX4 fork
+- Extend build_rover.yml to copy VelControl + PosControl files
+- Push fork, CI build, flash to CubeOrangePlus
+- Start Phase 2: write OFFBOARD ROS2 node on Jetson
+
 ## Phase 2 Entries Start Below
 
 <!-- Template for future entries:
