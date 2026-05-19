@@ -1,9 +1,14 @@
 /mavros/mavros_node:
   ros__parameters:
     plugin_denylist:
-      - image_pub
-      - vibration
-      - distance_sensor
-      - rangefinder
-      - wheel_odometry
-      - odometry
+      - image_pub        # No camera
+      - vibration        # No vibration monitoring
+      - distance_sensor  # No proximity sensors
+      - rangefinder      # No rangefinder hardware
+      - wheel_odometry   # Conflicts with PX4 EKF2 odometry
+      - odometry         # Conflicts with PX4 EKF2 odometry
+      - hil              # Safety: HIL on real FCU is dangerous
+      - actuator_control # Safety: direct PWM bypass skips all limits
+      - 3dr_radio        # No radio telemetry hardware
+      - ftp              # File transfer not needed
+      # gps_rtk is intentionally NOT denied — required for NTRIP RTK injection

@@ -1,0 +1,64 @@
+[Unit]
+Description=PX4 DXP Bridge - MAVROS2 + NTRIP RTK (CubeOrangePlus)
+After=network.target network-online.target dev-ttyACM0.device
+Wants=network-online.target
+BindsTo=dev-ttyACM0.device
+
+[Service]
+Type=exec
+User=flash
+Group=flash
+WorkingDirectory=/home/flash/PX4_DXP
+ExecStart=/home/flash/PX4_DXP/px4_start_service.sh
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=always
+RestartSec=10
+StartLimitInterval=120
+StartLimitBurst=5
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/flash/.ros /home/flash/PX4_DXP /tmp /var/tmp
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+SupplementaryGroups=dialout
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+MemoryMax=3G
+CPUQuota=400%
+
+# Environment
+Environment=ROS_DOMAIN_ID=0
+Environment=ROS_LOCALHOST_ONLY=0
+UnsetEnvironment=AMENT_TRACE_SETUP_FILES
+Environment=HOME=/home/flash
+
+# NTRIP credentials — REQUIRED for ntrip_rtcm_node.py
+# ntrip_rtcm_node.py requires NTRIP_USER and NTRIP_PASS env vars (no defaults).
+# Run deploy.sh to create the env file (prompts once, skips if exists):
+#   cd ~/PX4_DXP && ./deploy.sh
+EnvironmentFile=/home/flash/.config/ntrip/env
+
+# Output
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=px4-dxp
+
+# Shutdown
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+# Watchdog disabled until sd_notify is added to px4_start_service.sh
+# (without sd_notify heartbeat, systemd kills the process after timeout)
+# WatchdogSec=60
+
+[Install]
+WantedBy=multi-user.target

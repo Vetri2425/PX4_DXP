@@ -1,0 +1,14 @@
+# logrotate config for NTRIP RTK client log
+# Deploy to: /etc/logrotate.d/ntrip
+# Install: sudo cp ntrip.logrotate /etc/logrotate.d/ntrip
+
+/tmp/ntrip.log {
+    daily
+    rotate 7
+    maxsize 10M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

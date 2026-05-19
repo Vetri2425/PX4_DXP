@@ -13,8 +13,20 @@ GCS_UDP_PORT="14550"
 JETSON_IP="192.168.1.102"
 ROS_SETUP="/opt/ros/humble/setup.bash"
 
+# Timing constants
+MAVROS_READY_TIMEOUT=35
+MAVROS_READY_WAIT=30
+NTRIP_READY_WAIT=2
+MAVROS_RESTART_DELAY=3
+NTRIP_RESTART_DELAY=3
+MAVROS_FAIL_DELAY=5
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+NTRIP_SCRIPT="${SCRIPT_DIR}/ntrip_rtcm_node.py"
+
 declare -a CHILD_PIDS=()
 MAVROS_WATCHDOG_PID=""
+NTRIP_WATCHDOG_PID=""
 
 log() { echo "[px4_service] $(date '+%H:%M:%S') $*"; }
 
@@ -42,8 +54,13 @@ check_ros_node() {
 free_port() {
     local port=$1
     if lsof -i ":$port" >/dev/null 2>&1; then
-        log "Port $port busy — freeing..."
-        lsof -ti ":$port" | xargs -r kill -9 || true
+        log "Port $port busy — freeing gracefully..."
+        lsof -ti ":$port" | xargs -r kill -TERM 2>/dev/null || true
+        sleep 2
+        if lsof -i ":$port" >/dev/null 2>&1; then
+            log "Port $port still busy — force killing..."
+            lsof -ti ":$port" | xargs -r kill -9 2>/dev/null || true
+        fi
     fi
 }
 
@@ -61,11 +78,20 @@ mavros_watchdog() {
         free_port 14550
         sleep 1
 
-        ros2 launch mavros node.launch             fcu_url:=${FCU_DEVICE}:${FCU_BAUD}             gcs_url:=udp-b://:${GCS_UDP_PORT}@             pluginlists_yaml:=/home/flash/PX4_DXP/px4_pluginlists_rover.yaml             config_yaml:=/opt/ros/humble/share/mavros/launch/px4_config.yaml             fcu_protocol:=v2.0             tgt_system:=1             tgt_component:=1             log_output:=screen             respawn_mavros:=false &
+        ros2 launch mavros node.launch \
+            fcu_url:=${FCU_DEVICE}:${FCU_BAUD} \
+            gcs_url:=udp-b://:${GCS_UDP_PORT}@ \
+            pluginlists_yaml:=${SCRIPT_DIR}/px4_pluginlists_rover.yaml \
+            config_yaml:=/opt/ros/humble/share/mavros/launch/px4_config.yaml \
+            fcu_protocol:=v2.0 \
+            tgt_system:=1 \
+            tgt_component:=1 \
+            log_output:=screen \
+            respawn_mavros:=false &
         mavros_pid=$!
 
         local ready=0
-        for i in {1..30}; do
+        for i in $(seq 1 "$MAVROS_READY_WAIT"); do
             if check_ros_node "/mavros"; then
                 ready=1
                 break
@@ -74,23 +100,43 @@ mavros_watchdog() {
                 log "Watchdog: MAVROS exited before node appeared"
                 break
             fi
-            log "Waiting for /mavros node... ($i/30)"
+            log "Waiting for /mavros node... ($i/$MAVROS_READY_WAIT)"
             sleep 1
         done
 
         if [[ "$ready" -eq 1 ]]; then
             log "Watchdog: MAVROS ready (PID $mavros_pid)"
             wait "$mavros_pid" 2>/dev/null || true
-            log "Watchdog: MAVROS exited — restarting in 3s..."
+            log "Watchdog: MAVROS exited — restarting in ${MAVROS_RESTART_DELAY}s..."
             mavros_pid=""
-            sleep 3
+            sleep "$MAVROS_RESTART_DELAY"
         else
-            log "Watchdog: MAVROS failed to start — retrying in 5s..."
+            log "Watchdog: MAVROS failed to start — retrying in ${MAVROS_FAIL_DELAY}s..."
             kill "$mavros_pid" 2>/dev/null || true
             wait "$mavros_pid" 2>/dev/null || true
             mavros_pid=""
-            sleep 5
+            sleep "$MAVROS_FAIL_DELAY"
         fi
+    done
+}
+
+ntrip_watchdog() {
+    local ntrip_pid=""
+
+    _ntrip_cleanup() {
+        [[ -n "$ntrip_pid" ]] && kill "$ntrip_pid" 2>/dev/null || true
+        exit 0
+    }
+    trap '_ntrip_cleanup' TERM INT
+
+    while true; do
+        log "Watchdog: starting NTRIP RTK client..."
+        python3 "$NTRIP_SCRIPT" >> /tmp/ntrip.log 2>&1 &
+        ntrip_pid=$!
+        wait "$ntrip_pid" 2>/dev/null || true
+        log "Watchdog: NTRIP exited — restarting in ${NTRIP_RESTART_DELAY}s..."
+        ntrip_pid=""
+        sleep "$NTRIP_RESTART_DELAY"
     done
 }
 
@@ -115,7 +161,8 @@ set +u; source "$ROS_SETUP"; set -u
 ros2 daemon stop >/dev/null 2>&1 || true
 
 # Kill any stale MAVROS instances
-pkill -f "mavros px4.launch" 2>/dev/null || true
+pkill -f "mavros.*node.launch" 2>/dev/null || true
+pkill -f "ntrip_rtcm_node" 2>/dev/null || true
 sleep 1
 
 log "====================================================="
@@ -126,13 +173,19 @@ log " QGC setup: Comm Links → Add → UDP → Port $GCS_UDP_PORT"
 log " Or QGC auto-discovers on same LAN (no config needed)"
 log "====================================================="
 
+# Rotate NTRIP log if >10MB
+if [[ -f /tmp/ntrip.log ]] && [[ $(stat -c%s /tmp/ntrip.log 2>/dev/null || echo 0) -gt 10485760 ]]; then
+    mv /tmp/ntrip.log /tmp/ntrip.log.old
+    log "Rotated NTRIP log"
+fi
+
 mavros_watchdog &
 MAVROS_WATCHDOG_PID=$!
 CHILD_PIDS+=("$MAVROS_WATCHDOG_PID")
 
 log "Waiting for MAVROS to initialise..."
 mavros_ready=0
-for i in {1..35}; do
+for i in $(seq 1 "$MAVROS_READY_TIMEOUT"); do
     if check_ros_node "/mavros"; then
         mavros_ready=1
         break
@@ -141,7 +194,7 @@ for i in {1..35}; do
         log "ERROR: MAVROS watchdog died unexpectedly"
         exit 1
     fi
-    log "Waiting... ($i/35)"
+    log "Waiting... ($i/$MAVROS_READY_TIMEOUT)"
     sleep 1
 done
 
@@ -151,13 +204,30 @@ if [[ "$mavros_ready" -eq 0 ]]; then
 fi
 
 log "MAVROS is READY"
+
+# Validate FCU connection
+if ros2 topic echo /mavros/state --once --timeout 5 2>/dev/null | grep -q "connected: true"; then
+    log "FCU connected via MAVROS"
+else
+    log "WARNING: MAVROS node exists but FCU may not be connected — check serial link"
+fi
+
 log "Starting NTRIP RTK client..."
-nohup python3 /home/flash/ntrip_rtcm_node.py >> /tmp/ntrip.log 2>&1 &
-CHILD_PIDS+=($!)
-sleep 2
+if [[ -z "${NTRIP_USER:-}" ]] || [[ -z "${NTRIP_PASS:-}" ]]; then
+    log "WARNING: NTRIP_USER/NTRIP_PASS env vars not set — NTRIP will crash-loop"
+    log "Create /home/flash/.config/ntrip/env or set vars in systemd override"
+fi
+ntrip_watchdog &
+NTRIP_WATCHDOG_PID=$!
+CHILD_PIDS+=("$NTRIP_WATCHDOG_PID")
+
+sleep "$NTRIP_READY_WAIT"
+if ! kill -0 "$NTRIP_WATCHDOG_PID" 2>/dev/null; then
+    log "WARNING: NTRIP watchdog exited immediately — check /tmp/ntrip.log"
+fi
 
 log "Active ROS nodes:"
 ros2 node list || true
 log "=== Bridge running. QGC → UDP → ${JETSON_IP}:${GCS_UDP_PORT} ==="
 
-wait "$MAVROS_WATCHDOG_PID"
+wait "$MAVROS_WATCHDOG_PID" "$NTRIP_WATCHDOG_PID"
