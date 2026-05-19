@@ -1,0 +1,26 @@
+# Build artifacts
+build/
+install/
+log/
+__pycache__/
+*.pyc
+
+# rosbags
+*.bag
+*.db3
+*.mcap
+bags/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Local env / secrets
+.env
+*.local
+secrets/
+
+# OS
+.DS_Store
+Thumbs.db

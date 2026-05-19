@@ -1,0 +1,9 @@
+/mavros/mavros_node:
+  ros__parameters:
+    plugin_denylist:
+      - image_pub
+      - vibration
+      - distance_sensor
+      - rangefinder
+      - wheel_odometry
+      - odometry
