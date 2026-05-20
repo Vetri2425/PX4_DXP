@@ -93,6 +93,9 @@ sudo systemctl restart px4-dxp.service
   │   ├── xtrack_logger_node.py      ← 20Hz CSV logger (18 columns)
   │   ├── mission_runner_node.py      ← OFFBOARD lifecycle state machine
   │   └── launch/rpp_pipeline.launch.py ← ordered startup
+  ├── params/                        ← PX4 parameter files
+  │   ├── Param_with_Roboclaw.params ← full param set (RBCLW_QPPS_MAX=0, must set!)
+  │   └── README.md                  ← param file docs + safety table
   ├── server/                        ← FastAPI backend (Phase 2)
   │   ├── main.py                    ← FastAPI app + Socket.IO + telemetry loop
   │   ├── ros_node.py                ← rclpy bridge (subscribers + async service calls)
