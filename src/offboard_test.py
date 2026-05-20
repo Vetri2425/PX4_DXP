@@ -110,6 +110,7 @@ class OffboardTestNode(Node):
         self.offboard_engaged = False
         self.mission_done = False
         self.phase = "preflight"  # preflight → stream → arm → run → stop → disarm
+        self._last_logged_phase = None
 
         # --- QoS profiles ---
         # MAVROS setpoint: BEST_EFFORT + VOLATILE (PX4 expects frequent updates)
@@ -255,14 +256,25 @@ class OffboardTestNode(Node):
         return msg
 
     def _get_yaw_rad(self) -> float:
-        """Get current heading in radians from pose quaternion (NED convention)."""
+        """Get current heading in NED radians from MAVROS pose quaternion.
+
+        MAVROS publishes poses in ENU frame (x=East, y=North, z=Up).
+        The quaternion yaw gives ENU yaw (0°=East, CCW positive).
+        NED yaw is 90° offset: yaw_NED = π/2 - yaw_ENU.
+        NED convention: 0°=North, CW positive.
+        """
         if self.current_pose is None:
             return 0.0
         q = self.current_pose.pose.orientation
-        # Quaternion to yaw (NED): yaw=0 is North, positive clockwise
+        # Extract ENU yaw from quaternion (0°=East, CCW positive)
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        return math.atan2(siny_cosp, cosy_cosp)
+        yaw_enu = math.atan2(siny_cosp, cosy_cosp)
+        # Convert ENU yaw to NED yaw (0°=North, CW positive)
+        yaw_ned = math.pi / 2.0 - yaw_enu
+        # Normalize to [-π, π]
+        yaw_ned = (yaw_ned + math.pi) % (2 * math.pi) - math.pi
+        return yaw_ned
 
     def _make_velocity_setpoint(self, vx: float, vy: float) -> PositionTarget:
         """Create a velocity-only setpoint, transforming body frame to NED.
@@ -276,6 +288,10 @@ class OffboardTestNode(Node):
         yaw = self._get_yaw_rad()
         north_vel = vx * math.cos(yaw) - vy * math.sin(yaw)
         east_vel = vx * math.sin(yaw) + vy * math.cos(yaw)
+        self.get_logger().debug(
+            f"vel transform: yaw_ned={math.degrees(yaw):.1f}° "
+            f"body=({vx:.2f},{vy:.2f}) → ned=({north_vel:.3f},{east_vel:.3f})"
+        )
 
         msg = PositionTarget()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -307,6 +323,12 @@ class OffboardTestNode(Node):
         """Publish setpoints at 50Hz. Content depends on mission phase."""
         if self.mission_done:
             return
+
+        # Log heading once when phase changes (for velocity modes)
+        if self.phase != self._last_logged_phase and self.phase.startswith("run_velocity"):
+            yaw_deg = math.degrees(self._get_yaw_rad())
+            self.get_logger().info(f"Heading: {yaw_deg:.1f}° NED (phase={self.phase})")
+            self._last_logged_phase = self.phase
 
         if self.phase == "preflight":
             # Before OFFBOARD: stream hold-at-origin to satisfy PX4 pre-stream requirement
