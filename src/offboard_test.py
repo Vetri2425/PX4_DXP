@@ -37,7 +37,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
-from mavros_msgs.msg import PositionTarget, State, ExtendedState
+from mavros_msgs.msg import PositionTarget, State, ExtendedState, StatusText
 from mavros_msgs.srv import SetMode, CommandBool
 from geometry_msgs.msg import PoseStamped
 
@@ -143,6 +143,9 @@ class OffboardTestNode(Node):
         self.ext_state_sub = self.create_subscription(
             ExtendedState, "/mavros/extended_state", self._ext_state_cb, state_qos
         )
+        self.statustext_sub = self.create_subscription(
+            StatusText, "/mavros/statustext", self._statustext_cb, state_qos
+        )
 
         # --- Service clients ---
         self.set_mode_cli = self.create_client(SetMode, "/mavros/set_mode")
@@ -195,6 +198,14 @@ class OffboardTestNode(Node):
         else:
             self.get_logger().warn("No ExtendedState received — GPS/arming status unknown")
 
+        # --- Reset to MANUAL for clean start ---
+        if self.current_state.mode not in ("MANUAL", "CMODE(393216)"):
+            self.get_logger().info(
+                f"FCU in {self.current_state.mode} — resetting to MANUAL first"
+            )
+            self._set_mode("MANUAL")
+            self._spin_for(1.0)
+
         # --- Start mission sequence ---
         self._run_mission()
 
@@ -223,6 +234,11 @@ class OffboardTestNode(Node):
 
     def _ext_state_cb(self, msg: ExtendedState):
         self.extended_state = msg
+
+    def _statustext_cb(self, msg: StatusText):
+        severity = {0: "EMERG", 1: "ALERT", 2: "CRIT", 3: "ERR", 4: "WARN", 5: "NOTICE", 6: "INFO", 7: "DEBUG"}
+        tag = severity.get(msg.severity, f"?{msg.severity}")
+        self.get_logger().info(f"[FCU {tag}] {msg.text}")
 
     # ------------------------------------------------------------------
     # Setpoint generators
@@ -568,9 +584,9 @@ class OffboardTestNode(Node):
                 time.sleep(0.02)
             self._arm(False)
 
-        # Switch back to MANUAL or HOLD
+        # Switch back to MANUAL (not HOLD — rover doesn't have HOLD mode)
         if self.offboard_engaged:
-            self._set_mode("HOLD")
+            self._set_mode("MANUAL")
 
 
 def main():
