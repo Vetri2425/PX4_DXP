@@ -211,22 +211,23 @@ class OffboardTestNode(Node):
         return msg
 
     def _make_velocity_setpoint(self, vx: float, vy: float) -> PositionTarget:
-        """Create a velocity-only setpoint in NED frame.
+        """Create a velocity-only setpoint in BODY frame.
 
-        For differential rover, yaw is derived from velocity direction.
-        vx=positive = forward (North), vy=positive = right (East).
+        Uses FRAME_BODY_OFFSET_NED so vx=forward, vy=right relative to rover heading.
+        This is correct for differential rovers: vx=-0.3 means reverse regardless of yaw.
+        The PX4 firmware translates body-frame velocity to NED internally using yaw.
         """
         msg = PositionTarget()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.coordinate_frame = FRAME_LOCAL_NED
+        msg.coordinate_frame = FRAME_BODY_OFFSET_NED
         msg.type_mask = TYPE_MASK_VELOCITY
-        msg.velocity.x = vx  # North m/s
-        msg.velocity.y = vy  # East m/s
+        msg.velocity.x = vx  # Forward m/s (positive=forward, negative=reverse)
+        msg.velocity.y = vy  # Right m/s (0 for differential, lateral only for mecanum)
         msg.velocity.z = 0.0
         return msg
 
     def _make_stop_setpoint(self) -> PositionTarget:
-        """Create a zero-velocity stop setpoint (holds current heading via P4 fix)."""
+        """Create a zero-velocity stop setpoint in body frame (P4 holds heading)."""
         return self._make_velocity_setpoint(0.0, 0.0)
 
     def _make_hold_setpoint(self) -> PositionTarget:
@@ -354,15 +355,20 @@ class OffboardTestNode(Node):
     def _run_velocity_mission(self):
         """Session 3: Velocity-mode OFFBOARD test — forward, reverse, stop, heading hold.
 
+        Uses FRAME_BODY_OFFSET_NED for velocity commands:
+          vx=+0.3 → forward at 0.3 m/s (regardless of compass heading)
+          vx=-0.3 → reverse at 0.3 m/s (regardless of compass heading)
+          vx=0    → stop, P4 holds current heading (no North-snap)
+
         Sequence:
         1. Stream zero-velocity for 1s (preflight)
         2. Switch to OFFBOARD mode
         3. Arm
         4. Forward 0.3 m/s for 3s
-        5. Stop (heading hold test)
-        6. Reverse -0.3 m/s for 3s (P3 test: backward without 180° spin)
-        7. Stop again
-        8. Hold for 2s (P4 test: no North-snap)
+        5. Stop (heading hold test — P4 validation)
+        6. Reverse -0.3 m/s for 3s (P3 validation — backward without 180° spin)
+        7. Stop again (heading hold — P4 validation)
+        8. Hold for 2s
         9. Disarm
         """
         self.get_logger().info("=== VELOCITY MODE: forward/reverse/stop test ===")
@@ -400,8 +406,8 @@ class OffboardTestNode(Node):
         self.phase = "run_velocity_stop"
         self._spin_for(2.0)
 
-        # Step 6: Reverse (P3 validation — no 180° spin)
-        self.get_logger().info(f"Step 6: Reverse {-self.target_speed} m/s for 3s...")
+        # Step 6: Reverse (P3 validation — backward without 180° spin)
+        self.get_logger().info(f"Step 6: Reverse {-self.target_speed} m/s for 3s (body frame)...")
         self.phase = "run_velocity_reverse"
         self._spin_for(3.0)
 
