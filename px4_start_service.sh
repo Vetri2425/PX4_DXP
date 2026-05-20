@@ -32,6 +32,7 @@ log() { echo "[px4_service] $(date '+%H:%M:%S') $*"; }
 
 cleanup() {
     log "Cleaning up child processes..."
+    rm -f /tmp/px4_mavros_ready
     for pid in "${CHILD_PIDS[@]:-}"; do
         if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true
@@ -106,6 +107,7 @@ mavros_watchdog() {
 
         if [[ "$ready" -eq 1 ]]; then
             log "Watchdog: MAVROS ready (PID $mavros_pid)"
+            touch /tmp/px4_mavros_ready
             wait "$mavros_pid" 2>/dev/null || true
             log "Watchdog: MAVROS exited — restarting in ${MAVROS_RESTART_DELAY}s..."
             mavros_pid=""
@@ -131,7 +133,7 @@ ntrip_watchdog() {
 
     while true; do
         log "Watchdog: starting NTRIP RTK client..."
-        python3 "$NTRIP_SCRIPT" >> /tmp/ntrip.log 2>&1 &
+        python3 "$NTRIP_SCRIPT" &
         ntrip_pid=$!
         wait "$ntrip_pid" 2>/dev/null || true
         log "Watchdog: NTRIP exited — restarting in ${NTRIP_RESTART_DELAY}s..."
@@ -158,7 +160,7 @@ if [[ ! -f "$ROS_SETUP" ]]; then
 fi
 set +u; source "$ROS_SETUP"; set -u
 
-ros2 daemon stop >/dev/null 2>&1 || true
+timeout 5 ros2 daemon stop >/dev/null 2>&1 || true
 
 # Kill any stale MAVROS instances
 pkill -f "mavros.*node.launch" 2>/dev/null || true
@@ -173,11 +175,7 @@ log " QGC setup: Comm Links → Add → UDP → Port $GCS_UDP_PORT"
 log " Or QGC auto-discovers on same LAN (no config needed)"
 log "====================================================="
 
-# Rotate NTRIP log if >10MB
-if [[ -f /tmp/ntrip.log ]] && [[ $(stat -c%s /tmp/ntrip.log 2>/dev/null || echo 0) -gt 10485760 ]]; then
-    mv /tmp/ntrip.log /tmp/ntrip.log.old
-    log "Rotated NTRIP log"
-fi
+rm -f /tmp/px4_mavros_ready
 
 mavros_watchdog &
 MAVROS_WATCHDOG_PID=$!
@@ -186,8 +184,9 @@ CHILD_PIDS+=("$MAVROS_WATCHDOG_PID")
 log "Waiting for MAVROS to initialise..."
 mavros_ready=0
 for i in $(seq 1 "$MAVROS_READY_TIMEOUT"); do
-    if check_ros_node "/mavros"; then
+    if [[ -f /tmp/px4_mavros_ready ]]; then
         mavros_ready=1
+        rm -f /tmp/px4_mavros_ready
         break
     fi
     if ! kill -0 "$MAVROS_WATCHDOG_PID" 2>/dev/null; then
@@ -215,7 +214,7 @@ fi
 log "Starting NTRIP RTK client..."
 if [[ -z "${NTRIP_USER:-}" ]] || [[ -z "${NTRIP_PASS:-}" ]]; then
     log "WARNING: NTRIP_USER/NTRIP_PASS env vars not set — NTRIP will crash-loop"
-    log "Create /home/flash/.config/ntrip/env or set vars in systemd override"
+    log "Run deploy.sh to create config/ntrip.env"
 fi
 ntrip_watchdog &
 NTRIP_WATCHDOG_PID=$!
@@ -223,7 +222,7 @@ CHILD_PIDS+=("$NTRIP_WATCHDOG_PID")
 
 sleep "$NTRIP_READY_WAIT"
 if ! kill -0 "$NTRIP_WATCHDOG_PID" 2>/dev/null; then
-    log "WARNING: NTRIP watchdog exited immediately — check /tmp/ntrip.log"
+    log "WARNING: NTRIP watchdog exited immediately — check: journalctl -u px4-dxp.service -n 50"
 fi
 
 log "Active ROS nodes:"

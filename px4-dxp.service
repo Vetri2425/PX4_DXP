@@ -2,7 +2,6 @@
 Description=PX4 DXP Bridge - MAVROS2 + NTRIP RTK (CubeOrangePlus)
 After=network.target network-online.target dev-ttyACM0.device
 Wants=network-online.target
-BindsTo=dev-ttyACM0.device
 
 [Service]
 Type=exec
@@ -13,8 +12,8 @@ ExecStart=/home/flash/PX4_DXP/px4_start_service.sh
 ExecStop=/bin/kill -TERM $MAINPID
 Restart=always
 RestartSec=10
-StartLimitInterval=120
-StartLimitBurst=5
+StartLimitInterval=300
+StartLimitBurst=10
 
 # Security hardening
 NoNewPrivileges=yes
@@ -24,7 +23,7 @@ ReadWritePaths=/home/flash/.ros /home/flash/PX4_DXP /tmp /var/tmp
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-RestrictRealtime=yes
+RestrictRealtime=no
 SupplementaryGroups=dialout
 
 # Resource limits
@@ -43,7 +42,7 @@ Environment=HOME=/home/flash
 # ntrip_rtcm_node.py requires NTRIP_USER and NTRIP_PASS env vars (no defaults).
 # Run deploy.sh to create the env file (prompts once, skips if exists):
 #   cd ~/PX4_DXP && ./deploy.sh
-EnvironmentFile=/home/flash/.config/ntrip/env
+EnvironmentFile=/home/flash/PX4_DXP/config/ntrip.env
 
 # Output
 StandardOutput=journal

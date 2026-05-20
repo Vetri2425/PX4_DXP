@@ -23,7 +23,15 @@ from sensor_msgs.msg import NavSatFix, NavSatStatus
 # ---------------------------------------------------------------------------
 NTRIP_HOST = os.environ.get("NTRIP_HOST", "caster.emlid.com")
 NTRIP_PORT = int(os.environ.get("NTRIP_PORT", "2101"))
-NTRIP_MOUNTPT = os.environ.get("NTRIP_MOUNTPT", "MP23960a")
+_NTRIP_MOUNTPT_ENV = os.environ.get("NTRIP_MOUNTPT")
+if not _NTRIP_MOUNTPT_ENV:
+    import warnings
+    warnings.warn(
+        "NTRIP_MOUNTPT not set — using default 'MP23960a'. "
+        "Add NTRIP_MOUNTPT to config/ntrip.env and restart.",
+        stacklevel=1,
+    )
+NTRIP_MOUNTPT = _NTRIP_MOUNTPT_ENV or "MP23960a"
 
 _NTRIP_USER = os.environ.get("NTRIP_USER")
 _NTRIP_PASS = os.environ.get("NTRIP_PASS")
@@ -70,22 +78,27 @@ class NtripNode(Node):
     def __init__(self):
         super().__init__("ntrip_rtcm_node")
 
-        # -- Publisher (BEST_EFFORT, depth=10) --
+        # -- Publisher: RELIABLE to match MAVROS gps_rtk plugin subscription --
         rtcm_qos = QoSProfile(
             depth=10,
-            reliability=ReliabilityPolicy.BEST_EFFORT,
+            reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
         )
         self.pub = self.create_publisher(RTCM, "/mavros/gps_rtk/send_rtcm", rtcm_qos)
 
-        # -- GGA back-feed subscriber --
+        # -- GGA back-feed subscriber: BEST_EFFORT to match MAVROS GPS publisher --
+        gps_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
         self._gps_fix = None
         self._gps_lock = threading.Lock()
         self.create_subscription(
             NavSatFix,
             "/mavros/global_position/raw/fix",
             self._gps_callback,
-            10,
+            gps_qos,
         )
 
         # -- Thread control --
@@ -97,6 +110,9 @@ class NtripNode(Node):
         # -- Health monitoring --
         self._last_data_time = self.get_clock().now()
         self._reconnect_count = 0
+        self._stats_lock = threading.Lock()
+        self._frame_count = 0
+        self._byte_count = 0
         self.create_timer(30.0, self._check_health)
 
         # -- GGA back-feed timer (every 10 s) --
@@ -199,9 +215,21 @@ class NtripNode(Node):
     def _check_health(self):
         now = self.get_clock().now()
         elapsed = (now - self._last_data_time).nanoseconds / 1e9
+
+        with self._stats_lock:
+            frames = self._frame_count
+            bytess = self._byte_count
+            self._frame_count = 0
+            self._byte_count = 0
+
         if elapsed > 30.0:
             self.get_logger().warn(
                 f"No RTCM data for {elapsed:.0f}s "
+                f"(reconnects: {self._reconnect_count})"
+            )
+        else:
+            self.get_logger().info(
+                f"RTCM: {frames} frames, {bytess} bytes in last 30s "
                 f"(reconnects: {self._reconnect_count})"
             )
 
@@ -350,6 +378,9 @@ class NtripNode(Node):
                         msg.data = list(frame)
                         self.pub.publish(msg)
                         self._last_data_time = self.get_clock().now()
+                        with self._stats_lock:
+                            self._frame_count += 1
+                            self._byte_count += len(frame)
 
             except Exception as e:
                 self._reconnect_count += 1

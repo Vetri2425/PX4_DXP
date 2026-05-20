@@ -16,10 +16,11 @@ bags/
 .idea/
 *.swp
 
-# Local env / secrets
+# Local env / secrets (never commit credentials)
 .env
 *.local
 secrets/
+config/*.env
 
 # OS
 .DS_Store

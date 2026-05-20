@@ -26,17 +26,17 @@ Fallback: RC override → PX4 RTL. GPIO pulse from Jetson triggers RC failsafe.
 
 **Current state:** Running as `px4-dxp.service`. `/dev/ttyACM0` @ 921600 baud, GCS `udp-b://:14550@`. Production-hardened with watchdogs.
 
-### 1.2 — Localization: Dual-Layer
+### 1.2 — Localization: PX4 EKF2 Primary, Jetson Fusion Deferred
 
 | Option | Verdict |
 |---|---|
-| PX4 EKF only | Rejected — ignores wheel odometry, no NHC |
+| **PX4 EKF2 only** | **Phase 2 default** — proven ±1.2-2.1cm xtrack, hits ±3cm budget |
 | Jetson only | Rejected — CPU spikes cause dead-reckoning divergence |
-| **Both (dual-layer)** | **Selected** |
+| Dual-layer (robot_localization) | Deferred to Phase 3-4 — add only if GPS dropouts or arc error >3cm |
 
 ```
-UM982 RTK (dual-antenna) → PX4 EKF3 (50Hz) → /mavros/global_position
-CubeOrangePlus IMU ───────→ PX4 EKF3 ─────────→ /mavros/imu/data
+UM982 RTK (dual-antenna) → PX4 EKF2 (50Hz) → /mavros/global_position
+CubeOrangePlus IMU ───────→ PX4 EKF2 ─────────→ /mavros/imu/data
                                                     ↓
 Jetson robot_localization (20Hz) ←──────────────────┘
     ↑ wheel odometry (AMT102 via STM32 bridge)
@@ -47,7 +47,7 @@ Jetson robot_localization (20Hz) ←──────────────�
 
 Graceful degradation: if Jetson EKF fails, PX4 position still works (less smooth). If PX4 EKF fails, Jetson degrades to dead-reckoning (~30s).
 
-**Current state:** PX4 EKF3 running with RTK injection via NTRIP node. Jetson robot_localization NOT yet built (Phase 2).
+**Current state:** PX4 EKF2 running with RTK injection via NTRIP node. Jetson robot_localization NOT yet built (deferred — EKF2 alone hits ±3cm target).
 
 ### 1.3 — IMU: CubeOrangePlus Built-In
 
@@ -175,8 +175,8 @@ Benefit: 5-15% improvement on arcs, 12-34% during GPS outages. Zero hardware cos
          ┌────────────────────────────────────────┐
          │        CUBEORANGEPLUS (PX4 v1.16.2)     │
          │                                        │
-         │  [PX4 EKF3] ← UM982 RTK (dual-antenna) │  ← RUNNING
-         │  [PX4 EKF3] ← ICM42688P IMU            │  ← RUNNING
+         │  [PX4 EKF2] ← UM982 RTK (dual-antenna) │  ← RUNNING
+         │  [PX4 EKF2] ← ICM42688P IMU            │  ← RUNNING
          │  [Offboard Mode] ← /cmd_vel via MAVROS  │  ← Phase 2
          │  [AUTO Mode] ← Mission waypoints       │  ← WORKING
          │  [Motor Rate PIDs] → Sabertooth 2x32    │  ← RUNNING

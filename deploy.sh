@@ -68,25 +68,34 @@ else
 fi
 
 # ── 3. NTRIP credentials ───────────────────────────────────────────
-NTRIP_ENV="/home/flash/.config/ntrip/env"
+NTRIP_ENV="${SCRIPT_DIR}/config/ntrip.env"
 
 if [[ -f "$NTRIP_ENV" ]]; then
     log "ntrip: env file exists at ${NTRIP_ENV}"
+    # Patch existing file if NTRIP_MOUNTPT is missing
+    if ! grep -q "^NTRIP_MOUNTPT=" "$NTRIP_ENV"; then
+        echo ""
+        echo "  NTRIP_MOUNTPT not found in ${NTRIP_ENV} — adding it now."
+        read -rp "  NTRIP_MOUNTPT (e.g. MP23960a): " ntrip_mountpt
+        echo "NTRIP_MOUNTPT=${ntrip_mountpt}" >> "$NTRIP_ENV"
+        log "ntrip: NTRIP_MOUNTPT added to ${NTRIP_ENV}"
+    fi
 else
     log "ntrip: env file NOT found — creating it now"
-    sudo mkdir -p "$(dirname "$NTRIP_ENV")"
+    mkdir -p "$(dirname "$NTRIP_ENV")"
 
     echo ""
     echo "  NTRIP credentials required for RTK injection."
-    echo "  These are stored at ${NTRIP_ENV} (root-owned, mode 600)."
+    echo "  Stored at ${NTRIP_ENV} (gitignored, flash-owned, mode 600)."
     echo ""
     read -rp "  NTRIP_USER: " ntrip_user
     read -rp "  NTRIP_PASS: " ntrip_pass
+    read -rp "  NTRIP_MOUNTPT (e.g. MP23960a): " ntrip_mountpt
 
-    echo "NTRIP_USER=${ntrip_user}" | sudo tee "$NTRIP_ENV" > /dev/null
-    echo "NTRIP_PASS=${ntrip_pass}" | sudo tee -a "$NTRIP_ENV" > /dev/null
-    sudo chmod 600 "$NTRIP_ENV"
-    log "ntrip: env file created at ${NTRIP_ENV}"
+    printf "NTRIP_USER=%s\nNTRIP_PASS=%s\nNTRIP_MOUNTPT=%s\n" \
+        "$ntrip_user" "$ntrip_pass" "$ntrip_mountpt" > "$NTRIP_ENV"
+    chmod 600 "$NTRIP_ENV"
+    log "ntrip: env file created at ${NTRIP_ENV} (mode 600, owner flash)"
 fi
 
 # ── 4. Ensure service references env file ──────────────────────────

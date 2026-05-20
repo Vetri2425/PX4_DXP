@@ -11,4 +11,10 @@
       - actuator_control # Safety: direct PWM bypass skips all limits
       - 3dr_radio        # No radio telemetry hardware
       - ftp              # File transfer not needed
+      - fake_gps         # Simulated GPS — dangerous on real hardware
+      - landing_target   # Copter/VTOL only — not a rover concept
+      - mocap_pose_estimate  # No motion capture system
+      - vision_pose_estimate # No visual odometry pipeline
+      - setpoint_accel   # Phase 2 uses setpoint_raw/local + setpoint_velocity
+      - safety_area      # No visualiser consuming fence markers
       # gps_rtk is intentionally NOT denied — required for NTRIP RTK injection

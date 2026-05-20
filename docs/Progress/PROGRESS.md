@@ -145,6 +145,24 @@ Running log of all work. Each entry: what built, what fixed, what's next, time s
 - Push fork, CI build, flash to CubeOrangePlus
 - Start Phase 2: write OFFBOARD ROS2 node on Jetson
 
+## 2026-05-20 — Phase 2 Start: OFFBOARD Patches Applied (1 session)
+
+### Built
+- Firmware patches P1-P4 committed and pushed to fork (commit 1e2ce81a)
+  - P1: DifferentialPosControl — NaN-invalidate cached position on OFFBOARD exit + disarm
+  - P2: RoverDifferential — _was_armed guard, zero actuator on disarm, slew-rate reset
+  - P3: DifferentialVelControl — signed speed projection (body-x axis) for reverse motion
+  - P4: DifferentialVelControl — hold-yaw-at-stop (freeze _vehicle_yaw when vel < 0.01 m/s)
+- DifferentialVelControl directory created in fork (was missing from overlay)
+- build_rover.yml extended: now copies VelControl (.cpp/.hpp/CMakeLists.txt) + PosControl (.cpp/.hpp)
+- CI build triggered on push to main
+
+### Next
+- Monitor CI build at https://github.com/Vetri2425/PX4-Autopilot/actions
+- Download firmware artifact, flash to CubeOrangePlus
+- Set 13 FCU params in QGC (safety + performance)
+- Begin OFFBOARD ROS2 node on Jetson (Phase 2 milestone 1: straight-line velocity)
+
 ## Phase 2 Entries Start Below
 
 <!-- Template for future entries:

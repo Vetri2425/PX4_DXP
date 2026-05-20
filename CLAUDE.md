@@ -42,7 +42,7 @@ ros2 topic echo /mavros/state --once  # should show "connected: true"
 **What `deploy.sh` does:**
 - Symlinks `px4-dxp.service` → `/etc/systemd/system/` (future `git pull` auto-updates)
 - Symlinks `ntrip.logrotate` → `/etc/logrotate.d/` (future `git pull` auto-updates)
-- Creates NTRIP env file at `~/.config/ntrip/env` (prompts once, skips if exists)
+- Creates NTRIP env file at `~/PX4_DXP/config/ntrip.env` (prompts once, skips if exists)
 - Reloads systemd daemon + enables service
 
 **Why symlinks?** Once deployed, `git pull` updates the repo files in-place. Since systemd and logrotate read through the symlink, **no re-deploy needed for content changes** — just restart the service. Only re-run `deploy.sh` if you add NEW files or change the service definition.
@@ -55,7 +55,7 @@ ros2 topic echo /mavros/state --once  # should show "connected: true"
 - NTRIP node: `~/PX4_DXP/ntrip_rtcm_node.py` (launched by start script)
 - Config: `~/PX4_DXP/px4_pluginlists_rover.yaml`
 - Log rotation: `~/PX4_DXP/ntrip.logrotate` (symlinked to `/etc/logrotate.d/`)
-- Credentials: `~/.config/ntrip/env` (NTRIP_USER, NTRIP_PASS)
+- Credentials: `~/PX4_DXP/config/ntrip.env` (gitignored — never committed)
 
 **Status checks:**
 ```bash
@@ -80,6 +80,8 @@ sudo systemctl restart px4-dxp.service
   ├── ntrip_rtcm_node.py             ← NTRIP RTK injector
   ├── px4-dxp.service                ← systemd unit (symlinked to system)
   ├── ntrip.logrotate                ← log rotation (symlinked to system)
+  ├── config/                        ← local config (gitignored secrets)
+  │   └── ntrip.env                  ← NTRIP credentials (gitignored, never committed)
   ├── docs/                          ← architecture docs
   │   ├── MAVROS_vs_DDS.md
   │   └── Pure_DDS.md
@@ -172,6 +174,6 @@ cd ~/PX4_DXP && ./deploy.sh --restart
 - MAVROS pluginlist: `~/PX4_DXP/px4_pluginlists_rover.yaml`
 - MAVROS PX4 config: `/opt/ros/humble/share/mavros/launch/px4_config.yaml`
 - Service log: `journalctl -u px4-dxp.service -f`
-- NTRIP credentials: `~/.config/ntrip/env`
+- NTRIP credentials: `~/PX4_DXP/config/ntrip.env` (gitignored)
 - QGC UDP port: 14550 (laptop QGC connects here)
 - Date format in memory/files: `YYYY-MM-DD`

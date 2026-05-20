@@ -1,7 +1,3 @@
-# Kiro Opus Prompt — PX4 Rover OFFBOARD Code Audit
-
----
-
 ## Context
 
 You are auditing the PX4 v1.16.2 rover differential OFFBOARD control path for a **commercial marking rover** (3WD differential drive, 0.4 m/s, target ±3cm arc accuracy). The rover draws paint lines on construction sites. A runaway or failure to stop is a **safety incident**, not just a bug.
