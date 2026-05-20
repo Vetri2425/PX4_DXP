@@ -165,6 +165,43 @@ Running log of all work. Each entry: what built, what fixed, what's next, time s
 
 ## Phase 2 Entries Start Below
 
+## 2026-05-20 — Phase 2 Sessions 1-3: OFFBOARD Test Node (1 session)
+
+### Built
+- `src/offboard_test.py` — OFFBOARD test node with two modes:
+  - **Position mode** (Session 2): 1m North in NED, hold, stop, disarm
+  - **Velocity mode** (Session 3): forward 0.3 m/s → stop → reverse -0.3 m/s → stop → hold → disarm
+  - 50Hz setpoint stream, 1s preflight, OFFBOARD mode confirmation, auto-disarm on exit
+  - STATUSTEXT subscription for FCU denial reasons
+  - ExtendedState subscription for landed state / system status
+  - Mode reset to MANUAL before OFFBOARD (prevents stale state from previous test)
+- Position mode: **WORKING** — armed, drove toward NED target, disarmed
+- Velocity mode forward: **WORKING** — both motors same direction after ENU→NED fix
+- Velocity mode reverse: **NOT WORKING** — P3 not active, rover spot-turns instead of reversing
+- Jetson + laptop PX4_DXP repos synced (both at commit `dd2a134`)
+
+### Fixed
+- **Bug: FRAME_BODY_OFFSET_NED (9) rejected** — PX4 rover firmware error `coordinate frame 9 unsupported`. Fix: use FRAME_LOCAL_NED (1) + body→NED velocity transform in node code
+- **Bug: ENU→NED yaw 90° error** — MAVROS `/mavros/local_position/pose` publishes quaternions in ENU frame (0°=East, CCW). Code was using ENU yaw as NED yaw (0°=North, CW), rotating all velocity setpoints 90° off heading. Fix: `yaw_NED = π/2 - yaw_ENU`
+- **Bug: Arming denied without stable heading** — NTRIP server 502 → no RTK → heading estimate unstable → PX4 refuses arm (ERROR, not WARN). COM_ARM_WO_GPS=1 does NOT bypass heading stability check. Workaround: disable GPS preflight check in QGC
+- **Bug: Stale OFFBOARD mode from previous test** — shutdown tried HOLD (rover doesn't have HOLD). Fix: switch to MANUAL on shutdown; reset to MANUAL before starting OFFBOARD sequence
+- **Bug: Double disarm race condition** — shutdown handler fires before state callback updates. Harmless but noisy.
+
+### Open issues
+- **P3 (reverse motion) not working in OFFBOARD** — PX4 rover velocity controller interprets negative speed as "turn 180° and drive forward" instead of "drive backward." P3 patch should fix this but appears NOT active in OFFBOARD velocity control path. Need to verify: is commit `24d78a81` actually flashed? Does P3 apply in OFFBOARD mode?
+- **P4 (heading hold at stop) NOT validated** — heading too unstable without RTK to test
+- **Throttle ramp slow** — 60% throttle produced only 0.01 m/s in 3s. Acceleration limiting (RO_ACCEL_LIM) causes gradual ramp. Not hardware.
+- **NTRIP server down** — external 502 Bad Gateway, no RTCM corrections flowing
+- **13 safety params NOT set on FCU** — COM_OF_LOSS_T, COM_OBL_RC_ACT, COM_RCL_EXCEPT, RD_TANK_MODE, etc.
+
+### Next
+- **Fix NTRIP** (external server issue) → RTK corrections → stable heading → retest velocity mode
+- **Verify P3 firmware** — is commit `24d78a81` actually flashed on CubeOrangePlus?
+- **Set safety params** on FCU via QGC
+- **Session 4**: Pure-pursuit arc controller node (can write code now, test with RTK later)
+
+---
+
 <!-- Template for future entries:
 ## YYYY-MM-DD — [Phase] [Description] (N sessions)
 
