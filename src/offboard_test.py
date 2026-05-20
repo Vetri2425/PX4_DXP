@@ -24,6 +24,10 @@ PX4 OFFBOARD sequence (MUST follow this order):
   3. Switch to OFFBOARD mode via /mavros/set_mode
   4. Arm via /mavros/cmd/arming
   5. Continue streaming setpoints without interruption
+
+Important: PX4 rover rejects FRAME_BODY_OFFSET_NED (9). All setpoints
+use FRAME_LOCAL_NED (1). Velocity commands are transformed from body frame
+(forward/right) to NED (north/east) using the current heading.
 """
 
 import math
@@ -33,16 +37,16 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
-from mavros_msgs.msg import PositionTarget, State
+from mavros_msgs.msg import PositionTarget, State, ExtendedState
 from mavros_msgs.srv import SetMode, CommandBool
-from geometry_msgs.msg import PoseStamped, TwistStamped
+from geometry_msgs.msg import PoseStamped
 
 
 # ---------------------------------------------------------------------------
 # PositionTarget type_mask constants (MAVLink SET_POSITION_TARGET_LOCAL_NED)
 # ---------------------------------------------------------------------------
 FRAME_LOCAL_NED = 1
-FRAME_BODY_OFFSET_NED = 9
+# FRAME_BODY_OFFSET_NED = 9  # REJECTED by PX4 rover — use FRAME_LOCAL_NED + heading transform
 
 IGNORE_PX = 1
 IGNORE_PY = 2
@@ -102,6 +106,7 @@ class OffboardTestNode(Node):
         # --- State ---
         self.current_state = State()
         self.current_pose = None  # PoseStamped from /mavros/local_position/pose
+        self.extended_state = None  # ExtendedState from /mavros/extended_state
         self.offboard_engaged = False
         self.mission_done = False
         self.phase = "preflight"  # preflight → stream → arm → run → stop → disarm
@@ -127,9 +132,6 @@ class OffboardTestNode(Node):
         self.sp_pub = self.create_publisher(
             PositionTarget, "/mavros/setpoint_raw/local", sp_qos
         )
-        self.vel_pub = self.create_publisher(
-            TwistStamped, "/mavros/setpoint_velocity/cmd_vel", sp_qos
-        )
 
         # --- Subscribers ---
         self.state_sub = self.create_subscription(
@@ -137,6 +139,9 @@ class OffboardTestNode(Node):
         )
         self.pose_sub = self.create_subscription(
             PoseStamped, "/mavros/local_position/pose", self._pose_cb, sp_qos
+        )
+        self.ext_state_sub = self.create_subscription(
+            ExtendedState, "/mavros/extended_state", self._ext_state_cb, state_qos
         )
 
         # --- Service clients ---
@@ -170,6 +175,26 @@ class OffboardTestNode(Node):
             f"armed={self.current_state.armed})"
         )
 
+        # --- Check position estimate ---
+        self.get_logger().info("Checking position estimate...")
+        self._spin_for(2.0)  # Let ExtendedState arrive
+        has_position = self.current_pose is not None
+        self.get_logger().info(
+            f"Position estimate: {'YES' if has_position else 'NO — may need COM_ARM_WO_GPS=1'}"
+        )
+        if not has_position:
+            self.get_logger().warn(
+                "No position estimate! If arming fails, set COM_ARM_WO_GPS=1 in QGC params"
+            )
+
+        # --- Check arm-readiness from ExtendedState ---
+        if self.extended_state is not None:
+            ls = self.extended_state.landed_state
+            ls_names = {0: "UNDEFINED", 1: "ON_GROUND", 2: "IN_AIR", 3: "TAKEOFF"}
+            self.get_logger().info(f"Landed state: {ls_names.get(ls, ls)}")
+        else:
+            self.get_logger().warn("No ExtendedState received — GPS/arming status unknown")
+
         # --- Start mission sequence ---
         self._run_mission()
 
@@ -196,6 +221,9 @@ class OffboardTestNode(Node):
     def _pose_cb(self, msg: PoseStamped):
         self.current_pose = msg
 
+    def _ext_state_cb(self, msg: ExtendedState):
+        self.extended_state = msg
+
     # ------------------------------------------------------------------
     # Setpoint generators
     # ------------------------------------------------------------------
@@ -210,24 +238,40 @@ class OffboardTestNode(Node):
         msg.position.z = 0.0     # NED Down (irrelevant for rover)
         return msg
 
-    def _make_velocity_setpoint(self, vx: float, vy: float) -> PositionTarget:
-        """Create a velocity-only setpoint in BODY frame.
+    def _get_yaw_rad(self) -> float:
+        """Get current heading in radians from pose quaternion (NED convention)."""
+        if self.current_pose is None:
+            return 0.0
+        q = self.current_pose.pose.orientation
+        # Quaternion to yaw (NED): yaw=0 is North, positive clockwise
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        return math.atan2(siny_cosp, cosy_cosp)
 
-        Uses FRAME_BODY_OFFSET_NED so vx=forward, vy=right relative to rover heading.
-        This is correct for differential rovers: vx=-0.3 means reverse regardless of yaw.
-        The PX4 firmware translates body-frame velocity to NED internally using yaw.
+    def _make_velocity_setpoint(self, vx: float, vy: float) -> PositionTarget:
+        """Create a velocity-only setpoint, transforming body frame to NED.
+
+        PX4 rover rejects FRAME_BODY_OFFSET_NED (9). We must use FRAME_LOCAL_NED (1)
+        and transform body-frame velocities ourselves using the current heading.
+
+        Body frame:  vx = forward (+) / reverse (-), vy = right (+) / left (-)
+        NED frame:   north = vx*cos(yaw) - vy*sin(yaw), east = vx*sin(yaw) + vy*cos(yaw)
         """
+        yaw = self._get_yaw_rad()
+        north_vel = vx * math.cos(yaw) - vy * math.sin(yaw)
+        east_vel = vx * math.sin(yaw) + vy * math.cos(yaw)
+
         msg = PositionTarget()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.coordinate_frame = FRAME_BODY_OFFSET_NED
+        msg.coordinate_frame = FRAME_LOCAL_NED
         msg.type_mask = TYPE_MASK_VELOCITY
-        msg.velocity.x = vx  # Forward m/s (positive=forward, negative=reverse)
-        msg.velocity.y = vy  # Right m/s (0 for differential, lateral only for mecanum)
+        msg.velocity.x = north_vel  # NED North m/s
+        msg.velocity.y = east_vel   # NED East m/s
         msg.velocity.z = 0.0
         return msg
 
     def _make_stop_setpoint(self) -> PositionTarget:
-        """Create a zero-velocity stop setpoint in body frame (P4 holds heading)."""
+        """Create a zero-velocity stop setpoint (P4 holds heading via P4 patch)."""
         return self._make_velocity_setpoint(0.0, 0.0)
 
     def _make_hold_setpoint(self) -> PositionTarget:
@@ -367,9 +411,9 @@ class OffboardTestNode(Node):
     def _run_velocity_mission(self):
         """Session 3: Velocity-mode OFFBOARD test — forward, reverse, stop, heading hold.
 
-        Uses FRAME_BODY_OFFSET_NED for velocity commands:
-          vx=+0.3 → forward at 0.3 m/s (regardless of compass heading)
-          vx=-0.3 → reverse at 0.3 m/s (regardless of compass heading)
+        Uses FRAME_LOCAL_NED with heading-aware transform for velocity commands:
+          vx=+0.3 → forward at 0.3 m/s (NED transform uses current yaw)
+          vx=-0.3 → reverse at 0.3 m/s (NED transform uses current yaw)
           vx=0    → stop, P4 holds current heading (no North-snap)
 
         Sequence:
@@ -431,7 +475,7 @@ class OffboardTestNode(Node):
         self._spin_for(2.0)
 
         # Step 6: Reverse (P3 validation — backward without 180° spin)
-        self.get_logger().info(f"Step 6: Reverse {-self.target_speed} m/s for 3s (body frame)...")
+        self.get_logger().info(f"Step 6: Reverse {-self.target_speed} m/s for 3s (NED transform)...")
         self.phase = "run_velocity_reverse"
         self._spin_for(3.0)
 
@@ -489,8 +533,10 @@ class OffboardTestNode(Node):
                 self.get_logger().info(f"{'Arm' if arm else 'Disarm'}: success")
                 return True
             else:
+                reason = getattr(result, 'result', None)
                 self.get_logger().error(
-                    f"{'Arm' if arm else 'Disarm'}: failed ({result})"
+                    f"{'Arm' if arm else 'Disarm'}: DENIED (result={reason}). "
+                    f"Likely causes: no GPS fix (set COM_ARM_WO_GPS=1) or pre-arm checks failed"
                 )
                 return False
         else:
