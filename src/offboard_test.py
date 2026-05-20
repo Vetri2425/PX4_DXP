@@ -316,6 +316,18 @@ class OffboardTestNode(Node):
             self.get_logger().error("Failed to enter OFFBOARD mode — aborting")
             self._shutdown()
             return
+
+        # Step 2b: Wait for mode to actually change
+        self.get_logger().info("Waiting for OFFBOARD mode confirmation...")
+        deadline = time.time() + 5.0
+        while self.current_state.mode != "OFFBOARD" and time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        if self.current_state.mode != "OFFBOARD":
+            self.get_logger().error(
+                f"Mode did not switch to OFFBOARD (stuck at {self.current_state.mode}) — aborting"
+            )
+            self._shutdown()
+            return
         self.offboard_engaged = True
 
         # Step 3: Arm
@@ -383,6 +395,18 @@ class OffboardTestNode(Node):
         result = self._set_mode("OFFBOARD")
         if not result:
             self.get_logger().error("Failed to enter OFFBOARD mode — aborting")
+            self._shutdown()
+            return
+
+        # Step 2b: Wait for mode to actually change
+        self.get_logger().info("Waiting for OFFBOARD mode confirmation...")
+        deadline = time.time() + 5.0
+        while self.current_state.mode != "OFFBOARD" and time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        if self.current_state.mode != "OFFBOARD":
+            self.get_logger().error(
+                f"Mode did not switch to OFFBOARD (stuck at {self.current_state.mode}) — aborting"
+            )
             self._shutdown()
             return
         self.offboard_engaged = True
