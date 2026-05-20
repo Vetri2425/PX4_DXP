@@ -12,9 +12,9 @@
 |---|------|-------|--------|
 | T1 | `T1_mission_formats.md` | Mission/file formats used by commercial marking rovers | TODO |
 | T2 | `T2_trajectory_planning.md` | Pattern/trajectory planning from CAD, DXF, waypoints | TODO |
-| T3 | `T3_controller_pipeline.md` | Trajectory → controller → OFFBOARD command flow | TODO |
+| T3 | `T3_controller_pipeline.md` | Trajectory → controller → OFFBOARD command flow | **COMPLETE** — code in `src/` |
 | T4 | `T4_sensor_fusion.md` | Position feedback, sensor fusion, heading sources | TODO |
-| T5 | `T5_rpp_arc_controller.md` | RPP (Rover Pure Pursuit) commander for arc/shape following | TODO |
+| T5 | `T5_rpp_arc_controller.md` | RPP (Rover Pure Pursuit) commander for arc/shape following | **MERGED INTO T3** |
 | T6 | `T6_full_system_architecture.md` | End-to-end system: mission → trajectory → controller → motors → feedback | TODO |
 
 ## How to Use

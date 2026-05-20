@@ -84,8 +84,33 @@ sudo systemctl restart px4-dxp.service
   │   └── ntrip.env                  ← NTRIP credentials (gitignored, never committed)
   ├── docs/                          ← architecture docs
   │   ├── MAVROS_vs_DDS.md
-  │   └── Pure_DDS.md
-  └── (future) src/, launch/         ← Phase 2 ROS2 nodes
+  │   ├── Pure_DDS.md
+  │   └── Progress/PROGRESS.md       ← running project log
+  ├── src/                           ← ROS2 nodes (Phase 2)
+  │   ├── rpp_controller_node.py     ← RPP controller (NED velocity output)
+  │   ├── twist_to_setpoint_node.py  ← 50Hz PositionTarget streamer
+  │   ├── path_publisher_node.py      ← test path publisher (hardcoded + QGC/CSV)
+  │   ├── xtrack_logger_node.py      ← 20Hz CSV logger (18 columns)
+  │   ├── mission_runner_node.py      ← OFFBOARD lifecycle state machine
+  │   └── launch/rpp_pipeline.launch.py ← ordered startup
+  ├── server/                        ← FastAPI backend (Phase 2)
+  │   ├── main.py                    ← FastAPI app + Socket.IO + telemetry loop
+  │   ├── ros_node.py                ← rclpy bridge (subscribers + async service calls)
+  │   ├── offboard_controller.py     ← OFFBOARD lifecycle (arm → OFFBOARD → run → stop)
+  │   ├── path_manager.py            ← path loading (6 built-in + QGC + CSV)
+  │   ├── rpp_status.py              ← RPP debug decoder + done-settle
+  │   ├── emergency.py               ← e-stop: stop-path + MANUAL + disarm
+  │   ├── beacon.py                  ← UDP discovery broadcast
+  │   ├── auth.py                    ← shared-secret token auth
+  │   ├── config.py, models.py       ← constants + Pydantic models
+  │   ├── logging_setup.py           ← structured logging
+  │   ├── routes/                    ← 6 REST route modules
+  │   ├── sockets/events.py          ← Socket.IO event handlers
+  │   ├── missions/                  ← uploaded .waypoints/.csv files (gitignored)
+  │   ├── requirements.txt           ← pip dependencies
+  │   ├── run.sh                     ← startup script (source ROS2 + uvicorn)
+  │   └── ARCHITECTURE.md            ← full build specification
+  └── (legacy files outside repo)
 
 ~/circle_drive.py, half_circle.py, square_drive.py, d_shape.py,
 ~/u_turn.py, u_turn_simple.py, test_arc.py, spin360.py, spin360_1.py
@@ -99,6 +124,34 @@ sudo systemctl restart px4-dxp.service
 1. **All runtime files live inside `~/PX4_DXP/`** — `git pull` updates everything. No scattered files outside the repo.
 2. **System files are symlinked, not copied** — `deploy.sh` creates symlinks so git changes propagate automatically. Just restart the service.
 3. **NTRIP node is inside the repo** — old location `~/ntrip_rtcm_node.py` is dead. The start script references `$SCRIPT_DIR/ntrip_rtcm_node.py`.
+
+## FastAPI Backend Server
+
+**Location:** `~/PX4_DXP/server/`
+**Port:** 5001 (default, configurable via `FASTAPI_PORT` env var)
+**Discovery:** UDP broadcast on port 5002 every 2s
+
+**Architecture:** Frontend (React/Vue) → FastAPI + Socket.IO → rclpy node → ROS2 topics/services → MAVROS → PX4
+
+**Running the server:**
+```bash
+cd ~/PX4_DXP/server && bash run.sh       # production (requires token)
+ROVER_DISABLE_AUTH=1 bash run.sh          # dev mode (no auth)
+```
+
+**API endpoints:** See `server/ARCHITECTURE.md` for full specification.
+**Key endpoints:** `/api/ping`, `/api/arm`, `/api/set_mode`, `/api/estop`, `/api/mission/start`, `/api/mission/stop`, `/api/mission/status`, `/api/paths`, `/api/path/upload`, `/api/path/publish`, `/api/telemetry/latest`
+
+**Socket.IO events:** `telemetry` (10Hz), `mission_status` (10Hz), `arm`, `set_mode`, `emergency_stop`, `mission_load/start/stop/abort`
+
+**Auth:** Shared-secret token at `~/.rover_token` (auto-generated). Set `ROVER_DISABLE_AUTH=1` for LAN-only dev.
+
+**Critical implementation details:**
+- **Pure rclpy** — no roslibpy, no CLI fallback. Server runs on same Jetson as ROS2 nodes.
+- **Async service calls** — `arm_async()`, `set_mode_async()` use `call_async` + `add_done_callback`, never block FastAPI event loop.
+- **Stop-path, not empty Path** — RPP node ignores empty Path (early return). E-stop publishes single point at rover's current position instead.
+- **ENU→NED conversion** — MAVROS pose is ENU frame. Server converts: `yaw_NED = π/2 - yaw_ENU`, `pos_n = pose.y`, `pos_e = pose.x`.
+- **MAVROS process-crash detection** — TRANSIENT_LOCAL keeps last message with `connected=True` even after MAVROS dies. Server tracks `_state_recv_time` and overrides `connected=False` after 2s timeout.
 
 ## Phase 2 plan (active — see laptop `project_architecture_decision.md`)
 
@@ -167,6 +220,21 @@ journalctl -u px4-dxp.service -f
 
 # Post-pull deploy
 cd ~/PX4_DXP && ./deploy.sh --restart
+
+# Start FastAPI server (manual)
+cd ~/PX4_DXP/server && bash run.sh
+
+# Start FastAPI server (dev mode, no auth)
+ROVER_DISABLE_AUTH=1 cd ~/PX4_DXP/server && bash run.sh
+
+# Test server health
+curl http://localhost:5001/api/ping
+
+# Watch RPP debug
+ros2 topic echo /rpp/debug --once
+
+# Watch velocity output
+ros2 topic echo /rpp/velocity_ned --once
 ```
 
 ## Useful pointers

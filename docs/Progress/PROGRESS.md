@@ -165,6 +165,178 @@ Running log of all work. Each entry: what built, what fixed, what's next, time s
 
 ## Phase 2 Entries Start Below
 
+## 2026-05-20 — Phase 2 Session 5: RPP Pipeline Built (1 session)
+
+### Built
+- **rpp_controller_node.py** (~577 lines) — Regulated Pure Pursuit controller
+  - Outputs **NED velocity vector** (Vector3Stamped on /rpp/velocity_ned), NOT body-frame (v, ω)
+  - PX4 derives yaw from atan2(vE, vN) in DifferentialOffboardMode — no ω command needed
+  - Segment projection (not vertex search) for closest-point on path
+  - Curvature-regulated speed: slows on tight curves, full speed on straights
+  - Approach scaling: linear deceleration in last 0.6m to goal
+  - P4 zero-vel floor: below 2 cm/s, set speed=0 to trigger heading-hold
+  - Pose freshness check: stale >200ms → emergency stop (0,0,0), OFFBOARD stays alive
+  - Publishes /rpp/debug (8 floats: xtrack, heading_err, lookahead, speed, κ, dist_goal, pose_age, state)
+  - No rotate-to-heading FSM — PX4 spot-turn handles large heading errors (RD_TRANS_DRV_TRN)
+- **twist_to_setpoint_node.py** (~231 lines) — MAVROS OFFBOARD heartbeat bridge
+  - 50Hz PositionTarget stream, type_mask=3527, FRAME_LOCAL_NED
+  - Input already in NED — no body→NED transform needed (RPP outputs NED)
+  - Stale input (>200ms) → zero velocity (safe fail-stop, OFFBOARD stays live)
+  - NaN/Inf rejection on input
+- **path_publisher_node.py** (~185 lines) — Test paths
+  - straight_5m, arc_quarter_1m5, lshape_2x2
+  - TRANSIENT_LOCAL durability, frame_id validation
+- **xtrack_logger_node.py** (~269 lines) — 20Hz CSV logger
+  - 18 columns: t, pose, xtrack, heading_err, speed, κ, state, velocity, MAVROS setpoint
+  - Flushes every ~1s for crash resilience
+- **mission_runner_node.py** (~350 lines) — OFFBOARD lifecycle state machine
+  - INIT → WAIT_FCU → WAIT_STREAM → SWITCH_OFFBOARD → ARM → RUNNING → DISARM → MANUAL → FINISHED
+  - 5Hz tick, mission timeout (5 min default), external OFFBOARD exit detection
+  - Dry run mode for telemetry capture without arming
+  - Monitors /rpp/debug state_code for DONE detection
+- **launch/rpp_pipeline.launch.py** (~169 lines) — Ordered startup
+  - twist_to_setpoint first (heartbeat), rpp_controller second, path_publisher after 2s
+  - auto_run flag: mission_runner after 4s (OFFBOARD + arm)
+  - dry_run flag: skip arm/mode commands
+
+### Key architectural change from original T3 spec
+- Original spec: RPP outputs body-frame (v, ω) → twist_to_setpoint does body→NED rotation
+- Built system: RPP outputs NED velocity vector → twist_to_setpoint just wraps in PositionTarget
+- Reason: PX4 v1.16 DifferentialOffboardMode computes `bearing = atan2(vE, vN)` from velocity vector direction. It ignores yaw/yaw_rate in the setpoint. Sending ω would be pointless.
+- PX4's internal spot-turn FSM (RD_TRANS_DRV_TRN ≈ 30° → spot-turn, RD_TRANS_TRN_DRV ≈ 5° → resume driving) handles large heading errors automatically.
+
+### Research task status
+- T1 (Mission Formats) — TODO
+- T2 (Trajectory Planning) — TODO
+- T3 (Controller Pipeline) — **COMPLETE** (code written, not yet tested)
+- T4 (Sensor Fusion) — TODO
+- T5 (RPP Arc Controller) — **MERGED INTO T3**
+- T6 (Full System Architecture) — TODO
+
+### Next (pre-hardware checklist, in order)
+1. Run Motion Studio autotune → get RBCLW_QPPS_MAX value
+2. Add SER_TEL2_BAUD = 115200 to param file
+3. Flash firmware with RoboClaw QPPS patch
+4. Verify both motors spin forward with positive command
+5. Fix NTRIP → validate RTK → retest velocity mode
+6. SITL validation of RPP pipeline (Gazebo + PX4 SITL)
+7. Hardware bring-up with RTK (straight line → arc → L-shape)
+8. Research T1/T2/T4 for Phase 3 (CAD → mission pipeline)
+
+---
+
+## 2026-05-20 — Phase 2 Session 4: Research & Architecture (1 session)
+
+### Built
+- Research tasks T1-T6 created in `docs/Researches/COMMERCIAL_ROVER_RESEARCH/`
+- T3 Controller Pipeline synthesis completed (multi-AI research: ChatGPT, Gemini, GLM, Grok + primary sources)
+- T3 FINAL_SYNTHESIS.md: RPP on Jetson, velocity setpoints only, MAVROS2 only, no Nav2 stack
+- RoboClaw driver patch (Kiro Opus): open-loop duty → closed-loop velocity QPPS (opcodes 35/36)
+- Param file `Param_with_Roboclaw.params` created with RoboClaw params + safety params
+
+### Decisions from T3 synthesis
+1. **RPP (Regulated Pure Pursuit)** on Jetson — NOT Stanley, NOT MPC
+2. **Velocity setpoints only** (type_mask 3527) — position setpoints stack two pure-pursuit controllers = oscillation
+3. **MAVROS2 only** — uXRCE-DDS rover offboard broken (forum bug 48430, unresolved)
+4. **No Nav2 stack** — overkill for marking with no obstacles
+5. **Custom rpp_controller_node.py** (~200 lines) + **twist_to_setpoint_node.py**
+6. Build order: RPP node → twist_to_setpoint → path source → logger → SITL → hardware
+
+### RoboClaw driver update
+- **Opus patch applied**: `setMotorSpeed()` now sends QPPS velocity commands (opcodes 35/36) instead of duty (opcodes 0/1/4/5)
+- **RBCLW_QPPS_MAX = 0** in param file — **CRITICAL**: must be set from Motion Studio autotune, 0 = no motion
+- **SER_TEL2_BAUD missing** — must be added (recommend 115200, must match RoboClaw config)
+- PWM_MAIN_FUNC1-8 all set to 0 (motors moved from PWM to RoboClaw)
+- CA_R_REV = 3 still applies (control allocator reversal before driver)
+
+### Open issues
+- **RBCLW_QPPS_MAX** — must be measured with Motion Studio autotune before flashing
+- **SER_TEL2_BAUD** — must be added to param file (115200 recommended)
+- **P3 (reverse motion)** — not validated without RTK
+- **P4 (heading hold)** — not validated without RTK
+- **NTRIP server 502** — external issue, blocks RTK testing
+
+### Next
+- Run Motion Studio autotune → get RBCLW_QPPS_MAX value
+- Add SER_TEL2_BAUD = 115200 to param file
+- Flash firmware with RoboClaw QPPS patch
+- Test RoboClaw motor direction (both forward with positive command)
+- Fix NTRIP → validate RTK → retest velocity mode
+- Build rpp_controller_node.py (can write code now, test later with RTK)
+
+---
+
+## 2026-05-21 — Phase 2 Session 6: FastAPI Backend Server Built (1 session)
+
+### Built
+- **FastAPI backend server** (17 files, ~2500 lines) in `PX4_DXP/server/`
+  - `main.py` — FastAPI app factory with lifespan, Socket.IO mount, 10Hz telemetry loop with watchdog
+  - `ros_node.py` — Single rclpy node in background thread with MultiThreadedExecutor (4 threads)
+    - Subscribes to 7 MAVROS/RPP topics (state, pose, battery, GPS, RPP debug, RPP velocity)
+    - Publishes `/path` topic (TRANSIENT_LOCAL QoS for late-joining subscribers)
+    - Service clients for arm/disarm, set_mode, param get/set
+    - ENU→NED conversion for pose and heading
+    - Async service wrappers (`arm_async`, `set_mode_async`, `get_param_async`, `set_param_async`) using `call_async` + `add_done_callback`
+    - MAVROS process-crash detection: `_state_recv_time` timeout overrides TRANSIENT_LOCAL cached `connected=True`
+  - `offboard_controller.py` — Async OFFBOARD lifecycle state machine
+    - States: IDLE → ARMING → SWITCHING_OFFBOARD → RUNNING → STOPPING → IDLE (COMPLETED, ABORTED branches)
+    - Pre-flight checks: FCU connected, RPP not STALE
+    - OFFBOARD pre-stream grace period (0.5s delay before path publish)
+    - `publish_stop_path()` — publishes single-point path at rover's current position (empty Path ignored by RPP)
+    - Async lock on lifecycle calls to prevent concurrent arm/mode-switch
+  - `path_manager.py` — Path loading (6 built-in generators + QGC .waypoints + CSV)
+    - `lru_cache` on builtin generators for fast repeated access
+    - Upload validation: extension whitelist (.waypoints, .csv), 1MiB size limit
+    - Karney geodesic conversion for QGC WPL 110 format (same method as path_publisher_node)
+  - `rpp_status.py` — RPP debug array decoder with done-settle detection (1.0s default)
+  - `emergency.py` — Async e-stop: stop-path + MANUAL mode + disarm (3-step chain with per-step error handling)
+  - `beacon.py` — UDP broadcast for LAN discovery (port 5002, every 2s)
+  - `auth.py` — Shared-secret token auth (`~/.rover_token`, auto-generated, `ROVER_DISABLE_AUTH=1` to bypass)
+  - `logging_setup.py` — Structured logging with ISO-8601 timestamps
+  - `config.py` — All constants centralized: topic names, service names, QoS profiles, safety thresholds
+  - `models.py` — Pydantic v2 request/response models with typed enums
+  - Routes (6 modules): system, vehicle, mission, path, params, telemetry — all auth-protected except telemetry and ping
+  - Socket.IO events: arm, set_mode, emergency_stop, mission_load/start/stop/abort, request_params — all auth-protected
+  - Telemetry loop (10Hz): pushes telemetry + mission_status via Socket.IO, auto-completes on RPP DONE, auto-aborts on pose stale/disconnect
+
+### Key architecture decisions
+- **Pure rclpy** (no roslibpy, no CLI fallback) — server runs on same Jetson as ROS2 nodes
+- **Async service calls** — `call_async` + `add_done_callback` + `loop.call_soon_threadsafe`, never blocks FastAPI event loop
+- **MultiThreadedExecutor(4)** — prevents callback starvation from service calls blocking subscriptions
+- **Token auth** — shared secret, auto-generated, bypass with env var for dev/LAN-only
+- **Stop-path instead of empty Path** — RPP node ignores empty Path (early return), so e-stop publishes single point at rover's current position
+
+### API endpoints
+| Method | Path | Purpose |
+|---|---|---|
+| GET | /api/ping | Health check |
+| GET | /api/healthz | Detailed readiness (FCU, RPP state, pose age) |
+| GET | /api/activity | Activity log (last 500) |
+| POST | /api/arm | Arm/disarm vehicle |
+| POST | /api/set_mode | Set MANUAL/OFFBOARD |
+| POST | /api/estop | Emergency stop |
+| POST | /api/mission/load | Load path by name |
+| POST | /api/mission/start | Start OFFBOARD mission |
+| POST | /api/mission/stop | Soft stop (stay armed) |
+| POST | /api/mission/abort | Hard abort (MANUAL + disarm) |
+| GET | /api/mission/status | Current state + RPP status |
+| GET | /api/paths | List built-in + uploaded paths |
+| POST | /api/path/upload | Upload .waypoints or .csv |
+| POST | /api/path/publish | Publish path to /path topic |
+| DELETE | /api/path/{filename} | Delete uploaded file |
+| GET | /api/params/{name} | Get PX4 param |
+| POST | /api/params/{name} | Set PX4 param |
+| GET | /api/telemetry/latest | Telemetry snapshot |
+
+### Next
+- Add server to `px4-dxp.service` or create separate systemd unit
+- Test with SITL (PX4 SITL + MAVROS + RPP pipeline + server)
+- Hardware bring-up: verify full mission cycle via API
+- Build frontend (React dashboard)
+- Research T1/T2/T4/T6 for Phase 3
+
+---
+
 ## 2026-05-20 — Phase 2 Sessions 1-3: OFFBOARD Test Node (1 session)
 
 ### Built
