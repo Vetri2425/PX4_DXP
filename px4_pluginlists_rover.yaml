@@ -1,4 +1,4 @@
-/mavros/mavros_node:
+/**:
   ros__parameters:
     plugin_denylist:
       - image_pub        # No camera
