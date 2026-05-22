@@ -70,6 +70,12 @@ class MissionPhase(Enum):
 # RPP state codes from rpp_controller_node (kept in sync; see StateCode enum there)
 RPP_STATE_DONE = 3
 RPP_STATE_STALE = -1
+# B2: additional non-driving codes — same response as STALE (keep RUNNING,
+# warn at a throttled rate; the controller is publishing zero velocity for
+# a documented reason and the server-level watchdog handles eventual abort).
+RPP_STATE_RTK_WAIT = 4
+RPP_STATE_JUMP_SKIP = 5
+RPP_STATE_NONDRIVING = (RPP_STATE_STALE, RPP_STATE_RTK_WAIT, RPP_STATE_JUMP_SKIP)
 
 
 class MissionRunnerNode(Node):
@@ -258,6 +264,21 @@ class MissionRunnerNode(Node):
                         "RPP reports STALE pose — controller will emit zeros, "
                         "rover will hold position. Check MAVROS pose stream.",
                         throttle_duration_sec=5.0,
+                    )
+                elif state_code == RPP_STATE_RTK_WAIT:
+                    self.get_logger().warn(
+                        "RPP reports RTK_WAIT — GPS fix below RTK_FIXED. "
+                        "Controller refuses to drive until fix=6 OR you set "
+                        "require_rtk_fix:=false. Check NTRIP stream.",
+                        throttle_duration_sec=5.0,
+                    )
+                elif state_code == RPP_STATE_JUMP_SKIP:
+                    self.get_logger().warn(
+                        "RPP reports JUMP_SKIP — position jump > "
+                        "ekf_jump_threshold_m. One-cycle skip; if persistent "
+                        "the EKF is resetting (RTK acquisition?) or the "
+                        "threshold is too tight for current speed.",
+                        throttle_duration_sec=2.0,
                     )
 
         elif self._phase == MissionPhase.DISARM:

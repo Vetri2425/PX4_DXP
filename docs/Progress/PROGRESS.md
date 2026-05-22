@@ -374,15 +374,56 @@ Running log of all work. Each entry: what built, what fixed, what's next, time s
 
 ---
 
-<!-- Template for future entries:
-## YYYY-MM-DD — [Phase] [Description] (N sessions)
+## 2026-05-22 — Phase 2 Session 7+8: Sprint 1+2+Phase B Complete (2 sessions)
+
+**2026-05-22: Reverted RoboClaw boot-timing (617cce5a), completed Sprint 1+2 (P0.1-P0.3, P1.1-P1.4, 5 polish), Phase B (debug 10 fields, RTK_WAIT/JUMP_SKIP state codes, single-pass curvature walker). 15/15 tests pass, 9 files touched.**
 
 ### Built
-- [what was built]
+- **Firmware**: Reverted RoboClaw boot-timing retry commit (bfe914ce → 617cce5a). Downloaded CI artifact to `PX4_Firmware/Revert_Boot_Timing_617cce5a/`. Driver still dies on cold boot — manual `roboclaw stop && start` required until root cause is fixed.
+- **Sprint 1 — rpp_controller_node.py** (4 changes):
+  - P0.1: Closed-loop L_d — `v_for_ld = max(min_v, _last_speed_cmd)` instead of constant `max_v * 0.5`
+  - P0.2: EKF position-jump guard — skip cycle if position jumps > `ekf_jump_threshold_m` (default 5cm), reset segment hint
+  - P0.3: RTK FIX gate — subscribe to `/mavros/gpsstatus/gps1/raw`, refuse motion if `fix_type < 6` and `require_rtk_fix=true`
+  - P1.4: Segment search hint — `_project_onto_path` uses 6-segment window, `_hint_valid` forces full O(n) scan after path/jump reset
+- **Sprint 1 Polish** (5 commits, same file):
+  1. Dead `dt_s` removed
+  2. P0.1 bootstrap comment fixed (min_v → max_v * 0.5)
+  3. `_hint_valid` full-scan flag on first cycle
+  4. `RTK_WAIT=4`, `JUMP_SKIP=5` enum values reserved
+  5. `_check_threshold_compat()` boot-time warning if threshold too tight for max speed
+- **Sprint 2 — Geometry upgrades** (same file):
+  - P1.1: Predictive curvature regulation — `preview_curvature_n` (default 3), Menger κ across N preview points
+  - P1.2: Adaptive lookahead — `xtrack_lookahead_gain` (default 1.0), `L_d = clamp(k_v·v + k_e·|e⊥|, L_min, L_max)`
+  - P1.3: Path conditioning — `path_resample_spacing_m`, `corner_smooth_radius_m`, `corner_smooth_arc_pts` (all opt-in, default 0=off)
+- **Phase B — Observability + Perf** (9 files):
+  - B1: `/rpp/debug` expanded 8→10 fields (added `l_d_raw_m`, `kappa_speed`). Append-only, backward-compatible. `xtrack_logger_node.py` CSV now 20 columns. `server/ros_node.py` parses new fields with NaN fallback.
+  - B2: `RTK_WAIT=4` and `JUMP_SKIP=5` state codes replace `STALE=-1` for GPS-gate and EKF-jump cases. All 5 consumers updated: `config.py` (RPP_UNHEALTHY_CODES={-1,4,5}), `models.py` (Literal extended), `main.py` (watchdog uses set), `offboard_controller.py` (start guard with code-specific messages), `mission_runner_node.py` (throttled warns per code). Dependency order: consumers first, producer last.
+  - B3: Single-pass `_walk_path_samples()` replaces N×O(P) walks in `_max_preview_curvature`. ~7.5× speedup at N=3. Bit-exact verified (Test 14: max diff = 0.00e+00).
+- **Tests**: `test_sprint2_geometry.py` — 15 offline geometry tests, all pass. Covers: resample, smooth_corners, Menger κ, predictive κ integration, `_hint_valid` projection (full-scan, hint walk, stale-hint regression), single-pass walker bit-exact verification.
 
 ### Fixed
-- [what was fixed]
+- RoboClaw boot-timing retry reverted — retry mechanism masked the real issue (UART ACK timeout on cold boot)
+- Overloaded STALE state code split into RTK_WAIT and JUMP_SKIP for observability
+- Segment hint race condition closed — `_hint_valid` flag forces full scan after path/jump reset
+
+### Phase C Audit (Kiro, same session)
+GLM-5.1 shipped Phase C (C1 RT scheduling, C2 IMU extrapolation, P0.5 yaw setpoint, P3.1 feedforward yaw rate). Kiro found **7 bugs**, all fixed before field test:
+1. Duplicate `_yaw_pub` publisher (cosmetic)
+2. Duplicate `_latest_accel`/`_imu_recv_time` orphan state (cosmetic + dead state)
+3. **IMU acceleration path included gravity** (`/mavros/imu/data`); dropped dominant `v·dt` term — **wrong-direction performance** → P2.4 rewritten to velocity-based (`/mavros/local_position/velocity_local`)
+4. Pose freshness tripped STALE before extrapolation ran — negated P2.4 feature → reordered
+5. `CPUQuota=400%` ignored under SCHED_FIFO; FIFO grant depended on limits.conf → added `LimitRTPRIO=99`, removed `CPUQuota`
+6. **`NameError` in `_publish_yaw_rate`** — references undefined `v_n`/`v_e` every cycle → **runtime crash on every control cycle** (would kill OFFBOARD within 500ms)
+7. Docstring said "does NOT compute ω" but P3.1 added ω publisher → updated
+
+**Bug 6 is the headline.** `py_compile` misses runtime symbol errors. Geometry tests don't import the controller module. Smoke test written to catch this class of bug.
+
+**P2.4 realistic gain:** ~20mm at 0.4 m/s (= pose_age × v), NOT the 30-40mm originally claimed with acceleration integration. All Phase C performance numbers are **predictions** pending bench data.
+
+### Runtime smoke test added
+- `test_smoke_rpp_controller.py` — instantiates `RPPControllerNode` with rclpy, ticks `_control_loop` once with mocked subscribers, tests `_publish_zero`, `_publish_yaw_rate`, `_publish_yaw`. Would have caught Bug 6 in 30 seconds. Must run on Jetson (requires ROS2).
 
 ### Next
-- [what's next]
--->
+- **Phase A: Hardware validation** — flash 617cce5a, bench-verify motor direction, cold-boot test, OFFBOARD straight-line test, verify FIFO grant (`chrt -p`), audit twist_to_setpoint_node.py
+- **Phase D: Production hardening** — remove ROVER_DISABLE_AUTH, sd_notify, pytest suite, QGC origin re-anchor
+- **Doc corrections** — RPP_PARAMETERS_REFERENCE.md and RPP_UPGRADE_SESSION_COMPLETION.md are stale (Kiro audit corrections pending, GLM-5.1's lane per role split)

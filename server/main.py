@@ -33,10 +33,19 @@ from auth import init_auth
 from config import (
     BEACON_INTERVAL, BEACON_PORT, CORS_ALLOW_CREDENTIALS, CORS_ALLOW_ORIGINS,
     DEFAULT_PORT, MAX_ACTIVITY_LOG, MISSION_DIR, POSE_STALE_MS, ROVER_ID,
-    RPP_STALE, RPP_STATE_NAMES, SAFETY_STALE_GRACE_S, TELEMETRY_HZ,
+    RPP_STATE_NAMES, RPP_UNHEALTHY_CODES,
+    SAFETY_STALE_GRACE_S, TELEMETRY_HZ,
 )
 from logging_setup import configure_logging, get_logger
 from models import MissionState
+
+# ── sd_notify for systemd watchdog ────────────────────────────────────────────
+_sd_notifier = None
+try:
+    import sdnotify
+    _sd_notifier = sdnotify.SystemdNotifier()
+except ImportError:
+    pass
 
 # ── Module-level singletons (populated in lifespan) ───────────────────────────
 ros_node:          Optional["object"] = None
@@ -118,6 +127,10 @@ async def lifespan(app: FastAPI):
     _record("info", f"Server ready on port {DEFAULT_PORT}")
     log.info("server ready: port=%d telemetry=%dHz", DEFAULT_PORT, TELEMETRY_HZ)
 
+    # Notify systemd that we're ready (Type=notify)
+    if _sd_notifier:
+        _sd_notifier.notify("READY=1")
+
     yield  # ─── Running ───────────────────────────────────────────────────────
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
@@ -197,6 +210,8 @@ async def _telemetry_loop() -> None:
     prev_connected: Optional[bool] = None
     stale_since: Optional[float] = None
     consecutive_errors = 0
+    _watchdog_counter = 0
+    _WATCHDOG_EVERY_N = TELEMETRY_HZ * 3  # ping systemd every ~3s
 
     log.info("telemetry loop started @ %d Hz", TELEMETRY_HZ)
     try:
@@ -257,12 +272,15 @@ async def _telemetry_loop() -> None:
                                    {"state": offboard_ctrl.state.value,
                                     "name":  offboard_ctrl.loaded_path_name})
 
-                # ── 3. Watchdog: RUNNING + STALE/disconnected → estop ──────────
+                # ── 3. Watchdog: RUNNING + unhealthy/disconnected → estop ──────
+                # B2: RPP_UNHEALTHY_CODES covers STALE (-1), RTK_WAIT (4),
+                # JUMP_SKIP (5). All three mean "controller is publishing
+                # zero velocity for a safety reason" — same response.
                 pose_age = s.get("pose_age_ms") or 0.0
                 running  = (offboard_ctrl is not None
                             and offboard_ctrl.state == MissionState.RUNNING)
                 unhealthy = (
-                    code == RPP_STALE
+                    code in RPP_UNHEALTHY_CODES
                     or pose_age > POSE_STALE_MS
                     or s.get("connected") is False
                 )
@@ -271,16 +289,18 @@ async def _telemetry_loop() -> None:
                         stale_since = now
                     elif now - stale_since > SAFETY_STALE_GRACE_S:
                         if emergency_handler is not None:
+                            rpp_name = RPP_STATE_NAMES.get(code, f"?{code}")
                             log.warning(
-                                "safety abort: stale=%.0fms rpp=%s connected=%s",
-                                pose_age, code, s.get("connected"),
+                                "safety abort: stale=%.0fms rpp=%s(%s) connected=%s",
+                                pose_age, code, rpp_name, s.get("connected"),
                             )
                             await emergency_handler.estop_async()
                             await sio.emit("safety_abort", {
-                                "reason":      "pose stale or FCU disconnected",
-                                "pose_age_ms": pose_age,
-                                "rpp_state":   code,
-                                "connected":   s.get("connected"),
+                                "reason":         "pose stale or FCU disconnected",
+                                "pose_age_ms":    pose_age,
+                                "rpp_state":      code,
+                                "rpp_state_name": RPP_STATE_NAMES.get(code, "UNKNOWN"),
+                                "connected":      s.get("connected"),
                             })
                         stale_since = None
                 else:
@@ -294,6 +314,12 @@ async def _telemetry_loop() -> None:
                 prev_connected = connected
 
                 consecutive_errors = 0
+
+                # ── 5. Systemd watchdog heartbeat ──────────────────────────────
+                _watchdog_counter += 1
+                if _sd_notifier and _watchdog_counter >= _WATCHDOG_EVERY_N:
+                    _sd_notifier.notify("WATCHDOG=1")
+                    _watchdog_counter = 0
 
             except asyncio.CancelledError:
                 raise

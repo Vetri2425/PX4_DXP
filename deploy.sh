@@ -46,6 +46,37 @@ else
     sudo ln -s "$SERVICE_SRC" "$SERVICE_DST"
 fi
 
+# ── 1b. RPP pipeline service ───────────────────────────────────────
+_deploy_service() {
+    local src="$1" dst="$2" name="$3"
+    if [[ -L "$dst" ]]; then
+        local current
+        current=$(readlink -f "$dst")
+        if [[ "$current" == "$src" ]]; then
+            log "systemd: $name symlink already correct"
+        else
+            log "systemd: updating $name symlink"
+            sudo ln -sf "$src" "$dst"
+        fi
+    elif [[ -f "$dst" ]]; then
+        sudo mv "$dst" "${dst}.bak"
+        sudo ln -s "$src" "$dst"
+    else
+        log "systemd: creating $name symlink"
+        sudo ln -s "$src" "$dst"
+    fi
+}
+
+_deploy_service "${SCRIPT_DIR}/rpp-pipeline.service" \
+    "/etc/systemd/system/rpp-pipeline.service" "rpp-pipeline"
+
+_deploy_service "${SCRIPT_DIR}/rover-server.service" \
+    "/etc/systemd/system/rover-server.service" "rover-server"
+
+# Make startup scripts executable
+chmod +x "${SCRIPT_DIR}/rpp_start.sh" 2>/dev/null || true
+chmod +x "${SCRIPT_DIR}/server/run.sh" 2>/dev/null || true
+
 # ── 2. Logrotate config ────────────────────────────────────────────
 LOGROTATE_SRC="${SCRIPT_DIR}/ntrip.logrotate"
 LOGROTATE_DST="/etc/logrotate.d/ntrip"
@@ -115,26 +146,48 @@ log "systemd: daemon reloaded"
 
 # ── 6. Enable service (if not already) ─────────────────────────────
 if systemctl is-enabled px4-dxp.service >/dev/null 2>&1; then
-    log "systemd: service already enabled"
+    log "systemd: px4-dxp already enabled"
 else
     sudo systemctl enable px4-dxp.service
-    log "systemd: service enabled"
+    log "systemd: px4-dxp enabled"
+fi
+
+if systemctl is-enabled rpp-pipeline.service >/dev/null 2>&1; then
+    log "systemd: rpp-pipeline already enabled"
+else
+    sudo systemctl enable rpp-pipeline.service
+    log "systemd: rpp-pipeline enabled"
+fi
+
+if systemctl is-enabled rover-server.service >/dev/null 2>&1; then
+    log "systemd: rover-server already enabled"
+else
+    sudo systemctl enable rover-server.service
+    log "systemd: rover-server enabled"
 fi
 
 # ── 7. Restart (optional) ──────────────────────────────────────────
 if $RESTART; then
-    log "Restarting px4-dxp.service..."
+    log "Restarting all services..."
     sudo systemctl restart px4-dxp.service
     sleep 3
-    if systemctl is-active px4-dxp.service >/dev/null 2>&1; then
-        log "Service is ACTIVE"
-    else
-        log "WARNING: Service not active — check: journalctl -u px4-dxp.service -n 50"
-    fi
+    sudo systemctl restart rpp-pipeline.service
+    sleep 2
+    sudo systemctl restart rover-server.service
+    sleep 3
+    log ""
+    log "Service status:"
+    for svc in px4-dxp rpp-pipeline rover-server; do
+        if systemctl is-active "${svc}.service" >/dev/null 2>&1; then
+            log "  ✓ $svc is ACTIVE"
+        else
+            log "  ✗ $svc is NOT active — check: journalctl -u ${svc}.service -n 50"
+        fi
+    done
 else
     log ""
-    log "Files deployed. To restart the service now, run:"
-    log "  sudo systemctl restart px4-dxp.service"
+    log "Files deployed. To restart all services now, run:"
+    log "  sudo systemctl restart px4-dxp rpp-pipeline rover-server"
     log ""
     log "Or re-run with --restart:"
     log "  ./deploy.sh --restart"

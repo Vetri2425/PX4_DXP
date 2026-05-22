@@ -21,19 +21,28 @@ SRV_GET_PARAMS = "/mavros/param/get_parameters"
 SRV_SET_PARAMS = "/mavros/param/set_parameters"
 
 # ── RPP State Codes ───────────────────────────────────────────────────────────
-RPP_STALE    = -1
-RPP_IDLE     = 0
-RPP_TRACKING = 1
-RPP_APPROACH = 2
-RPP_DONE     = 3
+RPP_STALE     = -1
+RPP_IDLE      = 0
+RPP_TRACKING  = 1
+RPP_APPROACH  = 2
+RPP_DONE      = 3
+RPP_RTK_WAIT  = 4    # B2: GPS fix < RTK_FIXED; controller refusing to drive
+RPP_JUMP_SKIP = 5    # B2: one-cycle position-jump skip (EKF reset / RTK lock-on)
 
 RPP_STATE_NAMES = {
-    RPP_STALE:    "STALE",
-    RPP_IDLE:     "IDLE",
-    RPP_TRACKING: "TRACKING",
-    RPP_APPROACH: "APPROACH",
-    RPP_DONE:     "DONE",
+    RPP_STALE:     "STALE",
+    RPP_IDLE:      "IDLE",
+    RPP_TRACKING:  "TRACKING",
+    RPP_APPROACH:  "APPROACH",
+    RPP_DONE:      "DONE",
+    RPP_RTK_WAIT:  "RTK_WAIT",
+    RPP_JUMP_SKIP: "JUMP_SKIP",
 }
+
+# B2: codes that mean "controller is not driving safely". Treat the same as
+# STALE for safety-abort and OFFBOARD-start guard purposes. Centralised here
+# so server/main.py and server/offboard_controller.py stay in sync.
+RPP_UNHEALTHY_CODES = {RPP_STALE, RPP_RTK_WAIT, RPP_JUMP_SKIP}
 
 # ── Server Defaults ───────────────────────────────────────────────────────────
 DEFAULT_HOST     = "0.0.0.0"

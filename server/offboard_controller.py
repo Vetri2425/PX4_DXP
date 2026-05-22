@@ -17,7 +17,7 @@ import datetime
 from collections import deque
 from typing import Any, Optional
 
-from config import RPP_STALE, SETPOINT_STREAM_GRACE_S
+from config import RPP_STALE, RPP_UNHEALTHY_CODES, SETPOINT_STREAM_GRACE_S
 from logging_setup import get_logger
 from models import MissionState
 
@@ -95,12 +95,24 @@ class OffboardController:
                 self._log_entry("error", msg)
                 return False, msg
 
-            # Pre-stream check — twist_to_setpoint_node must be running.
-            # RPP_STALE is reported when no fresh pose is reaching the
-            # controller, which means the setpoint chain is not ready.
-            if fcu.get("rpp_state", -1) == RPP_STALE:
+            # Pre-stream / pre-conditions check.
+            # B2: any unhealthy code blocks OFFBOARD start.
+            #   STALE     → no fresh pose → setpoint chain not ready
+            #   RTK_WAIT  → GPS fix < RTK_FIXED → would refuse to drive anyway
+            #   JUMP_SKIP → mid-EKF-reset → wait for it to settle
+            rpp_code = fcu.get("rpp_state", RPP_STALE)
+            if rpp_code in RPP_UNHEALTHY_CODES:
                 self._state = MissionState.ERROR
-                msg = "start: RPP STALE — is twist_to_setpoint_node running?"
+                if rpp_code == RPP_STALE:
+                    msg = "start: RPP STALE — is twist_to_setpoint_node running?"
+                elif rpp_code == 4:  # RPP_RTK_WAIT
+                    msg = ("start: RPP RTK_WAIT — GPS fix < RTK_FIXED. "
+                           "Wait for fix or set require_rtk_fix:=false on the controller.")
+                elif rpp_code == 5:  # RPP_JUMP_SKIP
+                    msg = ("start: RPP JUMP_SKIP — EKF position jump in progress; "
+                           "retry in ~1 s once the estimator settles.")
+                else:
+                    msg = f"start: RPP unhealthy (code={rpp_code})"
                 self._log_entry("error", msg)
                 return False, msg
 

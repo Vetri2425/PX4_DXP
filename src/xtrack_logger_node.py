@@ -31,7 +31,8 @@ CSV columns
   speed_cmd_m_s        Commanded speed                        [from /rpp/debug]
   curvature_kappa      Path curvature                         [from /rpp/debug]
   dist_to_goal_m       Distance to final waypoint             [from /rpp/debug]
-  rpp_state            -1=stale, 0=idle, 1=tracking, 2=approach, 3=done
+  rpp_state            -1=stale, 0=idle, 1=tracking, 2=approach, 3=done,
+                        4=rtk_wait, 5=jump_skip
   v_ned_n_m_s          Velocity setpoint North (from /rpp/velocity_ned)
   v_ned_e_m_s          Velocity setpoint East
   mavros_v_n_m_s       Final MAVROS setpoint vN (from /mavros/setpoint_raw/local)
@@ -110,6 +111,7 @@ class XTrackLoggerNode(Node):
             "dist_to_goal_m", "rpp_state",
             "v_ned_n_m_s", "v_ned_e_m_s",
             "mavros_v_n_m_s", "mavros_v_e_m_s",
+            "l_d_raw_m", "kappa_speed",     # B1
         ])
         self._csv_file.flush()
 
@@ -200,7 +202,14 @@ class XTrackLoggerNode(Node):
                     closest_n, closest_e = fn, fe
 
         # --- /rpp/debug fields ---
-        dbg = self._debug.data if self._debug and len(self._debug.data) >= 8 else [float("nan")] * 8
+        # B1: layout is now 10 fields. Tolerate 8-field producers (legacy
+        # builds, replays of old bag files) by padding with NaN.
+        if self._debug and len(self._debug.data) >= 10:
+            dbg = list(self._debug.data)
+        elif self._debug and len(self._debug.data) >= 8:
+            dbg = list(self._debug.data) + [float("nan")] * (10 - len(self._debug.data))
+        else:
+            dbg = [float("nan")] * 10
         xtrack_signed_cm = dbg[0] * 100.0 if math.isfinite(dbg[0]) else float("nan")
         heading_err_deg = math.degrees(dbg[1]) if math.isfinite(dbg[1]) else float("nan")
         lookahead = dbg[2]
@@ -209,6 +218,8 @@ class XTrackLoggerNode(Node):
         dist_goal = dbg[5]
         pose_age_ms = dbg[6]
         rpp_state = int(dbg[7]) if math.isfinite(dbg[7]) else -99
+        l_d_raw = dbg[8]                         # B1
+        kappa_speed = dbg[9]                     # B1
 
         # --- /rpp/velocity_ned ---
         if self._vel_ned:
@@ -234,6 +245,7 @@ class XTrackLoggerNode(Node):
             f"{dist_goal:.4f}", rpp_state,
             f"{v_ned_n:.4f}", f"{v_ned_e:.4f}",
             f"{mv_n:.4f}", f"{mv_e:.4f}",
+            f"{l_d_raw:.3f}", f"{kappa_speed:.4f}",   # B1
         ])
 
         # Flush every ~1s so partial logs survive a Ctrl-C

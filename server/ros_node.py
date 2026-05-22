@@ -145,6 +145,8 @@ class RosBridgeNode(Node):
         "kappa": 0.0, "dist_to_goal_m": 0.0,
         "pose_age_ms": 0.0, "rpp_state": 0,
         "v_north": 0.0, "v_east": 0.0,
+        # B1 — predictive κ and pre-clamp Ld for tuning analysis
+        "l_d_raw_m": 0.0, "kappa_speed": 0.0,
     }
 
     def __init__(self) -> None:
@@ -271,6 +273,8 @@ class RosBridgeNode(Node):
             self._state["gps_sat"] = msg.satellites_visible
 
     def _cb_rpp_debug(self, msg: Float32MultiArray) -> None:
+        # B1: layout is 10 fields; fall back gracefully to legacy 8-field
+        # producers (old replays). New fields default to NaN when absent.
         if len(msg.data) >= 8:
             data = list(msg.data)
             self._rpp_monitor.update(data)
@@ -283,6 +287,9 @@ class RosBridgeNode(Node):
                 self._state["dist_to_goal_m"]  = data[5]
                 self._state["pose_age_ms"]     = data[6]
                 self._state["rpp_state"]       = int(data[7])
+                # B1 — only populate if the producer is the new version
+                self._state["l_d_raw_m"]   = data[8] if len(data) >= 9  else float("nan")
+                self._state["kappa_speed"] = data[9] if len(data) >= 10 else float("nan")
 
     def _cb_rpp_velocity(self, msg: Vector3Stamped) -> None:
         with self._lock:

@@ -71,7 +71,7 @@ class TelemetryData(BaseModel):
     kappa:           Optional[float] = None
     dist_to_goal_m:  Optional[float] = None
     pose_age_ms:     Optional[float] = None
-    rpp_state:       Optional[Literal[-1, 0, 1, 2, 3]] = None
+    rpp_state:       Optional[Literal[-1, 0, 1, 2, 3, 4, 5]] = None
     rpp_state_name:  Optional[str]   = None
     # FCU
     armed:     Optional[bool] = None
