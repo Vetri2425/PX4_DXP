@@ -16,7 +16,7 @@ This is the **Jetson-side** CLAUDE.md. It lives in `~/PX4_DXP/` on the Jetson Or
 | IP | `192.168.1.102` (eno1) |
 | ROS2 | Humble (`/opt/ros/humble/`) |
 | FCU link | `/dev/ttyACM0` @ 921600 (CubeOrangePlus, PX4 v1.16.2) |
-| RTK link | `/dev/ttyUSB0` (UM982 dual-antenna) |
+| RTK link | UM982 on TELEM1 (CubeOrangePlus) — NTRIP injects RTCM via MAVROS |
 | ROS_DOMAIN_ID | 0 (default) |
 
 ## Post-Pull Workflow (IMPORTANT)
