@@ -17,4 +17,15 @@
       - vision_pose_estimate # No visual odometry pipeline
       - setpoint_accel   # Phase 2 uses setpoint_raw/local + setpoint_velocity
       - safety_area      # No visualiser consuming fence markers
+      - guided_target    # Receive-only Nav2 goal plugin — we command, not receive goals
+      - setpoint_position # Redundant with setpoint_raw/local (we use PositionTarget directly)
+      - setpoint_attitude # Multirotor/VTOL attitude control — not applicable to rover
+      - setpoint_trajectory # MAVLink trajectory following — not used
+      - waypoint         # Mission waypoint management — we use OFFBOARD, not MAVLink missions
+      - geofence         # Geofence upload — not needed for marking rover
+      - rallypoint       # Rally points — multirotor concept
+      - home_position    # Home position get/set — not critical for rover
+      - altitude         # Altitude reporting — irrelevant for ground rover
+      - vfr_hud          # Airspeed/altitude HUD — aircraft only
+      - wind_estimation  # Wind estimation — aircraft only
       # gps_rtk is intentionally NOT denied — required for NTRIP RTK injection
