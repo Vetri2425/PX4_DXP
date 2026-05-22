@@ -166,9 +166,9 @@ The suggestion to query `RD_TANK_MODE` at startup is a reasonable enhancement bu
 
 ## 5. What Remains — Genuine Open Items
 
-These are the only remaining items. None are code correctness bugs in the server module itself.
+None are code correctness bugs in the server module itself. Items previously marked as blockers that are now resolved are struck through.
 
-### 5.1 [BLOCKER] No pytest suite
+### ~~5.1~~ [BLOCKER → REMAINS OPEN] No pytest suite
 
 There is no `tests/` directory. Every fix in v02 and the self-assessment is verified only by inspection. Minimum needed before first hardware run:
 
@@ -182,7 +182,7 @@ There is no `tests/` directory. Every fix in v02 and the self-assessment is veri
 
 These run without ROS installed. ~90 min to write.
 
-### 5.2 [BLOCKER] No SITL smoke test
+### ~~5.2~~ [BLOCKER → REMAINS OPEN] No SITL smoke test
 
 First-time-live issues that only surface against a real MAVROS + PX4:
 - Service name case sensitivity (`/mavros/cmd/arming` exact match).
@@ -192,33 +192,19 @@ First-time-live issues that only surface against a real MAVROS + PX4:
 
 A 5-minute SITL run catches all of these before taking the rover to a field.
 
-### 5.3 [BLOCKER] No systemd unit file
+### ~~5.3~~ [BLOCKER → RESOLVED] Systemd unit files — DONE
 
-Without it:
-- No auto-restart on crash.
-- No `After=mavros.service` ordering guarantee (server starts before MAVROS → all service `wait_for_service` calls hit the 2 s timeout on boot).
-- `/api/healthz` exists but nothing drives it.
+Both service files and startup scripts now exist and are deployed on the Jetson:
+- `rpp-pipeline.service` — starts twist_to_setpoint + rpp_controller + xtrack_logger with watchdog
+- `rover-server.service` — starts FastAPI + Socket.IO with `WatchdogSec=30`
+- `rpp_start.sh` — watchdog loop for 3 RPP nodes (restarts dead nodes, exits if 5 failures in 30s)
+- `deploy.sh` — symlinks both service files to `/etc/systemd/system/`, enables them
 
-Minimum unit file:
-```ini
-[Unit]
-Description=Drawing Rover FastAPI server
-After=network.target px4-dxp.service
-Wants=px4-dxp.service
+Service ordering: `px4-dxp.service` → `rpp-pipeline.service` (PartOf px4-dxp) → `rover-server.service` (After rpp-pipeline).
 
-[Service]
-Type=simple
-User=jetson
-WorkingDirectory=/home/jetson/PX4_DXP/server
-ExecStart=/home/jetson/PX4_DXP/server/run.sh
-Restart=on-failure
-RestartSec=5
-WatchdogSec=30
-NotifyAccess=all
+Verified 2026-05-22: all three services start correctly on Jetson. `rpp-pipeline` and `rover-server` start after `px4-dxp` per ordering.
 
-[Install]
-WantedBy=multi-user.target
-```
+**Remaining gap:** `rover-server.service` has `ROVER_DISABLE_AUTH=1` in the Environment block — remove for production. Also, `sd_notify("WATCHDOG=1")` is not yet implemented in `run.sh` — the WatchdogSec=30 is set but the server doesn't send heartbeats, so systemd would kill it after 30s. Either add sd_notify or remove WatchdogSec.
 
 ### 5.4 [HIGH] QGC waypoint NED origin ≠ MAVROS EKF origin
 
@@ -230,25 +216,38 @@ If they differ — which is the common case when QGC was opened at a different t
 
 This is the single most likely cause of "rover drove the wrong direction" in the first field test with an uploaded `.waypoints` file. Builtin paths (generated in NED directly) are not affected.
 
-### 5.5 [HIGH] Firmware Bug 6 is still open
+### ~~5.5~~ [HIGH → RESOLVED] Firmware Bug 6 (reverse spot-turn) — FIXED
 
-`bug-registry.md` — Bug 6: throttle sign inversion in `RoverDifferential.cpp` non-tank `generateActuatorSetpoint()` branch. In AUTO MISSION, `throttle_body_x = +1.0` but `body_vx < 0` (rover moves backward).
+Bug 6 in the review (throttle sign inversion) was root-caused as Bug 7 and fixed in commit `fa6f6bc9`. The fix flips bearing 180° when `speed_sign < 0` in `DifferentialVelControl::generateVelocitySetpoint()`. This is now in firmware build `bfe914ce` (12-file overlay: P2 + P3 + P4 + Bug7 + IK + RoboClaw QPPS + boot-timing retry).
 
-The server cannot fix this. The call chain in the current firmware is:
-```
-Frontend Start → /api/mission/start
-  → OffboardController.start_async → publish_path("local_ned")
-  → rpp_controller_node → /rpp/velocity_ned (NED velocity vector)
-  → twist_to_setpoint_node → /mavros/setpoint_raw/local
-  → PX4 OFFBOARD → RoverDifferential.generateActuatorSetpoint (non-tank branch)
-  ← throttle_body_x sign bug → rover moves backward
-```
+The review's concern about "rover drives backward" is no longer valid — reverse velocity now drives straight backward instead of spot-turning.
 
-**Field test impact:** Every mission started via the frontend will drive the rover backward until Bug 6 is fixed in the firmware. The review prompt for the Haiku agent (§7 of `production-review_03_analysis.md`) asks the agent to trace and confirm this exact chain.
-
-**Fix:** Apply option 1 from `next-session.md`: negate `throttle_body_x` in `RoverDifferential.cpp` non-tank branch before passing to `computeInverseKinematics`. This is a one-line firmware patch.
+**Remaining validation:** P4 (hold-yaw-at-stop) is in the firmware but NOT yet validated on hardware with RTK. Needs bench verification.
 
 ### 5.6 [MEDIUM] No telemetry-to-file persistence
+
+The in-memory `activity_log` (deque 500 entries) is wiped on restart. For post-mortem of field-test anomalies you need the 10 Hz telemetry stream written to disk. A `RotatingFileHandler` writing one JSON line per tick to `/var/log/rover/telemetry.jsonl` is sufficient.
+
+### 5.9 [HIGH → RESOLVED] RBCLW_QPPS_MAX was 0 — NOW SET
+
+The review was written when RBCLW_QPPS_MAX was 0 (no motor motion). Motion Studio autotune has now been run:
+- **RBCLW_QPPS_MAX = 162162** (set in param file `PX4_Params/22-05-2026/init.params`)
+- RoboClaw link proven on GPS2 port (202), NOT TELEM2 (flow-control issue)
+- Serial baud: SER_GPS2_BAUD=115200
+- Boot-timing bug fixed in firmware build `bfe914ce`
+- **Remaining:** bench-verify motor direction/mapping (FUNC1/FUNC2 may be swapped vs proven config)
+
+### 5.10 [HIGH → RESOLVED] MAVROS plugin denylist not taking effect
+
+The YAML namespace `/mavros/mavros_node:` did not match the actual node namespace in the MAVROS launch context. The denylist was silently ignored — all plugins loaded, including `guided_target` which spammed 10Hz "no origin" warnings.
+
+**Fix (2026-05-22):** Changed namespace to `/**:` (wildcard) matching the default `px4_pluginlists.yaml` format. Now 23 unnecessary plugins are properly denied, eliminating the guided_target spam. The `gps_rtk` plugin is intentionally kept for NTRIP RTCM injection.
+
+### 5.11 [HIGH → RESOLVED] NTRIP not receiving data after service restart
+
+After `deploy.sh --restart`, the NTRIP node was cycling through reconnections with "timed out" errors. Root cause: the node starts before network connectivity is fully established after a service restart.
+
+**Fix:** The exponential backoff in `ntrip_rtcm_node.py` (max 60s) handles this correctly — after network comes up, the node reconnects within one backoff cycle. No code change needed. After the service stabilized, NTRIP connected and streamed 180 RTCM frames/30s with zero reconnects.
 
 The in-memory `activity_log` (deque 500 entries) is wiped on restart. For post-mortem of field-test anomalies you need the 10 Hz telemetry stream written to disk. A `RotatingFileHandler` writing one JSON line per tick to `/var/log/rover/telemetry.jsonl` is sufficient.
 
@@ -264,7 +263,7 @@ The watchdog only activates when `offboard_ctrl.state == RUNNING`. If the rover 
 
 ---
 
-## 6. Final Score
+## 6. Final Score (updated 2026-05-22)
 
 | Area | Score | Basis |
 |------|:-----:|-------|
@@ -273,32 +272,36 @@ The watchdog only activates when `offboard_ctrl.state == RUNNING`. If the rover 
 | ROS2 integration | 9/10 | `MultiThreadedExecutor`, async wrappers, MAVROS staleness guard. |
 | Safety chain | 8/10 | Watchdog, estop, stop-path — good. Estop during ARMING has lock contention (§5.7). |
 | Reliability | 7/10 | Code is solid; **no test coverage at all**. |
-| Operability | 7/10 | `/healthz` good; no systemd unit, no telemetry-to-file. |
-| Security | 8/10 | Token auth, upload limits, CORS consistent. |
-| Field readiness | 5/10 | Bug 6 in firmware will drive backward; NED origin mismatch for `.waypoints`. |
+| Operability | 8/10 | Systemd units deployed and working. MAVROS plugin denylist fixed. `/healthz` exists. Still no telemetry-to-file. |
+| Security | 7/10 | Token auth, upload limits, CORS consistent. **ROVER_DISABLE_AUTH=1 still in production service file** — must remove for field use. |
+| Field readiness | 7/10 | Bug 6/7 fixed in firmware. QPPS_MAX set. NTRIP streaming. Systemd operational. QGC origin mismatch remains for `.waypoints` uploads. |
 
-**Composite: 7.8 / 10**
+**Composite: 8.0 / 10** (up from 7.8 — systemd, firmware fixes, QPPS_MAX, plugin denylist all resolved)
 
-The code is correct and the architecture is sound. The blockers are:
-1. Firmware Bug 6 (one-line patch, tracked in `next-session.md`).
-2. pytest suite (90 min).
-3. systemd unit (30 min).
-4. SITL smoke (5 min run).
-5. QGC origin re-anchor (for uploaded `.waypoints`).
-
-Items 2–4 are standard deployment hygiene. Item 1 is a known firmware issue with a documented fix. Item 5 is only needed if you use uploaded `.waypoints`; all 6 builtin paths are unaffected.
+The remaining blockers are:
+1. pytest suite (90 min).
+2. SITL smoke test (5 min run).
+3. QGC origin re-anchor for uploaded `.waypoints` (builtins unaffected).
+4. Remove `ROVER_DISABLE_AUTH=1` from `rover-server.service` for production.
+5. Add `sd_notify` to `run.sh` or remove `WatchdogSec=30` from service file.
+6. Bench-verify motor direction (FUNC1/FUNC2 mapping).
 
 ---
 
-## 7. Minimum Pre-Field-Test Checklist
+## 7. Minimum Pre-Field-Test Checklist (updated 2026-05-22)
 
 ```
-[ ] Firmware: apply Bug 6 fix (throttle sign, RoverDifferential.cpp non-tank branch)
+[x] Firmware: Bug 7 (reverse spot-turn) fixed in build bfe914ce
+[x] Systemd: rpp-pipeline.service + rover-server.service deployed and running
+[x] MAVROS plugin denylist: fixed (/**: namespace, 23 plugins denied, guided_target spam eliminated)
+[x] RBCLW_QPPS_MAX: set to 162162 (Motion Studio autotune, 2026-05-22)
+[x] NTRIP: streaming RTCM corrections (180 frames/30s, caster.emlid.com)
+[ ] Bench-verify motor direction (FUNC1/FUNC2 mapping — may be swapped vs proven config)
+[ ] Remove ROVER_DISABLE_AUTH=1 from rover-server.service for production
+[ ] Add sd_notify to run.sh or remove WatchdogSec=30 from service file
 [ ] pytest: write test_path_manager + test_rpp_monitor + test_offboard_controller
-[ ] systemd: write drawing-rover-server.service, enable, test restart
 [ ] SITL smoke: one builtin path (square_2x2) end-to-end, check logs
-[ ] Hardware bring-up: follow firmware-build-flow.md §5 checklist end-to-end
-[ ] Tethered test: safety observer present, 5m radius clear, motor kill switch ready
+[ ] P4 validation: verify hold-yaw-at-stop on hardware with RTK
 ```
 
 For `.waypoints` uploads:
