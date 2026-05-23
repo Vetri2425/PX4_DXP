@@ -1,15 +1,16 @@
 #!/bin/bash
 
 # PX4 MAVROS bridge — CubeOrangePlus via /dev/ttyACM0
-# QGC connects via UDP (no telemetry radio needed):
-#   In QGC: Comm Links → UDP → Port 14550 → connect
-#   Or QGC auto-discovers via UDP broadcast on the LAN
+# QGC connects via directed UDP (no telemetry radio needed):
+#   In QGC: Comm Links → Add → UDP → Port 14550 → connect
+#   MAVROS sends directed packets to LAPTOP_IP, not broadcast.
 
 set -euo pipefail
 
 FCU_DEVICE="/dev/ttyACM0"
 FCU_BAUD="921600"
 GCS_UDP_PORT="14550"
+LAPTOP_IP="192.168.1.103"
 JETSON_IP="192.168.1.102"
 ROS_SETUP="/opt/ros/humble/setup.bash"
 
@@ -82,12 +83,15 @@ mavros_watchdog() {
 
     while true; do
         log "Watchdog: starting MAVROS (PX4)..."
+        # Flush stale ROS2 daemon entries so check_ros_node doesn't
+        # return true from a dead /mavros node left over from the crash.
+        timeout 5 ros2 daemon stop >/dev/null 2>&1 || true
         free_port 14550
         sleep 1
 
         ros2 launch mavros node.launch \
             fcu_url:=${FCU_DEVICE}:${FCU_BAUD} \
-            gcs_url:=udp-b://:${GCS_UDP_PORT}@ \
+            gcs_url:=udp://${LAPTOP_IP}:${GCS_UDP_PORT}@ \
             pluginlists_yaml:=${SCRIPT_DIR}/px4_pluginlists_rover.yaml \
             config_yaml:=/opt/ros/humble/share/mavros/launch/px4_config.yaml \
             fcu_protocol:=v2.0 \
@@ -179,7 +183,7 @@ sleep 1
 log "====================================================="
 log " PX4 MAVROS UDP Bridge Starting"
 log " FCU : $FCU_DEVICE @ ${FCU_BAUD} baud"
-log " QGC : UDP broadcast port $GCS_UDP_PORT"
+log " QGC : UDP directed to $LAPTOP_IP:$GCS_UDP_PORT"
 log " QGC setup: Comm Links → Add → UDP → Port $GCS_UDP_PORT"
 log " Or QGC auto-discovers on same LAN (no config needed)"
 log "====================================================="
