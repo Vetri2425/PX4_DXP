@@ -91,7 +91,7 @@ mavros_watchdog() {
 
         ros2 launch mavros node.launch \
             fcu_url:=${FCU_DEVICE}:${FCU_BAUD} \
-            gcs_url:=udp://${LAPTOP_IP}:${GCS_UDP_PORT}@ \
+            gcs_url:=udp://@${LAPTOP_IP}:${GCS_UDP_PORT} \
             pluginlists_yaml:=${SCRIPT_DIR}/px4_pluginlists_rover.yaml \
             config_yaml:=/opt/ros/humble/share/mavros/launch/px4_config.yaml \
             fcu_protocol:=v2.0 \
