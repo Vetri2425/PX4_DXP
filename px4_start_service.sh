@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-FCU_DEVICE="/dev/ttyACM0"
+FCU_DEVICE="/dev/serial/by-id/usb-CubePilot_CubeOrange+_0-if00"
 FCU_BAUD="921600"
 GCS_UDP_PORT="14550"
 LAPTOP_IP="192.168.1.103"
