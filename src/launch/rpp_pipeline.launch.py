@@ -28,6 +28,8 @@ Launch arguments
                           square_2x2, rectangle_3x2, circle_1m5
   auto_run     If true, mission_runner auto-switches to OFFBOARD + arms
                  (default: false — operator runs mission_runner manually)
+  auto_origin  If true, offset path to start at rover's current position
+                 instead of EKF origin (default: false)
   dry_run      If true, mission_runner skips arm/mode commands
                  (default: false)
   log_level    ROS2 log level for all nodes (default: info)
@@ -71,6 +73,7 @@ def _node_cmd(script: str, log_level: str, params: dict | None = None) -> list[s
 def _build(context, *args, **kwargs):
     path_name = LaunchConfiguration("path_name").perform(context)
     auto_run = LaunchConfiguration("auto_run").perform(context).lower() == "true"
+    auto_origin = LaunchConfiguration("auto_origin").perform(context).lower() == "true"
     dry_run = LaunchConfiguration("dry_run").perform(context).lower() == "true"
     log_level = LaunchConfiguration("log_level").perform(context)
 
@@ -113,7 +116,7 @@ def _build(context, *args, **kwargs):
         cmd=_node_cmd(
             os.path.join(src_dir, "path_publisher_node.py"),
             log_level,
-            {"path_name": path_name},
+            {"path_name": path_name, "auto_origin": str(auto_origin).lower()},
         ),
         name="path_publisher",
         output="screen",
@@ -160,6 +163,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "dry_run", default_value="false",
             description="If true, mission_runner skips arm/mode commands",
+        ),
+        DeclareLaunchArgument(
+            "auto_origin", default_value="false",
+            description="If true, offset path to start at rover's current EKF position",
         ),
         DeclareLaunchArgument(
             "log_level", default_value="info",

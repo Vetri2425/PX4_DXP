@@ -285,6 +285,9 @@ class PathPublisherNode(Node):
         self.declare_parameter("mission_file", "")  # empty = use path_name
         self.declare_parameter("frame_id", "local_ned")
         self.declare_parameter("publish_delay_s", 1.0)
+        # auto_origin: offset path to start at rover's current EKF position.
+        # Waits for /mavros/local_position/pose before publishing.
+        self.declare_parameter("auto_origin", False)
 
         # TRANSIENT_LOCAL so late-joining subscribers (rpp_controller) get it
         path_qos = QoSProfile(
@@ -293,18 +296,92 @@ class PathPublisherNode(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
         )
+        be_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
         self._pub = self.create_publisher(Path, "/path", path_qos)
 
-        # One-shot timer to publish after a brief settle
-        delay = self.get_parameter("publish_delay_s").value
-        self._timer = self.create_timer(delay, self._publish_once)
+        self._auto_origin = self.get_parameter("auto_origin").value
+        self._origin_ned: tuple[float, float] | None = None  # (North, East)
+
+        if self._auto_origin:
+            # Subscribe to pose to get current position before publishing
+            self.create_subscription(
+                PoseStamped, "/mavros/local_position/pose",
+                self._pose_cb, be_qos)
+            # Timer checks if origin is ready, then publishes
+            self._timer = self.create_timer(0.2, self._try_publish_with_origin)
+        else:
+            # One-shot timer to publish after a brief settle
+            delay = self.get_parameter("publish_delay_s").value
+            self._timer = self.create_timer(delay, self._publish_once)
 
         mission_file = self.get_parameter("mission_file").value
         path_name = self.get_parameter("path_name").value
         source = f"file={mission_file}" if mission_file else f"path_name={path_name}"
+        mode = "auto_origin" if self._auto_origin else "origin_at_zero"
         self.get_logger().info(
-            f"path_publisher started — will publish {source} after {delay:.1f}s"
+            f"path_publisher started — will publish {source} after "
+            f"{'pose received' if self._auto_origin else f'{delay:.1f}s'} "
+            f"(mode={mode})"
         )
+
+    def _pose_cb(self, msg: PoseStamped):
+        """Capture current EKF position for auto-origin."""
+        if self._origin_ned is None:
+            # MAVROS pose is ENU: x=East, y=North → NED: N=y, E=x
+            self._origin_ned = (msg.pose.position.y, msg.pose.position.x)
+            self.get_logger().info(
+                f"Auto-origin captured: N={self._origin_ned[0]:.3f}, "
+                f"E={self._origin_ned[1]:.3f} (from ENU pose)"
+            )
+
+    def _try_publish_with_origin(self):
+        """Called every 200ms when auto_origin=True. Publishes once origin is known."""
+        if self._origin_ned is None:
+            return  # Still waiting for pose
+        self._timer.cancel()
+        self._publish_once()
+
+    def _publish_once(self):
+        """Load path, apply offset if auto_origin, and publish."""
+
+        frame_id = self.get_parameter("frame_id").value
+        mission_file = self.get_parameter("mission_file").value
+        path_name = self.get_parameter("path_name").value
+
+        # Load path points
+        if mission_file:
+            try:
+                pts = load_mission_file(mission_file)
+                source = mission_file
+            except Exception as e:
+                self.get_logger().error(f"Failed to load mission file: {e}")
+                return
+        elif path_name in PATH_GENERATORS:
+            pts = PATH_GENERATORS[path_name]()
+            source = path_name
+        else:
+            self.get_logger().error(
+                f"Unknown path_name {path_name!r}. "
+                f"Available: {list(PATH_GENERATORS.keys())}"
+            )
+            return
+
+        if not pts:
+            self.get_logger().error("No waypoints loaded — nothing to publish")
+            return
+
+        # Apply auto-origin offset if enabled
+        if self._origin_ned is not None:
+            offset_n, offset_e = self._origin_ned
+            pts = [(n + offset_n, e + offset_e) for (n, e) in pts]
+            self.get_logger().info(
+                f"Auto-origin offset applied: +{offset_n:.3f}N, +{offset_e:.3f}E"
+            )
 
     def _publish_once(self):
         self._timer.cancel()
