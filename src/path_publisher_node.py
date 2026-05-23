@@ -348,6 +348,8 @@ class PathPublisherNode(Node):
 
     def _publish_once(self):
         """Load path, apply offset if auto_origin, and publish."""
+        if not self._auto_origin:
+            self._timer.cancel()
 
         frame_id = self.get_parameter("frame_id").value
         mission_file = self.get_parameter("mission_file").value
@@ -382,35 +384,6 @@ class PathPublisherNode(Node):
             self.get_logger().info(
                 f"Auto-origin offset applied: +{offset_n:.3f}N, +{offset_e:.3f}E"
             )
-
-    def _publish_once(self):
-        self._timer.cancel()
-
-        frame_id = self.get_parameter("frame_id").value
-        mission_file = self.get_parameter("mission_file").value
-        path_name = self.get_parameter("path_name").value
-
-        # Load path points
-        if mission_file:
-            try:
-                pts = load_mission_file(mission_file)
-                source = mission_file
-            except Exception as e:
-                self.get_logger().error(f"Failed to load mission file: {e}")
-                return
-        elif path_name in PATH_GENERATORS:
-            pts = PATH_GENERATORS[path_name]()
-            source = path_name
-        else:
-            self.get_logger().error(
-                f"Unknown path_name {path_name!r}. "
-                f"Available: {list(PATH_GENERATORS.keys())}"
-            )
-            return
-
-        if not pts:
-            self.get_logger().error("No waypoints loaded — nothing to publish")
-            return
 
         # Build Path message
         path = Path()
