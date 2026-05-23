@@ -36,6 +36,12 @@ Safety
   - Ctrl+C triggers clean shutdown: stop streaming → disarm → MANUAL → exit
   - Total mission timeout (default 300 s = 5 min) — disarm if exceeded
 
+Service call design
+-------------------
+  All MAVROS service calls use call_async() + future polling in the 5 Hz tick.
+  This avoids the deadlock that spin_until_future_complete() causes when called
+  from within a timer callback (both share the same MutuallyExclusiveCallbackGroup).
+
 Usage
 -----
   ros2 run ... mission_runner --ros-args -p mission_timeout_s:=120.0
@@ -47,6 +53,7 @@ from enum import Enum
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+from rclpy.callback_groups import ReentrantCallbackGroup
 
 from mavros_msgs.msg import State
 from mavros_msgs.srv import SetMode, CommandBool
@@ -58,11 +65,15 @@ class MissionPhase(Enum):
     WAIT_FCU = "WAIT_FCU"
     WAIT_STREAM = "WAIT_STREAM"
     SWITCH_OFFBOARD = "SWITCH_OFFBOARD"
+    CONFIRM_OFFBOARD = "CONFIRM_OFFBOARD"
     ARM = "ARM"
+    CONFIRM_ARM = "CONFIRM_ARM"
     RUNNING = "RUNNING"
     DONE = "DONE"
     DISARM = "DISARM"
+    CONFIRM_DISARM = "CONFIRM_DISARM"
     EXIT_MANUAL = "EXIT_MANUAL"
+    CONFIRM_MANUAL = "CONFIRM_MANUAL"
     FINISHED = "FINISHED"
     ABORTED = "ABORTED"
 
@@ -76,6 +87,8 @@ RPP_STATE_STALE = -1
 RPP_STATE_RTK_WAIT = 4
 RPP_STATE_JUMP_SKIP = 5
 RPP_STATE_NONDRIVING = (RPP_STATE_STALE, RPP_STATE_RTK_WAIT, RPP_STATE_JUMP_SKIP)
+
+SERVICE_TIMEOUT_S = 5.0
 
 
 class MissionRunnerNode(Node):
@@ -102,6 +115,8 @@ class MissionRunnerNode(Node):
         self._mission_t0 = self.get_clock().now()
         self._done_t0: float | None = None
         self._was_offboard = False  # track external mode changes
+        self._pending_future = None   # active service call future
+        self._future_t0 = None        # timestamp when future was created
 
         # ------------------------------------------------------------------
         # QoS
@@ -120,16 +135,24 @@ class MissionRunnerNode(Node):
         )
 
         # ------------------------------------------------------------------
+        # Callback groups — Reentrant for service clients so call_async
+        # futures can complete while the timer tick is running.
+        # ------------------------------------------------------------------
+        svc_group = ReentrantCallbackGroup()
+
+        # ------------------------------------------------------------------
         # Subscribers
         # ------------------------------------------------------------------
         self.create_subscription(State, "/mavros/state", self._state_cb, state_qos)
         self.create_subscription(Float32MultiArray, "/rpp/debug", self._debug_cb, be_qos)
 
         # ------------------------------------------------------------------
-        # Service clients
+        # Service clients (ReentrantCallbackGroup to avoid deadlock)
         # ------------------------------------------------------------------
-        self._set_mode_cli = self.create_client(SetMode, "/mavros/set_mode")
-        self._arm_cli = self.create_client(CommandBool, "/mavros/cmd/arming")
+        self._set_mode_cli = self.create_client(
+            SetMode, "/mavros/set_mode", callback_group=svc_group)
+        self._arm_cli = self.create_client(
+            CommandBool, "/mavros/cmd/arming", callback_group=svc_group)
 
         # ------------------------------------------------------------------
         # Phase tick — 5 Hz state machine
@@ -165,6 +188,46 @@ class MissionRunnerNode(Node):
         self._rpp_debug = msg
 
     # ==================================================================
+    # Non-blocking service call helpers
+    # ==================================================================
+    def _call_set_mode(self, mode: str) -> bool:
+        """Initiate set_mode call. Returns True if call was sent, False if service unavailable."""
+        if not self._set_mode_cli.wait_for_service(timeout_sec=1.0):
+            self.get_logger().error("/mavros/set_mode unavailable")
+            return False
+        req = SetMode.Request()
+        req.custom_mode = mode
+        self._pending_future = self._set_mode_cli.call_async(req)
+        self._future_t0 = self.get_clock().now()
+        return True
+
+    def _call_arm(self, value: bool) -> bool:
+        """Initiate arm/disarm call. Returns True if call was sent, False if service unavailable."""
+        if not self._arm_cli.wait_for_service(timeout_sec=1.0):
+            self.get_logger().error("/mavros/cmd/arming unavailable")
+            return False
+        req = CommandBool.Request()
+        req.value = value
+        self._pending_future = self._arm_cli.call_async(req)
+        self._future_t0 = self.get_clock().now()
+        return True
+
+    def _future_done(self) -> bool:
+        """Check if the pending service call future has completed."""
+        return self._pending_future is not None and self._pending_future.done()
+
+    def _future_timed_out(self) -> bool:
+        """Check if the pending service call has exceeded SERVICE_TIMEOUT_S."""
+        if self._future_t0 is None:
+            return False
+        elapsed = (self.get_clock().now() - self._future_t0).nanoseconds * 1e-9
+        return elapsed > SERVICE_TIMEOUT_S
+
+    def _clear_future(self):
+        self._pending_future = None
+        self._future_t0 = None
+
+    # ==================================================================
     # State machine
     # ==================================================================
     def _phase_tick(self):
@@ -172,7 +235,8 @@ class MissionRunnerNode(Node):
         elapsed = (self.get_clock().now() - self._mission_t0).nanoseconds * 1e-9
         timeout = self.get_parameter("mission_timeout_s").value
         if elapsed > timeout and self._phase not in (
-            MissionPhase.DISARM, MissionPhase.EXIT_MANUAL,
+            MissionPhase.DISARM, MissionPhase.CONFIRM_DISARM,
+            MissionPhase.EXIT_MANUAL, MissionPhase.CONFIRM_MANUAL,
             MissionPhase.FINISHED, MissionPhase.ABORTED, MissionPhase.INIT,
         ):
             self.get_logger().error(
@@ -208,37 +272,73 @@ class MissionRunnerNode(Node):
                 self._phase = MissionPhase.RUNNING
                 self._was_offboard = True
                 return
-            ok = self._set_mode("OFFBOARD")
-            if ok:
-                # Wait for mode confirmation
-                deadline = time.time() + self.get_parameter("mode_switch_timeout_s").value
-                while time.time() < deadline:
-                    if self._fcu_state and self._fcu_state.mode == "OFFBOARD":
-                        self.get_logger().info("OFFBOARD confirmed")
-                        self._was_offboard = True
-                        self._phase = MissionPhase.ARM
-                        return
-                    rclpy.spin_once(self, timeout_sec=0.1)
-                self.get_logger().error(
-                    f"OFFBOARD not confirmed (still {self._fcu_state.mode if self._fcu_state else 'unknown'}) — aborting"
-                )
-                self._phase = MissionPhase.ABORTED
+            sent = self._call_set_mode("OFFBOARD")
+            if sent:
+                self._phase = MissionPhase.CONFIRM_OFFBOARD
             else:
-                self.get_logger().error("OFFBOARD switch rejected — aborting")
+                self.get_logger().error("OFFBOARD switch — service unavailable, aborting")
                 self._phase = MissionPhase.ABORTED
+
+        elif self._phase == MissionPhase.CONFIRM_OFFBOARD:
+            if self._future_done():
+                r = self._pending_future.result()
+                self._clear_future()
+                ok = bool(r.mode_sent) if r else False
+                if ok:
+                    self.get_logger().info("set_mode OFFBOARD: sent")
+                else:
+                    self.get_logger().warn(f"set_mode OFFBOARD: rejected ({r})")
+                # Wait for FCU state to reflect OFFBOARD regardless
+                self._phase_t0 = self.get_clock().now()
+                self._phase = MissionPhase.WAIT_OFFBOARD_STATE
+            elif self._future_timed_out():
+                self._clear_future()
+                self.get_logger().error("set_mode OFFBOARD: timeout")
+                self._phase = MissionPhase.ABORTED
+
+        elif self._phase == MissionPhase.WAIT_OFFBOARD_STATE:
+            # FCU state callback updates self._fcu_state; check if OFFBOARD
+            if self._fcu_state and self._fcu_state.mode == "OFFBOARD":
+                self.get_logger().info("OFFBOARD confirmed")
+                self._was_offboard = True
+                self._phase = MissionPhase.ARM
+            else:
+                mode_timeout = self.get_parameter("mode_switch_timeout_s").value
+                t = (self.get_clock().now() - self._phase_t0).nanoseconds * 1e-9
+                if t > mode_timeout:
+                    mode = self._fcu_state.mode if self._fcu_state else "unknown"
+                    self.get_logger().error(
+                        f"OFFBOARD not confirmed after {mode_timeout}s (still {mode}) — aborting"
+                    )
+                    self._phase = MissionPhase.ABORTED
 
         elif self._phase == MissionPhase.ARM:
             if self.get_parameter("dry_run").value:
                 self.get_logger().info("DRY RUN: skipping arm")
                 self._phase = MissionPhase.RUNNING
                 return
-            ok = self._arm(True)
-            if ok:
-                self.get_logger().info("Armed — mission running")
-                self._phase = MissionPhase.RUNNING
+            sent = self._call_arm(True)
+            if sent:
+                self._phase = MissionPhase.CONFIRM_ARM
             else:
-                self.get_logger().error("Arm rejected — aborting (set COM_ARM_WO_GPS=1 if no fix)")
-                self._phase = MissionPhase.EXIT_MANUAL  # back to MANUAL without disarm
+                self.get_logger().error("Arm — service unavailable, aborting")
+                self._phase = MissionPhase.EXIT_MANUAL
+
+        elif self._phase == MissionPhase.CONFIRM_ARM:
+            if self._future_done():
+                r = self._pending_future.result()
+                self._clear_future()
+                ok = bool(r.success) if r else False
+                if ok:
+                    self.get_logger().info("Armed — mission running")
+                    self._phase = MissionPhase.RUNNING
+                else:
+                    self.get_logger().error("Arm rejected (set COM_ARM_WO_GPS=1 if no fix)")
+                    self._phase = MissionPhase.EXIT_MANUAL
+            elif self._future_timed_out():
+                self._clear_future()
+                self.get_logger().error("Arm: timeout")
+                self._phase = MissionPhase.EXIT_MANUAL
 
         elif self._phase == MissionPhase.RUNNING:
             # Watch /rpp/debug for DONE state
@@ -286,64 +386,53 @@ class MissionRunnerNode(Node):
                 self.get_logger().info("DRY RUN: skipping disarm")
                 self._phase = MissionPhase.EXIT_MANUAL
                 return
-            self._arm(False)  # best effort
-            self._phase = MissionPhase.EXIT_MANUAL
+            sent = self._call_arm(False)
+            if sent:
+                self._phase = MissionPhase.CONFIRM_DISARM
+            else:
+                # Best effort — move on
+                self._phase = MissionPhase.EXIT_MANUAL
+
+        elif self._phase == MissionPhase.CONFIRM_DISARM:
+            if self._future_done():
+                self._clear_future()
+                self._phase = MissionPhase.EXIT_MANUAL
+            elif self._future_timed_out():
+                self._clear_future()
+                self.get_logger().warn("Disarm: timeout (continuing to MANUAL)")
+                self._phase = MissionPhase.EXIT_MANUAL
 
         elif self._phase == MissionPhase.EXIT_MANUAL:
             if self.get_parameter("dry_run").value:
                 self.get_logger().info("DRY RUN: skipping mode revert")
                 self._phase = MissionPhase.FINISHED
                 return
-            self._set_mode("MANUAL")
-            self._phase = MissionPhase.FINISHED
+            sent = self._call_set_mode("MANUAL")
+            if sent:
+                self._phase = MissionPhase.CONFIRM_MANUAL
+            else:
+                self._phase = MissionPhase.FINISHED
+
+        elif self._phase == MissionPhase.CONFIRM_MANUAL:
+            if self._future_done():
+                self._clear_future()
+                self._phase = MissionPhase.FINISHED
+            elif self._future_timed_out():
+                self._clear_future()
+                self.get_logger().warn("set_mode MANUAL: timeout")
+                self._phase = MissionPhase.FINISHED
 
         elif self._phase == MissionPhase.ABORTED:
             self.get_logger().error("Mission aborted — disarming and reverting to MANUAL")
             if not self.get_parameter("dry_run").value:
-                self._arm(False)
-                self._set_mode("MANUAL")
+                self._call_arm(False)
+                self._call_set_mode("MANUAL")
             self._phase = MissionPhase.FINISHED
 
         elif self._phase == MissionPhase.FINISHED:
             self.get_logger().info("Mission finished — shutting down node")
             self._tick.cancel()
-            # Trigger a clean shutdown
             rclpy.try_shutdown()
-
-    # ==================================================================
-    # Service helpers
-    # ==================================================================
-    def _set_mode(self, mode: str) -> bool:
-        if not self._set_mode_cli.wait_for_service(timeout_sec=2.0):
-            self.get_logger().error("/mavros/set_mode unavailable")
-            return False
-        req = SetMode.Request()
-        req.custom_mode = mode
-        future = self._set_mode_cli.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=3.0)
-        if future.done() and future.result():
-            r = future.result()
-            ok = bool(r.mode_sent)
-            self.get_logger().info(f"set_mode {mode}: {'sent' if ok else 'rejected'}")
-            return ok
-        self.get_logger().error(f"set_mode {mode}: timeout")
-        return False
-
-    def _arm(self, value: bool) -> bool:
-        if not self._arm_cli.wait_for_service(timeout_sec=2.0):
-            self.get_logger().error("/mavros/cmd/arming unavailable")
-            return False
-        req = CommandBool.Request()
-        req.value = value
-        future = self._arm_cli.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=3.0)
-        if future.done() and future.result():
-            r = future.result()
-            ok = bool(r.success)
-            self.get_logger().info(f"{'arm' if value else 'disarm'}: {'success' if ok else 'denied'}")
-            return ok
-        self.get_logger().error(f"{'arm' if value else 'disarm'}: timeout")
-        return False
 
 
 def main():
@@ -356,8 +445,14 @@ def main():
         if node:
             node.get_logger().info("Ctrl+C — disarming and reverting to MANUAL")
             try:
-                node._arm(False)
-                node._set_mode("MANUAL")
+                if node._arm_cli.service_is_ready():
+                    req = CommandBool.Request()
+                    req.value = False
+                    node._arm_cli.call_async(req)
+                if node._set_mode_cli.service_is_ready():
+                    req = SetMode.Request()
+                    req.custom_mode = "MANUAL"
+                    node._set_mode_cli.call_async(req)
             except Exception:
                 pass
     finally:
