@@ -1044,9 +1044,10 @@ class RPPControllerNode(Node):
             return
 
         # ---- Pose in NED ----
-        pos_n, pos_e, _yaw = self._enu_pose_to_ned(pose_for_projection)
-        # Note: yaw_ned is computed but NOT used in the velocity-vector design.
-        # PX4 derives target yaw from atan2(vE, vN) in DifferentialOffboardMode.
+        # Single quaternion extraction: yaw is captured here and reused at
+        # the body-frame κ computation below. Earlier versions called
+        # _enu_pose_to_ned twice per cycle; that's now consolidated.
+        pos_n, pos_e, yaw_ned = self._enu_pose_to_ned(pose_for_projection)
 
         # ---- P0.2: EKF / position-jump detection ----
         # If the pose jumps further than is physically possible in one control
@@ -1112,8 +1113,9 @@ class RPPControllerNode(Node):
         # ---- Step 3: Lookahead point (NED), then body-frame for κ ----
         lh_n, lh_e, hit_end = self._get_lookahead_point(seg_idx, foot_n, foot_e, l_d)
 
-        # Body-frame y-component for curvature math (need yaw here)
-        _, _, yaw_ned = self._enu_pose_to_ned(pose_for_projection)
+        # Body-frame y-component for curvature math (yaw_ned was already
+        # extracted at the pose-in-NED step above; do NOT call
+        # _enu_pose_to_ned again here).
         dn = lh_n - pos_n
         de = lh_e - pos_e
         # NED → body (NED yaw is CW+, North=0).
