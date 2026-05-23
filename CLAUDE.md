@@ -153,7 +153,8 @@ ROVER_DISABLE_AUTH=1 bash run.sh          # dev mode (no auth)
 - **Pure rclpy** — no roslibpy, no CLI fallback. Server runs on same Jetson as ROS2 nodes.
 - **Async service calls** — `arm_async()`, `set_mode_async()` use `call_async` + `add_done_callback`, never block FastAPI event loop.
 - **Stop-path, not empty Path** — RPP node ignores empty Path (early return). E-stop publishes single point at rover's current position instead.
-- **ENU→NED conversion** — MAVROS pose is ENU frame. Server converts: `yaw_NED = π/2 - yaw_ENU`, `pos_n = pose.y`, `pos_e = pose.x`.
+- **ENU→NED conversion** — MAVROS pose is ENU frame. RPP converts: `yaw_NED = π/2 - yaw_ENU`, `pos_n = pose.y`, `pos_e = pose.x`.
+- **NED→ENU conversion** — twist_to_setpoint outputs ENU to MAVROS: `velocity.x = v_e` (East), `velocity.y = v_n` (North), `velocity.z = -v_d` (Up). See [[debug_ned_enu_swap]] in laptop memory.
 - **MAVROS process-crash detection** — TRANSIENT_LOCAL keeps last message with `connected=True` even after MAVROS dies. Server tracks `_state_recv_time` and overrides `connected=False` after 2s timeout.
 
 ## Phase 2 plan (active — see laptop `project_architecture_decision.md`)
@@ -168,11 +169,19 @@ ROVER_DISABLE_AUTH=1 bash run.sh          # dev mode (no auth)
 5. For position/path control: `/mavros/setpoint_raw/local` (PositionTarget) — preferred for arc following.
 
 **Milestones:**
-1. Verify MAVROS bridge → `ros2 topic echo /mavros/state` shows `connected: true`.
-2. Build setpoint streamer node in `~/PX4_DXP/src/` — straight-line velocity first.
-3. Arm + switch to OFFBOARD via service calls. Confirm motion.
-4. Pure-pursuit arc controller node (later: MPC). Source path comes from laptop-generated waypoint files.
-5. Capture rosbag of every test → push to laptop for analysis.
+1. ✅ Verify MAVROS bridge → `ros2 topic echo /mavros/state` shows `connected: true`.
+2. ✅ Build setpoint streamer node in `~/PX4_DXP/src/` — straight-line velocity first.
+3. ✅ Arm + switch to OFFBOARD via service calls. Confirm motion.
+4. ✅ RPP controller node — pure pursuit with adaptive lookahead.
+5. ✅ 2m×2m square completed (2026-05-23, log 59). Max xtrack 9.4cm (corners), 1-3cm straights.
+6. **Next:** RPP tuning (reduce corner cutting), safety params on FCU, P4 validation with RTK.
+
+**Hardware-validated bugs fixed (05-23):**
+- NED→ENU velocity swap in twist_to_setpoint (90° heading error)
+- P4 floor startup deadlock (zero-speed blocking)
+- min_goal_travel_m for closed-loop paths (immediate DONE)
+- mission_runner deadlock (call_async + ReentrantCallbackGroup)
+- WAIT_OFFBOARD_STATE missing from enum
 
 ## Cross-Machine Workflow
 
