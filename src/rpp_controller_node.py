@@ -187,6 +187,10 @@ class RPPControllerNode(Node):
 
         # Goal handling
         self.declare_parameter("xy_goal_tolerance",                   0.02)   # 2 cm
+        # Minimum distance the rover must have traveled along the path before
+        # the goal check activates. Prevents DONE on closed-loop paths where
+        # the rover starts at the final waypoint. Set to 0 to disable.
+        self.declare_parameter("min_goal_travel_m",                   0.5)    # m
         self.declare_parameter("approach_velocity_scaling_dist",      0.6)    # m
         self.declare_parameter("min_approach_linear_velocity",        0.05)
         self.declare_parameter("p4_zero_vel_threshold",               0.02)   # m/s; floor speed below this to exactly 0 to trigger PX4 P4
@@ -274,6 +278,7 @@ class RPPControllerNode(Node):
         self._pose: PoseStamped | None = None
         self._pose_recv_time: RclTime | None = None
         self._path_done = False
+        self._path_travel_m: float = 0.0   # cumulative distance traveled along path
 
         # P1.4 — segment search hint: start projection from previous best seg
         self._closest_seg_hint: int = 0
@@ -434,6 +439,7 @@ class RPPControllerNode(Node):
 
         self._path = new_path
         self._path_done = False
+        self._path_travel_m = 0.0   # reset travel distance on new path
         # P1.4 — reset hint so search starts from beginning of new path
         self._closest_seg_hint = 0
         # P1.4 fixup — force full scan on first projection after re-plan
@@ -1114,12 +1120,23 @@ class RPPControllerNode(Node):
                 # as STALE (RPP_UNHEALTHY_CODES) — same response, more info.
                 self._publish_zero(StateCode.JUMP_SKIP, pose_age_ms=pose_age_s * 1000)
                 return
+        # Accumulate path travel distance for min_goal_travel_m gate.
+        # Must happen BEFORE _last_pos update so delta is non-zero.
+        if self._last_pos is not None:
+            dx = pos_n - self._last_pos[0]
+            dy = pos_e - self._last_pos[1]
+            self._path_travel_m += math.hypot(dx, dy)
+
         self._last_pos = (pos_n, pos_e)
 
         # ---- Goal check ----
+        # Skip until the rover has traveled min_goal_travel_m along the path.
+        # Prevents immediate DONE on closed-loop paths where the rover starts
+        # at the final waypoint (e.g., square_2x2 with auto_origin).
+        min_travel = self.get_parameter("min_goal_travel_m").value
         final = self._path[-1].pose.position
         dist_to_goal = self._dist(pos_n, pos_e, final.x, final.y)
-        if dist_to_goal <= goal_tol:
+        if dist_to_goal <= goal_tol and self._path_travel_m >= min_travel:
             self.get_logger().info(
                 f"Path complete — within {dist_to_goal * 100:.1f} cm of goal "
                 f"(tol={goal_tol * 100:.1f} cm)"
