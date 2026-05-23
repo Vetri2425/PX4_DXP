@@ -25,13 +25,11 @@ NTRIP_HOST = os.environ.get("NTRIP_HOST", "caster.emlid.com")
 NTRIP_PORT = int(os.environ.get("NTRIP_PORT", "2101"))
 _NTRIP_MOUNTPT_ENV = os.environ.get("NTRIP_MOUNTPT")
 if not _NTRIP_MOUNTPT_ENV:
-    import warnings
-    warnings.warn(
-        "NTRIP_MOUNTPT not set — using default 'MP23960a'. "
-        "Add NTRIP_MOUNTPT to config/ntrip.env and restart.",
-        stacklevel=1,
+    raise RuntimeError(
+        "NTRIP_MOUNTPT environment variable is required (no default). "
+        "Add NTRIP_MOUNTPT=<your_mountpoint> to config/ntrip.env and restart."
     )
-NTRIP_MOUNTPT = _NTRIP_MOUNTPT_ENV or "MP23960a"
+NTRIP_MOUNTPT = _NTRIP_MOUNTPT_ENV
 
 _NTRIP_USER = os.environ.get("NTRIP_USER")
 _NTRIP_PASS = os.environ.get("NTRIP_PASS")
