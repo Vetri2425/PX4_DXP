@@ -50,13 +50,12 @@ Sprint 2 upgrades vs Sprint 1
           curvature at κ_max = 1/r. Skips vertices where adjacent segments
           are too short to support the radius.
 
-Phase C / P0.5 / P3.1 — opt-in upgrades (default OFF for backward compat)
-------------------------------------------------------------------------
-  P0.5  Explicit yaw setpoint: publishes /rpp/yaw_setpoint_ned (Float32) so
-        twist_to_setpoint_node can include yaw in the PositionTarget setpoint.
-        Gives RPP authority over heading instead of relying on PX4's
-        atan2(vE, vN) derivation. When |v| < 1 cm/s, yaw freezes at the last
-        commanded heading (matches PX4 P4 patch behavior — no North snap).
+Phase C / P3.1 — opt-in upgrades (default OFF for backward compat)
+-----------------------------------------------------------------------
+  P0.5  REMOVED 2026-05-23: yaw is now computed in twist_to_setpoint_node from
+        the velocity vector (atan2(v_n, v_e)). No separate /rpp/yaw_setpoint_ned
+        topic needed. RPP still computes yaw_target internally for _last_yaw_cmd
+        state, but no longer publishes it.
   P2.4  Velocity-based pose extrapolation (latency closure): when on,
         dead-reckon `pose_for_projection = pose + vel_ned · pose_age` using
         /mavros/local_position/velocity_local (already EKF-clean and gravity-
@@ -88,14 +87,6 @@ Topic:  /rpp/velocity_ned   (geometry_msgs/Vector3Stamped)
         vector.x         = v_north  (m/s, NED North)
         vector.y         = v_east   (m/s, NED East)
         vector.z         = 0.0
-
-Topic:  /rpp/yaw_setpoint_ned   (std_msgs/Float32)  [P0.5]
-        data             = target yaw (radians, NED convention)
-                           Derived from velocity vector: atan2(v_e, v_n).
-                           When |v| < 1 cm/s, yaw is frozen at last commanded value.
-                           Allows twist_to_setpoint_node to include yaw in PositionTarget
-                           and gives RPP authority over heading instead of relying on
-                           PX4's atan2(vE, vN) derivation.
 
 When the path is complete, the velocity vector is exactly (0, 0, 0) and yaw is frozen.
 PX4's P4 patch detects |v| < 1 cm/s and freezes heading instead of snapping to North.
@@ -336,12 +327,6 @@ class RPPControllerNode(Node):
         )
         self._dbg_pub = self.create_publisher(
             Float32MultiArray, "/rpp/debug", be_qos
-        )
-        # P0.5: explicit yaw setpoint (NED, radians).  When use_explicit_yaw=True
-        # in twist_to_setpoint_node, this gives RPP authority over heading
-        # instead of relying on PX4's atan2(vE, vN) derivation.
-        self._yaw_pub = self.create_publisher(
-            Float32, "/rpp/yaw_setpoint_ned", be_qos
         )
         # P3.1: optional yaw rate (body-rate mode) publisher
         self._yaw_rate_pub = self.create_publisher(
@@ -1284,7 +1269,6 @@ class RPPControllerNode(Node):
 
         # ---- Publish ----
         self._publish_velocity(v_n, v_e)
-        self._publish_yaw(yaw_target_ned)  # P0.5
         self._publish_yaw_rate(yaw_rate_body)  # P3.1
 
         # ---- Diagnostics ----
@@ -1323,12 +1307,6 @@ class RPPControllerNode(Node):
         msg.vector.z = 0.0
         self._vel_pub.publish(msg)
 
-    # P0.5: publish explicit yaw setpoint (NED, radians)
-    def _publish_yaw(self, yaw_ned: float):
-        msg = Float32()
-        msg.data = float(yaw_ned)
-        self._yaw_pub.publish(msg)
-
     # P3.1: publish feedforward yaw rate (body frame, rad/s)
     def _publish_yaw_rate(self, yaw_rate_body: float):
         msg = Float32()
@@ -1343,8 +1321,6 @@ class RPPControllerNode(Node):
     ):
         """Publish (0, 0, 0) and a diagnostic. Used for IDLE/DONE/STALE/RTK_WAIT/JUMP_SKIP."""
         self._publish_velocity(0.0, 0.0)
-        # P0.5: freeze yaw at last commanded heading (do NOT snap to North).
-        self._publish_yaw(self._last_yaw_cmd)
         self._publish_yaw_rate(0.0)  # P3.1: zero yaw rate on stop
         self._publish_debug(
             cross_track=float("nan"),
