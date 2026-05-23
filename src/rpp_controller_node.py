@@ -254,6 +254,11 @@ class RPPControllerNode(Node):
         # Requires twist_to_setpoint_node to support body-rate output.
         self.declare_parameter("use_feedforward_yaw_rate",            False)
         self.declare_parameter("yaw_rate_feedback_gain",              0.5)  # heading error feedback
+        # Optional clamp on body yaw rate. Match PX4 RO_YAW_RATE_LIM (deg/s)
+        # converted to rad/s so RPP doesn't request more than PX4 will honor.
+        # Default 0.0 disables the clamp (preserves prior behavior).
+        # 0.52 rad/s ≈ 30°/s (PX4 default RO_YAW_RATE_LIM).
+        self.declare_parameter("max_yaw_rate_body",                   0.0)
 
         # Acceleration ramp (P0 polish): cap how fast `speed` can RAMP UP
         # cycle-to-cycle. Prevents motor jerk on mission start and after a
@@ -1176,6 +1181,11 @@ class RPPControllerNode(Node):
             yaw_rate_ff = kappa * speed  # feedforward: κ·v
             yaw_rate_fb = self.get_parameter("yaw_rate_feedback_gain").value * theta_e
             yaw_rate_body = yaw_rate_ff + yaw_rate_fb
+            # Optional clamp to PX4 RO_YAW_RATE_LIM (rad/s).
+            # Default param 0.0 disables; recommended 0.52 = 30°/s.
+            max_yr = self.get_parameter("max_yaw_rate_body").value
+            if max_yr > 0.0:
+                yaw_rate_body = self._clamp(yaw_rate_body, -max_yr, max_yr)
         else:
             yaw_rate_body = 0.0
 
