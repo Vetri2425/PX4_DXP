@@ -66,6 +66,7 @@ class MissionPhase(Enum):
     WAIT_STREAM = "WAIT_STREAM"
     SWITCH_OFFBOARD = "SWITCH_OFFBOARD"
     CONFIRM_OFFBOARD = "CONFIRM_OFFBOARD"
+    WAIT_OFFBOARD_STATE = "WAIT_OFFBOARD_STATE"
     ARM = "ARM"
     CONFIRM_ARM = "CONFIRM_ARM"
     RUNNING = "RUNNING"
@@ -238,6 +239,7 @@ class MissionRunnerNode(Node):
             MissionPhase.DISARM, MissionPhase.CONFIRM_DISARM,
             MissionPhase.EXIT_MANUAL, MissionPhase.CONFIRM_MANUAL,
             MissionPhase.FINISHED, MissionPhase.ABORTED, MissionPhase.INIT,
+            MissionPhase.WAIT_OFFBOARD_STATE,
         ):
             self.get_logger().error(
                 f"Mission timeout ({elapsed:.1f}s > {timeout:.1f}s) — aborting"
