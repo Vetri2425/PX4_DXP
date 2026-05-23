@@ -255,6 +255,13 @@ class RPPControllerNode(Node):
         self.declare_parameter("use_feedforward_yaw_rate",            False)
         self.declare_parameter("yaw_rate_feedback_gain",              0.5)  # heading error feedback
 
+        # Acceleration ramp (P0 polish): cap how fast `speed` can RAMP UP
+        # cycle-to-cycle. Prevents motor jerk on mission start and after a
+        # stop/re-plan. Decel is intentionally NOT limited — the P4 floor
+        # relies on instantaneous step-to-zero to trigger PX4 P4 yaw freeze
+        # at the goal. Set to 0.0 to disable.
+        self.declare_parameter("max_linear_accel",                    0.5)  # m/s²
+
         # ------------------------------------------------------------------
         # Internal state
         # ------------------------------------------------------------------
@@ -1180,6 +1187,16 @@ class RPPControllerNode(Node):
             approach_speed = max(approach_v, speed * scale)
             speed = min(speed, approach_speed)
             state_code = StateCode.APPROACH
+
+        # ---- Step 6.5: Accel-UP ramp (mission-start motor-jerk guard) ----
+        # Cap how fast `speed` can RAMP UP relative to the previous cycle.
+        # Decel is deliberately unbounded: the P4 floor relies on a clean
+        # step-to-zero at the goal, and a symmetric decel limiter would
+        # cause goal overshoot beyond the 2 cm xy_goal_tolerance.
+        max_accel = self.get_parameter("max_linear_accel").value
+        if max_accel > 0.0:
+            delta_up = max_accel / self.CONTROL_HZ
+            speed = min(speed, self._last_speed_cmd + delta_up)
 
         # ---- Step 7: P4 floor — exact zero below threshold for clean stop ----
         if speed < p4_floor:
