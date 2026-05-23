@@ -512,6 +512,32 @@ class RPPControllerNode(Node):
                 f"or you'll see false-positive JUMP_SKIPs during normal motion."
             )
 
+        # Min-approach vs P4-floor invariant: the P4 floor must be BELOW the
+        # approach floor, otherwise the rover hard-zeros throughout approach
+        # instead of only at the goal — destroying smooth deceleration.
+        p4_floor = float(self.get_parameter("p4_zero_vel_threshold").value)
+        approach_v = float(self.get_parameter("min_approach_linear_velocity").value)
+        if p4_floor >= approach_v:
+            self.get_logger().warn(
+                f"p4_zero_vel_threshold={p4_floor:.3f} >= "
+                f"min_approach_linear_velocity={approach_v:.3f}. Rover will "
+                f"abruptly zero throughout the approach zone, not just at goal. "
+                f"Set p4_zero_vel_threshold strictly less than "
+                f"min_approach_linear_velocity (e.g. 0.02 vs 0.05)."
+            )
+
+        # Accel ramp diagnostic: if max_linear_accel is so high that one
+        # cycle covers (max_v - min_v), the limiter is effectively a no-op.
+        accel = float(self.get_parameter("max_linear_accel").value)
+        min_v = float(self.get_parameter("min_linear_vel").value)
+        if accel > 0.0 and accel / self.CONTROL_HZ > (max_v - min_v):
+            self.get_logger().warn(
+                f"max_linear_accel={accel:.2f} m/s² allows full speed-up "
+                f"({max_v - min_v:.2f} m/s span) in one {1000/self.CONTROL_HZ:.0f} ms cycle. "
+                f"Limiter is effectively disabled. Set lower (e.g. 0.5) "
+                f"or use 0.0 to disable explicitly."
+            )
+
     # ==================================================================
     # Frame conversion helpers
     # ==================================================================
