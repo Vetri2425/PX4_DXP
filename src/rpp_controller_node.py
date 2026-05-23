@@ -1235,7 +1235,10 @@ class RPPControllerNode(Node):
             speed = min(speed, self._last_speed_cmd + delta_up)
 
         # ---- Step 7: P4 floor — exact zero below threshold for clean stop ----
-        if speed < p4_floor:
+        # Skip during initial ramp-up from standstill, otherwise the accel
+        # ramp (0.01 m/s per cycle at default 0.5 m/s²) can never exceed the
+        # floor (0.02 m/s) and the rover is permanently stuck at zero.
+        if speed < p4_floor and self._last_speed_cmd > 0.0:
             speed = 0.0
 
         # ---- P0.1: persist commanded speed for next cycle's L_d ----
