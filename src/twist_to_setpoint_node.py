@@ -26,7 +26,8 @@ Output contract
 Frame discipline
 ----------------
 Input is *already* in NED (Vector3Stamped from rpp_controller_node, header
-frame_id="local_ned"). No body→NED rotation needed in this node.
+frame_id="local_ned"). Output to MAVROS must be in ENU (REP-103):
+x=East, y=North, z=Up. We swap N↔E and negate z on output.
 
 Stale-input behaviour
 ---------------------
@@ -228,9 +229,13 @@ class TwistToSetpointNode(Node):
                         f"{max_age * 1000:.0f} ms) — streaming zero velocity"
                     )
 
-        msg.velocity.x = v_n
-        msg.velocity.y = v_e
-        msg.velocity.z = v_d
+        # MAVROS PositionTarget uses ENU convention (REP-103):
+        #   x = East, y = North, z = Up
+        # Our RPP controller outputs NED: v_n = North, v_e = East.
+        # Swap N↔E and negate z to convert NED → ENU.
+        msg.velocity.x = v_e       # ENU x = East  (was NED y)
+        msg.velocity.y = v_n       # ENU y = North (was NED x)
+        msg.velocity.z = -v_d      # ENU z = Up    (negate NED Down)
         msg.yaw = yaw_ned
 
         # Position, acceleration, yaw_rate are ignored by mask but set
