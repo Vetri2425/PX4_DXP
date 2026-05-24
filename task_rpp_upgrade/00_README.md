@@ -20,6 +20,14 @@ The trajectory planner upstream is responsible for kinodynamic feasibility
 (densifying arcs, inserting pivot waypoints, pen-up/down). RPP trusts the
 path it receives.
 
+## Core architecture decision
+
+**RPP is the primary steering controller.** It stays as primary throughout
+all upgrades. Stanley is a BLEND supplement for small-xtrack regime only
+(< 8 cm). Pivot-turn handles HARD 90° corners. No controller migration.
+No rewrite. All upgrades are incremental additions to the existing
+`rpp_controller_node.py`.
+
 ## Baseline (2026-05-23, log 59)
 
 2 m × 2 m square mission, RPP params from `Final_Best`:
@@ -66,19 +74,23 @@ Our upgrades hit each of those, in order of expected impact:
 
 | # | Upgrade | Expected xtrack reduction | Agent |
 |---|---|---|---|
-| 03 | **Path geometry + Stanley tracking** (replaces old 03/04/05) | **6-8 cm corners, 1-2 cm steady** | GLM |
-| ~~04~~ | ~~Path-κ feedforward~~ → folded into 03 (Block B.2) | — | — |
-| ~~05~~ | ~~Stanley xtrack blend~~ → folded into 03 (Block B.1, now primary) | — | — |
+| 03 | **PathGeometry** (arc-length + κ lookup, NO spline) | **5-7 cm corners** (removes vertex spikes) | GLM |
+| 04 | **Path-κ feedforward** | **1-2 cm steady** (reduces heading lag on curves) | Haiku |
+| 05 | **Stanley xtrack blend** (small-e regime ONLY, RPP stays primary) | **1-2 cm steady** (eliminates small-xtrack oscillation) | GLM |
 | 06 | Precomputed speed profile (a_lat-bounded) | 2-3 cm at corners | GLM |
 | 07 | xtrack integral term | bias-elimination, ~0.5-1 cm | Haiku |
 | 08 | Goal-approach PI (last 30 cm) | 1-2 cm at endpoint | Haiku |
 | 09 | κ low-pass + always-on yaw FF | smoothness, no xtrack but reduces jerk | Gemma |
 | 10 | Latency-compensated lookahead | 0.5-1 cm | Gemma |
 | 11 | Dynamic speed regulation by `|xtrack|` and `|ψ_e|` | safety, recovery shaping | Gemma |
-| 12 | Heading-bias online observer | bias-elimination over minutes | GLM |
+| 12 | ~~Heading-bias online observer~~ | **DEFERRED** — UM982 dual-antenna provides true heading | — |
+| 13 | Benchmark harness vs Nav2 | validation | GLM |
+| 14 | **Pivot-turn for HARD 90° corners** | **2-5 cm corners** (stop, spot-turn, resume) | GLM |
 
-A `13_benchmark_harness_vs_nav2.md` task closes the loop: head-to-head
-quantitative comparison on the same paths.
+~~04 (κ FF)~~ and ~~05 (Stanley blend)~~ are **no longer folded into 03**.
+They are separate, incremental tasks that build on the PathGeometry module
+from 03. Old task 03 (cubic spline) is **DEPRECATED** — replaced by
+polyline + Menger κ (no interpolation between waypoints).
 
 Read `01_architecture_and_upgrade_plan.md` next — it explains the controller
 block diagram and where each upgrade plugs in.

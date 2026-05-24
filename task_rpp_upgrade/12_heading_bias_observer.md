@@ -1,4 +1,13 @@
-# 12 — Heading-bias online observer
+# 12 — Heading-bias online observer (DEFERRED)
+
+**Status:** **DEFERRED** — The UM982 dual-antenna RTK GNSS provides true
+heading directly from the two-antenna baseline. No magnetometer bias to
+estimate. Implement this task ONLY if dual-antenna heading becomes
+unavailable (e.g., RTK FLOAT or NO-FIX fallback).
+
+**Original spec preserved below for reference.**
+
+---
 
 **Agent:** GLM (4.5 or 5.1)
 **Estimated diff:** +150 lines (1 new module + control-loop hook)
@@ -12,10 +21,16 @@ The integral term in task 07 catches steady xtrack bias but takes time
 that tracks the heading bias `b̂` directly converges faster on long runs
 and survives re-acquisition events.
 
-Symptom we're killing: every time we ARM the rover at the start of a path,
-the first ~30 cm shows a small drift to one side because the EKF's yaw and
-the IMU mounting differ by ~0.5-1°. Manually re-tuning the compass each
-session is annoying and incomplete.
+**Why DEFERRED:** Our UM982 dual-antenna RTK gives true heading from the
+antenna baseline — no compass involved, no magnetic declination or
+hard-iron offset. The xtrack bias on straights (1-3 cm in log 59) is well
+within tolerance without a heading-bias correction. This task should be
+revived ONLY if:
+
+1. Dual-antenna heading drops out (RTK FLOAT/NO-FIX) and we fall back to
+   GPS COG + compass, OR
+2. Field testing shows a consistent lateral bias > 2 cm that the I-term
+   (task 07) doesn't converge within 5 m.
 
 ## Math
 
@@ -35,7 +50,7 @@ e_⊥_rate ≈ v_path · sin(ψ_e + b)              # small-angle: ≈ v_path ·
 ```
 
 If `ψ_e_measured = ψ_path - ψ_vehicle_measured = (ψ_path - ψ_vehicle_true) - b
-            = ψ_e_true - b`, then in the model:
+            = ψ_e_true - b`, then:
 
 ```
 e_⊥_rate = v_path · (ψ_e_measured + b - b) = v_path · ψ_e_measured
@@ -51,8 +66,7 @@ b̂ ← b̂ + k_obs · (ε - 0) · sign(v_path)
 b̂ ← clamp(b̂, -b_max, +b_max)
 ```
 
-with `α = 0.99` (slow LPF, ~1 s at 50 Hz), `k_obs = 0.01 rad / m·s`,
-`b_max = 0.10 rad ≈ 5.7°`.
+with `α = 0.99`, `k_obs = 0.01`, `b_max = 0.10 rad ≈ 5.7°`.
 
 Apply correction:
 
@@ -60,8 +74,6 @@ Apply correction:
 ψ_vehicle_corrected = ψ_vehicle_measured - b̂
 ψ_e_corrected = ψ_path - ψ_vehicle_corrected
 ```
-
-Use corrected `ψ_e` everywhere downstream (Stanley blend, FF, etc.).
 
 ## Files to read first
 
@@ -73,7 +85,7 @@ Use corrected `ψ_e` everywhere downstream (Stanley blend, FF, etc.).
 
 ### A. New module `src/heading_bias_observer.py`
 
-A pure-math class:
+Pure-math class:
 
 ```
 HeadingBiasObserver(
@@ -87,9 +99,7 @@ HeadingBiasObserver(
   .reset()
 ```
 
-The observer only updates when `|κ_path|` < threshold AND `v_path` > min_v.
-Outside the active region, it holds the last estimate. This avoids picking
-up centripetal contributions on curves.
+Observer only updates when `|κ_path|` < threshold AND `v_path` > min_v.
 
 ### B. Wiring
 
@@ -103,26 +113,14 @@ else:
     yaw_vehicle_corrected = yaw_vehicle
 ```
 
-Use `yaw_vehicle_corrected` for all downstream heading-error calculations.
-
-### C. Persistence
-
-Save `b_hat` to a state file (e.g. `~/PX4_DXP/state/heading_bias.json`) on
-clean shutdown, restore on startup. Saves a few seconds of convergence
-each session. Optional, not blocking.
-
-### D. Parameters
+### C. Parameters
 
 - `rpp_enable_heading_bias_observer` (bool, default False).
 - `rpp_bias_alpha` (float, default 0.99).
 - `rpp_bias_k_obs` (float, default 0.01).
 - `rpp_bias_b_max_rad` (float, default 0.10).
 
-### E. Diagnostics
-
-`b_hat` and the active/inactive flag → `/rpp/debug` (extend if needed).
-
-### F. Tests
+### D. Tests
 
 `tests/test_heading_bias_observer.py`:
 
@@ -132,13 +130,6 @@ each session. Optional, not blocking.
 - v = 0 → no update.
 - Bias > b_max → clamps.
 
-## Out of scope
-
-- Multi-state Kalman with measurement covariance. Overkill for one
-  bias state.
-- Bias observability on highly curved paths (not possible without an
-  external heading reference like a dual-antenna GNSS).
-
 ## Acceptance criteria
 
 - [ ] On a 5 m straight run with a deliberately offset compass (manually
@@ -146,11 +137,10 @@ each session. Optional, not blocking.
 - [ ] Mean steady xtrack drops to within ±5 mm by 10 s.
 - [ ] On the 2 m square, no regression: bias holds during corners,
       updates only on straights.
-- [ ] Bias state file written on clean shutdown, restored on startup.
 
 ## Notes for the agent
 
-- Reference design: same principle as the wind-bias observer in fixed-wing
+- Reference: same principle as the wind-bias observer in fixed-wing
   autopilots. Single-state, slow, observability-gated.
 - This observer assumes a constant-in-time bias. If the bias is actually
   yaw-rate-proportional (gyroscope scale error), the observer will track
