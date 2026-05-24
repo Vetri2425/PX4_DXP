@@ -1,4 +1,15 @@
-# 05 — Stanley xtrack blend in small-error regime
+# 05 (FOLDED) — Stanley xtrack blend
+
+> **FOLDED INTO 03 on 2026-05-24.** Stanley is no longer a *blend* with
+> Pure Pursuit; it is the PRIMARY steering law in the new spec
+> `03_path_geometry_and_stanley_tracking.md` (Block B.1). Pure Pursuit
+> is retired for this controller. Do not implement separately.
+
+---
+
+# (Original spec below, kept for historical context)
+
+
 
 **Agent:** GLM (4.5 or 5.1)
 **Estimated diff:** +60 lines

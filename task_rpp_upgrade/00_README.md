@@ -4,6 +4,22 @@ Self-contained agent tasks to evolve the current Regulated Pure Pursuit (RPP)
 controller into a precision tracker that beats Nav2 RPP on cross-track error
 for the 3WD marking rover.
 
+## Application context
+
+This rover paints **road markings** and **sports field lines**. Path comes
+from a DXF / CSV upload via the frontend → trajectory planner → RPP. The
+path IS the line that will be painted on the ground. Implications:
+
+- Waypoints are sacred (no smoothing that deviates from them).
+- 90° corners must stay 90° (handled via pivot-turn, not by rounding).
+- Heading is as important as position (the marker pen is offset from
+  centre of rotation — heading drift = paint drift).
+- Speed must be regulated to keep the rover within controller bandwidth.
+
+The trajectory planner upstream is responsible for kinodynamic feasibility
+(densifying arcs, inserting pivot waypoints, pen-up/down). RPP trusts the
+path it receives.
+
 ## Baseline (2026-05-23, log 59)
 
 2 m × 2 m square mission, RPP params from `Final_Best`:
@@ -18,13 +34,20 @@ for the 3WD marking rover.
 
 ## Targets (post-upgrade)
 
+Calibrated for the **road / sports-field marking** application — the input
+path IS the painted line, so waypoints are sacred and 90° corners must stay
+90°. We achieve sharp corners via a pivot-turn sub-state at flagged HARD
+vertices, not by rounding the path.
+
 | Metric | Target | Stretch |
 |---|---|---|
-| Max xtrack (corners) | < 3 cm | < 2 cm |
-| Mean xtrack (straights) | < 1 cm | < 0.5 cm |
+| Mean xtrack (straights) | 1-2 cm | < 1 cm |
+| Max xtrack (smooth curves, R ≥ 1 m) | 2-3 cm | < 2 cm |
+| Max xtrack (HARD 90° corners, post-pivot) | 2-5 cm | < 3 cm |
 | RMS xtrack | < 1.5 cm | < 1 cm |
-| Goal endpoint precision | < 2 cm | < 1 cm |
-| Yaw err (steady) | < 2° | < 1° |
+| Goal endpoint precision | < 3 cm | < 2 cm |
+| Heading err (steady, on straights) | < 2° | < 1° |
+| Heading err (post-pivot exit) | < 3° | < 2° |
 
 ## How we beat Nav2 RPP
 
@@ -43,15 +66,15 @@ Our upgrades hit each of those, in order of expected impact:
 
 | # | Upgrade | Expected xtrack reduction | Agent |
 |---|---|---|---|
-| 03 | Cubic-spline path smoothing | **5-7 cm at corners** | GLM |
-| 04 | Path-κ feedforward | 2-3 cm transient | Haiku |
-| 05 | Stanley xtrack blend (small-e regime) | 1-2 cm steady | GLM |
+| 03 | **Path geometry + Stanley tracking** (replaces old 03/04/05) | **6-8 cm corners, 1-2 cm steady** | GLM |
+| ~~04~~ | ~~Path-κ feedforward~~ → folded into 03 (Block B.2) | — | — |
+| ~~05~~ | ~~Stanley xtrack blend~~ → folded into 03 (Block B.1, now primary) | — | — |
 | 06 | Precomputed speed profile (a_lat-bounded) | 2-3 cm at corners | GLM |
 | 07 | xtrack integral term | bias-elimination, ~0.5-1 cm | Haiku |
 | 08 | Goal-approach PI (last 30 cm) | 1-2 cm at endpoint | Haiku |
 | 09 | κ low-pass + always-on yaw FF | smoothness, no xtrack but reduces jerk | Gemma |
 | 10 | Latency-compensated lookahead | 0.5-1 cm | Gemma |
-| 11 | Dynamic speed regulation by `|xtrack|` | safety, recovery shaping | Gemma |
+| 11 | Dynamic speed regulation by `|xtrack|` and `|ψ_e|` | safety, recovery shaping | Gemma |
 | 12 | Heading-bias online observer | bias-elimination over minutes | GLM |
 
 A `13_benchmark_harness_vs_nav2.md` task closes the loop: head-to-head

@@ -4,6 +4,15 @@ This is the master design doc for the upgrade. Every task in this folder
 plugs into one of the labelled blocks below. If a task contradicts this
 plan, fix the plan first, then the task.
 
+> **2026-05-24 revision:** old tasks 03 (spline smoothing), 04 (κ FF), 05
+> (Stanley blend) are superseded by the single new spec
+> `03_path_geometry_and_stanley_tracking.md`. The cubic-spline approach
+> was rejected — interpolating splines round waypoints, which is wrong
+> for a marking rover (the path IS the painted line). The new design
+> uses polyline + windowed Menger κ + Stanley as primary steering +
+> pivot-turn for HARD corners. See sections below for the updated
+> pipeline; this header is the canonical pointer.
+
 ## 1. Current pipeline (post-`fd91d0c`)
 
 ```

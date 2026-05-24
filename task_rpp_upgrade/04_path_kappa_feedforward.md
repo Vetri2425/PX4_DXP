@@ -1,4 +1,14 @@
-# 04 — Path curvature feedforward
+# 04 (FOLDED) — Path curvature feedforward
+
+> **FOLDED INTO 03 on 2026-05-24.** Curvature feedforward is now Block B.2
+> of `03_path_geometry_and_stanley_tracking.md` and is enabled by default
+> when the new geometry module is on. Do not implement separately.
+
+---
+
+# (Original spec below, kept for historical context)
+
+
 
 **Agent:** Haiku 4.5
 **Estimated diff:** +40 lines

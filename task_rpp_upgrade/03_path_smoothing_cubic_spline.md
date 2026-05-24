@@ -1,4 +1,20 @@
-# 03 — Cubic-spline path smoothing (highest-impact upgrade)
+# 03 (DEPRECATED) — Cubic-spline path smoothing
+
+> **DEPRECATED 2026-05-24.** This spec is rejected for the marking-rover
+> application. Interpolating cubic splines through waypoints overshoot at
+> sharp corners (Runge-like oscillation), which would round the corners
+> our rover is paid to paint sharply.
+>
+> **Use `03_path_geometry_and_stanley_tracking.md` instead.** That spec
+> uses arc-length parameterisation of the polyline (no interpolation),
+> windowed Menger curvature for κ(s), and a HARD-corner pivot sub-state
+> for 90° turns. It also folds in tasks 04 and 05.
+
+---
+
+# (Original spec below, kept for historical context — DO NOT IMPLEMENT)
+
+
 
 **Agent:** GLM (4.5 or 5.1)
 **Estimated diff:** +300 lines (1 new module, controller edit), -50 lines
