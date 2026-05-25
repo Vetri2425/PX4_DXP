@@ -427,3 +427,62 @@ GLM-5.1 shipped Phase C (C1 RT scheduling, C2 IMU extrapolation, P0.5 yaw setpoi
 - **Phase A: Hardware validation** — flash 617cce5a, bench-verify motor direction, cold-boot test, OFFBOARD straight-line test, verify FIFO grant (`chrt -p`), audit twist_to_setpoint_node.py
 - **Phase D: Production hardening** — remove ROVER_DISABLE_AUTH, sd_notify, pytest suite, QGC origin re-anchor
 - **Doc corrections** — RPP_PARAMETERS_REFERENCE.md and RPP_UPGRADE_SESSION_COMPLETION.md are stale (Kiro audit corrections pending, GLM-5.1's lane per role split)
+
+---
+
+## 2026-05-25 — PX.4_DXp React Native frontend, Tasks 1–10 + production review (1 session)
+
+### Built
+- **Tasks 1–2 (scaffold + stores):** Expo SDK 56 / RN 0.85 / TypeScript strict / Zustand. Expo Router with 5 tabs (home/map/draw/drive/more), theme (colors/spacing/typography), telemetry/mission/socket type definitions, all 5 Zustand stores (connection, telemetry, mission, UI, DXF), `useRover()` composing hook.
+- **Tasks 3–5 (services + dashboard):** `services/api.ts` typed REST client, `services/socket.ts` Socket.IO bridge with every server event wired to stores. Dashboard with RoverHeroCard (live SVG path trace + heading-rotated icon), ConnectionBadge, EmergencyOverlay, QuickActions, SysDiagnostics. UI primitives (Card/Btn/Pill/Dot/Bar/Stat/SectionHeader/AppBar/IconBtn) + 60+ SVG icons.
+- **Tasks 6–10 (all screens):** Connect (3-step scan→connecting→done with real socket-event waiter), Drive (AttitudeIndicator + HeadingDisc + gesture-handler Joystick + motor monitor + e-stop), Map (`react-native-maps` with long-press waypoint add, draggable markers, type inspector, telemetry chip), Draw (DXF/Gallery/SVG/Draw/G-code tabs, finger-drawing canvas with throttled SVG render), More + 8 sub-screens (settings/ros-nodes/px4-params/calibrate/logs/fleet/firmware/camera).
+
+### Fixed (commits `3fc25aa` + `4ed5521`)
+20-item production code review + 4-item backend contract mismatch review, all addressed:
+
+**Safety / correctness (Critical):**
+- E-Stop button now calls `api.estop()` before flipping local UI state (was: local-only, lying about hardware state).
+- Arm button no longer flips UI to "armed" on backend failure (was: `catch { setArmed(!armed) }`).
+- `handleHold` now calls `api.stopMission()` — server has no `Hold` mode, only `MANUAL`/`OFFBOARD`.
+- `rover_disconnected` socket event wired (server emits this when FCU heartbeat drops while socket stays up; was deaf).
+- Connect flow waits for real Socket.IO `connect` event with 10 s timeout (was: 1.2 s sleep then unconditional "success").
+- Socket teardown on URL change (was: cached socket kept talking to old rover).
+- Telemetry store assigns every field; no `as any` cast; mode strings mapped through `mapPx4Mode()` table.
+- `TelemetryData` interface now optional for fields the server doesn't emit (`current/temp/hdop/rssi/roll/pitch/motor`) + added fields the server DOES emit (`lat/lon/pos_n/pos_e/xtrack_m/dist_to_goal_m/...`).
+- `GPS_FIX_LABELS` now `Partial<Record<...>>` with keys 0–8, RTK_FIXED at 6 (newer MAVROS).
+
+**Reliability (High):**
+- `AbortSignal.timeout()` on every fetch (5 s default, 1.5 s on estop).
+- Socket reconnection: `Infinity` attempts, 30 s cap. Manual `Reconnect` button in ConnectionBadge.
+- Joystick: `disabledSV` shared value short-circuits onUpdate on UI thread when prop flips mid-gesture; `runOnJS` throttled to 30 Hz.
+- DrawCanvas: live stroke in ref, React state only updated on `onEnd` + 30 Hz; no per-frame SVG rebuild.
+- Map markers: `tracksViewChanges={false}` to stop full-redraw thrash on telemetry tick.
+- RoverHeroCard: real `activeRoverUrl` instead of "Studio A"; "—" for fields not yet populated instead of Boston coordinate.
+- `mission_status` progress uses real `total_distance` when sent, fallback to `job.paths` (no more `/20` magic).
+- `arm_result` / `mode_result` `message` field surfaced to `backendError` + log buffer on failure.
+
+**Quality of life:**
+- `_layout.tsx` cancelled-flag prevents init/cleanup race.
+- Waypoint IDs use a monotonic counter (no `Date.now()` collision risk).
+- Structured `errorLog` ring buffer (200 entries) in `useUiStore`; `logs.tsx` consumes it with auto-scroll.
+- `setToken` async/awaited; AsyncStorage errors no longer fire-and-forget.
+
+**Tooling blockers:**
+- `babel.config.js` created with `react-native-reanimated/plugin` (re-export still works in Reanimated 4).
+- `npm run tsc` script wired (`tsc --noEmit`). Exits 0.
+
+### Outstanding (not done, deliberate)
+- `app.json` Google Maps API key still a placeholder — release-build blocker.
+- Real UDP rover discovery needs `react-native-udp` install + native rebuild. Today's REST `/api/discover` is theatre (returns *other* rovers on the LAN, not itself).
+- Backend extensions to emit `roll/pitch/motor[]/current/temp/hdop/rssi` — UI tolerates absence, will show real values once the Jetson side adds them.
+- `MissionMode` kept as Title-case display abstraction (`Manual/Hold/Draw/Mission`) mapped from raw PX4 strings via `mapPx4Mode()` — defensible, not a bug.
+
+### Lessons
+- A prior-turn claim of "all fixed, tsc clean" missed 5 contract bugs. `tsc --noEmit` exit 0 is necessary, not sufficient — types can be internally consistent and still lie. Saved as feedback memory: `feedback_verify_dont_trust_narration`.
+- Frontend↔backend wire details (auth header, mode enum, telemetry shape, event names) captured in `reference_frontend_backend_contract` to avoid re-deriving on the next change.
+
+### Next
+- Wire Joystick `onChange` to a `/api/cmd_vel` endpoint (need backend route).
+- Add real Google Maps API key + EAS secret pipeline.
+- Backend extension to emit attitude (roll/pitch from IMU) + motor PWMs.
+- Smoke test on physical Android tablet + Jetson backend.
