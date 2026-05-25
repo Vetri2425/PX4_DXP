@@ -1,6 +1,6 @@
 // stores/useTelemetryStore.ts
 import { create } from 'zustand';
-import { GPS_FIX_LABELS } from '../types/telemetry';
+import { gpsFixLabel } from '../types/telemetry';
 import type { TelemetryData, TelemetryHistory } from '../types/telemetry';
 
 /** #7 — explicit PX4 mode string → MissionMode mapping (no unsafe cast) */
@@ -93,7 +93,7 @@ export const useTelemetryStore = create<TelemetryState>((set) => ({
         temp: data.temp ?? prev.temp,
         sats: data.gps_sat ?? prev.sats,
         hdop: data.hdop ?? prev.hdop,
-        fix: data.gps_fix != null ? (GPS_FIX_LABELS[data.gps_fix] ?? prev.fix) : prev.fix,
+        fix: data.gps_fix != null ? gpsFixLabel(data.gps_fix) : prev.fix,
         rssi: data.rssi ?? prev.rssi,
         speed: data.speed_m_s ?? prev.speed,
         heading: data.heading_ned_deg ?? prev.heading,

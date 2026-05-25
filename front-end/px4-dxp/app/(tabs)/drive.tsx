@@ -77,9 +77,14 @@ export default function DriveScreen() {
   };
 
   const handleHold = async () => {
+    // Server has no "Hold" mode (only MANUAL / OFFBOARD). The "hold position"
+    // semantic on this stack is /api/mission/stop — publishes a stop-path
+    // while staying armed. See server/routes/mission.py:55.
     try {
-      await api.setMode('Hold');
-    } catch { /* mode_result event will update store */ }
+      await api.stopMission();
+    } catch (e) {
+      appendLog('ERR', `Hold (stop) failed: ${(e as Error).message}`);
+    }
     setMissionMode('Hold');
   };
 

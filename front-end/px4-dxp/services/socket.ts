@@ -101,15 +101,34 @@ export async function initSocket(): Promise<Socket> {
     useUiStore.getState().appendLog('ERR', msg);
   });
 
-  socket.on('arm_result', (data: { success: boolean; arm: boolean }) => {
-    // Only flip UI state when the backend confirms
-    if (data.success) useUiStore.getState().setArmed(data.arm);
+  socket.on('arm_result', (data: { success: boolean; arm: boolean; message?: string }) => {
+    if (data.success) {
+      useUiStore.getState().setArmed(data.arm);
+      useUiStore.getState().appendLog('INFO', `${data.arm ? 'Armed' : 'Disarmed'}`);
+    } else {
+      const msg = `Arm ${data.arm ? 'arm' : 'disarm'} rejected: ${data.message ?? 'unknown'}`;
+      useConnectionStore.getState().setBackendError(msg);
+      useUiStore.getState().appendLog('ERR', msg);
+    }
   });
 
-  socket.on('mode_result', (data: { success: boolean; mode: string }) => {
+  socket.on('mode_result', (data: { success: boolean; mode: string; message?: string }) => {
     if (data.success) {
       useMissionStore.getState().setMissionMode(toMissionMode(data.mode));
+    } else {
+      const msg = `Mode '${data.mode}' rejected: ${data.message ?? 'unknown'}`;
+      useConnectionStore.getState().setBackendError(msg);
+      useUiStore.getState().appendLog('ERR', msg);
     }
+  });
+
+  // Server emits this when FCU heartbeat transitions connected → disconnected
+  // (see server/main.py:317-320). The Socket.IO session is still alive, so
+  // 'disconnect' won't fire — this is the only signal the autopilot dropped.
+  socket.on('rover_disconnected', () => {
+    const msg = 'FCU disconnected from autopilot';
+    useConnectionStore.getState().setBackendError(msg);
+    useUiStore.getState().appendLog('ERR', msg);
   });
 
   socket.on('socket_error', (data: { reason?: string }) => {
