@@ -219,8 +219,19 @@ class PathManager:
         raise FileNotFoundError(f"Path not found: {name!r}")
 
     def save_uploaded(self, filename: str, content: bytes) -> str:
-        """Save raw bytes to missions dir. Validates extension + size."""
+        """Save raw bytes to missions dir. Validates extension + size + disk quota."""
         safe = validate_upload(filename, content)
+        # Check aggregate disk quota (200 MB)
+        total_bytes = sum(
+            os.path.getsize(os.path.join(self._dir, f))
+            for f in os.listdir(self._dir)
+            if os.path.isfile(os.path.join(self._dir, f))
+        ) if os.path.isdir(self._dir) else 0
+        quota = 200 * 1024 * 1024
+        if total_bytes + len(content) > quota:
+            raise UploadValidationError(
+                f"disk quota exceeded: {total_bytes + len(content)} > {quota} bytes"
+            )
         fpath = os.path.join(self._dir, safe)
         with open(fpath, "wb") as f:
             f.write(content)
@@ -250,11 +261,12 @@ class PathManager:
         from path_engine.parsers.dxf_parser import parse_dxf
         return parse_dxf(filepath, unit_scale=unit_scale, layer_mapping=layer_mapping)
 
-    def plan_path(self, name: str, **kwargs) -> dict:
+    def plan_path(self, name: str, summary_only: bool = False, **kwargs) -> dict:
         """Run the full planning pipeline on a file and return PlannedPath info.
 
         Args:
             name: Filename in missions dir or builtin path name.
+            summary_only: If True, return only counts/lengths (no waypoints).
             **kwargs: Passed to PathEngine.plan_file().
 
         Returns:
@@ -287,7 +299,7 @@ class PathManager:
         else:
             raise FileNotFoundError(f"Path not found: {name!r}")
 
-        return {
+        result = {
             "source": name,
             "num_waypoints": plan.num_waypoints,
             "num_segments": len(plan.segments),
@@ -297,16 +309,19 @@ class PathManager:
             "segments": [
                 {
                     "type": "MARK" if s.segment_type == 0 else "TRANSIT",
-                    "points": s.points,
                     "speed": s.speed,
                     "source": s.source_entity,
                     "length_m": round(s.length, 3),
                 }
                 for s in plan.segments
             ],
-            "merged_waypoints": plan.merged_waypoints,
-            "spray_flags": plan.spray_flags,
         }
+
+        if not summary_only:
+            result["merged_waypoints"] = plan.merged_waypoints
+            result["spray_flags"] = plan.spray_flags
+
+        return result
 
     # ── Internal ──────────────────────────────────────────────────────────────
 

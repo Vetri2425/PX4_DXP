@@ -45,7 +45,7 @@ RPP_STATE_NAMES = {
 RPP_UNHEALTHY_CODES = {RPP_STALE, RPP_RTK_WAIT, RPP_JUMP_SKIP}
 
 # ── Server Defaults ───────────────────────────────────────────────────────────
-DEFAULT_HOST     = "0.0.0.0"
+DEFAULT_HOST     = "0.0.0.0"  # overridden below when ROVER_DISABLE_AUTH is set
 DEFAULT_PORT     = int(os.environ.get("FASTAPI_PORT", "5001"))
 TELEMETRY_HZ     = 10                  # Socket.IO push rate
 MAX_ACTIVITY_LOG = 500
@@ -70,6 +70,10 @@ ALLOWED_UPLOAD_EXTENSIONS = {".waypoints", ".csv", ".dxf"}
 MAX_UPLOAD_BYTES          = 5 * 1024 * 1024   # 5 MiB (DXF files can be large)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-# LAN-only deployment — wildcard origin is safe ONLY when credentials are off.
-CORS_ALLOW_ORIGINS = ["*"]
+if os.environ.get("ROVER_DISABLE_AUTH"):
+    CORS_ALLOW_ORIGINS = ["http://localhost", "http://127.0.0.1"]
+    DEFAULT_HOST = "127.0.0.1"
+else:
+    CORS_ALLOW_ORIGINS = ["*"]
+    DEFAULT_HOST = "0.0.0.0"
 CORS_ALLOW_CREDENTIALS = False

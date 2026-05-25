@@ -54,6 +54,9 @@ def read_ned_csv_enhanced(filepath: str) -> list[PathSegment]:
       - 2 columns: old format. Defaults: spray_on=1, speed=0.35, segment_id=0, yaw=0.0
       - 6 columns: new format. All columns read.
 
+    Format is decided from the first non-comment row and enforced for
+    all subsequent rows. Column-count mismatch raises ValueError.
+
     Lines starting with # are ignored.
 
     Returns:
@@ -62,15 +65,24 @@ def read_ned_csv_enhanced(filepath: str) -> list[PathSegment]:
         merged into a single segment.
     """
     rows: list[dict] = []
+    expected_cols: int | None = None
     with open(filepath, "r", encoding="utf-8", errors="replace") as f:
         reader = csv.reader(f)
-        for row in reader:
+        for line_no, row in enumerate(reader, 1):
             if not row or row[0].strip().startswith("#"):
                 continue
+            n_cols = len(row)
+            if expected_cols is None:
+                expected_cols = n_cols
+            elif n_cols != expected_cols:
+                raise ValueError(
+                    f"CSV column count mismatch at line {line_no}: "
+                    f"expected {expected_cols}, got {n_cols}"
+                )
             try:
                 n = float(row[0].strip())
                 e = float(row[1].strip()) if len(row) > 1 else 0.0
-                if len(row) >= 6:
+                if expected_cols >= 6:
                     spray_on = int(float(row[2].strip()))
                     speed = float(row[3].strip())
                     seg_id = int(float(row[4].strip()))
@@ -98,6 +110,7 @@ def read_ned_csv_enhanced(filepath: str) -> list[PathSegment]:
     segments: list[PathSegment] = []
     current_key = (rows[0]["segment_id"], rows[0]["spray_on"])
     current_points: list[tuple[float, float]] = [(rows[0]["n"], rows[0]["e"])]
+    current_speed = rows[0]["speed"] if current_key[1] == 1 else 0.50
 
     for row in rows[1:]:
         key = (row["segment_id"], row["spray_on"])
@@ -109,19 +122,20 @@ def read_ned_csv_enhanced(filepath: str) -> list[PathSegment]:
             segments.append(PathSegment(
                 segment_type=seg_type,
                 points=list(current_points),
-                speed=rows[0]["speed"] if current_key[1] == 1 else 0.50,
+                speed=current_speed,
                 segment_id=current_key[0],
                 source_entity=f"csv:segment_{current_key[0]}",
             ))
             current_key = key
             current_points = [point]
+            current_speed = row["speed"] if key[1] == 1 else 0.50
 
     # Flush last segment
     seg_type = SegmentType.MARK if current_key[1] == 1 else SegmentType.TRANSIT
     segments.append(PathSegment(
         segment_type=seg_type,
         points=list(current_points),
-        speed=rows[0]["speed"] if current_key[1] == 1 else 0.50,
+        speed=current_speed,
         segment_id=current_key[0],
         source_entity=f"csv:segment_{current_key[0]}",
     ))

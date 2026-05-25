@@ -47,24 +47,24 @@ from ..planners.arc_curve import (
 
 log = logging.getLogger("path_engine.dxf_parser")
 
-# DXF $INSUNITS values to metres
+# DXF $INSUNITS values to metres (per DXF specification)
 _INSUNITS_TO_METRES = {
-    0: None,     # unspecified — use unit_scale param
-    1: 0.0254,   # inches
-    2: 0.3048,   # feet
-    3: 0.001,    # miles (unlikely but defined)
-    4: 0.001,    # mm
-    5: 0.01,     # cm
-    6: 1.0,      # m
-    7: 0.0,      # km (unlikely)
-    8: 0.0000001, # microinches
-    9: 0.000001,  # mils
-    10: 0.0000254, # yards
-    11: 0.00000001, # angstroms (unlikely)
-    12: 0.000000001, # nanometers (unlikely)
-    13: 0.000001,   # microns
-    14: 0.001,      # decimeters (not standard, but some DXF use this)
-    15: 0.0001,     # centimeters (some DXF use 15 for cm)
+    0: None,          # unspecified — use unit_scale param
+    1: 0.0254,        # inches
+    2: 0.3048,        # feet
+    3: 1609.344,       # miles
+    4: 0.001,         # mm
+    5: 0.01,          # cm
+    6: 1.0,           # m
+    7: 1000.0,         # km
+    8: 2.54e-8,       # microinches
+    9: 2.54e-5,       # mils (1/1000 inch)
+    10: 0.9144,        # yards
+    11: 1e-10,         # angstroms
+    12: 1e-9,          # nanometers
+    13: 1e-6,          # microns (micrometers)
+    14: 0.1,           # decimeters
+    15: 100.0,         # hectometers (per DXF spec)
 }
 
 
@@ -82,8 +82,13 @@ def _get_unit_scale(filepath: str, fallback: float = 0.01) -> float:
         scale = _INSUNITS_TO_METRES.get(insunits)
         if scale is not None and scale > 0:
             return scale
-    except Exception:
-        pass
+        if insunits == 0:
+            log.warning("$INSUNITS is 0 (unspecified) — using fallback scale %.4f", fallback)
+    except (FileNotFoundError, PermissionError):
+        raise
+    except Exception as exc:
+        log.warning("Failed to read $INSUNITS from %s: %s — using fallback %.4f",
+                     filepath, exc, fallback)
     return fallback
 
 
@@ -114,9 +119,16 @@ def parse_dxf(
     doc = ezdxf.readfile(filepath)
     msp = doc.modelspace()
 
-    # Auto-detect unit scale
+    # Auto-detect unit scale from the doc we just opened (avoid second readfile)
     if unit_scale is None:
-        unit_scale = _get_unit_scale(filepath)
+        insunits = doc.header.get("$INSUNITS", 0)
+        scale = _INSUNITS_TO_METRES.get(insunits)
+        if scale is not None and scale > 0:
+            unit_scale = scale
+        else:
+            if insunits == 0:
+                log.warning("$INSUNITS is 0 (unspecified) — using fallback scale 0.01")
+            unit_scale = 0.01
 
     entities: list[DXFEntity] = []
 
@@ -226,8 +238,10 @@ def parse_dxf(
                     },
                     unit_scale=unit_scale,
                 ))
-            except Exception:
+            except (ValueError, AttributeError, RuntimeError) as exc:
                 # Fallback: store control points for manual flattening
+                log.warning("SPLINE %s on layer %s: flattening failed (%s); using control points",
+                            handle, layer, exc)
                 control_points = list(entity.control_points) if hasattr(entity, "control_points") else []
                 pts = [(cp.y * s, cp.x * s) for cp in control_points] if control_points else []
                 entities.append(DXFEntity(
@@ -259,8 +273,9 @@ def parse_dxf(
                     },
                     unit_scale=unit_scale,
                 ))
-            except Exception:
-                # Fallback: store raw ellipse params
+            except (ValueError, AttributeError, RuntimeError) as exc:
+                log.warning("ELLIPSE %s on layer %s: flattening failed (%s); using raw params",
+                            handle, layer, exc)
                 center = entity.dxf.center
                 major_axis = entity.dxf.major_axis
                 ratio = entity.dxf.ratio
@@ -301,14 +316,20 @@ def parse_dxf(
                             },
                             unit_scale=unit_scale,
                         ))
-            except Exception:
-                pass  # Skip block references that can't be decomposed
+            except (ValueError, AttributeError, RuntimeError) as exc:
+                log.warning("INSERT %s on layer %s: decomposition failed (%s)",
+                            handle, layer, exc)
 
         else:
-            log.debug("Skipping unsupported DXF entity type: %s (layer=%s, handle=%s)",
+            log.warning("Skipping unsupported DXF entity type: %s (layer=%s, handle=%s)",
                        etype, layer, handle)
 
     return entities
+
+
+MAX_ENTITIES = 10000
+MAX_WAYPOINTS_PER_ENTITY = 50000
+MAX_TOTAL_WAYPOINTS = 500000
 
 
 def entities_to_segments(
@@ -343,6 +364,12 @@ def entities_to_segments(
     """
     segments: list[PathSegment] = []
     seg_id = 0
+    total_waypoints = 0
+
+    if len(entities) > MAX_ENTITIES:
+        raise ValueError(
+            f"Too many DXF entities: {len(entities)} exceeds limit {MAX_ENTITIES}"
+        )
 
     # Filter out ignored entities
     filtered: list[DXFEntity] = []
@@ -366,25 +393,31 @@ def entities_to_segments(
         if ent.entity_type == "LINE":
             start = ent.geometry["start"]
             end = ent.geometry["end"]
+            pts = [start, end]
             segments.append(PathSegment(
                 segment_type=seg_type,
-                points=[start, end],
+                points=pts,
                 speed=speed,
                 segment_id=seg_id,
                 source_entity=f"LINE_{ent.entity_id}",
             ))
             seg_id += 1
+            total_waypoints += len(pts)
 
         elif ent.entity_type == "POINT":
             pos = ent.geometry["position"]
+            # Expand POINT into dwell segment (2 identical points)
+            # Single point would be skipped by RPP in one cycle — no paint.
+            pts = [pos, pos]
             segments.append(PathSegment(
                 segment_type=seg_type,
-                points=[pos],
+                points=pts,
                 speed=speed,
                 segment_id=seg_id,
                 source_entity=f"POINT_{ent.entity_id}",
             ))
             seg_id += 1
+            total_waypoints += len(pts)
 
         elif ent.entity_type == "CIRCLE":
             center = ent.geometry["center"]
@@ -403,6 +436,7 @@ def entities_to_segments(
                 source_entity=f"CIRCLE_{ent.entity_id}",
             ))
             seg_id += 1
+            total_waypoints += len(pts)
 
         elif ent.entity_type == "ARC":
             center = ent.geometry["center"]
@@ -424,6 +458,7 @@ def entities_to_segments(
                 source_entity=f"ARC_{ent.entity_id}",
             ))
             seg_id += 1
+            total_waypoints += len(pts)
 
         elif ent.entity_type == "LWPOLYLINE":
             vertices = ent.geometry.get("vertices", [])
@@ -443,7 +478,7 @@ def entities_to_segments(
             else:
                 # Pure polyline (no arcs) — just use vertices
                 pts = list(vertices)
-                if closed and pts and pts[0] != pts[-1]:
+                if closed and pts and math.hypot(pts[0][0]-pts[-1][0], pts[0][1]-pts[-1][1]) > 1e-6:
                     pts.append(pts[0])
 
             if len(pts) >= 2:
@@ -455,6 +490,7 @@ def entities_to_segments(
                     source_entity=f"LWPOLYLINE_{ent.entity_id}",
                 ))
                 seg_id += 1
+                total_waypoints += len(pts)
 
         elif ent.entity_type in ("SPLINE", "ELLIPSE"):
             # Already flattened by make_path + flattening in parse_dxf
@@ -468,5 +504,12 @@ def entities_to_segments(
                     source_entity=f"{ent.entity_type}_{ent.entity_id}",
                 ))
                 seg_id += 1
+                total_waypoints += len(pts)
+
+        if total_waypoints > MAX_TOTAL_WAYPOINTS:
+            raise ValueError(
+                f"Path too large: {total_waypoints} waypoints exceeds "
+                f"limit {MAX_TOTAL_WAYPOINTS}"
+            )
 
     return segments

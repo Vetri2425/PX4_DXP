@@ -444,3 +444,219 @@ def _HAS_EZDXF():
         return True
     except ImportError:
         return False
+
+
+# ── Spray toggle simulation tests ──────────────────────────────────────────────
+
+def test_spray_toggle_mark_transit_alternation_via_pose():
+    """Simulate pose-driven spray edge detection through a MARK→TRANSIT→MARK plan.
+
+    The path_publisher node finds the closest waypoint to the current pose
+    and edge-detects spray_flags changes. We simulate that logic here.
+    """
+    engine = PathEngine(optimize_order=True, compensate_spray=False)
+
+    seg1 = PathSegment(segment_type=SegmentType.MARK, points=[(0, 0), (5, 0)], speed=0.35)
+    seg2 = PathSegment(segment_type=SegmentType.MARK, points=[(10, 0), (15, 0)], speed=0.35)
+    plan = engine.plan_segments([seg1, seg2])
+
+    spray_flags = plan.spray_flags
+    waypoints = plan.merged_waypoints
+
+    # Simulate: walk through waypoints, collect spray state transitions
+    transitions = []
+    last_state = None
+    for i, flag in enumerate(spray_flags):
+        if flag != last_state:
+            transitions.append((i, flag))
+            last_state = flag
+
+    # Should have at least: True (MARK start), False (TRANSIT), True (MARK again)
+    true_false = [(t[1]) for t in transitions]
+    assert True in true_false, "Should have MARK transitions"
+    assert False in true_false, "Should have TRANSIT transitions"
+    # Verify at least 2 MARK→True entries (spray turns ON at least twice)
+    mark_on_count = sum(1 for _, state in transitions if state is True)
+    assert mark_on_count >= 2, f"Expected spray ON at least 2 times, got {mark_on_count}"
+
+
+def test_spray_toggle_single_segment_no_transitions():
+    """Single MARK segment — spray stays ON, no transitions."""
+    engine = PathEngine(optimize_order=False, compensate_spray=False)
+    seg = PathSegment(segment_type=SegmentType.MARK, points=[(0, 0), (5, 0)], speed=0.35)
+    plan = engine.plan_segments([seg])
+
+    transitions = []
+    last_state = None
+    for flag in plan.spray_flags:
+        if flag != last_state:
+            transitions.append(flag)
+            last_state = flag
+
+    assert len(transitions) == 1, "Single MARK should have exactly 1 transition (OFF→ON)"
+    assert transitions[0] is True
+
+
+def test_spray_toggle_progress_increments_with_pose():
+    """Simulate progress tracking as pose advances through waypoints."""
+    engine = PathEngine(optimize_order=True, compensate_spray=False)
+    seg1 = PathSegment(segment_type=SegmentType.MARK, points=[(0, 0), (5, 0)], speed=0.35)
+    seg2 = PathSegment(segment_type=SegmentType.MARK, points=[(10, 0), (15, 0)], speed=0.35)
+    plan = engine.plan_segments([seg1, seg2])
+
+    total = plan.num_waypoints
+    assert total > 0
+
+    # Simulate finding closest waypoint as we walk along x-axis
+    visited = 0
+    for pose_n in [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 12.0, 14.0]:
+        best = visited
+        best_d = float("inf")
+        for i in range(visited, min(visited + 50, total)):
+            wp = plan.merged_waypoints[i]
+            d = (wp[0] - pose_n) ** 2 + (wp[1] - 0.0) ** 2
+            if d < best_d:
+                best_d = d
+                best = i
+        visited = best
+        progress = visited / total
+        assert 0.0 <= progress <= 1.0
+
+    # By end, should be near 1.0
+    assert visited / total > 0.8
+
+
+# ── INSUNITS scaling tests ─────────────────────────────────────────────────────
+
+def test_insunits_yards_scaling():
+    """DXF with $INSUNITS=10 (yards) scales correctly: 1 yard = 0.9144 m."""
+    if not _HAS_EZDXF():
+        return
+
+    from path_engine.parsers.dxf_parser import _INSUNITS_TO_METRES
+    assert _INSUNITS_TO_METRES[10] == 0.9144, "Yards should be 0.9144 m"
+
+
+def test_insunits_km_scaling():
+    """DXF with $INSUNITS=7 (km) scales correctly: 1 km = 1000 m."""
+    if not _HAS_EZDXF():
+        return
+
+    from path_engine.parsers.dxf_parser import _INSUNITS_TO_METRES
+    assert _INSUNITS_TO_METRES[7] == 1000.0, "km should be 1000.0 m"
+
+
+def test_insunits_miles_scaling():
+    """DXF with $INSUNITS=3 (miles) scales correctly: 1 mile = 1609.344 m."""
+    if not _HAS_EZDXF():
+        return
+
+    from path_engine.parsers.dxf_parser import _INSUNITS_TO_METRES
+    assert _INSUNITS_TO_METRES[3] == 1609.344, "miles should be 1609.344 m"
+
+
+def test_insunits_mils_scaling():
+    """DXF with $INSUNITS=9 (mils) scales correctly: 1 mil = 2.54e-5 m."""
+    if not _HAS_EZDXF():
+        return
+
+    from path_engine.parsers.dxf_parser import _INSUNITS_TO_METRES
+    assert abs(_INSUNITS_TO_METRES[9] - 2.54e-5) < 1e-10, "mils should be 2.54e-5 m"
+
+
+def test_insunits_hectometers_scaling():
+    """DXF with $INSUNITS=15 (hectometers) scales correctly: 1 hm = 100 m."""
+    if not _HAS_EZDXF():
+        return
+
+    from path_engine.parsers.dxf_parser import _INSUNITS_TO_METRES
+    assert _INSUNITS_TO_METRES[15] == 100.0, "hectometers should be 100.0 m"
+
+
+def test_insunits_microinches_scaling():
+    """DXF with $INSUNITS=8 (microinches) scales correctly."""
+    if not _HAS_EZDXF():
+        return
+
+    from path_engine.parsers.dxf_parser import _INSUNITS_TO_METRES
+    assert abs(_INSUNITS_TO_METRES[8] - 2.54e-8) < 1e-12, "microinches should be 2.54e-8 m"
+
+
+def test_insunits_decimeters_scaling():
+    """DXF with $INSUNITS=14 (decimeters) scales correctly: 1 dm = 0.1 m."""
+    if not _HAS_EZDXF():
+        return
+
+    from path_engine.parsers.dxf_parser import _INSUNITS_TO_METRES
+    assert _INSUNITS_TO_METRES[14] == 0.1, "decimeters should be 0.1 m"
+
+
+# ── TSP with non-zero origin tests ─────────────────────────────────────────────
+
+def test_tsp_nonzero_origin_deoffsets_start_position():
+    """start_position in offset frame is correctly de-offset for TSP comparison.
+
+    With origin=(50, 80) and start_position=(50.5, 80.5), TSP should compare
+    de-offset start (0.5, 0.5) against raw segment points near (0,0), not the
+    offset values. Seg A at (0,0)→(0,10), Seg B at (5,5)→(5,15).
+    (0.5,0.5) is closer to A than B, so A should come first.
+    """
+    engine = PathEngine(optimize_order=True, compensate_spray=False)
+
+    # Two MARK segments at raw DXF coords near origin
+    seg_a = PathSegment(segment_type=SegmentType.MARK, points=[(0, 0), (0, 10)], speed=0.35)
+    seg_b = PathSegment(segment_type=SegmentType.MARK, points=[(5, 5), (5, 15)], speed=0.35)
+
+    # start_position close to A in the offset frame (50+0=50, 80+0=80)
+    # De-offset: start = (50.5-50, 80.5-80) = (0.5, 0.5) near seg_a (0,0)
+    plan = engine.plan_segments(
+        [seg_a, seg_b],
+        origin=(50.0, 80.0),
+        start_position=(50.5, 80.5),
+    )
+
+    # Segments still have raw coords (offset applied in merge).
+    # First MARK should be seg_a (0,0) since de-offset start is closest to it.
+    first_mark = [s for s in plan.segments if s.segment_type == SegmentType.MARK][0]
+    assert abs(first_mark.points[0][0]) < 1.0, \
+        "With de-offset start near A, should visit A first (raw coords)"
+
+
+def test_tsp_nonzero_origin_far_segment_second():
+    """With origin far from segments, TSP still picks nearest by raw coords."""
+    engine = PathEngine(optimize_order=True, compensate_spray=False)
+
+    seg_a = PathSegment(segment_type=SegmentType.MARK, points=[(0, 0), (0, 1)], speed=0.35)
+    seg_b = PathSegment(segment_type=SegmentType.MARK, points=[(20, 0), (20, 1)], speed=0.35)
+
+    # origin=(100,100) — far from both segments but irrelevant to TSP
+    # start_position=(100,100) — after de-offset: (0,0) near seg_a
+    plan = engine.plan_segments(
+        [seg_a, seg_b],
+        origin=(100.0, 100.0),
+        start_position=(100.0, 100.0),
+    )
+
+    first_mark = [s for s in plan.segments if s.segment_type == SegmentType.MARK][0]
+    # De-offset: start=(0,0), seg_a start=(0,0), seg_b start=(20,0) → A first
+    # Segments have raw coords; merged waypoints have offset
+    assert abs(first_mark.points[0][0]) < 1.0, \
+        "De-offset start should pick A first (raw coords)"
+
+
+def test_engine_validation_negative_spacing():
+    """PathEngine raises ValueError for negative spacing."""
+    try:
+        PathEngine(mark_spacing=-0.01)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "mark_spacing" in str(e)
+
+
+def test_engine_validation_zero_speed():
+    """PathEngine raises ValueError for zero speed."""
+    try:
+        PathEngine(marking_speed=0.0)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "marking_speed" in str(e)

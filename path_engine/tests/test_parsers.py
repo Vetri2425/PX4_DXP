@@ -90,8 +90,8 @@ def test_qgc_waypoints_basic():
     content = (
         "QGC WPL 110\n"
         "0\t1\t0\t0\t0\t0\t0\t0\t13.0720378\t80.2619352\t0\t1\n"
-        "1\t0\t0\t0\t0\t0\t0\t0\t13.0720838\t80.2619352\t0\t1\n"
-        "2\t0\t0\t0\t0\t0\t0\t0\t13.0721298\t80.2619352\t0\t1\n"
+        "1\t0\t0\t16\t0\t0\t0\t0\t13.0720838\t80.2619352\t0\t1\n"
+        "2\t0\t0\t16\t0\t0\t0\t0\t13.0721298\t80.2619352\t0\t1\n"
     )
     with tempfile.NamedTemporaryFile(mode="w", suffix=".waypoints", delete=False) as f:
         f.write(content)

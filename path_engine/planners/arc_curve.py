@@ -10,7 +10,10 @@ So: north = center_n + r*sin(angle), east = center_e + r*cos(angle).
 
 from __future__ import annotations
 
+import logging
 import math
+
+log = logging.getLogger("path_engine.arc_curve")
 
 
 def arc_waypoints(
@@ -75,10 +78,20 @@ def arc_waypoints(
     if direction.upper() == "CCW":
         sweep = end_rad - start_rad
         if sweep <= 0:
+            log.warning(
+                "arc_waypoints: CCW sweep <= 0 (start=%.1f°, end=%.1f°) — "
+                "adding 2π wrap. If this is unintended, set direction='CW'.",
+                start_angle_deg, end_angle_deg,
+            )
             sweep += 2.0 * math.pi
     else:  # CW
         sweep = start_rad - end_rad
         if sweep <= 0:
+            log.warning(
+                "arc_waypoints: CW sweep <= 0 (start=%.1f°, end=%.1f°) — "
+                "adding 2π wrap. If this is unintended, set direction='CCW'.",
+                start_angle_deg, end_angle_deg,
+            )
             sweep += 2.0 * math.pi
         # For CW, we iterate from start_angle going clockwise
         # Equivalent to CCW iteration from end_angle with reversed sweep
@@ -146,8 +159,9 @@ def densify_circle(
         max_spacing=max_spacing,
         direction="CCW",
     )
-    # Close the loop: last point should match first
-    if pts and (abs(pts[-1][0] - pts[0][0]) > 1e-6 or abs(pts[-1][1] - pts[0][1]) > 1e-6):
+    # Close the loop: last point should match first (tolerance scaled to chord_error)
+    tol = max(0.1 * chord_error, 1e-9)
+    if pts and (abs(pts[-1][0] - pts[0][0]) > tol or abs(pts[-1][1] - pts[0][1]) > tol):
         pts.append(pts[0])
     return pts
 
@@ -233,11 +247,7 @@ def densify_lwpolyline_bulge(
 
         if abs(bulge) < 1e-9:
             # Straight line segment — just add the endpoint
-            # (start point already in pts from previous segment)
-            if not closed or i < num_segments - 1:
-                pts.append(end)
-            else:
-                pts.append(end)
+            pts.append(end)
         else:
             # Arc segment — compute center, radius, angles from bulge
             # Bulge = tan(included_angle / 4)

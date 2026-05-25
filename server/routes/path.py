@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import os
 
+import tempfile
+
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
 from auth import require_token
@@ -83,11 +85,14 @@ async def parse_dxf_file(file: UploadFile = File(...)):
     if ext != ".dxf":
         raise HTTPException(415, f"Expected .dxf file, got {ext!r}")
 
-    # Save temporarily for parsing
-    saved = path_mgr.save_uploaded(filename, content)
-    fpath = os.path.join(MISSION_DIR, saved)
-
+    # Write to temp file first — only persist to missions dir on successful parse
+    safe = os.path.basename(filename)
+    tmp = tempfile.NamedTemporaryFile(suffix=".dxf", delete=False, dir=MISSION_DIR)
     try:
+        tmp.write(content)
+        tmp.close()
+        fpath = tmp.name
+
         from path_engine.parsers.dxf_parser import parse_dxf
         entities = parse_dxf(fpath)
 
@@ -119,16 +124,22 @@ async def parse_dxf_file(file: UploadFile = File(...)):
                 length_m=round(length, 3),
             ))
 
+        # Parse succeeded — move temp file to final location
+        final_path = os.path.join(MISSION_DIR, safe)
+        os.replace(fpath, final_path)
+
         return DXFParseResponse(
-            filename=saved,
+            filename=safe,
             num_entities=len(entities),
             entities=entity_infos,
             unit_scale=unit_scale,
             layer_names=sorted(layer_names),
         )
     except ImportError:
+        os.unlink(fpath)
         raise HTTPException(500, "ezdxf not installed. Run: pip install ezdxf")
     except Exception as exc:
+        os.unlink(fpath)
         raise HTTPException(422, f"DXF parse error: {exc}")
 
 
@@ -137,25 +148,34 @@ async def parse_dxf_file(file: UploadFile = File(...)):
 @path_router.post("/plan")
 async def plan_path(req: PathPlanRequest):
     """Run the full planning pipeline and return merged waypoints with spray flags."""
+    import asyncio
     from main import path_mgr
 
     origin = tuple(req.origin) if req.origin else (0.0, 0.0)
     start_position = tuple(req.start_position) if req.start_position else None
+    summary_only = not (req.include_waypoints)
 
     try:
-        result = path_mgr.plan_path(
-            req.source,
-            line_spacing=req.line_spacing,
-            transit_spacing=req.transit_spacing,
-            marking_speed=req.marking_speed,
-            transit_speed=req.transit_speed,
-            origin=origin,
-            start_position=start_position,
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                path_mgr.plan_path,
+                req.source,
+                summary_only=summary_only,
+                line_spacing=req.line_spacing,
+                transit_spacing=req.transit_spacing,
+                marking_speed=req.marking_speed,
+                transit_speed=req.transit_speed,
+                origin=origin,
+                start_position=start_position,
+            ),
+            timeout=15.0,
         )
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc))
     except ImportError as exc:
         raise HTTPException(500, str(exc))
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "Planning timed out (15s limit)")
     except Exception as exc:
         raise HTTPException(422, f"Planning error: {exc}")
 
@@ -167,8 +187,8 @@ async def plan_path(req: PathPlanRequest):
         transit_length_m=result["transit_length_m"],
         total_length_m=result["total_length_m"],
         segments=result["segments"],
-        merged_waypoints=result["merged_waypoints"],
-        spray_flags=result["spray_flags"],
+        merged_waypoints=result.get("merged_waypoints", []),
+        spray_flags=result.get("spray_flags", []),
     )
 
 

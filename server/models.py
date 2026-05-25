@@ -175,6 +175,7 @@ class PathPlanRequest(BaseModel):
     transit_speed: float = 0.50                       # TRANSIT speed (m/s)
     optimize: bool = True                              # Reorder segments for minimal dead-heading
     compensate_spray: bool = True                      # Apply spray latency compensation
+    include_waypoints: bool = True                     # If False, return summary only (no waypoint arrays)
 
 
 class PathPlanResponse(BaseModel):

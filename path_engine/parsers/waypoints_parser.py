@@ -9,7 +9,10 @@ All other waypoints are converted to metres North/East from home.
 
 from __future__ import annotations
 
+import logging
 import math
+
+log = logging.getLogger("path_engine.waypoints_parser")
 
 try:
     from geographiclib.geodesic import Geodesic
@@ -52,6 +55,7 @@ def read_qgc_waypoints(filepath: str) -> list[tuple[float, float]]:
 
             try:
                 current = int(fields[1])
+                command = int(fields[3]) if len(fields) > 3 else 16
                 lat = float(fields[8])
                 lon = float(fields[9])
             except (ValueError, IndexError):
@@ -59,8 +63,10 @@ def read_qgc_waypoints(filepath: str) -> list[tuple[float, float]]:
 
             if current == 1:
                 home_lat, home_lon = lat, lon
-            else:
+            elif command == 16:  # NAV_WAYPOINT only
                 wps.append((lat, lon))
+            else:
+                log.debug("Skipping non-WAYPOINT command %d", command)
 
     if home_lat is None:
         if wps:

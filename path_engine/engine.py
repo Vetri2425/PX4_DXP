@@ -43,6 +43,14 @@ class PathEngine:
         optimize_order: bool = True,
         compensate_spray: bool = True,
     ):
+        if mark_spacing <= 0:
+            raise ValueError(f"mark_spacing must be > 0, got {mark_spacing}")
+        if transit_spacing <= 0:
+            raise ValueError(f"transit_spacing must be > 0, got {transit_spacing}")
+        if marking_speed <= 0:
+            raise ValueError(f"marking_speed must be > 0, got {marking_speed}")
+        if transit_speed <= 0:
+            raise ValueError(f"transit_speed must be > 0, got {transit_speed}")
         self.mark_spacing = mark_spacing
         self.transit_spacing = transit_spacing
         self.marking_speed = marking_speed
@@ -143,17 +151,17 @@ class PathEngine:
         origin: tuple[float, float],
         start_position: tuple[float, float] | None,
     ) -> tuple[float, float] | None:
-        """Resolve start position for TSP using fallback chain.
+        """Resolve start position for TSP in the segment (pre-offset) frame.
 
-        Fallback: explicit start_position → origin (if non-zero) → first segment start → None.
+        start_position is in the offset (output) frame, so subtract origin
+        to compare against raw segment points (which haven't been offset yet).
+        Fallback: explicit start_position → first segment start → None.
+        Never falls back to origin — it's in the wrong frame for TSP.
         """
-        # A: Explicit start_position provided
+        # A: Explicit start_position — de-offset into segment frame
         if start_position is not None:
-            return start_position
-        # B: origin is non-zero (georeferenced path)
-        if origin != (0.0, 0.0):
-            return origin
-        # C: Use first segment's start point
+            return (start_position[0] - origin[0], start_position[1] - origin[1])
+        # B: Use first segment's start point (already in segment frame)
         for seg in segments:
             if seg.points:
                 return seg.points[0]

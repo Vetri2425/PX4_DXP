@@ -55,6 +55,7 @@ Usage
 """
 
 import csv
+import logging
 import math
 import os
 
@@ -65,6 +66,15 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
 from std_msgs.msg import Bool, Float32
+
+try:
+    from path_engine import PathEngine as _PathEngine
+    _HAS_PATH_ENGINE = True
+except ImportError:
+    _PathEngine = None  # type: ignore[assignment,misc]
+    _HAS_PATH_ENGINE = False
+
+_logger = logging.getLogger("path_publisher")
 
 
 # ---------------------------------------------------------------------------
@@ -267,16 +277,11 @@ def load_mission_file(filepath: str, start_position: tuple[float, float] | None 
     elif ext == ".csv":
         return read_ned_csv(filepath)
     elif ext == ".dxf":
-        try:
-            from path_engine import PathEngine
-            engine = PathEngine()
-            plan = engine.plan_file(filepath, start_position=start_position)
-            return plan.merged_waypoints
-        except ImportError:
-            raise ImportError(
-                "path_engine is required for .dxf files. "
-                "Ensure path_engine package is in PYTHONPATH."
-            )
+        if _PathEngine is None:
+            raise ImportError("path_engine is required for .dxf files")
+        engine = _PathEngine()
+        plan = engine.plan_file(filepath, start_position=start_position)
+        return plan.merged_waypoints
     else:
         # Try QGC format first, fall back to CSV
         try:
@@ -333,11 +338,20 @@ class PathPublisherNode(Node):
         self._origin_ned: tuple[float, float] | None = None  # (North, East)
         self._start_position: tuple[float, float] | None = None  # For TSP optimization
 
+        # Spray tracking state
+        self._spray_flags: list[bool] | None = None
+        self._path_pts: list[tuple[float, float]] = []  # offset pts for pose lookup
+        self._total_waypoints: int = 0
+        self._waypoints_visited: int = 0
+        self._last_spray_state: bool | None = None
+        self._mission_active: bool = False
+
+        # Subscribe to pose for spray edge-detection + progress tracking
+        self.create_subscription(
+            PoseStamped, "/mavros/local_position/pose",
+            self._pose_cb, be_qos)
+
         if self._auto_origin:
-            # Subscribe to pose to get current position before publishing
-            self.create_subscription(
-                PoseStamped, "/mavros/local_position/pose",
-                self._pose_cb, be_qos)
             # Timer checks if origin is ready, then publishes
             self._timer = self.create_timer(0.2, self._try_publish_with_origin)
         else:
@@ -356,16 +370,23 @@ class PathPublisherNode(Node):
         )
 
     def _pose_cb(self, msg: PoseStamped):
-        """Capture current EKF position for auto-origin and TSP start_position."""
+        """Capture current EKF position for auto-origin, TSP, spray, and progress."""
+        # MAVROS pose is ENU: x=East, y=North → NED: N=y, E=x
+        pn = msg.pose.position.y
+        pe = msg.pose.position.x
+
         if self._origin_ned is None:
-            # MAVROS pose is ENU: x=East, y=North → NED: N=y, E=x
-            ned = (msg.pose.position.y, msg.pose.position.x)
+            ned = (pn, pe)
             self._origin_ned = ned
-            self._start_position = ned  # Same position used for TSP optimization
+            self._start_position = ned
             self.get_logger().info(
                 f"Auto-origin captured: N={ned[0]:.3f}, "
                 f"E={ned[1]:.3f} (from ENU pose)"
             )
+
+        # Pose-driven spray edge-detection and progress tracking
+        if self._mission_active and self._spray_flags and self._path_pts:
+            self._update_spray_and_progress(pn, pe)
 
     def _try_publish_with_origin(self):
         """Called every 200ms when auto_origin=True. Publishes once origin is known."""
@@ -392,19 +413,18 @@ class PathPublisherNode(Node):
                 ext = os.path.splitext(mission_file)[1].lower()
                 if ext in (".dxf", ".csv"):
                     # Use path_engine for DXF and enhanced CSV
-                    try:
-                        from path_engine import PathEngine
-                        engine = PathEngine()
-                        plan = engine.plan_file(
-                            mission_file, start_position=self._start_position,
+                    if _PathEngine is None:
+                        self.get_logger().error(
+                            "path_engine not installed — refusing .dxf mission"
                         )
-                        pts = plan.merged_waypoints
-                        spray_flags = plan.spray_flags
-                        source = mission_file
-                    except ImportError:
-                        # Fallback to basic loader (no spray_flags)
-                        pts = load_mission_file(mission_file)
-                        source = mission_file
+                        return
+                    engine = _PathEngine()
+                    plan = engine.plan_file(
+                        mission_file, start_position=self._start_position,
+                    )
+                    pts = plan.merged_waypoints
+                    spray_flags = plan.spray_flags
+                    source = mission_file
                 else:
                     pts = load_mission_file(mission_file, start_position=self._start_position)
                     source = mission_file
@@ -450,11 +470,13 @@ class PathPublisherNode(Node):
 
         self._pub.publish(path)
 
-        # Publish initial spray state and store spray schedule for progress tracking
+        # Store offset waypoints for pose-driven spray+progress tracking
+        self._path_pts = list(pts)
         self._total_waypoints = len(pts)
         self._waypoints_visited = 0
         self._spray_flags = spray_flags
         self._last_spray_state = None
+        self._mission_active = True
 
         if spray_flags:
             # Publish initial spray command
@@ -464,12 +486,13 @@ class PathPublisherNode(Node):
             self._spray_pub.publish(spray_msg)
             self._last_spray_state = initial_spray
 
-            # Start progress timer at 1Hz
-            self._progress_timer = self.create_timer(1.0, self._progress_cb)
             self.get_logger().info(
                 f"Spray schedule loaded: {sum(spray_flags)} MARK / "
                 f"{len(spray_flags) - sum(spray_flags)} TRANSIT waypoints"
             )
+
+        # Start 1Hz progress timer
+        self._progress_timer = self.create_timer(1.0, self._progress_cb)
 
         self.get_logger().info(
             f"Published {source!r}: {len(path.poses)} waypoints "
@@ -478,14 +501,32 @@ class PathPublisherNode(Node):
             f"frame={frame_id!r}"
         )
 
-    def _progress_cb(self):
-        """1Hz progress publisher — tracks waypoint completion via RPP state.
+    def _update_spray_and_progress(self, pn: float, pe: float):
+        """Find closest waypoint from current pose, edge-detect spray, update progress."""
+        # Search forward from last index in a small window (avoids backtracking)
+        search_ahead = 50
+        best = self._waypoints_visited
+        best_d = float("inf")
+        for i in range(self._waypoints_visited,
+                       min(self._waypoints_visited + search_ahead, self._total_waypoints)):
+            wp = self._path_pts[i]
+            d = (wp[0] - pn) ** 2 + (wp[1] - pe) ** 2
+            if d < best_d:
+                best_d = d
+                best = i
+        self._waypoints_visited = best
 
-        Note: This is a basic implementation. For accurate tracking,
-        the rover's actual position should be compared against path
-        waypoints. Currently publishes 0.0 until position tracking
-        is implemented.
-        """
+        # Edge-detect spray state change
+        if self._spray_flags:
+            state = self._spray_flags[min(best, len(self._spray_flags) - 1)]
+            if state != self._last_spray_state:
+                spray_msg = Bool()
+                spray_msg.data = bool(state)
+                self._spray_pub.publish(spray_msg)
+                self._last_spray_state = state
+
+    def _progress_cb(self):
+        """1Hz progress publisher — reports waypoint completion fraction."""
         progress = Float32()
         if self._total_waypoints > 0:
             progress.data = float(self._waypoints_visited) / float(self._total_waypoints)

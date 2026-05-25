@@ -28,6 +28,7 @@ from typing import Optional
 import socketio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 
 from auth import init_auth
 from config import (
@@ -54,6 +55,7 @@ path_mgr:          Optional["object"] = None
 emergency_handler: Optional["object"] = None
 _executor:         Optional["object"] = None
 _beacon:           Optional["object"] = None
+_listener:         Optional["object"] = None
 _telemetry_task:   Optional[asyncio.Task] = None
 
 # Bounded, thread-safe ring buffer (deque maxlen). All log appends are atomic
@@ -78,7 +80,7 @@ socket_app = socketio.ASGIApp(sio)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global ros_node, offboard_ctrl, path_mgr, emergency_handler
-    global _executor, _beacon, _telemetry_task
+    global _executor, _beacon, _listener, _telemetry_task
 
     configure_logging()
     init_auth()
@@ -100,7 +102,7 @@ async def lifespan(app: FastAPI):
                 f"ROS2 unavailable — server running without MAVROS: {exc}")
 
     # ── Build shared objects ──────────────────────────────────────────────────
-    from beacon import RoverBeacon
+    from beacon import RoverBeacon, BeaconListener
     from emergency import EmergencyHandler
     from offboard_controller import OffboardController
     from path_manager import PathManager
@@ -123,6 +125,8 @@ async def lifespan(app: FastAPI):
         rover_id=ROVER_ID, server_port=DEFAULT_PORT,
     )
     _beacon.start()
+    _listener = BeaconListener(port=BEACON_PORT)
+    _listener.start()
 
     _record("info", f"Server ready on port {DEFAULT_PORT}")
     log.info("server ready: port=%d telemetry=%dHz", DEFAULT_PORT, TELEMETRY_HZ)
@@ -143,6 +147,8 @@ async def lifespan(app: FastAPI):
         except (asyncio.CancelledError, Exception):
             pass
 
+    if _listener:
+        _listener.stop()
     if _beacon:
         _beacon.stop()
 
@@ -171,6 +177,7 @@ def create_app() -> FastAPI:
         version="1.0.0",
         lifespan=lifespan,
     )
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=CORS_ALLOW_ORIGINS,
