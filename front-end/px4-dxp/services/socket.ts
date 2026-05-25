@@ -2,16 +2,38 @@
 import { io, Socket } from 'socket.io-client';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useConnectionStore } from '../stores/useConnectionStore';
-import { useTelemetryStore } from '../stores/useTelemetryStore';
+import { useTelemetryStore, mapPx4Mode } from '../stores/useTelemetryStore';
 import { useUiStore } from '../stores/useUiStore';
 import { useMissionStore } from '../stores/useMissionStore';
+import type { MissionMode } from '../types/mission';
 
 let socket: Socket | null = null;
+/** Track which URL the current socket was built for (#4) */
+let socketUrl = '';
+
+const VALID_MODES = new Set<MissionMode>(['Manual', 'Hold', 'Draw', 'Mission']);
+
+function toMissionMode(raw: string): MissionMode {
+  // #7 — map raw PX4 string through the explicit table, never cast blindly
+  const mapped = mapPx4Mode(raw);
+  return VALID_MODES.has(mapped as MissionMode)
+    ? (mapped as MissionMode)
+    : 'Manual'; // safe fallback
+}
 
 export async function initSocket(): Promise<Socket> {
+  const url = useConnectionStore.getState().activeRoverUrl;
+
+  // #4 — tear down the cached socket when the URL changes
+  if (socket && socketUrl !== url) {
+    socket.removeAllListeners();
+    socket.disconnect();
+    socket = null;
+    socketUrl = '';
+  }
+
   if (socket?.connected) return socket;
 
-  const url = useConnectionStore.getState().activeRoverUrl;
   const token = await AsyncStorage.getItem('rover_token');
 
   socket = io(url, {
@@ -19,44 +41,47 @@ export async function initSocket(): Promise<Socket> {
     auth: { token: token || '' },
     reconnection: true,
     reconnectionDelay: 1000,
-    reconnectionAttempts: 10,
+    reconnectionDelayMax: 30000, // #13 — cap back-off
+    reconnectionAttempts: Infinity, // #13 — keep trying indefinitely
   });
+  socketUrl = url;
 
   socket.on('connect', () => {
     useConnectionStore.getState().setBackendConnected(true);
     useConnectionStore.getState().setBackendError(null);
+    useUiStore.getState().appendLog('INFO', `Socket connected to ${url}`);
   });
 
-  socket.on('disconnect', () => {
+  socket.on('disconnect', (reason) => {
     useConnectionStore.getState().setBackendConnected(false);
+    useUiStore.getState().appendLog('WARN', `Socket disconnected: ${reason}`);
   });
 
   socket.on('connect_error', (err: Error) => {
     useConnectionStore.getState().setBackendError(err.message || 'Connection error');
+    useUiStore.getState().appendLog('ERR', `Socket error: ${err.message}`);
   });
 
-  type TelPayload = Record<string, unknown> & {
-    armed?: boolean;
-    mode?: string;
-  };
+  socket.on('telemetry', (data: Record<string, unknown>) => {
+    // #2 — typed through the store's own signature; no `as any`
+    type TelSocketPayload = Parameters<ReturnType<typeof useTelemetryStore.getState>['updateFromSocket']>[0];
+    useTelemetryStore.getState().updateFromSocket(data as TelSocketPayload);
 
-  socket.on('telemetry', (data: TelPayload) => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    useTelemetryStore.getState().updateFromSocket(data as any);
-    if (data.armed != null) useUiStore.getState().setArmed(Boolean(data.armed));
-    if (data.mode && typeof data.mode === 'string') {
-      useMissionStore.getState().setMissionMode(
-        data.mode as 'Manual' | 'Hold' | 'Draw' | 'Mission'
-      );
+    const raw = data as { armed?: boolean; mode?: string };
+    if (raw.armed != null) useUiStore.getState().setArmed(Boolean(raw.armed));
+    if (typeof raw.mode === 'string') {
+      useMissionStore.getState().setMissionMode(toMissionMode(raw.mode));
     }
   });
 
-  socket.on('mission_status', (data: { dist_to_goal?: number }) => {
+  socket.on('mission_status', (data: { dist_to_goal?: number; total_distance?: number }) => {
     const job = useMissionStore.getState().activeJob;
     if (job && data.dist_to_goal != null) {
+      // #15 — use real total_distance when available; fall back to job.paths as metres
+      const total = data.total_distance ?? (job.paths > 0 ? job.paths : 20);
       useMissionStore.getState().setActiveJob({
         ...job,
-        progress: Math.max(0, Math.min(1, 1 - data.dist_to_goal / 20)),
+        progress: Math.max(0, Math.min(1, 1 - data.dist_to_goal / total)),
       });
     }
   });
@@ -65,26 +90,32 @@ export async function initSocket(): Promise<Socket> {
     useMissionStore.getState().setDrawProgress(1);
     useMissionStore.getState().setMissionMode('Hold');
     useUiStore.getState().setArmed(false);
+    useUiStore.getState().appendLog('INFO', 'Mission completed');
   });
 
   socket.on('safety_abort', (data: { reason?: string }) => {
     useUiStore.getState().triggerEStop();
     useMissionStore.getState().setMissionMode('Hold');
-    useConnectionStore.getState().setBackendError(`SAFETY ABORT: ${data.reason || 'Unknown reason'}`);
+    const msg = `SAFETY ABORT: ${data.reason ?? 'Unknown reason'}`;
+    useConnectionStore.getState().setBackendError(msg);
+    useUiStore.getState().appendLog('ERR', msg);
   });
 
   socket.on('arm_result', (data: { success: boolean; arm: boolean }) => {
+    // Only flip UI state when the backend confirms
     if (data.success) useUiStore.getState().setArmed(data.arm);
   });
 
   socket.on('mode_result', (data: { success: boolean; mode: string }) => {
     if (data.success) {
-      useMissionStore.getState().setMissionMode(data.mode as 'Manual' | 'Hold' | 'Draw' | 'Mission');
+      useMissionStore.getState().setMissionMode(toMissionMode(data.mode));
     }
   });
 
   socket.on('socket_error', (data: { reason?: string }) => {
-    useConnectionStore.getState().setBackendError(data.reason || 'Socket error');
+    const msg = data.reason ?? 'Socket error';
+    useConnectionStore.getState().setBackendError(msg);
+    useUiStore.getState().appendLog('ERR', msg);
   });
 
   return socket;
@@ -92,8 +123,10 @@ export async function initSocket(): Promise<Socket> {
 
 export function disconnectSocket(): void {
   if (socket) {
+    socket.removeAllListeners();
     socket.disconnect();
     socket = null;
+    socketUrl = '';
   }
 }
 
@@ -101,8 +134,10 @@ export function getSocket(): Socket | null {
   return socket;
 }
 
+/** #13 — expose a manual reconnect action (used by ConnectionBadge) */
 export function reconnectSocket(): void {
-  if (socket && !socket.connected) {
+  if (!socket) return;
+  if (!socket.connected) {
     socket.connect();
   }
 }

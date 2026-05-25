@@ -12,9 +12,42 @@ import { Dot } from '../components/ui/Dot';
 import { SectionHeader } from '../components/ui/SectionHeader';
 import { Icons } from '../components/icons';
 import { useConnectionStore, type Rover } from '../stores/useConnectionStore';
-import { initSocket } from '../services/socket';
+import { initSocket, getSocket } from '../services/socket';
 
 type Step = 'scan' | 'connecting' | 'done';
+
+/** #5 — wait for real Socket.IO 'connect' event with a 10 s timeout */
+async function waitForSocketConnect(): Promise<void> {
+  const sock = await initSocket();
+  if (sock.connected) return; // already connected (same URL, cached)
+
+  return new Promise<void>((resolve, reject) => {
+    const TIMEOUT_MS = 10_000;
+
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error('Connection timed out (10 s)'));
+    }, TIMEOUT_MS);
+
+    const onConnect = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = (err: Error) => {
+      cleanup();
+      reject(err);
+    };
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      sock.off('connect', onConnect);
+      sock.off('connect_error', onError);
+    };
+
+    sock.once('connect', onConnect);
+    sock.once('connect_error', onError);
+  });
+}
 
 function RadarLoader() {
   return (
@@ -78,8 +111,8 @@ export default function ConnectScreen() {
     try {
       const url = `http://${rover.host}:${rover.port}`;
       await setBaseUrl(url);
-      await initSocket();
-      await new Promise((res) => setTimeout(res, 1200));
+      // #5 — wait for real socket 'connect' event instead of sleeping
+      await waitForSocketConnect();
       setStep('done');
     } catch (e) {
       setConnectError((e as Error).message || 'Connection failed');
@@ -94,8 +127,8 @@ export default function ConnectScreen() {
     setConnectError(null);
     try {
       await setBaseUrl(manualUrl.trim());
-      await initSocket();
-      await new Promise((res) => setTimeout(res, 1200));
+      // #5 — wait for real socket 'connect' event instead of sleeping
+      await waitForSocketConnect();
       setStep('done');
     } catch (e) {
       setConnectError((e as Error).message || 'Connection failed');

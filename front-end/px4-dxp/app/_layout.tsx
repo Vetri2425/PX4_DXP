@@ -1,5 +1,5 @@
 // app/_layout.tsx
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
@@ -9,12 +9,25 @@ import { initApi } from '../services/api';
 import { initSocket, disconnectSocket } from '../services/socket';
 
 export default function RootLayout() {
+  // #14 — cancelled flag prevents setState after unmount / double-effect
+  const cancelled = useRef(false);
+
   useEffect(() => {
+    cancelled.current = false;
+
     (async () => {
-      await initApi();
-      await initSocket();
+      try {
+        await initApi();
+        if (!cancelled.current) {
+          await initSocket();
+        }
+      } catch {
+        // Non-fatal — app works offline with mock data
+      }
     })();
+
     return () => {
+      cancelled.current = true;
       disconnectSocket();
     };
   }, []);
@@ -30,7 +43,6 @@ export default function RootLayout() {
             animation: 'slide_from_right',
           }}
         >
-          {/* Sub-screens */}
           <Stack.Screen name="connect" />
           <Stack.Screen name="camera" />
           <Stack.Screen name="ros-nodes" />

@@ -3,6 +3,30 @@ import { create } from 'zustand';
 import { GPS_FIX_LABELS } from '../types/telemetry';
 import type { TelemetryData, TelemetryHistory } from '../types/telemetry';
 
+/** #7 — explicit PX4 mode string → MissionMode mapping (no unsafe cast) */
+const PX4_MODE_MAP: Record<string, string> = {
+  // PX4 mode strings as reported by MAVROS custom_mode / base_mode
+  MANUAL: 'Manual',
+  STABILIZED: 'Manual',
+  ACRO: 'Manual',
+  ALTCTL: 'Manual',
+  POSCTL: 'Manual',
+  HOLD: 'Hold',
+  AUTO_HOLD: 'Hold',
+  AUTO_LOITER: 'Hold',
+  MISSION: 'Mission',
+  AUTO_MISSION: 'Mission',
+  OFFBOARD: 'Draw',       // RPP pipeline uses OFFBOARD for drawing
+  GUIDED: 'Draw',
+  DRAW: 'Draw',
+  // Fallback: anything unrecognised stays as passed through
+};
+
+export function mapPx4Mode(raw: string): string {
+  const upper = raw.toUpperCase().replace(/ /g, '_');
+  return PX4_MODE_MAP[upper] ?? PX4_MODE_MAP[raw] ?? raw;
+}
+
 interface TelemetryState {
   battery: number;
   voltage: number;
@@ -21,7 +45,9 @@ interface TelemetryState {
   motor: [number, number, number, number];
   history: TelemetryHistory;
 
-  updateFromSocket: (data: Partial<TelemetryData> & { connected?: boolean; armed?: boolean; mode?: string }) => void;
+  updateFromSocket: (
+    data: Partial<TelemetryData> & { connected?: boolean; armed?: boolean; mode?: string }
+  ) => void;
 }
 
 export const useTelemetryStore = create<TelemetryState>((set) => ({
@@ -46,20 +72,41 @@ export const useTelemetryStore = create<TelemetryState>((set) => ({
     cpu: Array.from({ length: 40 }, (_, i) => 30 + Math.sin(i / 5) * 8),
   },
 
+  // #2 — assign every field from the socket payload; no `as any`
   updateFromSocket: (data) =>
-    set((prev) => ({
-      battery: data.battery_pct ?? prev.battery,
-      voltage: data.battery_v ?? prev.voltage,
-      sats: data.gps_sat ?? prev.sats,
-      fix: data.gps_fix != null ? (GPS_FIX_LABELS[data.gps_fix] ?? prev.fix) : prev.fix,
-      speed: data.speed_m_s ?? prev.speed,
-      heading: data.heading_ned_deg ?? prev.heading,
-      alt: data.alt ?? prev.alt,
-      yaw: data.heading_ned_deg ?? prev.yaw,
-      history: {
-        v: [...prev.history.v.slice(1), data.battery_v ?? prev.history.v[39]],
-        a: [...prev.history.a.slice(1), prev.current],
-        cpu: [...prev.history.cpu.slice(1), 30 + Math.random() * 4],
-      },
-    })),
+    set((prev) => {
+      // Motor array: accept up to 4 values
+      let motor: [number, number, number, number] = prev.motor;
+      if (Array.isArray(data.motor) && data.motor.length >= 2) {
+        motor = [
+          (data.motor[0] as number) ?? prev.motor[0],
+          (data.motor[1] as number) ?? prev.motor[1],
+          (data.motor[2] as number) ?? prev.motor[2],
+          (data.motor[3] as number) ?? prev.motor[3],
+        ];
+      }
+
+      return {
+        battery: data.battery_pct ?? prev.battery,
+        voltage: data.battery_v ?? prev.voltage,
+        current: data.current ?? prev.current,
+        temp: data.temp ?? prev.temp,
+        sats: data.gps_sat ?? prev.sats,
+        hdop: data.hdop ?? prev.hdop,
+        fix: data.gps_fix != null ? (GPS_FIX_LABELS[data.gps_fix] ?? prev.fix) : prev.fix,
+        rssi: data.rssi ?? prev.rssi,
+        speed: data.speed_m_s ?? prev.speed,
+        heading: data.heading_ned_deg ?? prev.heading,
+        alt: data.alt ?? prev.alt,
+        roll: data.roll ?? prev.roll,
+        pitch: data.pitch ?? prev.pitch,
+        yaw: data.yaw ?? (data.heading_ned_deg ?? prev.yaw),
+        motor,
+        history: {
+          v: [...prev.history.v.slice(1), data.battery_v ?? prev.history.v[39]],
+          a: [...prev.history.a.slice(1), data.current ?? prev.current],
+          cpu: [...prev.history.cpu.slice(1), 30 + Math.random() * 4],
+        },
+      };
+    }),
 }));

@@ -1,5 +1,5 @@
-// app/logs.tsx
-import React from 'react';
+// app/logs.tsx — #20: reads from useUiStore.errorLog (live structured buffer)
+import React, { useRef, useEffect } from 'react';
 import { View, Text, ScrollView, StyleSheet } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { router } from 'expo-router';
@@ -8,44 +8,56 @@ import { AppBar } from '../components/ui/AppBar';
 import { Card } from '../components/ui/Card';
 import { IconBtn } from '../components/ui/IconBtn';
 import { Icons } from '../components/icons';
+import { useUiStore, type LogEntry } from '../stores/useUiStore';
 
-const LOG_LINES = [
-  { ts: '16:39:54.001', level: 'INFO', msg: 'RoboClaw: Successfully connected on /dev/ttyS5' },
-  { ts: '16:39:54.412', level: 'INFO', msg: 'EKF2: initialised with GPS fix type 5' },
-  { ts: '16:39:55.100', level: 'WARN', msg: 'Compass divergence detected, recalibrate recommended' },
-  { ts: '16:39:55.222', level: 'INFO', msg: 'Mission: 5 waypoints loaded' },
-  { ts: '16:39:56.001', level: 'INFO', msg: 'MAVROS: heartbeat received from PX4' },
-  { ts: '16:39:57.001', level: 'ERR',  msg: 'USB camera: frame drop detected (bandwidth)' },
-  { ts: '16:39:58.100', level: 'INFO', msg: 'RPP pipeline: lookahead 0.82 m, xtrack 0.04 m' },
-];
-
-const LEVEL_COLOR: Record<string, string> = {
+const LEVEL_COLOR: Record<LogEntry['level'], string> = {
   INFO: C.good,
   WARN: C.warn,
   ERR: C.danger,
 };
 
+function formatTs(ms: number): string {
+  const d = new Date(ms);
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  const ms3 = String(d.getMilliseconds()).padStart(3, '0');
+  return `${hh}:${mm}:${ss}.${ms3}`;
+}
+
 export default function LogsScreen() {
+  const errorLog = useUiStore((s) => s.errorLog);
+  const scrollRef = useRef<ScrollView>(null);
+
+  // Auto-scroll to bottom on new entries
+  useEffect(() => {
+    scrollRef.current?.scrollToEnd({ animated: true });
+  }, [errorLog.length]);
+
   return (
     <SafeAreaView style={styles.safeArea} edges={['top']}>
       <AppBar
         title="Logs & Diagnostics"
-        subtitle="Rosout · MAVLink · uORB"
+        subtitle={`${errorLog.length} entries · Rosout · MAVLink · uORB`}
         leading={<IconBtn icon={<Icons.chevL size={18} color={C.text2} />} onPress={() => router.back()} />}
         trailing={<IconBtn icon={<Icons.download size={18} color={C.text2} />} />}
       />
       <View style={styles.logContainer}>
         <Card pad={0} style={styles.logCard}>
-          <ScrollView style={styles.logScroll}>
-            {LOG_LINES.map((l, i) => (
-              <View key={i} style={styles.logLine}>
-                <Text style={styles.logTs}>{l.ts}</Text>
-                <Text style={[styles.logLevel, { color: LEVEL_COLOR[l.level] ?? C.text2 }]}>
-                  {l.level.padEnd(4)}
-                </Text>
-                <Text style={styles.logMsg}>{l.msg}</Text>
-              </View>
-            ))}
+          <ScrollView ref={scrollRef} style={styles.logScroll}>
+            {errorLog.length === 0 ? (
+              <Text style={styles.empty}>No log entries yet.</Text>
+            ) : (
+              errorLog.map((entry, i) => (
+                <View key={i} style={styles.logLine}>
+                  <Text style={styles.logTs}>{formatTs(entry.ts)}</Text>
+                  <Text style={[styles.logLevel, { color: LEVEL_COLOR[entry.level] }]}>
+                    {entry.level.padEnd(4)}
+                  </Text>
+                  <Text style={styles.logMsg} numberOfLines={3}>{entry.msg}</Text>
+                </View>
+              ))
+            )}
           </ScrollView>
         </Card>
       </View>
@@ -63,8 +75,10 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 4,
     gap: 8,
+    flexWrap: 'nowrap',
   },
-  logTs: { fontSize: 10, color: C.text3, flexShrink: 0, width: 80 },
+  logTs: { fontSize: 10, color: C.text3, flexShrink: 0, width: 84 },
   logLevel: { fontSize: 10, fontWeight: '700', flexShrink: 0, width: 36 },
   logMsg: { fontSize: 11, color: C.text2, flexShrink: 1, flexWrap: 'wrap' },
+  empty: { fontSize: 12, color: C.text3, padding: 16, textAlign: 'center' },
 });

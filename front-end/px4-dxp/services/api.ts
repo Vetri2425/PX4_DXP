@@ -25,9 +25,10 @@ export async function setBaseUrl(url: string): Promise<void> {
   await AsyncStorage.setItem('rover_base_url', u);
 }
 
-export function setToken(token: string): void {
+/** #18 — async, awaited, errors surfaced */
+export async function setToken(token: string): Promise<void> {
   _token = token;
-  AsyncStorage.setItem('rover_token', token);
+  await AsyncStorage.setItem('rover_token', token);
 }
 
 export function getToken(): string {
@@ -40,11 +41,17 @@ function headers(): Record<string, string> {
   return h;
 }
 
-async function post(path: string, body: Record<string, unknown> = {}): Promise<unknown> {
+/** #8 — AbortSignal.timeout() on every fetch. Default 5 s, estop gets 1.5 s. */
+async function post(
+  path: string,
+  body: Record<string, unknown> = {},
+  timeoutMs = 5000
+): Promise<unknown> {
   const res = await fetch(`${_baseUrl}${path}`, {
     method: 'POST',
     headers: headers(),
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) {
     const text = await res.text();
@@ -53,8 +60,11 @@ async function post(path: string, body: Record<string, unknown> = {}): Promise<u
   return res.json();
 }
 
-async function get(path: string): Promise<unknown> {
-  const res = await fetch(`${_baseUrl}${path}`, { headers: headers() });
+async function get(path: string, timeoutMs = 5000): Promise<unknown> {
+  const res = await fetch(`${_baseUrl}${path}`, {
+    headers: headers(),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text);
@@ -70,7 +80,8 @@ export const api = {
   arm: (arm: boolean) => post('/api/arm', { arm }),
   disarm: () => post('/api/arm', { arm: false }),
   setMode: (mode: string) => post('/api/set_mode', { mode }),
-  estop: () => post('/api/estop', {}),
+  /** #8 — 1.5 s timeout for safety-critical estop */
+  estop: () => post('/api/estop', {}, 1500),
 
   // Mission control
   loadMission: (name: string) => post('/api/mission/load', { path_name: name }),

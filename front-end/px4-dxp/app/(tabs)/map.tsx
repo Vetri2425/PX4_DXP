@@ -46,13 +46,16 @@ export default function MissionScreen() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [mapType, setMapType] = useState<'satellite' | 'standard'>('satellite');
   const mapRef = useRef<MapView>(null);
+  // #17 — monotonic counter for waypoint IDs
+  const wpCounter = useRef(0);
 
   const selectedWp = waypoints.find((w) => w.id === selectedId) ?? null;
   const selectedIdx = waypoints.findIndex((w) => w.id === selectedId);
 
   const handleLongPress = (e: LongPressEvent) => {
     const { latitude, longitude } = e.nativeEvent.coordinate;
-    const id = `wp_${Date.now()}`;
+    // #17 — use a monotonic counter instead of Date.now() to guarantee uniqueness
+    const id = `wp_${wpCounter.current++}`;
     const newWp: Waypoint = { id, latitude, longitude, type: 'pen-down' };
     setWaypoints((prev) => [...prev, newWp]);
     setSelectedId(id);
@@ -127,6 +130,7 @@ export default function MissionScreen() {
                 coordinate={{ latitude: wp.latitude, longitude: wp.longitude }}
                 anchor={{ x: 0.5, y: 0.5 }}
                 draggable
+                tracksViewChanges={false}
                 onPress={() => setSelectedId(wp.id)}
                 onDragEnd={(e) => updatePosition(wp.id, e.nativeEvent.coordinate.latitude, e.nativeEvent.coordinate.longitude)}
               >

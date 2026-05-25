@@ -5,6 +5,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { C } from '../../theme/colors';
 import { Dot } from '../ui/Dot';
 import { useConnectionStore } from '../../stores/useConnectionStore';
+import { reconnectSocket } from '../../services/socket';
 
 export function ConnectionBadge() {
   const { backendConnected, backendError, activeRoverUrl } = useConnectionStore();
@@ -31,10 +32,7 @@ export function ConnectionBadge() {
         onPress={() => setShowTooltip(!showTooltip)}
         style={[
           styles.badge,
-          {
-            backgroundColor: `${color}1a`,
-            borderColor: `${color}33`,
-          },
+          { backgroundColor: `${color}1a`, borderColor: `${color}33` },
         ]}
       >
         <Dot color={color} size={6} pulse={backendConnected && !backendError} />
@@ -51,6 +49,18 @@ export function ConnectionBadge() {
                   ? `Connected · ${activeRoverUrl}`
                   : 'Offline · mock data active'}
             </Text>
+            {/* #13 — expose a Reconnect action when disconnected */}
+            {!backendConnected && (
+              <Pressable
+                style={styles.reconnectBtn}
+                onPress={() => {
+                  setShowTooltip(false);
+                  reconnectSocket();
+                }}
+              >
+                <Text style={styles.reconnectText}>Reconnect</Text>
+              </Pressable>
+            )}
           </View>
         </Pressable>
       )}
@@ -95,9 +105,24 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.5,
     shadowRadius: 8,
     shadowOffset: { width: 0, height: 4 },
+    gap: 8,
   },
   tooltipText: {
     fontSize: 11,
     color: C.text2,
+  },
+  reconnectBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 6,
+    backgroundColor: `${C.accent}22`,
+    borderWidth: 1,
+    borderColor: `${C.accent}44`,
+    alignSelf: 'flex-start',
+  },
+  reconnectText: {
+    fontSize: 11,
+    color: C.accent,
+    fontWeight: '600',
   },
 });

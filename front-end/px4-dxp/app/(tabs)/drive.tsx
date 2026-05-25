@@ -46,25 +46,40 @@ function ActionChip({ on, onPress, icon, label, color = C.accent }: ActionChipPr
 
 export default function DriveScreen() {
   const { pitch, roll, heading, speed, alt, voltage, current, motor } = useTelemetryStore();
-  const { armed, emergency, setArmed, triggerEStop, clearEStop, push } = useUiStore();
+  const { armed, emergency, setArmed, triggerEStop, clearEStop, push, appendLog } = useUiStore();
   const { setMissionMode } = useMissionStore();
   const [penDown, setPenDown] = useState(false);
   const [headlights, setHeadlights] = useState(true);
 
   const handleArm = async () => {
+    // #3 — never lie about arm state; only flip UI on backend confirmation (arm_result)
     try {
       await api.arm(!armed);
-      setArmed(!armed);
-    } catch {
-      // backend might not be connected, toggle anyway for demo
-      setArmed(!armed);
+      // UI state is updated by the arm_result socket event, not here
+    } catch (e) {
+      appendLog('ERR', `Arm command failed: ${(e as Error).message}`);
     }
+  };
+
+  const handleEStop = async () => {
+    // #1 — call backend BEFORE flipping local state
+    try {
+      await api.estop();
+    } catch (e) {
+      appendLog('WARN', `E-stop backend call failed: ${(e as Error).message}`);
+      // Still trigger locally — hardware safety > UI consistency
+    }
+    triggerEStop();
+  };
+
+  const handleClearEStop = async () => {
+    clearEStop();
   };
 
   const handleHold = async () => {
     try {
       await api.setMode('Hold');
-    } catch { /* no-op */ }
+    } catch { /* mode_result event will update store */ }
     setMissionMode('Hold');
   };
 
@@ -198,7 +213,7 @@ export default function DriveScreen() {
         {/* E-stop */}
         <View style={styles.section}>
           <Pressable
-            onPress={emergency ? clearEStop : triggerEStop}
+            onPress={emergency ? handleClearEStop : handleEStop}
             style={({ pressed }) => [
               styles.estop,
               emergency ? styles.estopClear : styles.estopActive,

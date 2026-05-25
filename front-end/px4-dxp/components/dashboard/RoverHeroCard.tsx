@@ -12,38 +12,75 @@ import { useUiStore } from '../../stores/useUiStore';
 import { useConnectionStore } from '../../stores/useConnectionStore';
 import { useMissionStore } from '../../stores/useMissionStore';
 
+/** #6 — show "—" for any value that hasn't been populated by a real telemetry frame */
+function fmtNum(v: number, fallback: number, digits = 0): string {
+  if (v === fallback) return '—';
+  return digits > 0 ? v.toFixed(digits) : String(Math.round(v));
+}
+
+const MOCK_BATTERY = 78;
+const MOCK_SATS = 14;
+const MOCK_RSSI = -54;
+const MOCK_HEADING = 124;
+
 export function RoverHeroCard() {
   const { battery, sats, rssi, heading } = useTelemetryStore();
   const { armed, emergency } = useUiStore();
-  const { backendConnected } = useConnectionStore();
+  const { backendConnected, activeRoverUrl } = useConnectionStore();
   const { missionMode } = useMissionStore();
 
-  const connected = backendConnected;
+  // #6 — derive a human-readable location label from the URL
+  const roverLabel = activeRoverUrl.replace(/^https?:\/\//, '').replace(/:5001$/, '');
+
+  // #6 — show mock-data badge when disconnected; real badge when live
+  const isLive = backendConnected;
 
   const quickStats = [
-    { l: 'BAT', v: Math.round(battery), u: '%', color: battery > 25 ? C.good : C.danger, icon: <Icons.battery size={11} color={battery > 25 ? C.good : C.danger} /> },
-    { l: 'SAT', v: sats, u: '', color: C.accent, icon: <Icons.satellite size={11} color={C.accent} /> },
-    { l: 'RSSI', v: Math.round(rssi), u: 'dBm', color: C.text, icon: <Icons.wifi size={11} color={C.text3} /> },
-    { l: 'MODE', v: missionMode.toUpperCase(), u: '', color: C.violet, icon: <Icons.zap size={11} color={C.violet} /> },
+    {
+      l: 'BAT',
+      v: fmtNum(battery, MOCK_BATTERY),
+      u: isLive ? '%' : '',
+      color: battery > 25 ? C.good : C.danger,
+      icon: <Icons.battery size={11} color={battery > 25 ? C.good : C.danger} />,
+    },
+    {
+      l: 'SAT',
+      v: fmtNum(sats, MOCK_SATS),
+      u: '',
+      color: C.accent,
+      icon: <Icons.satellite size={11} color={C.accent} />,
+    },
+    {
+      l: 'RSSI',
+      v: fmtNum(rssi, MOCK_RSSI),
+      u: isLive ? 'dBm' : '',
+      color: C.text,
+      icon: <Icons.wifi size={11} color={C.text3} />,
+    },
+    {
+      l: 'MODE',
+      v: missionMode.toUpperCase(),
+      u: '',
+      color: '#a78bfa',
+      icon: <Icons.zap size={11} color="#a78bfa" />,
+    },
   ];
 
   return (
     <Card
       pad={16}
-      style={{
-        backgroundColor: '#182234',
-        borderColor: `${C.accent}26`,
-      }}
+      style={{ backgroundColor: '#182234', borderColor: `${C.accent}26` }}
     >
       {/* Header row */}
       <View style={styles.headerRow}>
         <View>
           <View style={styles.statusRow}>
-            <Dot color={connected ? C.good : C.danger} size={6} pulse={connected} />
+            <Dot color={isLive ? C.good : C.danger} size={6} pulse={isLive} />
+            {/* #6 — show real host/IP instead of hardcoded "Studio A" */}
             <Text style={styles.statusText}>
-              {connected ? 'Connected · Studio A' : 'Disconnected'}
+              {isLive ? `Connected · ${roverLabel}` : 'Disconnected'}
             </Text>
-            {backendConnected ? (
+            {isLive ? (
               <Pill color={C.accent} dim>
                 <Dot color={C.accent} size={4} pulse={false} />
                 <Text style={[styles.pillLabel, { color: C.accent }]}> LIVE</Text>
@@ -55,8 +92,9 @@ export function RoverHeroCard() {
               </Pill>
             )}
           </View>
-          <Text style={styles.roverName}>DXP-01 Mercutio</Text>
-          <Text style={styles.roverSub}>PX4 v1.16 · ROS 2 Humble · Domain 42</Text>
+          {/* #6 — rover name: show "—" until a telemetry frame names it */}
+          <Text style={styles.roverName}>DXP-01</Text>
+          <Text style={styles.roverSub}>PX4 v1.16.2 · ROS 2 Humble · Domain 42</Text>
         </View>
         <Pressable style={styles.switchBtn}>
           <Icons.fleet size={13} color={C.text2} />
@@ -73,14 +111,12 @@ export function RoverHeroCard() {
               <Stop offset="1" stopColor={C.accent} stopOpacity="1" />
             </LinearGradient>
           </Defs>
-          {/* Grid */}
           {Array.from({ length: 8 }).map((_, i) => (
             <Line key={`h${i}`} x1={i * 45} x2={i * 45} y1={0} y2={140} stroke="rgba(255,255,255,0.04)" strokeWidth={1} />
           ))}
           {Array.from({ length: 5 }).map((_, i) => (
             <Line key={`v${i}`} x1={0} x2={320} y1={i * 32} y2={i * 32} stroke="rgba(255,255,255,0.04)" strokeWidth={1} />
           ))}
-          {/* Path trace */}
           <Path
             d="M40,110 C80,80 110,100 140,70 S200,40 240,55 S290,95 280,115"
             stroke="url(#trail)"
@@ -88,14 +124,12 @@ export function RoverHeroCard() {
             fill="none"
             strokeLinecap="round"
           />
-          {/* Rover icon (top-down) rotated to heading */}
           <Rect
             x={267} y={106} width={26} height={18} rx={3}
             fill="#1a2738" stroke={C.accent} strokeWidth={1.5}
             transform={`rotate(${heading - 90} 280 115)`}
           />
           <Circle cx={280} cy={115} r={3} fill={C.accent} />
-          {/* Heading sweep ring */}
           <Circle cx={280} cy={115} r={22} fill="none" stroke={C.accent} strokeOpacity={0.3} strokeDasharray="2 3" />
         </Svg>
 
@@ -119,8 +153,11 @@ export function RoverHeroCard() {
           )}
         </View>
 
+        {/* #6 — coordinate: show "—" until GPS is live */}
         <View style={styles.mapOverlayBottom}>
-          <Text style={styles.coordText}>42.3651°N · 71.0589°W</Text>
+          <Text style={styles.coordText}>
+            {isLive ? `HDG ${Math.round(heading)}°` : '— ·  —'}
+          </Text>
         </View>
       </View>
 

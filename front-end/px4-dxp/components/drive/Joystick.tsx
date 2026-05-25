@@ -1,5 +1,5 @@
 // components/drive/Joystick.tsx
-import React, { useCallback } from 'react';
+import React, { useCallback, useRef } from 'react';
 import { View, Text, StyleSheet } from 'react-native';
 import Animated, {
   useSharedValue,
@@ -20,16 +20,41 @@ interface JoystickProps {
 }
 
 const MAX_DIST = 52;
+/** #10 — throttle: minimum ms between JS-thread onChange calls (≤30 Hz = ~33 ms) */
+const NOTIFY_INTERVAL_MS = 33;
 
 export function Joystick({ label, hint, disabled, onChange }: JoystickProps) {
+  // Animated knob position (UI thread)
   const knobX = useSharedValue(0);
   const knobY = useSharedValue(0);
   const isActive = useSharedValue(false);
-  const normX = useSharedValue(0);
-  const normY = useSharedValue(0);
+
+  // #10 — last-notify timestamp, kept as a plain ref (JS thread)
+  const lastNotifyMs = useRef(0);
+
+  // #9 — track disabled state in a shared value so onUpdate can short-circuit on the UI thread
+  const disabledSV = useSharedValue(disabled ? 1 : 0);
+  // Keep the shared value in sync with the prop
+  React.useEffect(() => {
+    disabledSV.value = disabled ? 1 : 0;
+    if (disabled) {
+      // Snap knob back and zero output when mid-gesture
+      knobX.value = withTiming(0, { duration: 100 });
+      knobY.value = withTiming(0, { duration: 100 });
+      runOnJS(notifyZero)();
+    }
+  }, [disabled]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const notifyZero = useCallback(() => {
+    onChange?.(0, 0);
+  }, [onChange]);
 
   const notify = useCallback(
     (x: number, y: number) => {
+      // #10 — throttle to NOTIFY_INTERVAL_MS on the JS thread
+      const now = Date.now();
+      if (now - lastNotifyMs.current < NOTIFY_INTERVAL_MS) return;
+      lastNotifyMs.current = now;
       onChange?.(x, y);
     },
     [onChange]
@@ -38,22 +63,29 @@ export function Joystick({ label, hint, disabled, onChange }: JoystickProps) {
   const gesture = Gesture.Pan()
     .enabled(!disabled)
     .onStart(() => {
+      if (disabledSV.value) return; // #9 — extra guard
       isActive.value = true;
     })
     .onUpdate((e) => {
+      // #9 — short-circuit if disabled flipped during the gesture
+      if (disabledSV.value) {
+        knobX.value = withTiming(0, { duration: 100 });
+        knobY.value = withTiming(0, { duration: 100 });
+        runOnJS(notifyZero)();
+        return;
+      }
       const dx = Math.max(-MAX_DIST, Math.min(MAX_DIST, e.translationX));
       const dy = Math.max(-MAX_DIST, Math.min(MAX_DIST, e.translationY));
       knobX.value = dx;
       knobY.value = dy;
-      normX.value = dx / MAX_DIST;
-      normY.value = -(dy / MAX_DIST); // invert Y
+      // #10 — runOnJS calls are throttled inside notify()
       runOnJS(notify)(dx / MAX_DIST, -(dy / MAX_DIST));
     })
     .onEnd(() => {
       isActive.value = false;
       knobX.value = withTiming(0, { duration: 150 });
       knobY.value = withTiming(0, { duration: 150 });
-      runOnJS(notify)(0, 0);
+      runOnJS(notifyZero)();
     });
 
   const knobStyle = useAnimatedStyle(() => ({
@@ -68,15 +100,10 @@ export function Joystick({ label, hint, disabled, onChange }: JoystickProps) {
     shadowOpacity: isActive.value ? 0.4 : 0,
   }));
 
-  const xDisplay = useAnimatedStyle(() => ({})); // purely visual
-
   return (
     <Card pad={12} style={disabled ? styles.disabled : undefined}>
       <View style={styles.header}>
         <Text style={styles.label}>{label}</Text>
-        <Text style={styles.coords}>
-          x  y
-        </Text>
       </View>
 
       <GestureDetector gesture={gesture}>
@@ -106,9 +133,7 @@ export function Joystick({ label, hint, disabled, onChange }: JoystickProps) {
 }
 
 const styles = StyleSheet.create({
-  disabled: {
-    opacity: 0.5,
-  },
+  disabled: { opacity: 0.5 },
   header: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -121,10 +146,6 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
     letterSpacing: 0.8,
     fontWeight: '600',
-  },
-  coords: {
-    fontSize: 10,
-    color: C.text3,
   },
   base: {
     width: '100%',
@@ -140,9 +161,7 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 0 },
     shadowRadius: 12,
   },
-  disabledBase: {
-    backgroundColor: '#181f2c',
-  },
+  disabledBase: { backgroundColor: '#181f2c' },
   knobAnchor: {
     position: 'absolute',
     top: 0,
@@ -171,4 +190,3 @@ const styles = StyleSheet.create({
     color: C.text3,
   },
 });
-

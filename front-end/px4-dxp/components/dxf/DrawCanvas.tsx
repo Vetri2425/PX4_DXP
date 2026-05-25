@@ -1,5 +1,5 @@
 // components/dxf/DrawCanvas.tsx
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 import { View, Text, StyleSheet } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Svg, { Path, Rect, Defs, Pattern, Circle } from 'react-native-svg';
@@ -11,30 +11,61 @@ import { Icons } from '../icons';
 
 type Stroke = [number, number][];
 
+/** #12 — minimum ms between React state updates during drawing (~30 Hz) */
+const UPDATE_INTERVAL_MS = 33;
+
 export function DrawCanvas() {
+  // Committed strokes (only updated on onEnd or throttled)
   const [strokes, setStrokes] = useState<Stroke[]>([]);
-  const currentStroke = React.useRef<Stroke>([]);
-  const [, forceUpdate] = useState(0);
+
+  // #12 — live stroke lives in a ref; SVG re-render is driven by a counter
+  const liveStrokeRef = useRef<Stroke>([]);
+  const [renderTick, setRenderTick] = useState(0);
+  const lastUpdateMs = useRef(0);
+  const isDrawing = useRef(false);
+
+  const forceRender = useCallback(() => setRenderTick((t) => t + 1), []);
 
   const gesture = Gesture.Pan()
     .runOnJS(true)
     .onStart((e) => {
-      currentStroke.current = [[e.x, e.y]];
-      setStrokes((prev) => [...prev, currentStroke.current]);
+      isDrawing.current = true;
+      liveStrokeRef.current = [[e.x, e.y]];
+      lastUpdateMs.current = Date.now();
+      forceRender();
     })
     .onUpdate((e) => {
-      currentStroke.current = [...currentStroke.current, [e.x, e.y]];
-      setStrokes((prev) => [...prev.slice(0, -1), [...currentStroke.current]]);
+      liveStrokeRef.current = [...liveStrokeRef.current, [e.x, e.y]];
+
+      // #12 — throttle state updates; only re-render at ~30 Hz
+      const now = Date.now();
+      if (now - lastUpdateMs.current >= UPDATE_INTERVAL_MS) {
+        lastUpdateMs.current = now;
+        forceRender();
+      }
     })
     .onEnd(() => {
-      currentStroke.current = [];
+      isDrawing.current = false;
+      // #12 — commit completed stroke to state on onEnd, then clear ref
+      const finished = [...liveStrokeRef.current];
+      liveStrokeRef.current = [];
+      if (finished.length > 1) {
+        setStrokes((prev) => [...prev, finished]);
+      }
+      forceRender();
     });
 
   const undo = useCallback(() => setStrokes((s) => s.slice(0, -1)), []);
-  const clear = useCallback(() => setStrokes([]), []);
+  const clear = useCallback(() => {
+    setStrokes([]);
+    liveStrokeRef.current = [];
+    forceRender();
+  }, [forceRender]);
 
   const toPath = (stroke: Stroke) =>
     stroke.map(([x, y], i) => `${i === 0 ? 'M' : 'L'}${x},${y}`).join(' ');
+
+  const liveStroke = liveStrokeRef.current;
 
   return (
     <View style={styles.outer}>
@@ -60,6 +91,8 @@ export function DrawCanvas() {
                 </Pattern>
               </Defs>
               <Rect width="100%" height="100%" fill="url(#dots)" />
+
+              {/* Committed strokes */}
               {strokes.map((stroke, i) => (
                 <Path
                   key={i}
@@ -71,8 +104,20 @@ export function DrawCanvas() {
                   strokeLinejoin="round"
                 />
               ))}
+
+              {/* #12 — live in-progress stroke from ref (no extra state write per point) */}
+              {liveStroke.length > 1 && (
+                <Path
+                  d={toPath(liveStroke)}
+                  stroke="#0a0d12"
+                  strokeWidth={2.5}
+                  fill="none"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              )}
             </Svg>
-            {strokes.length === 0 && (
+            {strokes.length === 0 && !isDrawing.current && (
               <Text style={styles.emptyText}>Draw with your finger</Text>
             )}
           </View>
@@ -125,4 +170,3 @@ const styles = StyleSheet.create({
   actions: { flexDirection: 'row', gap: 10 },
   actionBtn: { flex: 1, alignSelf: 'auto', justifyContent: 'center', alignItems: 'center' },
 });
-
