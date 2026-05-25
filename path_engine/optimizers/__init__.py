@@ -1,0 +1,1 @@
+"""Segment optimizers — reorder for minimal dead-heading."""

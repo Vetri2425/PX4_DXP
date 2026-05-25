@@ -235,6 +235,79 @@ class PathManager:
             return True
         return False
 
+    def parse_dxf(self, filepath: str, unit_scale: float | None = None,
+                   layer_mapping: dict[str, str] | None = None) -> list:
+        """Parse a DXF file and return DXFEntity list via path_engine.
+
+        Args:
+            filepath: Path to .dxf file (may be in missions dir or absolute).
+            unit_scale: Metres per DXF unit (None = auto-detect from $INSUNITS).
+            layer_mapping: Dict mapping layer patterns to "mark"/"transit"/"ignore".
+
+        Returns:
+            List of DXFEntity objects.
+        """
+        from path_engine.parsers.dxf_parser import parse_dxf
+        return parse_dxf(filepath, unit_scale=unit_scale, layer_mapping=layer_mapping)
+
+    def plan_path(self, name: str, **kwargs) -> dict:
+        """Run the full planning pipeline on a file and return PlannedPath info.
+
+        Args:
+            name: Filename in missions dir or builtin path name.
+            **kwargs: Passed to PathEngine.plan_file().
+
+        Returns:
+            Dict with waypoints, segments, and metadata.
+        """
+        from path_engine.engine import PathEngine
+        engine = PathEngine(
+            mark_spacing=kwargs.pop("line_spacing", 0.05),
+            transit_spacing=kwargs.pop("transit_spacing", 0.15),
+            marking_speed=kwargs.pop("marking_speed", 0.35),
+            transit_speed=kwargs.pop("transit_speed", 0.50),
+        )
+
+        # Resolve file path
+        fpath = os.path.join(self._dir, os.path.basename(name))
+        if os.path.isfile(fpath):
+            plan = engine.plan_file(fpath, **kwargs)
+        elif name in BUILTIN_PATHS:
+            # For builtins, use the simple flat waypoint list
+            pts = list(_cached_builtin(name))
+            from path_engine.core import PathSegment, SegmentType
+            segments = [PathSegment(
+                segment_type=SegmentType.MARK,
+                points=pts,
+                speed=0.35,
+                source_entity=f"builtin:{name}",
+            )]
+            plan = engine.plan_segments(segments, origin=kwargs.get("origin", (0.0, 0.0)),
+                                         start_position=kwargs.get("start_position"))
+        else:
+            raise FileNotFoundError(f"Path not found: {name!r}")
+
+        return {
+            "source": name,
+            "num_waypoints": plan.num_waypoints,
+            "num_segments": len(plan.segments),
+            "mark_length_m": round(plan.total_mark_length, 3),
+            "transit_length_m": round(plan.total_transit_length, 3),
+            "total_length_m": round(plan.total_length, 3),
+            "segments": [
+                {
+                    "type": "MARK" if s.segment_type == 0 else "TRANSIT",
+                    "points": s.points,
+                    "speed": s.speed,
+                    "source": s.source_entity,
+                    "length_m": round(s.length, 3),
+                }
+                for s in plan.segments
+            ],
+            "merged_waypoints": plan.merged_waypoints,
+            "spray_flags": plan.spray_flags,
+        }
+
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _load_file(self, fpath: str) -> list[tuple[float, float]]:
@@ -243,6 +316,11 @@ class PathManager:
             return read_qgc_waypoints(fpath)
         if ext == ".csv":
             return read_ned_csv(fpath)
+        if ext == ".dxf":
+            from path_engine import PathEngine
+            engine = PathEngine()
+            plan = engine.plan_file(fpath)
+            return plan.merged_waypoints
         try:
             return read_qgc_waypoints(fpath)
         except Exception:

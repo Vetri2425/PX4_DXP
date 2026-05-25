@@ -5,4 +5,5 @@ python-multipart==0.0.17
 websockets==13.1
 pydantic==2.10.3
 geographiclib==2.0
+ezdxf>=1.4
 sdnotify==0.3.2

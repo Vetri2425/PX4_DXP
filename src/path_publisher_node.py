@@ -64,6 +64,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
+from std_msgs.msg import Bool, Float32
 
 
 # ---------------------------------------------------------------------------
@@ -250,11 +251,12 @@ def read_ned_csv(filepath: str) -> list[tuple[float, float]]:
     return pts
 
 
-def load_mission_file(filepath: str) -> list[tuple[float, float]]:
+def load_mission_file(filepath: str, start_position: tuple[float, float] | None = None) -> list[tuple[float, float]]:
     """Auto-detect file format and load waypoints.
 
     .waypoints → QGC WPL 110 (lat/lon → NED via Karney)
-    .csv       → simple NED metres (north, east)
+    .csv       → simple NED metres (north, east) or enhanced 6-col
+    .dxf       → DXF CAD file (via path_engine, with start_position for TSP)
     """
     if not os.path.isfile(filepath):
         raise FileNotFoundError(f"Mission file not found: {filepath}")
@@ -264,6 +266,17 @@ def load_mission_file(filepath: str) -> list[tuple[float, float]]:
         return read_qgc_waypoints(filepath)
     elif ext == ".csv":
         return read_ned_csv(filepath)
+    elif ext == ".dxf":
+        try:
+            from path_engine import PathEngine
+            engine = PathEngine()
+            plan = engine.plan_file(filepath, start_position=start_position)
+            return plan.merged_waypoints
+        except ImportError:
+            raise ImportError(
+                "path_engine is required for .dxf files. "
+                "Ensure path_engine package is in PYTHONPATH."
+            )
     else:
         # Try QGC format first, fall back to CSV
         try:
@@ -304,8 +317,21 @@ class PathPublisherNode(Node):
         )
         self._pub = self.create_publisher(Path, "/path", path_qos)
 
+        # /dyx/spray_cmd — spray ON/OFF control (edge-triggered from spray_flags)
+        spray_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        self._spray_pub = self.create_publisher(Bool, "/dyx/spray_cmd", spray_qos)
+
+        # /dyx/mission/progress — 0.0→1.0 completion (1Hz)
+        self._progress_pub = self.create_publisher(Float32, "/dyx/mission/progress", be_qos)
+
         self._auto_origin = self.get_parameter("auto_origin").value
         self._origin_ned: tuple[float, float] | None = None  # (North, East)
+        self._start_position: tuple[float, float] | None = None  # For TSP optimization
 
         if self._auto_origin:
             # Subscribe to pose to get current position before publishing
@@ -330,13 +356,15 @@ class PathPublisherNode(Node):
         )
 
     def _pose_cb(self, msg: PoseStamped):
-        """Capture current EKF position for auto-origin."""
+        """Capture current EKF position for auto-origin and TSP start_position."""
         if self._origin_ned is None:
             # MAVROS pose is ENU: x=East, y=North → NED: N=y, E=x
-            self._origin_ned = (msg.pose.position.y, msg.pose.position.x)
+            ned = (msg.pose.position.y, msg.pose.position.x)
+            self._origin_ned = ned
+            self._start_position = ned  # Same position used for TSP optimization
             self.get_logger().info(
-                f"Auto-origin captured: N={self._origin_ned[0]:.3f}, "
-                f"E={self._origin_ned[1]:.3f} (from ENU pose)"
+                f"Auto-origin captured: N={ned[0]:.3f}, "
+                f"E={ned[1]:.3f} (from ENU pose)"
             )
 
     def _try_publish_with_origin(self):
@@ -355,11 +383,31 @@ class PathPublisherNode(Node):
         mission_file = self.get_parameter("mission_file").value
         path_name = self.get_parameter("path_name").value
 
-        # Load path points
+        # Load path points — pass start_position for TSP if using path_engine
+        spray_flags: list[bool] | None = None
+        pts: list[tuple[float, float]] = []
+
         if mission_file:
             try:
-                pts = load_mission_file(mission_file)
-                source = mission_file
+                ext = os.path.splitext(mission_file)[1].lower()
+                if ext in (".dxf", ".csv"):
+                    # Use path_engine for DXF and enhanced CSV
+                    try:
+                        from path_engine import PathEngine
+                        engine = PathEngine()
+                        plan = engine.plan_file(
+                            mission_file, start_position=self._start_position,
+                        )
+                        pts = plan.merged_waypoints
+                        spray_flags = plan.spray_flags
+                        source = mission_file
+                    except ImportError:
+                        # Fallback to basic loader (no spray_flags)
+                        pts = load_mission_file(mission_file)
+                        source = mission_file
+                else:
+                    pts = load_mission_file(mission_file, start_position=self._start_position)
+                    source = mission_file
             except Exception as e:
                 self.get_logger().error(f"Failed to load mission file: {e}")
                 return
@@ -401,12 +449,49 @@ class PathPublisherNode(Node):
             path.poses.append(ps)
 
         self._pub.publish(path)
+
+        # Publish initial spray state and store spray schedule for progress tracking
+        self._total_waypoints = len(pts)
+        self._waypoints_visited = 0
+        self._spray_flags = spray_flags
+        self._last_spray_state = None
+
+        if spray_flags:
+            # Publish initial spray command
+            initial_spray = spray_flags[0]
+            spray_msg = Bool()
+            spray_msg.data = initial_spray
+            self._spray_pub.publish(spray_msg)
+            self._last_spray_state = initial_spray
+
+            # Start progress timer at 1Hz
+            self._progress_timer = self.create_timer(1.0, self._progress_cb)
+            self.get_logger().info(
+                f"Spray schedule loaded: {sum(spray_flags)} MARK / "
+                f"{len(spray_flags) - sum(spray_flags)} TRANSIT waypoints"
+            )
+
         self.get_logger().info(
             f"Published {source!r}: {len(path.poses)} waypoints "
             f"first=({pts[0][0]:.3f}N,{pts[0][1]:.3f}E) "
             f"last=({pts[-1][0]:.3f}N,{pts[-1][1]:.3f}E) "
             f"frame={frame_id!r}"
         )
+
+    def _progress_cb(self):
+        """1Hz progress publisher — tracks waypoint completion via RPP state.
+
+        Note: This is a basic implementation. For accurate tracking,
+        the rover's actual position should be compared against path
+        waypoints. Currently publishes 0.0 until position tracking
+        is implemented.
+        """
+        progress = Float32()
+        if self._total_waypoints > 0:
+            progress.data = float(self._waypoints_visited) / float(self._total_waypoints)
+        else:
+            progress.data = 0.0
+        self._progress_pub.publish(progress)
 
 
 def main():

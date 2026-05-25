@@ -66,8 +66,8 @@ TOKEN_FILE_DEFAULT = os.path.expanduser("~/.rover_token")
 TOKEN_HEADER_NAME  = "X-Rover-Token"
 
 # ── File upload limits ────────────────────────────────────────────────────────
-ALLOWED_UPLOAD_EXTENSIONS = {".waypoints", ".csv"}
-MAX_UPLOAD_BYTES          = 1 * 1024 * 1024   # 1 MiB
+ALLOWED_UPLOAD_EXTENSIONS = {".waypoints", ".csv", ".dxf"}
+MAX_UPLOAD_BYTES          = 5 * 1024 * 1024   # 5 MiB (DXF files can be large)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 # LAN-only deployment — wildcard origin is safe ONLY when credentials are off.

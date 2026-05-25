@@ -1,0 +1,1 @@
+"""Path planners — densify geometry into waypoint sequences."""
