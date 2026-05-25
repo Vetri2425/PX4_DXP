@@ -40,3 +40,19 @@ async def activity():
     from main import activity_log
     # activity_log is a deque(maxlen=MAX_ACTIVITY_LOG); slice as a list
     return list(activity_log)[-MAX_ACTIVITY_LOG:]
+
+@router.post("/discover")
+async def discover():
+    """Return rovers discovered via UDP beacon on the LAN.
+
+    The beacon listener caches beacons from other rover servers
+    broadcasting on the discovery port. Returns active beacons
+    seen within the TTL window.
+    """
+    from beacon import get_beacons
+    beacons = get_beacons()
+    return {
+        "beacons": beacons,
+        "count": len(beacons),
+    }
+

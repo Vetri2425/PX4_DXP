@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>DXP — PX4 Drawing Rover</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:       #0a0d12;
+    --bg-2:     #0e1219;
+    --card:     #141923;
+    --card-2:   #1a2030;
+    --line:     rgba(255,255,255,0.07);
+    --line-2:   rgba(255,255,255,0.12);
+    --text:     #e6edf6;
+    --text-2:   #a3adbf;
+    --text-3:   #6b7585;
+    --accent:   #22d3ee;
+    --accent-2: #5eead4;
+    --warn:     #fbbf24;
+    --danger:   #fb7185;
+    --good:     #34d399;
+    --violet:   #a78bfa;
+    --r-sm:     10px;
+    --r-md:     14px;
+    --r-lg:     22px;
+    --r-xl:     28px;
+    --sans:     'Geist','Inter',-apple-system,system-ui,sans-serif;
+    --mono:     'Geist Mono','JetBrains Mono',ui-monospace,monospace;
+  }
+  html,body{margin:0;padding:0;background:#1a1d24;color:var(--text);font-family:var(--sans);-webkit-font-smoothing:antialiased}
+  body{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box;
+       background:
+        radial-gradient(1200px 800px at 20% -10%, #1f2536 0%, transparent 60%),
+        radial-gradient(900px 700px at 110% 110%, #0c1a22 0%, transparent 60%),
+        #0a0c10;
+  }
+  *{box-sizing:border-box}
+  button{font-family:inherit;color:inherit}
+
+  .px-app[data-typeface="mono"]{ --sans: var(--mono); }
+  .px-app{ font-family: var(--sans); }
+</style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+
+  <script type="text/babel" src="ios-frame.jsx"></script>
+  <script type="text/babel" src="tweaks-panel.jsx"></script>
+  <script type="text/babel" src="lib/icons.jsx"></script>
+  <script type="text/babel" src="lib/ui.jsx"></script>
+  <script type="text/babel" src="lib/api.jsx"></script>
+  <script type="text/babel" src="lib/store.jsx"></script>
+  <script type="text/babel" src="lib/dxf-data.jsx"></script>
+  <script type="text/babel" src="screens/dxf.jsx"></script>
+  <script type="text/babel" src="screens/home.jsx"></script>
+  <script type="text/babel" src="screens/map.jsx"></script>
+  <script type="text/babel" src="screens/drive.jsx"></script>
+  <script type="text/babel" src="screens/draw.jsx"></script>
+  <script type="text/babel" src="screens/more.jsx"></script>
+  <script type="text/babel" src="screens/sub-1.jsx"></script>
+  <script type="text/babel" src="screens/sub-2.jsx"></script>
+  <script type="text/babel" src="screens/sub-3.jsx"></script>
+  <script type="text/babel" src="app.jsx"></script>
+</body>
+</html>

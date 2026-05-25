@@ -23,7 +23,7 @@
 - Create: `px4-dxp/theme/spacing.ts`
 - Create: `px4-dxp/theme/typography.ts`
 
-- [ ] **Step 1: Create the Expo project**
+- [x] **Step 1: Create the Expo project**
 
 Run from `D:\Vetri\3WD_GCS\PX4_DXP\front-end\`:
 
@@ -33,7 +33,7 @@ npx create-expo-app px4-dxp --template blank-typescript
 
 This creates the `px4-dxp/` directory with Expo SDK 54, TypeScript, and the blank template.
 
-- [ ] **Step 2: Install core dependencies**
+- [x] **Step 2: Install core dependencies**
 
 ```bash
 cd px4-dxp
@@ -42,7 +42,7 @@ npm install zustand socket.io-client
 npx expo install react-native-maps
 ```
 
-- [ ] **Step 3: Configure app.json**
+- [x] **Step 3: Configure app.json**
 
 Replace the generated `app.json` with:
 
@@ -85,7 +85,7 @@ Replace the generated `app.json` with:
 }
 ```
 
-- [ ] **Step 4: Create theme/colors.ts**
+- [x] **Step 4: Create theme/colors.ts**
 
 ```typescript
 // theme/colors.ts
@@ -110,7 +110,7 @@ export const C = {
 export type ColorKey = keyof typeof C;
 ```
 
-- [ ] **Step 5: Create theme/spacing.ts**
+- [x] **Step 5: Create theme/spacing.ts**
 
 ```typescript
 // theme/spacing.ts
@@ -132,7 +132,7 @@ export const R = {
 } as const;
 ```
 
-- [ ] **Step 6: Create theme/typography.ts**
+- [x] **Step 6: Create theme/typography.ts**
 
 ```typescript
 // theme/typography.ts
@@ -159,7 +159,7 @@ export const FW = {
 };
 ```
 
-- [ ] **Step 7: Create app/_layout.tsx (root layout)**
+- [x] **Step 7: Create app/_layout.tsx (root layout)**
 
 ```typescript
 // app/_layout.tsx
@@ -183,7 +183,7 @@ export default function RootLayout() {
 }
 ```
 
-- [ ] **Step 8: Create app/(tabs)/_layout.tsx (tab navigator)**
+- [x] **Step 8: Create app/(tabs)/_layout.tsx (tab navigator)**
 
 ```typescript
 // app/(tabs)/_layout.tsx
@@ -227,7 +227,7 @@ export default function TabLayout() {
 }
 ```
 
-- [ ] **Step 9: Create app/(tabs)/index.tsx (placeholder Home)**
+- [x] **Step 9: Create app/(tabs)/index.tsx (placeholder Home)**
 
 ```typescript
 // app/(tabs)/index.tsx
@@ -264,7 +264,7 @@ const styles = StyleSheet.create({
 });
 ```
 
-- [ ] **Step 10: Create remaining tab placeholders**
+- [x] **Step 10: Create remaining tab placeholders**
 
 Create these files with minimal placeholder content (same pattern as Step 9, just change the title):
 
@@ -273,7 +273,7 @@ Create these files with minimal placeholder content (same pattern as Step 9, jus
 - `app/(tabs)/drive.tsx` — title: "Manual Drive"
 - `app/(tabs)/more.tsx` — title: "More"
 
-- [ ] **Step 11: Create types/telemetry.ts**
+- [x] **Step 11: Create types/telemetry.ts**
 
 ```typescript
 // types/telemetry.ts
@@ -313,7 +313,7 @@ export const GPS_FIX_LABELS: Record<number, GpsFixLabel> = {
 };
 ```
 
-- [ ] **Step 12: Create types/mission.ts**
+- [x] **Step 12: Create types/mission.ts**
 
 ```typescript
 // types/mission.ts
@@ -338,7 +338,7 @@ export interface Job {
 }
 ```
 
-- [ ] **Step 13: Create types/socket-events.ts**
+- [x] **Step 13: Create types/socket-events.ts**
 
 ```typescript
 // types/socket-events.ts
@@ -391,7 +391,7 @@ export interface ModeResultPayload {
 }
 ```
 
-- [ ] **Step 14: Verify the app starts**
+- [x] **Step 14: Verify the app starts**
 
 ```bash
 cd px4-dxp && npx expo start
@@ -399,7 +399,7 @@ cd px4-dxp && npx expo start
 
 Expected: App starts in Expo Go, shows tab navigator with 5 tabs. Each tab shows its placeholder title on a dark navy background.
 
-- [ ] **Step 15: Commit**
+- [x] **Step 15: Commit**
 
 ```bash
 git add -A && git commit -m "feat: scaffold PX.4_DXp with Expo Router, theme, types
