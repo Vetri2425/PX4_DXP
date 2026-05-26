@@ -70,7 +70,7 @@ log = get_logger("server.main")
 # implementations and both must agree.
 sio = socketio.AsyncServer(
     async_mode="asgi",
-    cors_allowed_origins=CORS_ALLOW_ORIGINS,
+    cors_allowed_origins="*" if "*" in CORS_ALLOW_ORIGINS else CORS_ALLOW_ORIGINS,
 )
 socket_app = socketio.ASGIApp(sio)
 
