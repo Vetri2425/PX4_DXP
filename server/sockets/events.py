@@ -32,7 +32,7 @@ def register_handlers(sio) -> None:
     """Attach all client → server event handlers to the given AsyncServer."""
 
     @sio.event
-    async def connect(sid, environ):
+    async def connect(sid, environ, auth=None):
         from main import activity_log
         activity_log.append({"timestamp": _now(), "level": "info",
                               "message": f"Socket connected: {sid}"})
