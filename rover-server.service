@@ -6,7 +6,7 @@ Wants=rpp-pipeline.service
 # so we do NOT use PartOf here. Only stop the server explicitly.
 
 [Service]
-Type=notify
+Type=simple
 User=flash
 Group=flash
 WorkingDirectory=/home/flash/PX4_DXP/server
@@ -16,9 +16,6 @@ RestartSec=5
 StartLimitInterval=300
 StartLimitBurst=10
 
-# Watchdog: server must call sd_notify("WATCHDOG=1") within this interval.
-# The telemetry loop (10 Hz) sends the heartbeat every ~3s.
-WatchdogSec=30
 
 # Security hardening
 NoNewPrivileges=yes
