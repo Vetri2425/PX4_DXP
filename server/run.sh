@@ -1,10 +1,8 @@
 #!/bin/bash
 # Drawing Rover FastAPI backend — launch script
 # Called by rover-server.service (systemd Type=notify + WatchdogSec=30)
-set -euo pipefail
+set -eo pipefail
 
-# Pre-define so ROS2 chain never trips on it with set -u
-export AMENT_TRACE_SETUP_FILES="${AMENT_TRACE_SETUP_FILES:-}"
 source /opt/ros/humble/setup.bash
 
 export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
