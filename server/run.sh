@@ -1,10 +1,12 @@
 #!/bin/bash
 # Drawing Rover FastAPI backend — launch script
 # Called by rover-server.service (systemd Type=notify + WatchdogSec=30)
-set -euo pipefail
+set -eo pipefail
 
-# Source ROS2 Humble
+# ROS2 setup.bash uses unbound variables internally — suspend -u around it
+set +u
 source /opt/ros/humble/setup.bash
+set -u
 
 export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
 export FASTAPI_PORT=${FASTAPI_PORT:-5001}
