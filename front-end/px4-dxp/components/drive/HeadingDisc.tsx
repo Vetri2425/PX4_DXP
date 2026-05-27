@@ -1,5 +1,5 @@
 // components/drive/HeadingDisc.tsx
-import React from 'react';
+import React, { useMemo } from 'react';
 import { View, StyleSheet } from 'react-native';
 import Svg, { Line, Text as SvgText, Path, G } from 'react-native-svg';
 import { C } from '../../theme/colors';
@@ -16,7 +16,25 @@ const CARDINALS: [string, number][] = [
   ['W', 270],
 ];
 
-export function HeadingDisc({ heading, size = 140 }: HeadingDiscProps) {
+const MINOR_TICKS = (
+  <>
+    {Array.from({ length: 36 }).map((_, i) => {
+      if (i % 9 === 0) return null;
+      return (
+        <Line key={i} x1={50} y1={9} x2={50} y2={i % 3 === 0 ? 13 : 11}
+          stroke="rgba(255,255,255,0.3)" strokeWidth={0.8}
+          transform={`rotate(${i * 10} 50 50)`} />
+      );
+    })}
+  </>
+);
+
+export const HeadingDisc = React.memo(function HeadingDisc({ heading, size = 140 }: HeadingDiscProps) {
+  const rotateStyle = useMemo(
+    () => [StyleSheet.absoluteFill, { transform: [{ rotate: `${-heading}deg` }] }],
+    [heading]
+  );
+
   return (
     <View
       style={[
@@ -29,7 +47,7 @@ export function HeadingDisc({ heading, size = 140 }: HeadingDiscProps) {
         viewBox="0 0 100 100"
         width={size}
         height={size}
-        style={[StyleSheet.absoluteFill, { transform: [{ rotate: `${-heading}deg` }] }]}
+        style={rotateStyle}
       >
         {/* Cardinal labels */}
         {CARDINALS.map(([l, a]) => (
@@ -55,21 +73,7 @@ export function HeadingDisc({ heading, size = 140 }: HeadingDiscProps) {
           </G>
         ))}
         {/* Minor ticks every 10° */}
-        {Array.from({ length: 36 }).map((_, i) => {
-          if (i % 9 === 0) return null;
-          return (
-            <Line
-              key={i}
-              x1={50}
-              y1={9}
-              x2={50}
-              y2={i % 3 === 0 ? 13 : 11}
-              stroke="rgba(255,255,255,0.3)"
-              strokeWidth={0.8}
-              transform={`rotate(${i * 10} 50 50)`}
-            />
-          );
-        })}
+        {MINOR_TICKS}
       </Svg>
 
       {/* Fixed overlay: pointer + heading text */}
@@ -105,7 +109,7 @@ export function HeadingDisc({ heading, size = 140 }: HeadingDiscProps) {
       </Svg>
     </View>
   );
-}
+});
 
 const styles = StyleSheet.create({
   container: {
@@ -116,4 +120,3 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
 });
-

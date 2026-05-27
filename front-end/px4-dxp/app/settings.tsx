@@ -17,7 +17,7 @@ export default function SettingsScreen() {
   const [url, setUrl] = useState(activeRoverUrl);
 
   return (
-    <SafeAreaView style={styles.safeArea} edges={['top']}>
+    <SafeAreaView style={styles.safeArea} edges={[]}>
       <AppBar
         title="Settings"
         subtitle="Account · units · API"
@@ -62,7 +62,7 @@ export default function SettingsScreen() {
 
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: C.bg },
-  content: { paddingBottom: 100 },
+  content: { paddingBottom: 110 },
   section: { paddingHorizontal: 16, paddingBottom: 4 },
   label: { fontSize: 12, color: C.text2, fontWeight: '500', marginBottom: 8 },
   input: {

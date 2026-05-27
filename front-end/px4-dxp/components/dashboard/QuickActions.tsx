@@ -1,9 +1,9 @@
 // components/dashboard/QuickActions.tsx
 import React from 'react';
 import { View, Text, Pressable, StyleSheet } from 'react-native';
+import { router } from 'expo-router';
 import { C } from '../../theme/colors';
 import { Icons } from '../icons';
-import { useUiStore } from '../../stores/useUiStore';
 
 const ACTIONS = [
   {
@@ -41,9 +41,17 @@ const ACTIONS = [
   },
 ];
 
-export function QuickActions() {
-  const { setTab, push } = useUiStore();
+const TAB_ROUTES: Record<string, string> = {
+  drive: '/(tabs)/drive',
+  draw: '/(tabs)/draw',
+  map: '/(tabs)/map',
+};
 
+const SCREEN_ROUTES: Record<string, string> = {
+  camera: '/camera',
+};
+
+export function QuickActions() {
   return (
     <View style={styles.grid}>
       {ACTIONS.map((q) => {
@@ -52,8 +60,8 @@ export function QuickActions() {
           <Pressable
             key={q.key}
             onPress={() => {
-              if (q.tab) setTab(q.tab);
-              else if (q.screen) push(q.screen);
+              if (q.tab) router.push(TAB_ROUTES[q.tab] as never);
+              else if (q.screen) router.push(SCREEN_ROUTES[q.screen] as never);
             }}
             style={({ pressed }) => [styles.card, { opacity: pressed ? 0.8 : 1 }]}
           >

@@ -1,5 +1,5 @@
 // components/ui/Dot.tsx
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useMemo } from 'react';
 import { Animated, StyleSheet } from 'react-native';
 import { C } from '../../theme/colors';
 
@@ -9,7 +9,7 @@ interface DotProps {
   pulse?: boolean;
 }
 
-export function Dot({ color = C.good, size = 8, pulse = true }: DotProps) {
+export const Dot = React.memo(function Dot({ color = C.good, size = 8, pulse = true }: DotProps) {
   const opacity = useRef(new Animated.Value(1)).current;
 
   useEffect(() => {
@@ -27,16 +27,17 @@ export function Dot({ color = C.good, size = 8, pulse = true }: DotProps) {
     return () => anim.stop();
   }, [pulse, opacity]);
 
+  const baseDotStyle = useMemo(
+    () => [styles.dot, { width: size, height: size, borderRadius: size / 2, backgroundColor: color }],
+    [size, color]
+  );
+
   return (
     <Animated.View
-      style={[
-        styles.dot,
-        { width: size, height: size, borderRadius: size / 2, backgroundColor: color },
-        pulse ? { opacity } : null,
-      ]}
+      style={pulse ? [baseDotStyle, { opacity }] : baseDotStyle}
     />
   );
-}
+});
 
 const styles = StyleSheet.create({
   dot: {

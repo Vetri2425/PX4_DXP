@@ -21,6 +21,8 @@ function toMissionMode(raw: string): MissionMode {
     : 'Manual'; // safe fallback
 }
 
+let _lastTelMs = 0;
+
 export async function initSocket(): Promise<Socket> {
   const url = useConnectionStore.getState().activeRoverUrl;
 
@@ -65,8 +67,13 @@ export async function initSocket(): Promise<Socket> {
   socket.on('telemetry', (data: Record<string, unknown>) => {
     // #2 — typed through the store's own signature; no `as any`
     type TelSocketPayload = Parameters<ReturnType<typeof useTelemetryStore.getState>['updateFromSocket']>[0];
-    useTelemetryStore.getState().updateFromSocket(data as TelSocketPayload);
+    const now = Date.now();
+    if (now - _lastTelMs >= 66) {
+      _lastTelMs = now;
+      useTelemetryStore.getState().updateFromSocket(data as TelSocketPayload);
+    }
 
+    // Safety-critical fields: never throttled
     const raw = data as { armed?: boolean; mode?: string };
     if (raw.armed != null) useUiStore.getState().setArmed(Boolean(raw.armed));
     if (typeof raw.mode === 'string') {
@@ -147,15 +154,33 @@ export function disconnectSocket(): void {
     socket = null;
     socketUrl = '';
   }
+  _lastTelMs = 0;
 }
 
 export function getSocket(): Socket | null {
   return socket;
 }
 
-/** #13 — expose a manual reconnect action (used by ConnectionBadge) */
+/** #13 — expose a manual reconnect action (used by ConnectionBadge).
+ *  Robust version: clears previous error, handles missing/stale socket by
+ *  falling back to full initSocket(), then triggers connect if needed.
+ */
 export function reconnectSocket(): void {
-  if (!socket) return;
+  const store = useConnectionStore.getState();
+  const currentUrl = store.activeRoverUrl;
+
+  // Clear transient error so the UI immediately reflects "trying again"
+  store.setBackendError(null);
+
+  // No socket yet, or the existing one was created for a different URL
+  // → do a proper (re)initialization. This also re-attaches all listeners.
+  if (!socket || socketUrl !== currentUrl) {
+    initSocket().catch(() => {
+      // Errors will surface via the 'connect_error' listener and setBackendError
+    });
+    return;
+  }
+
   if (!socket.connected) {
     socket.connect();
   }

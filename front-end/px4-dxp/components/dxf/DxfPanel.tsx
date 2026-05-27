@@ -1,6 +1,7 @@
 // components/dxf/DxfPanel.tsx
-import React from 'react';
-import { View, Text, Pressable, StyleSheet, ScrollView } from 'react-native';
+import React, { useState } from 'react';
+import { View, Text, Pressable, StyleSheet, ScrollView, Alert } from 'react-native';
+import * as DocumentPicker from 'expo-document-picker';
 import { C } from '../../theme/colors';
 import { Card } from '../ui/Card';
 import { Btn } from '../ui/Btn';
@@ -9,6 +10,7 @@ import { Icons } from '../icons';
 import { useDxfStore } from '../../stores/useDxfStore';
 import { useMissionStore } from '../../stores/useMissionStore';
 import { useUiStore } from '../../stores/useUiStore';
+import { api } from '../../services/api';
 
 const TEMPLATES = [
   { id: 'pitch', icon: '⚽', name: '5-a-side pitch', count: 42 },
@@ -20,12 +22,65 @@ const TEMPLATES = [
 ];
 
 export function DxfPanel() {
-  const { dxfFile, setDxfFile, dxfSelected, setDxfSelected, setDxfInspectorOpen } = useDxfStore();
+  const { dxfFile, setDxfFile, dxfSelected, setDxfSelected, setDxfInspectorOpen, planResult, setPlanResult, reset } = useDxfStore();
   const { setActiveJob, setMissionMode } = useMissionStore();
   const { setTab } = useUiStore();
 
+  const [uploading, setUploading] = useState(false);
+  const [planning, setPlanning] = useState(false);
+
+  async function pickAndUpload() {
+    const result = await DocumentPicker.getDocumentAsync({
+      type: '*/*',
+      copyToCacheDirectory: true,
+    });
+    if (result.canceled || !result.assets?.length) return;
+    const asset = result.assets[0];
+    if (!asset.name.toLowerCase().endsWith('.dxf')) {
+      Alert.alert('Wrong file type', 'Please select a .dxf file.');
+      return;
+    }
+    setUploading(true);
+    try {
+      const parsed = await api.parseDxf(asset.uri, asset.name);
+      setDxfFile(parsed);
+    } catch (e: unknown) {
+      Alert.alert('Upload failed', e instanceof Error ? e.message : String(e));
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  async function planAndSend() {
+    if (!dxfFile) return;
+    setPlanning(true);
+    try {
+      const selectedIds = dxfSelected ? Array.from(dxfSelected) : undefined;
+      const plan = await api.planPath(dxfFile.filename, {
+        selected_entities: selectedIds,
+      });
+      setPlanResult(plan);
+
+      setActiveJob({
+        id: 'dxf',
+        name: dxfFile.filename,
+        progress: 0,
+        eta: `${plan.total_length_m.toFixed(1)} m`,
+        paths: plan.num_segments,
+        done: 0,
+      });
+      setMissionMode('Draw');
+      setTab('home');
+
+      await api.startMission(dxfFile.filename);
+    } catch (e: unknown) {
+      Alert.alert('Plan failed', e instanceof Error ? e.message : String(e));
+    } finally {
+      setPlanning(false);
+    }
+  }
+
   if (!dxfFile) {
-    // No file — show upload prompt + templates
     return (
       <View style={styles.container}>
         <Card pad={20} style={styles.uploadCard}>
@@ -38,11 +93,14 @@ export function DxfPanel() {
               Up to 50 MB · LINE · CIRCLE · ARC · LWPOLYLINE · SPLINE
             </Text>
             <View style={styles.uploadBtns}>
-              <Btn variant="primary" size="sm" icon={<Icons.upload size={14} color="#06202a" />}>
-                Choose .dxf
-              </Btn>
-              <Btn variant="secondary" size="sm" icon={<Icons.cam size={14} color={C.text2} />}>
-                Scan blueprint
+              <Btn
+                variant="primary"
+                size="sm"
+                icon={<Icons.upload size={14} color="#06202a" />}
+                onPress={pickAndUpload}
+                disabled={uploading}
+              >
+                {uploading ? 'Uploading…' : 'Choose .dxf'}
               </Btn>
             </View>
           </View>
@@ -67,9 +125,9 @@ export function DxfPanel() {
     );
   }
 
-  // Has file
+  // File loaded
   const total = dxfFile.entities.length;
-  const sel = dxfSelected ? dxfSelected.size : 0;
+  const sel = dxfSelected ? dxfSelected.size : total;
 
   const layerMap: Record<string, number> = {};
   dxfFile.entities.forEach((e) => {
@@ -80,14 +138,13 @@ export function DxfPanel() {
     <View style={styles.container}>
       <Card pad={14}>
         <View style={styles.fileRow}>
-          {/* Thumbnail placeholder */}
           <View style={styles.thumb}>
             <Icons.layers size={32} color={C.accent} />
           </View>
           <View style={styles.fileMeta}>
-            <Text style={styles.fileName}>{dxfFile.name}</Text>
+            <Text style={styles.fileName}>{dxfFile.filename}</Text>
             <Text style={styles.fileInfo}>
-              {total} entities · {Object.keys(layerMap).length} layers · {dxfFile.size}
+              {total} entities · {dxfFile.layer_names.length} layers · scale {dxfFile.unit_scale.toFixed(4)} m/u
             </Text>
             <View style={styles.layerPills}>
               {Object.entries(layerMap).map(([l, c]) => (
@@ -112,10 +169,22 @@ export function DxfPanel() {
             variant="secondary"
             size="sm"
             icon={<Icons.trash size={13} color={C.text2} />}
-            onPress={() => { setDxfFile(null); setDxfSelected(null); }}
+            onPress={reset}
           />
         </View>
       </Card>
+
+      {planResult && (
+        <Card pad={12} style={styles.planCard}>
+          <Text style={styles.planTitle}>Plan ready</Text>
+          <Text style={styles.planDetail}>
+            {planResult.num_waypoints} wps · {planResult.num_segments} segs · {planResult.total_length_m.toFixed(1)} m total
+          </Text>
+          <Text style={styles.planDetail}>
+            Mark {planResult.mark_length_m.toFixed(1)} m · Transit {planResult.transit_length_m.toFixed(1)} m
+          </Text>
+        </Card>
+      )}
 
       <Text style={styles.templatesLabel}>Run</Text>
       <Card pad={12}>
@@ -123,27 +192,14 @@ export function DxfPanel() {
           {sel} entit{sel === 1 ? 'y' : 'ies'} selected
         </Text>
         <View style={styles.runBtns}>
-          <Btn variant="secondary" style={styles.runBtn} icon={<Icons.target size={14} color={C.text2} />}>
-            Dry run
-          </Btn>
           <Btn
             variant="primary"
             style={styles.runBtn}
             icon={<Icons.play size={14} color="#06202a" />}
-            onPress={() => {
-              setActiveJob({
-                id: 'dxf',
-                name: dxfFile.name,
-                progress: 0,
-                eta: '—',
-                paths: sel,
-                done: 0,
-              });
-              setMissionMode('Draw');
-              setTab('home');
-            }}
+            onPress={planAndSend}
+            disabled={planning}
           >
-            Send to rover
+            {planning ? 'Planning…' : 'Plan & Send'}
           </Btn>
         </View>
       </Card>
@@ -178,6 +234,7 @@ const styles = StyleSheet.create({
     letterSpacing: 0.8,
     textTransform: 'uppercase',
     marginBottom: 8,
+    marginTop: 16,
   },
   templateGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   templateCard: {
@@ -213,6 +270,9 @@ const styles = StyleSheet.create({
   layerPillText: { fontSize: 10, color: C.text2 },
   fileActions: { flexDirection: 'row', gap: 8 },
   editBtn: { flex: 1 },
+  planCard: { marginTop: 12, borderColor: C.accent, borderWidth: 1 },
+  planTitle: { fontSize: 12, fontWeight: '700', color: C.accent, marginBottom: 4 },
+  planDetail: { fontSize: 11, color: C.text2 },
   runInfo: { fontSize: 12, color: C.text2, marginBottom: 10 },
   runBtns: { flexDirection: 'row', gap: 8 },
   runBtn: { flex: 1, alignSelf: 'auto', justifyContent: 'center', alignItems: 'center' },

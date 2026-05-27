@@ -29,3 +29,17 @@ Thumbs.db
 
 # Claude Code local state
 .claude/
+
+# Node / frontend build artifacts
+node_modules/
+.expo/
+dist/
+*.tsbuildinfo
+
+# Android / iOS native build outputs (Capacitor / RN / Expo)
+android/
+ios/
+
+# Misc
+nul
+.grok/

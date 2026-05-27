@@ -1,7 +1,9 @@
 // app/(tabs)/drive.tsx
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import { View, Text, ScrollView, Pressable, StyleSheet } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { router } from 'expo-router';
+import { useShallow } from 'zustand/react/shallow';
 import { C } from '../../theme/colors';
 import { AppBar } from '../../components/ui/AppBar';
 import { Card } from '../../components/ui/Card';
@@ -25,28 +27,28 @@ interface ActionChipProps {
   color?: string;
 }
 
-function ActionChip({ on, onPress, icon, label, color = C.accent }: ActionChipProps) {
+const ActionChip = React.memo(function ActionChip({ on, onPress, icon, label, color = C.accent }: ActionChipProps) {
+  const chipStyle = useMemo(
+    () => [styles.chip, { backgroundColor: on ? `${color}26` : C.card2, borderColor: on ? `${color}66` : C.line2 }],
+    [on, color]
+  );
   return (
     <Pressable
       onPress={onPress}
-      style={({ pressed }) => [
-        styles.chip,
-        {
-          backgroundColor: on ? `${color}26` : C.card2,
-          borderColor: on ? `${color}66` : C.line2,
-          opacity: pressed ? 0.75 : 1,
-        },
-      ]}
+      style={({ pressed }) => pressed ? [chipStyle, styles.chipPressed] : chipStyle}
     >
       {icon}
       <Text style={[styles.chipLabel, { color: on ? color : C.text2 }]}>{label}</Text>
     </Pressable>
   );
-}
+});
 
 export default function DriveScreen() {
-  const { pitch, roll, heading, speed, alt, voltage, current, motor } = useTelemetryStore();
-  const { armed, emergency, setArmed, triggerEStop, clearEStop, push, appendLog } = useUiStore();
+  const { pitch, roll, heading, speed, alt, voltage, current, motor } = useTelemetryStore(
+    useShallow((s) => ({ pitch: s.pitch, roll: s.roll, heading: s.heading,
+      speed: s.speed, alt: s.alt, voltage: s.voltage, current: s.current, motor: s.motor }))
+  );
+  const { armed, emergency, setArmed, triggerEStop, clearEStop, appendLog } = useUiStore();
   const { setMissionMode } = useMissionStore();
   const [penDown, setPenDown] = useState(false);
   const [headlights, setHeadlights] = useState(true);
@@ -89,7 +91,7 @@ export default function DriveScreen() {
   };
 
   return (
-    <SafeAreaView style={styles.safeArea} edges={['top']}>
+    <SafeAreaView style={styles.safeArea} edges={[]}>
       <ScrollView
         style={styles.scroll}
         contentContainerStyle={styles.content}
@@ -102,7 +104,7 @@ export default function DriveScreen() {
             <View style={styles.trailingRow}>
               <IconBtn
                 icon={<Icons.cam size={18} color={C.text2} />}
-                onPress={() => push('camera')}
+                onPress={() => router.push('/camera')}
               />
               <IconBtn
                 icon={armed
@@ -123,13 +125,13 @@ export default function DriveScreen() {
             <AttitudeIndicator pitch={pitch} roll={roll} />
             <View style={styles.attitudeStats}>
               <Text style={styles.attitudeStat}>
-                R: <Text style={{ color: C.accent }}>{roll.toFixed(1)}°</Text>
+                R: <Text style={styles.attitudeAccent}>{roll.toFixed(1)}°</Text>
               </Text>
               <Text style={styles.attitudeStat}>
-                P: <Text style={{ color: C.accent }}>{pitch.toFixed(1)}°</Text>
+                P: <Text style={styles.attitudeAccent}>{pitch.toFixed(1)}°</Text>
               </Text>
               <Text style={styles.attitudeStat}>
-                Y: <Text style={{ color: C.accent }}>{Math.round(heading)}°</Text>
+                Y: <Text style={styles.attitudeAccent}>{Math.round(heading)}°</Text>
               </Text>
             </View>
           </Card>
@@ -206,7 +208,7 @@ export default function DriveScreen() {
                 color={C.accent}
               />
               <ActionChip
-                onPress={() => push('camera')}
+                onPress={() => router.push('/camera')}
                 icon={<Icons.cam size={14} color={C.text2} />}
                 label="Camera"
                 color={C.text2}
@@ -249,7 +251,7 @@ export default function DriveScreen() {
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: C.bg },
   scroll: { flex: 1 },
-  content: { paddingBottom: 100 },
+  content: { paddingBottom: 110 },
   trailingRow: { flexDirection: 'row', gap: 8 },
   attitudeRow: {
     flexDirection: 'row',
@@ -276,6 +278,7 @@ const styles = StyleSheet.create({
     fontSize: 11,
     color: C.text3,
   },
+  attitudeAccent: { color: C.accent },
   statsRow: {
     flexDirection: 'row',
     gap: 6,
@@ -312,6 +315,7 @@ const styles = StyleSheet.create({
     borderRadius: 9999,
     borderWidth: 1,
   },
+  chipPressed: { opacity: 0.75 },
   chipLabel: { fontSize: 12, fontWeight: '600' },
   estop: {
     width: '100%',

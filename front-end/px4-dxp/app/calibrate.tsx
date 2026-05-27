@@ -21,7 +21,7 @@ const CAL_ITEMS = [
 
 export default function CalibrateScreen() {
   return (
-    <SafeAreaView style={styles.safeArea} edges={['top']}>
+    <SafeAreaView style={styles.safeArea} edges={['bottom']}>
       <AppBar
         title="Calibration"
         subtitle="Compass · accel · gyro"
@@ -69,7 +69,7 @@ export default function CalibrateScreen() {
 
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: C.bg },
-  content: { paddingBottom: 100 },
+  content: { paddingBottom: 28 },
   section: { paddingHorizontal: 16, paddingBottom: 4 },
   row: {
     flexDirection: 'row',

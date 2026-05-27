@@ -54,7 +54,7 @@ function Row({ item }: { item: RowItem }) {
 
 export default function MoreScreen() {
   return (
-    <SafeAreaView style={styles.safeArea} edges={['top']}>
+    <SafeAreaView style={styles.safeArea} edges={[]}>
       <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
         <AppBar
           title="More"
@@ -95,7 +95,7 @@ export default function MoreScreen() {
 
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: C.bg },
-  content: { paddingBottom: 100 },
+  content: { paddingBottom: 110 },
   section: { paddingHorizontal: 16, paddingBottom: 4 },
   row: {
     flexDirection: 'row',

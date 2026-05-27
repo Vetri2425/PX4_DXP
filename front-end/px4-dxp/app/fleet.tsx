@@ -20,7 +20,7 @@ const STATUS_COLOR = { connected: C.good, offline: C.text3, standby: C.accent };
 
 export default function FleetScreen() {
   return (
-    <SafeAreaView style={styles.safeArea} edges={['top']}>
+    <SafeAreaView style={styles.safeArea} edges={['bottom']}>
       <AppBar
         title="Fleet"
         subtitle={`${FLEET.length} rovers`}
@@ -54,7 +54,7 @@ export default function FleetScreen() {
 
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: C.bg },
-  content: { paddingBottom: 100 },
+  content: { paddingBottom: 28 },
   section: { paddingHorizontal: 16, gap: 10 },
   card: { marginBottom: 0 },
   cardHeader: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 6 },

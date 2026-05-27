@@ -72,6 +72,68 @@ async function get(path: string, timeoutMs = 5000): Promise<unknown> {
   return res.json();
 }
 
+// ── Types mirroring server models.py ─────────────────────────────────────────
+
+export interface DXFEntityInfo {
+  entity_type: string;
+  layer: string;
+  color: number;
+  entity_id: string;
+  is_mark: boolean;
+  length_m: number;
+}
+
+export interface DXFParseResponse {
+  filename: string;
+  num_entities: number;
+  entities: DXFEntityInfo[];
+  unit_scale: number;
+  layer_names: string[];
+}
+
+export interface PathPlanOptions {
+  selected_entities?: string[];
+  overrides?: Record<string, Record<string, unknown>>;
+  order?: string[];
+  origin?: [number, number];
+  line_spacing?: number;
+  transit_spacing?: number;
+  marking_speed?: number;
+  transit_speed?: number;
+}
+
+export interface PathPlanResponse {
+  source: string;
+  num_waypoints: number;
+  num_segments: number;
+  mark_length_m: number;
+  transit_length_m: number;
+  total_length_m: number;
+  segments: unknown[];
+  merged_waypoints: [number, number][];
+  spray_flags: boolean[];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function postMultipart(path: string, uri: string, name: string, timeoutMs = 30000): Promise<unknown> {
+  const form = new FormData();
+  form.append('file', { uri, name, type: 'application/octet-stream' } as unknown as Blob);
+  const h: Record<string, string> = {};
+  if (_token) h['X-Rover-Token'] = _token;
+  const res = await fetch(`${_baseUrl}${path}`, {
+    method: 'POST',
+    headers: h,
+    body: form,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text);
+  }
+  return res.json();
+}
+
 export const api = {
   // Connection
   discover: () => post('/api/discover') as Promise<{ beacons: unknown[] }>,
@@ -80,7 +142,7 @@ export const api = {
   arm: (arm: boolean) => post('/api/arm', { arm }),
   disarm: () => post('/api/arm', { arm: false }),
   setMode: (mode: string) => post('/api/set_mode', { mode }),
-  /** #8 — 1.5 s timeout for safety-critical estop */
+  /** 1.5 s timeout for safety-critical estop */
   estop: () => post('/api/estop', {}, 1500),
 
   // Mission control
@@ -93,4 +155,14 @@ export const api = {
   getTelemetry: () => get('/api/telemetry/latest'),
   getMissionStatus: () => get('/api/mission/status'),
   getPaths: () => get('/api/paths'),
+
+  // DXF pipeline
+  parseDxf: (uri: string, name: string) =>
+    postMultipart('/api/path/parse-dxf', uri, name) as Promise<DXFParseResponse>,
+
+  planPath: (source: string, opts: PathPlanOptions = {}) =>
+    post('/api/path/plan', { source, include_waypoints: false, ...opts }) as Promise<PathPlanResponse>,
+
+  publishPath: (name: string) =>
+    post('/api/path/publish', { name }) as Promise<{ published: string; num_points: number }>,
 };

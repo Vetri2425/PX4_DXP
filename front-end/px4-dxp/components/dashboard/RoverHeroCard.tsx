@@ -1,7 +1,8 @@
 // components/dashboard/RoverHeroCard.tsx
-import React from 'react';
+import React, { useMemo } from 'react';
 import { View, Text, StyleSheet, Pressable } from 'react-native';
 import Svg, { Line, Path, Rect, Circle, Defs, LinearGradient, Stop } from 'react-native-svg';
+import { useShallow } from 'zustand/react/shallow';
 import { C } from '../../theme/colors';
 import { Card } from '../ui/Card';
 import { Dot } from '../ui/Dot';
@@ -23,11 +24,28 @@ const MOCK_SATS = 14;
 const MOCK_RSSI = -54;
 const MOCK_HEADING = 124;
 
-export function RoverHeroCard() {
-  const { battery, sats, rssi, heading } = useTelemetryStore();
-  const { armed, emergency } = useUiStore();
-  const { backendConnected, activeRoverUrl } = useConnectionStore();
-  const { missionMode } = useMissionStore();
+const SVG_GRID = (
+  <>
+    {Array.from({ length: 8 }).map((_, i) => (
+      <Line key={`h${i}`} x1={i * 45} x2={i * 45} y1={0} y2={140} stroke="rgba(255,255,255,0.04)" strokeWidth={1} />
+    ))}
+    {Array.from({ length: 5 }).map((_, i) => (
+      <Line key={`v${i}`} x1={0} x2={320} y1={i * 32} y2={i * 32} stroke="rgba(255,255,255,0.04)" strokeWidth={1} />
+    ))}
+  </>
+);
+
+export const RoverHeroCard = React.memo(function RoverHeroCard() {
+  const { battery, sats, rssi, heading } = useTelemetryStore(
+    useShallow((s) => ({ battery: s.battery, sats: s.sats, rssi: s.rssi, heading: s.heading }))
+  );
+  const { armed, emergency } = useUiStore(
+    useShallow((s) => ({ armed: s.armed, emergency: s.emergency }))
+  );
+  const { backendConnected, activeRoverUrl } = useConnectionStore(
+    useShallow((s) => ({ backendConnected: s.backendConnected, activeRoverUrl: s.activeRoverUrl }))
+  );
+  const missionMode = useMissionStore((s) => s.missionMode);
 
   // #6 — derive a human-readable location label from the URL
   const roverLabel = activeRoverUrl.replace(/^https?:\/\//, '').replace(/:5001$/, '');
@@ -35,7 +53,7 @@ export function RoverHeroCard() {
   // #6 — show mock-data badge when disconnected; real badge when live
   const isLive = backendConnected;
 
-  const quickStats = [
+  const quickStats = useMemo(() => [
     {
       l: 'BAT',
       v: fmtNum(battery, MOCK_BATTERY),
@@ -64,7 +82,7 @@ export function RoverHeroCard() {
       color: '#a78bfa',
       icon: <Icons.zap size={11} color="#a78bfa" />,
     },
-  ];
+  ], [battery, sats, rssi, missionMode, isLive]);
 
   return (
     <Card
@@ -111,12 +129,7 @@ export function RoverHeroCard() {
               <Stop offset="1" stopColor={C.accent} stopOpacity="1" />
             </LinearGradient>
           </Defs>
-          {Array.from({ length: 8 }).map((_, i) => (
-            <Line key={`h${i}`} x1={i * 45} x2={i * 45} y1={0} y2={140} stroke="rgba(255,255,255,0.04)" strokeWidth={1} />
-          ))}
-          {Array.from({ length: 5 }).map((_, i) => (
-            <Line key={`v${i}`} x1={0} x2={320} y1={i * 32} y2={i * 32} stroke="rgba(255,255,255,0.04)" strokeWidth={1} />
-          ))}
+          {SVG_GRID}
           <Path
             d="M40,110 C80,80 110,100 140,70 S200,40 240,55 S290,95 280,115"
             stroke="url(#trail)"
@@ -178,7 +191,7 @@ export function RoverHeroCard() {
       </View>
     </Card>
   );
-}
+});
 
 const styles = StyleSheet.create({
   headerRow: {

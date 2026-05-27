@@ -18,22 +18,28 @@ type Step = 'scan' | 'connecting' | 'done';
 
 /** #5 — wait for real Socket.IO 'connect' event with a 10 s timeout */
 async function waitForSocketConnect(): Promise<void> {
+  console.log('[socket] initSocket()...');
   const sock = await initSocket();
+  console.log('[socket] initSocket returned, connected?', sock.connected);
   if (sock.connected) return; // already connected (same URL, cached)
 
+  console.log('[socket] registering connect/error listeners, 10s timeout');
   return new Promise<void>((resolve, reject) => {
     const TIMEOUT_MS = 10_000;
 
     const timer = setTimeout(() => {
       cleanup();
+      console.log('[socket] TIMEOUT 10s — no connect event');
       reject(new Error('Connection timed out (10 s)'));
     }, TIMEOUT_MS);
 
     const onConnect = () => {
+      console.log('[socket] "connect" event fired!');
       cleanup();
       resolve();
     };
     const onError = (err: Error) => {
+      console.log('[socket] "connect_error" event:', err.message);
       cleanup();
       reject(err);
     };
@@ -105,40 +111,53 @@ export default function ConnectScreen() {
   }, []);
 
   const handleConnect = async (rover: Rover) => {
+    console.log('[connect] handleConnect called', rover.name, `${rover.host}:${rover.port}`);
     setSelectedRover(rover);
     setStep('connecting');
     setConnectError(null);
+    console.log('[connect] step → "connecting", radar should show');
     try {
       const url = `http://${rover.host}:${rover.port}`;
+      console.log('[connect] setBaseUrl:', url);
       await setBaseUrl(url);
+      console.log('[connect] setBaseUrl OK, waiting for socket connect...');
       // #5 — wait for real socket 'connect' event instead of sleeping
       await waitForSocketConnect();
+      console.log('[connect] socket connected! step → "done"');
       setStep('done');
     } catch (e) {
-      setConnectError((e as Error).message || 'Connection failed');
+      const msg = (e as Error).message || 'Connection failed';
+      console.log('[connect] FAILED:', msg);
+      setConnectError(msg);
       setStep('scan');
     }
   };
 
   const handleManualConnect = async () => {
     if (!manualUrl.trim()) return;
+    console.log('[connect] handleManualConnect', manualUrl);
     setSelectedRover(null);
     setStep('connecting');
     setConnectError(null);
     try {
+      console.log('[connect] manual setBaseUrl:', manualUrl.trim());
       await setBaseUrl(manualUrl.trim());
+      console.log('[connect] manual setBaseUrl OK, waiting for socket connect...');
       // #5 — wait for real socket 'connect' event instead of sleeping
       await waitForSocketConnect();
+      console.log('[connect] manual socket connected! step → "done"');
       setStep('done');
     } catch (e) {
-      setConnectError((e as Error).message || 'Connection failed');
+      const msg = (e as Error).message || 'Connection failed';
+      console.log('[connect] manual FAILED:', msg);
+      setConnectError(msg);
       setStep('scan');
     }
   };
 
   if (step === 'connecting') {
     return (
-      <SafeAreaView style={styles.safeArea}>
+      <SafeAreaView style={styles.safeArea} edges={['bottom']}>
         <AppBar
           title="Connecting..."
           subtitle={selectedRover?.name ?? manualUrl}
@@ -172,7 +191,7 @@ export default function ConnectScreen() {
 
   if (step === 'done') {
     return (
-      <SafeAreaView style={styles.safeArea}>
+      <SafeAreaView style={styles.safeArea} edges={['bottom']}>
         <AppBar title="Connected" subtitle="Ready" />
         <View style={styles.centreContent}>
           <View style={styles.successIcon}>
@@ -180,7 +199,7 @@ export default function ConnectScreen() {
           </View>
           <Text style={styles.connectedTitle}>Connected</Text>
           <Text style={styles.connectedUrl}>{activeRoverUrl}</Text>
-          <Btn variant="primary" onPress={() => router.back()}>Open dashboard</Btn>
+          <Btn variant="primary" onPress={() => router.replace('/')}>Open dashboard</Btn>
         </View>
       </SafeAreaView>
     );
@@ -198,12 +217,6 @@ export default function ConnectScreen() {
               : discoveredRovers.length > 0
                 ? `${discoveredRovers.length} rover${discoveredRovers.length !== 1 ? 's' : ''} found`
                 : 'No rovers discovered'
-          }
-          leading={
-            <IconBtn
-              icon={<Icons.chevL size={18} color={C.text2} />}
-              onPress={() => router.back()}
-            />
           }
           trailing={
             <IconBtn
@@ -230,7 +243,9 @@ export default function ConnectScreen() {
                       <Text style={styles.roverName}>{r.name}</Text>
                       <Text style={styles.roverSub}>{r.host}:{r.port} · {r.status}</Text>
                     </View>
-                    <Text style={styles.roverTag}>LAN</Text>
+                    <View style={styles.connectChip}>
+                      <Text style={styles.connectChipText}>Connect</Text>
+                    </View>
                   </Pressable>
                   {i < discoveredRovers.length - 1 && <View style={styles.divider} />}
                 </React.Fragment>
@@ -340,7 +355,7 @@ export default function ConnectScreen() {
 
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: C.bg },
-  scrollContent: { paddingBottom: 100 },
+  scrollContent: { paddingBottom: 110 },
   section: { paddingHorizontal: 16, gap: 0 },
   centreContent: {
     flex: 1,
@@ -389,14 +404,18 @@ const styles = StyleSheet.create({
   roverMeta: { flex: 1 },
   roverName: { fontSize: 15, fontWeight: '500', color: C.text },
   roverSub: { fontSize: 12, color: C.text3, marginTop: 1 },
-  roverTag: {
-    fontSize: 10,
-    color: C.accent,
+  connectChip: {
+    paddingHorizontal: 11,
+    paddingVertical: 6,
+    borderRadius: 8,
+    backgroundColor: `${C.accent}18`,
+    borderWidth: 1,
+    borderColor: `${C.accent}33`,
+  },
+  connectChipText: {
+    fontSize: 11,
     fontWeight: '600',
-    backgroundColor: `${C.accent}1a`,
-    paddingHorizontal: 7,
-    paddingVertical: 3,
-    borderRadius: 6,
+    color: C.accent,
   },
   divider: { height: 1, backgroundColor: C.line, marginLeft: 64, marginRight: 14 },
   scanningRow: {

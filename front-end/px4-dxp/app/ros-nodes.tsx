@@ -21,7 +21,7 @@ const NODES = [
 
 export default function RosNodesScreen() {
   return (
-    <SafeAreaView style={styles.safeArea} edges={['top']}>
+    <SafeAreaView style={styles.safeArea} edges={['bottom']}>
       <AppBar
         title="ROS 2 Nodes"
         subtitle={`${NODES.filter((n) => n.alive).length} alive · domain 42`}
@@ -56,7 +56,7 @@ export default function RosNodesScreen() {
 
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: C.bg },
-  content: { paddingBottom: 100 },
+  content: { paddingBottom: 28 },
   section: { paddingHorizontal: 16 },
   row: {
     flexDirection: 'row',

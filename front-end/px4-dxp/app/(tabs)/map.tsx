@@ -85,7 +85,7 @@ export default function MissionScreen() {
   const toggleMapType = () => setMapType((t) => (t === 'satellite' ? 'standard' : 'satellite'));
 
   return (
-    <SafeAreaView style={styles.safeArea} edges={['top']}>
+    <SafeAreaView style={styles.safeArea} edges={[]}>
       <View style={styles.container}>
         <AppBar
           title="Mission"
@@ -268,7 +268,7 @@ const styles = StyleSheet.create({
     borderRadius: 9999,
   },
   hintText: { fontSize: 11, color: C.text2, fontWeight: '500' },
-  bottomSheet: { padding: 14, paddingBottom: 100 },
+  bottomSheet: { padding: 14, paddingBottom: 110 },
   sheetRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   sheetLabel: {
     fontSize: 11,

@@ -19,7 +19,7 @@ export default function CameraScreen() {
   const [channel, setChannel] = useState<'front' | 'depth' | 'therm'>('front');
 
   return (
-    <SafeAreaView style={styles.safeArea} edges={['top']}>
+    <SafeAreaView style={styles.safeArea} edges={[]}>
       <AppBar
         title="Camera"
         subtitle={`1080p · 30 fps · ${recording ? 'REC' : 'preview'}`}
@@ -170,7 +170,7 @@ const styles = StyleSheet.create({
     backgroundColor: 'transparent',
   },
   recBtnActive: { backgroundColor: C.danger },
-  statsRow: { padding: 16, paddingBottom: 100 },
+  statsRow: { padding: 16, paddingBottom: 110 },
   statsCard: {},
   statsGrid: { flexDirection: 'row', gap: 8 },
 });

@@ -22,6 +22,8 @@ interface ConnectionState {
   setDiscoveredRovers: (rovers: Rover[]) => void;
   setBaseUrl: (url: string) => Promise<void>;
   discover: () => Promise<void>;
+  /** Hydrate last-used rover URL from AsyncStorage (called once at app boot) */
+  hydrate: () => Promise<void>;
 }
 
 const DEFAULT_URL = 'http://192.168.1.102:5001';
@@ -61,6 +63,19 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
       set({ discoveredRovers: data.beacons || [], discovering: false });
     } catch {
       set({ discoveredRovers: [], discovering: false });
+    }
+  },
+
+  hydrate: async () => {
+    const saved = await AsyncStorage.getItem('rover_base_url');
+    if (saved) {
+      // Normalize same way as setBaseUrl
+      let u = saved.trim();
+      if (!u.startsWith('http://') && !u.startsWith('https://')) u = 'http://' + u;
+      if (u.endsWith('/')) u = u.slice(0, -1);
+      if (u !== get().activeRoverUrl) {
+        set({ activeRoverUrl: u });
+      }
     }
   },
 }));

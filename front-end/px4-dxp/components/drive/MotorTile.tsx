@@ -1,5 +1,5 @@
 // components/drive/MotorTile.tsx
-import React from 'react';
+import React, { useMemo } from 'react';
 import { View, Text, StyleSheet } from 'react-native';
 import { C } from '../../theme/colors';
 import { Bar } from '../ui/Bar';
@@ -9,18 +9,19 @@ interface MotorTileProps {
   value: number; // 0-100
 }
 
-export function MotorTile({ label, value }: MotorTileProps) {
+export const MotorTile = React.memo(function MotorTile({ label, value }: MotorTileProps) {
   const color = value > 90 ? C.warn : C.accent;
+  const valueStyle = useMemo(() => [styles.value, { color }], [color]);
   return (
     <View style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.label}>{label}</Text>
-        <Text style={[styles.value, { color }]}>{Math.round(value)}%</Text>
+        <Text style={valueStyle}>{Math.round(value)}%</Text>
       </View>
       <Bar value={value} color={color} height={4} style={styles.bar} />
     </View>
   );
-}
+});
 
 const styles = StyleSheet.create({
   container: {

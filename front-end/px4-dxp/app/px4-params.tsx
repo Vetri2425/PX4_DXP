@@ -21,7 +21,7 @@ const PARAMS = [
 
 export default function Px4ParamsScreen() {
   return (
-    <SafeAreaView style={styles.safeArea} edges={['top']}>
+    <SafeAreaView style={styles.safeArea} edges={['bottom']}>
       <AppBar
         title="PX4 Parameters"
         subtitle="Tune & save"
@@ -55,7 +55,7 @@ export default function Px4ParamsScreen() {
 
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: C.bg },
-  content: { paddingBottom: 100 },
+  content: { paddingBottom: 28 },
   section: { paddingHorizontal: 16 },
   row: {
     flexDirection: 'row',

@@ -21,7 +21,7 @@ const PACKAGES = [
 
 export default function FirmwareScreen() {
   return (
-    <SafeAreaView style={styles.safeArea} edges={['top']}>
+    <SafeAreaView style={styles.safeArea} edges={['bottom']}>
       <AppBar
         title="Firmware & Packages"
         subtitle="apt · pip · OTA"
@@ -71,7 +71,7 @@ export default function FirmwareScreen() {
 
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: C.bg },
-  content: { paddingBottom: 100 },
+  content: { paddingBottom: 28 },
   section: { paddingHorizontal: 16, paddingBottom: 4 },
   row: {
     flexDirection: 'row',

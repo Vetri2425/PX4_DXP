@@ -5,13 +5,29 @@
     "version": "1.0.0",
     "orientation": "landscape",
     "icon": "./assets/icon.png",
+    "androidStatusBar": {
+      "barStyle": "light-content",
+      "backgroundColor": "#0a0d12"
+    },
+    "androidNavigationBar": {
+      "barStyle": "light-content",
+      "backgroundColor": "#0a0d12"
+    },
     "userInterfaceStyle": "dark",
     "scheme": "px4dxp",
     "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0a0d12"
+    },
     "android": {
       "package": "com.vetri.px4dxp",
+      "jsEngine": "hermes",
       "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png",
         "backgroundColor": "#0a0d12"
       },
       "config": {
@@ -25,6 +41,7 @@
     },
     "plugins": [
       "expo-router",
+      "expo-system-ui",
       [
         "expo-font",
         {

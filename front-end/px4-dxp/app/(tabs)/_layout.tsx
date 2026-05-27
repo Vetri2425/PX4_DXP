@@ -1,5 +1,6 @@
 // app/(tabs)/_layout.tsx
 import { Tabs } from 'expo-router';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { C } from '../../theme/colors';
 
 const TAB_CONFIG = [
@@ -11,6 +12,8 @@ const TAB_CONFIG = [
 ] as const;
 
 export default function TabLayout() {
+  const insets = useSafeAreaInsets();
+
   return (
     <Tabs
       screenOptions={{
@@ -18,12 +21,13 @@ export default function TabLayout() {
         tabBarStyle: {
           backgroundColor: 'rgba(20,25,35,0.78)',
           borderTopColor: C.line,
-          height: 70,
-          paddingBottom: 8,
+          height: 62 + insets.bottom,
+          paddingBottom: insets.bottom + 6,
+          paddingTop: 6,
         },
         tabBarActiveTintColor: C.accent,
         tabBarInactiveTintColor: C.text3,
-        tabBarLabelStyle: { fontSize: 11, fontWeight: '600' },
+        tabBarLabelStyle: { fontSize: 11, fontWeight: '600', marginTop: -2 },
       }}
     >
       {TAB_CONFIG.map((tab) => (

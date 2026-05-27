@@ -1,5 +1,5 @@
 // components/drive/AttitudeIndicator.tsx
-import React from 'react';
+import React, { useMemo } from 'react';
 import { View, StyleSheet } from 'react-native';
 import Svg, { Path, Circle, Line, G } from 'react-native-svg';
 import { C } from '../../theme/colors';
@@ -10,8 +10,32 @@ interface AttitudeIndicatorProps {
   size?: number;
 }
 
-export function AttitudeIndicator({ pitch, roll, size = 140 }: AttitudeIndicatorProps) {
+const ROLL_SCALE_TICKS = (
+  <>
+    {[0, -30, -60, 60, 30].map((deg) => (
+      <G key={deg} transform={`rotate(${deg} 50 50)`}>
+        <Line x1={50} y1={6} x2={50} y2={Math.abs(deg) % 30 === 0 ? 11 : 9}
+          stroke="rgba(255,255,255,0.5)" strokeWidth={1.2} />
+      </G>
+    ))}
+  </>
+);
+
+export const AttitudeIndicator = React.memo(function AttitudeIndicator({ pitch, roll, size = 140 }: AttitudeIndicatorProps) {
   const pitchOffset = (pitch / 90) * size * 0.55;
+
+  const pitchTicks = useMemo(() =>
+    [-30, -20, -10, 10, 20, 30].map((p) => {
+      const tickOffset = -(p * (size * 0.55) / 90) + pitchOffset;
+      const w = Math.abs(p) === 10 ? 38 : Math.abs(p) === 20 ? 28 : 20;
+      return (
+        <View key={p} style={[styles.pitchTick, {
+          width: w, top: size / 2 - tickOffset,
+          left: '50%', marginLeft: -(w / 2),
+        }]} />
+      );
+    }),
+  [pitchOffset, size]);
 
   return (
     <View
@@ -50,24 +74,7 @@ export function AttitudeIndicator({ pitch, roll, size = 140 }: AttitudeIndicator
           ]}
         />
         {/* Pitch ladder ticks */}
-        {[-30, -20, -10, 10, 20, 30].map((p) => {
-          const tickOffset = -(p * (size * 0.55) / 90) + pitchOffset;
-          const w = Math.abs(p) === 10 ? 38 : Math.abs(p) === 20 ? 28 : 20;
-          return (
-            <View
-              key={p}
-              style={[
-                styles.pitchTick,
-                {
-                  width: w,
-                  top: size / 2 - tickOffset,
-                  left: '50%',
-                  marginLeft: -(w / 2),
-                },
-              ]}
-            />
-          );
-        })}
+        {pitchTicks}
       </View>
 
       {/* SVG overlay: reticle, roll triangle, scale marks */}
@@ -93,22 +100,11 @@ export function AttitudeIndicator({ pitch, roll, size = 140 }: AttitudeIndicator
         </G>
 
         {/* Fixed roll scale ticks */}
-        {[0, -30, -60, 60, 30].map((deg) => (
-          <G key={deg} transform={`rotate(${deg} 50 50)`}>
-            <Line
-              x1={50}
-              y1={6}
-              x2={50}
-              y2={Math.abs(deg) % 30 === 0 ? 11 : 9}
-              stroke="rgba(255,255,255,0.5)"
-              strokeWidth={1.2}
-            />
-          </G>
-        ))}
+        {ROLL_SCALE_TICKS}
       </Svg>
     </View>
   );
-}
+});
 
 const styles = StyleSheet.create({
   container: {
@@ -150,4 +146,3 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(255,255,255,0.5)',
   },
 });
-

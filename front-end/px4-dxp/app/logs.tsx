@@ -1,6 +1,6 @@
 // app/logs.tsx — #20: reads from useUiStore.errorLog (live structured buffer)
 import React, { useRef, useEffect } from 'react';
-import { View, Text, ScrollView, StyleSheet } from 'react-native';
+import { View, Text, FlatList, StyleSheet } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { router } from 'expo-router';
 import { C } from '../theme/colors';
@@ -27,15 +27,15 @@ function formatTs(ms: number): string {
 
 export default function LogsScreen() {
   const errorLog = useUiStore((s) => s.errorLog);
-  const scrollRef = useRef<ScrollView>(null);
+  const flatListRef = useRef<FlatList<LogEntry>>(null);
 
   // Auto-scroll to bottom on new entries
   useEffect(() => {
-    scrollRef.current?.scrollToEnd({ animated: true });
+    flatListRef.current?.scrollToEnd({ animated: false });
   }, [errorLog.length]);
 
   return (
-    <SafeAreaView style={styles.safeArea} edges={['top']}>
+    <SafeAreaView style={styles.safeArea} edges={[]}>
       <AppBar
         title="Logs & Diagnostics"
         subtitle={`${errorLog.length} entries · Rosout · MAVLink · uORB`}
@@ -44,21 +44,26 @@ export default function LogsScreen() {
       />
       <View style={styles.logContainer}>
         <Card pad={0} style={styles.logCard}>
-          <ScrollView ref={scrollRef} style={styles.logScroll}>
-            {errorLog.length === 0 ? (
-              <Text style={styles.empty}>No log entries yet.</Text>
-            ) : (
-              errorLog.map((entry, i) => (
-                <View key={i} style={styles.logLine}>
-                  <Text style={styles.logTs}>{formatTs(entry.ts)}</Text>
-                  <Text style={[styles.logLevel, { color: LEVEL_COLOR[entry.level] }]}>
-                    {entry.level.padEnd(4)}
-                  </Text>
-                  <Text style={styles.logMsg} numberOfLines={3}>{entry.msg}</Text>
-                </View>
-              ))
+          <FlatList
+            ref={flatListRef}
+            data={errorLog}
+            keyExtractor={(_, i) => String(i)}
+            renderItem={({ item: entry }) => (
+              <View style={styles.logLine}>
+                <Text style={styles.logTs}>{formatTs(entry.ts)}</Text>
+                <Text style={[styles.logLevel, { color: LEVEL_COLOR[entry.level] }]}>
+                  {entry.level.padEnd(4)}
+                </Text>
+                <Text style={styles.logMsg} numberOfLines={3}>{entry.msg}</Text>
+              </View>
             )}
-          </ScrollView>
+            ListEmptyComponent={<Text style={styles.empty}>No log entries yet.</Text>}
+            style={styles.logScroll}
+            getItemLayout={(_data, index) => ({ length: 26, offset: 26 * index, index })}
+            initialNumToRender={20}
+            maxToRenderPerBatch={20}
+            windowSize={5}
+          />
         </Card>
       </View>
     </SafeAreaView>
@@ -67,7 +72,7 @@ export default function LogsScreen() {
 
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: C.bg },
-  logContainer: { flex: 1, paddingHorizontal: 16, paddingBottom: 100 },
+  logContainer: { flex: 1, paddingHorizontal: 16, paddingBottom: 110 },
   logCard: { flex: 1, overflow: 'hidden' },
   logScroll: { flex: 1, backgroundColor: '#0a0d12' },
   logLine: {

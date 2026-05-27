@@ -1,37 +1,28 @@
 // stores/useDxfStore.ts
 import { create } from 'zustand';
+import type { DXFEntityInfo, DXFParseResponse, PathPlanResponse } from '../services/api';
 
-interface DxfEntity {
-  id: string;
-  type: string;
-  layer: string;
-  color: string;
-  length: number;
-  closed: boolean;
-  [key: string]: unknown;
-}
-
-interface DxfFile {
-  name: string;
-  size: string;
-  entities: DxfEntity[];
-  bounds: { w: number; h: number };
-  tint?: string;
-}
+export type { DXFEntityInfo };
 
 interface DxfState {
-  dxfFile: DxfFile | null;
+  // Parsed file from server
+  dxfFile: DXFParseResponse | null;
+  // Selected entity IDs (null = all selected)
   dxfSelected: Set<string> | null;
-  dxfOverrides: Record<string, unknown>;
+  dxfOverrides: Record<string, Record<string, unknown>>;
   dxfOrder: string[];
   dxfInspectorOpen: boolean;
+  // Result of last /api/path/plan call
+  planResult: PathPlanResponse | null;
 
-  setDxfFile: (file: DxfFile | null) => void;
+  setDxfFile: (file: DXFParseResponse | null) => void;
   setDxfSelected: (selected: Set<string> | null) => void;
-  setDxfOverrides: (overrides: Record<string, unknown>) => void;
+  setDxfOverrides: (overrides: Record<string, Record<string, unknown>>) => void;
   setDxfOrder: (order: string[]) => void;
   setDxfInspectorOpen: (open: boolean) => void;
-  confirmSelection: (selected: Set<string>, overrides: Record<string, unknown>, order: string[]) => void;
+  setPlanResult: (result: PathPlanResponse | null) => void;
+  confirmSelection: (selected: Set<string>, overrides: Record<string, Record<string, unknown>>, order: string[]) => void;
+  reset: () => void;
 }
 
 export const useDxfStore = create<DxfState>((set) => ({
@@ -40,12 +31,15 @@ export const useDxfStore = create<DxfState>((set) => ({
   dxfOverrides: {},
   dxfOrder: [],
   dxfInspectorOpen: false,
+  planResult: null,
 
-  setDxfFile: (file) => set({ dxfFile: file }),
+  setDxfFile: (file) => set({ dxfFile: file, dxfSelected: null, dxfOrder: [], dxfOverrides: {}, planResult: null }),
   setDxfSelected: (selected) => set({ dxfSelected: selected }),
   setDxfOverrides: (overrides) => set({ dxfOverrides: overrides }),
   setDxfOrder: (order) => set({ dxfOrder: order }),
   setDxfInspectorOpen: (open) => set({ dxfInspectorOpen: open }),
+  setPlanResult: (result) => set({ planResult: result }),
   confirmSelection: (selected, overrides, order) =>
     set({ dxfSelected: selected, dxfOverrides: overrides, dxfOrder: order, dxfInspectorOpen: false }),
+  reset: () => set({ dxfFile: null, dxfSelected: null, dxfOverrides: {}, dxfOrder: [], dxfInspectorOpen: false, planResult: null }),
 }));

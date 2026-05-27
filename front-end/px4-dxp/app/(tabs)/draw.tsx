@@ -47,7 +47,7 @@ export default function DrawScreen() {
   const [activeTab, setActiveTab] = useState<DrawTab>('dxf');
 
   return (
-    <SafeAreaView style={styles.safeArea} edges={['top']}>
+    <SafeAreaView style={styles.safeArea} edges={[]}>
       <AppBar
         title="New Drawing"
         subtitle="Upload SVG · draw · import G-code"
@@ -155,7 +155,7 @@ const styles = StyleSheet.create({
   tabLabel: { fontSize: 11, fontWeight: '600', color: C.text2, letterSpacing: 0.3 },
   tabLabelActive: { color: C.accent },
   scroll: { flex: 1 },
-  content: { paddingBottom: 100 },
+  content: { paddingBottom: 110 },
   placeholder: { alignItems: 'center', justifyContent: 'center', padding: 40, gap: 8 },
   placeholderText: { fontSize: 16, fontWeight: '600', color: C.text },
   placeholderSub: { fontSize: 12, color: C.text3 },

@@ -5,8 +5,8 @@ import { C } from '../../theme/colors';
 import { Card } from '../ui/Card';
 import { Dot } from '../ui/Dot';
 import { Btn } from '../ui/Btn';
+import { router } from 'expo-router';
 import { Icons } from '../icons';
-import { useUiStore } from '../../stores/useUiStore';
 
 interface SysTileProps {
   label: string;
@@ -29,8 +29,6 @@ function SysTile({ label, value, ok, warn }: SysTileProps) {
 }
 
 export function SysDiagnostics() {
-  const { push } = useUiStore();
-
   return (
     <View style={styles.container}>
       <Card pad={14}>
@@ -47,7 +45,7 @@ export function SysDiagnostics() {
             variant="secondary"
             size="sm"
             icon={<Icons.terminal size={13} color={C.text2} />}
-            onPress={() => push('logs')}
+            onPress={() => router.push('/logs')}
           >
             Logs
           </Btn>
@@ -55,7 +53,7 @@ export function SysDiagnostics() {
             variant="secondary"
             size="sm"
             icon={<Icons.cpu size={13} color={C.text2} />}
-            onPress={() => push('ros')}
+            onPress={() => router.push('/ros-nodes')}
           >
             Nodes
           </Btn>
@@ -63,7 +61,7 @@ export function SysDiagnostics() {
             variant="secondary"
             size="sm"
             icon={<Icons.sliders size={13} color={C.text2} />}
-            onPress={() => push('px4')}
+            onPress={() => router.push('/px4-params')}
           >
             Params
           </Btn>
