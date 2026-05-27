@@ -1218,8 +1218,13 @@ class RPPControllerNode(Node):
             yaw_rate_body = 0.0
 
         # ---- Step 6: Approach scaling near goal ----
+        # FIX: Gate approach scaling behind min_goal_travel_m.  Without this,
+        # closed-loop paths (e.g. square_2x2) where the start IS the goal
+        # immediately trigger approach scaling, floor speed to approach_v
+        # (0.05 m/s), and the rover can never accelerate — it sits there
+        # yawing in place at 5 cm/s forever.
         state_code = StateCode.TRACKING
-        if dist_to_goal < approach_d:
+        if dist_to_goal < approach_d and self._path_travel_m >= approach_d:
             # Linearly scale speed from full → approach_v as dist → 0
             scale = self._clamp(dist_to_goal / approach_d, 0.0, 1.0)
             approach_speed = max(approach_v, speed * scale)
