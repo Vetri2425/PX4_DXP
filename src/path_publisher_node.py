@@ -107,6 +107,21 @@ def gen_arc_quarter_1m5(radius: float = 1.5, arc_spacing: float = 0.1) \
     return pts
 
 
+def gen_arc_half_1m5(radius: float = 1.5, arc_spacing: float = 0.1) \
+        -> list[tuple[float, float]]:
+    """Half circle, radius 1.5 m. Starts heading north at origin,
+    sweeps to the east (right turn). Centre of circle is at (0, +R)."""
+    arc_len = radius * math.pi
+    n_steps = max(2, int(arc_len / arc_spacing) + 1)
+    pts = []
+    for i in range(n_steps):
+        theta = math.pi * (i / (n_steps - 1))
+        n = radius * math.sin(theta)
+        e = radius * (1.0 - math.cos(theta))
+        pts.append((n, e))
+    return pts
+
+
 def gen_lshape_2x2(spacing: float = 0.25) -> list[tuple[float, float]]:
     """2 m north, then 2 m east. Sharp 90° corner."""
     pts = []
@@ -174,6 +189,7 @@ PATH_GENERATORS = {
     "straight_5m":     gen_straight_5m,
     "straight_3m":     gen_straight_3m,
     "arc_quarter_1m5": gen_arc_quarter_1m5,
+    "arc_half_1m5":    gen_arc_half_1m5,
     "lshape_2x2":      gen_lshape_2x2,
     "square_2x2":      gen_square_2x2,
     "rectangle_3x2":   gen_rectangle_3x2,
