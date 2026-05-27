@@ -16,11 +16,11 @@ Output contract
   Topic:  /mavros/setpoint_raw/local   (mavros_msgs/PositionTarget)
   Rate:   50 Hz, continuous (never gaps; PX4 drops OFFBOARD after 500 ms gap)
   Frame:  FRAME_LOCAL_NED (1)
-  Mask:   2503 (velocity + explicit yaw; ignore positions, accelerations, yaw_rate)
+  Mask:   455 (velocity + explicit yaw + yaw_rate feedforward; ignore positions, accelerations)
           Yaw is computed from velocity direction: yaw_ENU = atan2(v_n, v_e).
-          This gives PX4's yaw controller an explicit target instead of relying
-          on PX4's internal atan2(vE,vN) derivation which leaves trajectory_setpoint
-          yaw as NaN and causes yaw tracking lag on turns.
+          yaw_rate = -yaw_rate_body (NED CW+ → ENU CCW-) from /rpp/yaw_rate_body.
+          Feedforward κ·v eliminates arc outside-drift structural bias caused by
+          yaw controller phase lag on continuous curves.
 
 Frame discipline
 ----------------
@@ -44,6 +44,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 
 from geometry_msgs.msg import Vector3Stamped
 from mavros_msgs.msg import PositionTarget
+from std_msgs.msg import Float32
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +84,15 @@ TYPE_MASK_VELOCITY_AND_YAW = (
     | IGNORE_YAW_RATE
 )  # = 2503 (yaw is NOT ignored)
 
+# P3.1 — Velocity + yaw + yaw_rate feedforward: send vN, vE, vD, yaw, yaw_rate.
+# Adds continuous curvature feedforward (κ·v from RPP) so PX4's yaw controller
+# tracks the arc tangent without phase lag → eliminates outside-drift structural bias.
+# 455 = 2503 - 2048 = IGNORE_YAW_RATE removed from TYPE_MASK_VELOCITY_AND_YAW.
+TYPE_MASK_VEL_YAW_YAWRATE = (
+    IGNORE_PX | IGNORE_PY | IGNORE_PZ
+    | IGNORE_AFX | IGNORE_AFY | IGNORE_AFZ
+)  # = 455 (velocity + yaw + yaw_rate all active)
+
 
 class TwistToSetpointNode(Node):
     """Bridges /rpp/velocity_ned to /mavros/setpoint_raw/local at 50 Hz."""
@@ -106,6 +116,8 @@ class TwistToSetpointNode(Node):
         # ------------------------------------------------------------------
         self._latest_vel: Vector3Stamped | None = None
         self._latest_recv_time = None
+        self._latest_yaw_rate_body: float = 0.0   # NED CW+ rad/s from RPP
+        self._yaw_rate_recv_time = None
         self._last_yaw_cmd: float = 0.0  # Track last yaw for zero-speed hold
         self._published_count = 0
         self._stale_warn_count = 0
@@ -129,6 +141,9 @@ class TwistToSetpointNode(Node):
         self.create_subscription(
             Vector3Stamped, "/rpp/velocity_ned", self._vel_cb, be_qos
         )
+        self.create_subscription(
+            Float32, "/rpp/yaw_rate_body", self._yaw_rate_cb, be_qos
+        )
 
         # ------------------------------------------------------------------
         # 50 Hz stream timer
@@ -137,8 +152,9 @@ class TwistToSetpointNode(Node):
 
         self.get_logger().info(
             f"twist_to_setpoint started — streaming /mavros/setpoint_raw/local "
-            f"at {self.STREAM_HZ} Hz (frame=LOCAL_NED). Source: /rpp/velocity_ned. "
-            f"Explicit yaw from velocity direction (type_mask={TYPE_MASK_VELOCITY_AND_YAW})."
+            f"at {self.STREAM_HZ} Hz (frame=LOCAL_NED). Sources: /rpp/velocity_ned + "
+            f"/rpp/yaw_rate_body. Yaw+yaw_rate feedforward active "
+            f"(type_mask={TYPE_MASK_VEL_YAW_YAWRATE})."
         )
 
     # ------------------------------------------------------------------
@@ -166,6 +182,11 @@ class TwistToSetpointNode(Node):
         self._latest_vel = msg
         self._latest_recv_time = self.get_clock().now()
 
+    def _yaw_rate_cb(self, msg: Float32):
+        if math.isfinite(msg.data):
+            self._latest_yaw_rate_body = msg.data
+            self._yaw_rate_recv_time = self.get_clock().now()
+
     # ------------------------------------------------------------------
     # 50 Hz stream
     # ------------------------------------------------------------------
@@ -176,7 +197,7 @@ class TwistToSetpointNode(Node):
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = ""  # PX4 ignores; coordinate_frame is what matters
         msg.coordinate_frame = FRAME_LOCAL_NED
-        msg.type_mask = TYPE_MASK_VELOCITY_AND_YAW  # Always publish explicit yaw
+        msg.type_mask = TYPE_MASK_VEL_YAW_YAWRATE  # velocity + yaw + yaw_rate feedforward
 
         # Default: zero velocity (safe fail-stop)
         v_n = 0.0
@@ -229,15 +250,24 @@ class TwistToSetpointNode(Node):
             yaw_enu = self._last_yaw_cmd
         msg.yaw = yaw_enu
 
-        # Position, acceleration, yaw_rate are ignored by mask but set
-        # to safe values to avoid uninitialised-memory paranoia.
+        # Position and acceleration: ignored by mask, set to safe values.
         msg.position.x = 0.0
         msg.position.y = 0.0
         msg.position.z = 0.0
         msg.acceleration_or_force.x = 0.0
         msg.acceleration_or_force.y = 0.0
         msg.acceleration_or_force.z = 0.0
-        msg.yaw_rate = 0.0
+
+        # Yaw_rate feedforward: κ·v from RPP (NED CW+) → ENU CCW+ for MAVROS.
+        # Use only if source is fresh (same staleness window as velocity).
+        # If stale or zero-velocity, send 0 (yaw angle alone is sufficient).
+        yaw_rate_age = float("inf")
+        if self._yaw_rate_recv_time is not None:
+            yaw_rate_age = (self.get_clock().now() - self._yaw_rate_recv_time).nanoseconds * 1e-9
+        if source == "rpp" and yaw_rate_age <= max_age:
+            msg.yaw_rate = -self._latest_yaw_rate_body   # NED CW+ → ENU CCW-
+        else:
+            msg.yaw_rate = 0.0
 
         self._sp_pub.publish(msg)
         self._last_yaw_cmd = yaw_enu  # Track for next cycle's zero-speed hold
@@ -247,7 +277,8 @@ class TwistToSetpointNode(Node):
         if self._published_count % (self.STREAM_HZ * 5) == 0:
             self.get_logger().debug(
                 f"streaming [{source}] v=({v_n:+.3f},{v_e:+.3f},{v_d:+.3f}) m/s "
-                f"yaw_enu={yaw_enu:.3f}rad published={self._published_count}"
+                f"yaw_enu={yaw_enu:.3f}rad yaw_rate={msg.yaw_rate:+.3f}rad/s "
+                f"published={self._published_count}"
             )
 
 def main():
