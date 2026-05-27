@@ -249,11 +249,10 @@ class RPPControllerNode(Node):
         # Requires twist_to_setpoint_node to support body-rate output.
         self.declare_parameter("use_feedforward_yaw_rate",            True)
         self.declare_parameter("yaw_rate_feedback_gain",              0.8)  # heading error feedback
-        # Optional clamp on body yaw rate. Match PX4 RO_YAW_RATE_LIM (deg/s)
-        # converted to rad/s so RPP doesn't request more than PX4 will honor.
-        # Default 0.0 disables the clamp (preserves prior behavior).
-        # 0.52 rad/s ≈ 30°/s (PX4 default RO_YAW_RATE_LIM).
-        self.declare_parameter("max_yaw_rate_body",                   0.0)
+        # Clamp on body yaw rate. Match PX4 RO_YAW_RATE_LIM (deg/s) converted
+        # to rad/s so RPP doesn't request more than PX4 will honor.
+        # 0.5 rad/s ≈ 28.6°/s — safe default. Set 0.0 to disable.
+        self.declare_parameter("max_yaw_rate_body",                   0.5)
 
         # Acceleration ramp (P0 polish): cap how fast `speed` can RAMP UP
         # cycle-to-cycle. Prevents motor jerk on mission start and after a
@@ -1200,22 +1199,6 @@ class RPPControllerNode(Node):
             radius = float("inf")
             speed = max_v
 
-        # P3.1 — Feedforward yaw rate (body-rate mode)
-        # ω_ff = κ·v (feedforward from path curvature and speed)
-        # Plus small heading-error feedback to prevent drift.
-        use_ff_yaw_rate = self.get_parameter("use_feedforward_yaw_rate").value
-        if use_ff_yaw_rate:
-            yaw_rate_ff = kappa * speed  # feedforward: κ·v
-            yaw_rate_fb = self.get_parameter("yaw_rate_feedback_gain").value * theta_e
-            yaw_rate_body = yaw_rate_ff + yaw_rate_fb
-            # Optional clamp to PX4 RO_YAW_RATE_LIM (rad/s).
-            # Default param 0.0 disables; recommended 0.52 = 30°/s.
-            max_yr = self.get_parameter("max_yaw_rate_body").value
-            if max_yr > 0.0:
-                yaw_rate_body = self._clamp(yaw_rate_body, -max_yr, max_yr)
-        else:
-            yaw_rate_body = 0.0
-
         # ---- Step 6: Approach scaling near goal ----
         # FIX: Gate approach scaling behind min_goal_travel_m.  Without this,
         # closed-loop paths (e.g. square_2x2) where the start IS the goal
@@ -1249,6 +1232,21 @@ class RPPControllerNode(Node):
 
         # ---- P0.1: persist commanded speed for next cycle's L_d ----
         self._last_speed_cmd = speed
+
+        # ---- P3.1 — Feedforward yaw rate (body-rate mode) ----
+        # Must run AFTER all speed modifications (approach scaling, accel ramp, P4 floor)
+        # so that yaw_rate_ff = κ·v uses the same speed that will actually be commanded.
+        # Computing before approach scaling caused 4× over-command during deceleration.
+        use_ff_yaw_rate = self.get_parameter("use_feedforward_yaw_rate").value
+        if use_ff_yaw_rate:
+            yaw_rate_ff = kappa * speed  # feedforward: κ·v (speed is now fully resolved)
+            yaw_rate_fb = self.get_parameter("yaw_rate_feedback_gain").value * theta_e
+            yaw_rate_body = yaw_rate_ff + yaw_rate_fb
+            max_yr = self.get_parameter("max_yaw_rate_body").value
+            if max_yr > 0.0:
+                yaw_rate_body = self._clamp(yaw_rate_body, -max_yr, max_yr)
+        else:
+            yaw_rate_body = 0.0
 
         # ---- Step 8: Build NED velocity vector ----
         # Direction: unit vector from rover to lookahead point, in NED.
