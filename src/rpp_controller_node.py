@@ -168,12 +168,12 @@ class RPPControllerNode(Node):
         # RPP geometry
         self.declare_parameter("max_linear_vel",                      0.4)
         self.declare_parameter("min_linear_vel",                      0.15)
-        self.declare_parameter("min_lookahead_dist",                  0.30)
-        self.declare_parameter("max_lookahead_dist",                  0.60)
-        self.declare_parameter("lookahead_time",                      1.2)
+        self.declare_parameter("min_lookahead_dist",                  0.20)
+        self.declare_parameter("max_lookahead_dist",                  0.40)
+        self.declare_parameter("lookahead_time",                      0.8)
 
         # Curvature regulation
-        self.declare_parameter("regulated_linear_scaling_min_radius", 0.6)
+        self.declare_parameter("regulated_linear_scaling_min_radius", 3.0)
         self.declare_parameter("regulated_linear_scaling_min_speed",  0.15)
 
         # Goal handling
