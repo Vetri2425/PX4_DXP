@@ -183,7 +183,7 @@ class RPPControllerNode(Node):
         # the rover starts at the final waypoint. Set to 0 to disable.
         self.declare_parameter("min_goal_travel_m",                   0.5)    # m
         self.declare_parameter("approach_velocity_scaling_dist",      0.6)    # m
-        self.declare_parameter("min_approach_linear_velocity",        0.05)
+        self.declare_parameter("min_approach_linear_velocity",        0.1)
         self.declare_parameter("p4_zero_vel_threshold",               0.02)   # m/s; floor speed below this to exactly 0 to trigger PX4 P4
 
         # Safety

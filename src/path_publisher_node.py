@@ -86,6 +86,12 @@ def gen_straight_5m(spacing: float = 0.5) -> list[tuple[float, float]]:
     return [(i * spacing, 0.0) for i in range(n_steps)]
 
 
+def gen_straight_3m(spacing: float = 0.5) -> list[tuple[float, float]]:
+    """3 m straight north, points at `spacing` intervals."""
+    n_steps = int(3.0 / spacing) + 1
+    return [(i * spacing, 0.0) for i in range(n_steps)]
+
+
 def gen_arc_quarter_1m5(radius: float = 1.5, arc_spacing: float = 0.1) \
         -> list[tuple[float, float]]:
     """Quarter circle, radius 1.5 m. Starts heading north at origin,
@@ -166,6 +172,7 @@ def gen_circle_1m5(radius: float = 1.5, arc_spacing: float = 0.1) \
 
 PATH_GENERATORS = {
     "straight_5m":     gen_straight_5m,
+    "straight_3m":     gen_straight_3m,
     "arc_quarter_1m5": gen_arc_quarter_1m5,
     "lshape_2x2":      gen_lshape_2x2,
     "square_2x2":      gen_square_2x2,
