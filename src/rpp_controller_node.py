@@ -174,7 +174,7 @@ class RPPControllerNode(Node):
 
         # Curvature regulation
         self.declare_parameter("regulated_linear_scaling_min_radius", 3.0)
-        self.declare_parameter("regulated_linear_scaling_min_speed",  0.15)
+        self.declare_parameter("regulated_linear_scaling_min_speed",  0.05)
 
         # Goal handling
         self.declare_parameter("xy_goal_tolerance",                   0.02)   # 2 cm
@@ -213,7 +213,7 @@ class RPPControllerNode(Node):
         # L_d = clamp(lookahead_time * v + xtrack_lookahead_gain * |e_⊥|, L_min, L_max)
         # Set 0.0 to disable the cross-track term (pure velocity-scaled).
         # 1.0 means a 10 cm cross-track adds 10 cm of lookahead.
-        self.declare_parameter("xtrack_lookahead_gain",               1.0)
+        self.declare_parameter("xtrack_lookahead_gain",               0.3)
 
         # P1.3 — Path conditioning on receipt
         # path_resample_spacing_m: if > 0, linearly resample the path to this
@@ -1187,9 +1187,8 @@ class RPPControllerNode(Node):
         # corners — the rover slows BEFORE entering them, not as it enters.
         # If preview_curvature_n <= 1 this falls back to baseline behaviour.
         if n_preview > 1:
-            kappa_speed = max(abs(kappa),
-                              self._max_preview_curvature(seg_idx, foot_n, foot_e,
-                                                          l_d, n_preview))
+            kappa_speed = self._max_preview_curvature(seg_idx, foot_n, foot_e,
+                                                      l_d, n_preview)
         else:
             kappa_speed = abs(kappa)
 
