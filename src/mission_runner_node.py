@@ -107,6 +107,9 @@ class MissionRunnerNode(Node):
         self.declare_parameter("stream_warmup_s",     1.5)   # stream before OFFBOARD
         self.declare_parameter("mode_switch_timeout_s", 5.0)
         self.declare_parameter("dry_run",            False)  # if true, never actually arms
+        self.declare_parameter("post_offboard_settle_s", 3.0)  # min wait after OFFBOARD before arm
+        self.declare_parameter("arm_max_retries",        3)    # retry arm this many times
+        self.declare_parameter("arm_retry_delay_s",      5.0)  # seconds between retries
 
         # ------------------------------------------------------------------
         # State
@@ -120,6 +123,8 @@ class MissionRunnerNode(Node):
         self._pending_future = None   # active service call future
         self._future_t0 = None        # timestamp when future was created
         self._running_t0: float | None = None  # wall time when RUNNING entered
+        self._arm_attempts = 0        # number of arm attempts made
+        self._arm_retry_t0: float | None = None  # wall time of last arm rejection
 
         # ------------------------------------------------------------------
         # QoS
@@ -206,10 +211,14 @@ class MissionRunnerNode(Node):
         self._rpp_debug = msg
 
     def _statustext_cb(self, msg: StatusText):
-        """Log PX4 statustext during RUNNING — shows exact failsafe reason."""
-        if self._phase in (MissionPhase.RUNNING, MissionPhase.ABORTED):
+        """Log PX4 statustext during any active phase — shows arm rejections and failsafe reasons."""
+        _quiet = (MissionPhase.INIT, MissionPhase.WAIT_FCU, MissionPhase.WAIT_STREAM,
+                  MissionPhase.FINISHED)
+        if self._phase not in _quiet:
             elapsed = (self.get_clock().now() - self._mission_t0).nanoseconds * 1e-9
-            self.get_logger().warn(f"PX4 [{msg.severity}] t={elapsed:.2f}s: {msg.text}")
+            self.get_logger().warn(
+                f"PX4 [{msg.severity}] t={elapsed:.2f}s [{self._phase.name}]: {msg.text}"
+            )
 
     # ==================================================================
     # Non-blocking service call helpers
@@ -330,41 +339,36 @@ class MissionRunnerNode(Node):
                 self._phase = MissionPhase.WAIT_POSITION
 
         elif self._phase == MissionPhase.WAIT_POSITION:
-            # Wait until RPP reports TRACKING (state=1) — confirms EKF has valid
-            # position. Without this, arming is rejected when EKF hasn't fused
-            # GPS yet (EKF2_REQ_GPS_H timeout). Timeout = mode_switch_timeout_s.
+            # Wait until (a) RPP reports TRACKING (state=1) and (b) post_offboard_settle_s
+            # has elapsed. The settle guard prevents arm rejection when EKF is still
+            # stabilising after OFFBOARD switch (common on second run without reboot).
             rpp_state = int(self._rpp_debug.data[7]) if (
                 self._rpp_debug and len(self._rpp_debug.data) >= 8) else -99
-            if rpp_state == 1:
-                wait_s = (self.get_clock().now() - self._phase_t0).nanoseconds * 1e-9
+            wait_s = (self.get_clock().now() - self._phase_t0).nanoseconds * 1e-9
+            settle = self.get_parameter("post_offboard_settle_s").value
+            pos_timeout = self.get_parameter("mode_switch_timeout_s").value
+
+            if rpp_state == 1 and wait_s >= settle:
                 self.get_logger().info(
-                    f"EKF position valid — RPP TRACKING after {wait_s:.1f}s — arming")
+                    f"EKF position valid — RPP TRACKING, settled {wait_s:.1f}s — arming")
                 self._phase = MissionPhase.ARM
+            elif rpp_state == 1:
+                self.get_logger().info(
+                    f"RPP TRACKING — EKF settling ({wait_s:.1f}s/{settle:.1f}s)...",
+                    throttle_duration_sec=1.0,
+                )
+            elif wait_s > pos_timeout:
+                self.get_logger().error(
+                    f"EKF position not valid after {pos_timeout:.0f}s "
+                    f"(RPP state={rpp_state}) — aborting. "
+                    f"Check EKF2_REQ_GPS_H (should be 1.0, not 10.0)."
+                )
+                self._phase = MissionPhase.ABORTED
             else:
-                t = (self.get_clock().now() - self._phase_t0).nanoseconds * 1e-9
-                pos_timeout = self.get_parameter("mode_switch_timeout_s").value
-                if t > pos_timeout:
-                    self.get_logger().error(
-                        f"EKF position not valid after {pos_timeout:.0f}s "
-                        f"(RPP state={rpp_state}) — aborting. "
-                        f"Check EKF2_REQ_GPS_H (should be 1.0, not 10.0)."
-                    )
-                    self._phase = MissionPhase.ABORTED
-                elif int(t) % 3 == 0 and t > 0.9:
-                    self.get_logger().info(
-                        f"Waiting for EKF position (RPP state={rpp_state}, "
-                        f"t={t:.1f}s)...",
-                        throttle_duration_sec=3.0,
-                    )
-                else:
-                    mode_timeout = self.get_parameter("mode_switch_timeout_s").value
-                    t = (self.get_clock().now() - self._phase_t0).nanoseconds * 1e-9
-                    if t > mode_timeout:
-                        mode = self._fcu_state.mode if self._fcu_state else "unknown"
-                        self.get_logger().error(
-                            f"OFFBOARD not confirmed after {mode_timeout}s (still {mode}) — aborting"
-                        )
-                        self._phase = MissionPhase.ABORTED
+                self.get_logger().info(
+                    f"Waiting for EKF position (RPP state={rpp_state}, t={wait_s:.1f}s)...",
+                    throttle_duration_sec=3.0,
+                )
 
         elif self._phase == MissionPhase.ARM:
             if self.get_parameter("dry_run").value:
@@ -379,6 +383,19 @@ class MissionRunnerNode(Node):
                 self._phase = MissionPhase.EXIT_MANUAL
 
         elif self._phase == MissionPhase.CONFIRM_ARM:
+            # If we're in a retry backoff, just wait
+            if self._arm_retry_t0 is not None:
+                retry_delay = self.get_parameter("arm_retry_delay_s").value
+                waited = time.time() - self._arm_retry_t0
+                if waited >= retry_delay:
+                    self._arm_retry_t0 = None
+                    self.get_logger().info(
+                        f"Arm retry attempt {self._arm_attempts + 1}/"
+                        f"{self.get_parameter('arm_max_retries').value}..."
+                    )
+                    self._phase = MissionPhase.ARM
+                return
+
             if self._future_done():
                 r = self._pending_future.result()
                 self._clear_future()
@@ -388,8 +405,23 @@ class MissionRunnerNode(Node):
                     self._running_t0 = time.time()
                     self._phase = MissionPhase.RUNNING
                 else:
-                    self.get_logger().error("Arm rejected (set COM_ARM_WO_GPS=1 if no fix)")
-                    self._phase = MissionPhase.EXIT_MANUAL
+                    self._arm_attempts += 1
+                    max_retries = self.get_parameter("arm_max_retries").value
+                    retry_delay = self.get_parameter("arm_retry_delay_s").value
+                    if self._arm_attempts < max_retries:
+                        self.get_logger().warn(
+                            f"Arm rejected (attempt {self._arm_attempts}/{max_retries}) — "
+                            f"retrying in {retry_delay:.0f}s. "
+                            f"See PX4 statustext above for reason."
+                        )
+                        self._arm_retry_t0 = time.time()
+                        # stay in CONFIRM_ARM — retry timer will flip back to ARM
+                    else:
+                        self.get_logger().error(
+                            f"Arm rejected after {self._arm_attempts} attempts — aborting. "
+                            f"See PX4 statustext above for exact reason."
+                        )
+                        self._phase = MissionPhase.EXIT_MANUAL
             elif self._future_timed_out():
                 self._clear_future()
                 self.get_logger().error("Arm: timeout")
