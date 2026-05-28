@@ -169,12 +169,12 @@ class RPPControllerNode(Node):
         # RPP geometry
         self.declare_parameter("max_linear_vel",                      0.4)
         self.declare_parameter("min_linear_vel",                      0.15)
-        self.declare_parameter("min_lookahead_dist",                  0.35)
+        self.declare_parameter("min_lookahead_dist",                  0.4)
         self.declare_parameter("max_lookahead_dist",                  0.60)
         self.declare_parameter("lookahead_time",                      1.5)
 
         # Curvature regulation
-        self.declare_parameter("regulated_linear_scaling_min_radius", 3.0)
+        self.declare_parameter("regulated_linear_scaling_min_radius", 1.0)
         self.declare_parameter("regulated_linear_scaling_min_speed",  0.15)
 
         # Goal handling
@@ -208,7 +208,7 @@ class RPPControllerNode(Node):
         # Speed is regulated by max(|κ|) over the previews, not just the
         # one at L_d. 3 previews is the Nav2 default and a good compromise.
         # Set 1 to disable (matches baseline RPP).
-        self.declare_parameter("preview_curvature_n",                 3)
+        self.declare_parameter("preview_curvature_n",                 4)
 
         # P1.2 — Adaptive lookahead based on cross-track error
         # L_d = clamp(lookahead_time * v + xtrack_lookahead_gain * |e_⊥|, L_min, L_max)
@@ -227,8 +227,8 @@ class RPPControllerNode(Node):
         #   corners with a warning. 0.0 disables.
         # corner_smooth_arc_pts: number of points used to discretise each
         #   inscribed arc (only used when corner_smooth_radius_m > 0).
-        self.declare_parameter("path_resample_spacing_m",             0.0)
-        self.declare_parameter("corner_smooth_radius_m",              0.0)
+        self.declare_parameter("path_resample_spacing_m",             0.08)
+        self.declare_parameter("corner_smooth_radius_m",              0.5)
         self.declare_parameter("corner_smooth_arc_pts",               6)
 
         # P2.4 — Velocity-based pose extrapolation (latency closure)
@@ -249,11 +249,11 @@ class RPPControllerNode(Node):
         # Bypasses spot-turn FSM, smoother corners, better rate tracking.
         # Requires twist_to_setpoint_node to support body-rate output.
         self.declare_parameter("use_feedforward_yaw_rate",            True)
-        self.declare_parameter("yaw_rate_feedback_gain",              0.8)  # heading error feedback
+        self.declare_parameter("yaw_rate_feedback_gain",              1.2)  # heading error feedback
         # Clamp on body yaw rate. Match PX4 RO_YAW_RATE_LIM (deg/s) converted
         # to rad/s so RPP doesn't request more than PX4 will honor.
         # 0.5 rad/s ≈ 28.6°/s — safe default. Set 0.0 to disable.
-        self.declare_parameter("max_yaw_rate_body",                   0.5)
+        self.declare_parameter("max_yaw_rate_body",                   1.0)
 
         # Acceleration ramp (P0 polish): cap how fast `speed` can RAMP UP
         # cycle-to-cycle. Prevents motor jerk on mission start and after a
