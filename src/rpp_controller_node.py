@@ -107,6 +107,7 @@ Topic:  /rpp/debug   (std_msgs/Float32MultiArray, layout encoded below)
         [7]  state_code           (see StateCode below; backward compatible)
         [8]  l_d_raw_m            (B1: requested Ld before clamp; saturation visible)
         [9]  kappa_speed          (B1: worst preview κ used for speed scaling)
+        [10] yaw_rate_cmd_rad_s   (P3.1: final clamped body yaw rate cmd; 0 if FF disabled)
 Layout is append-only: indices [0..7] keep their meaning forever. Consumers
 that only read [0..7] continue to work.
 
@@ -1283,8 +1284,9 @@ class RPPControllerNode(Node):
             dist_goal=dist_to_goal,
             pose_age_ms=pose_age_s * 1000,
             state=state_code,
-            l_d_raw=l_d_raw,           # B1
-            kappa_speed=kappa_speed,   # B1
+            l_d_raw=l_d_raw,                   # B1
+            kappa_speed=kappa_speed,           # B1
+            yaw_rate=yaw_rate_body,            # P3.1
         )
 
         self.get_logger().debug(
@@ -1335,6 +1337,7 @@ class RPPControllerNode(Node):
             state=state,
             l_d_raw=float("nan"),       # B1
             kappa_speed=float("nan"),   # B1
+            yaw_rate=0.0,               # P3.1
         )
 
     def _publish_debug(
@@ -1349,17 +1352,19 @@ class RPPControllerNode(Node):
         state: StateCode,
         l_d_raw: float = float("nan"),       # B1: requested Ld before clamp
         kappa_speed: float = float("nan"),   # B1: predictive κ used for speed
+        yaw_rate: float = 0.0,               # P3.1: final clamped body yaw rate cmd
     ):
         """Publish /rpp/debug Float32MultiArray.
 
         Layout is append-only — indices [0..7] retained verbatim from the
         original 8-field schema so existing consumers (xtrack_logger,
         mission_runner, server/ros_node, server/main, server/rpp_status)
-        continue to work without changes. New B1 fields are at [8..9].
+        continue to work without changes. New B1 fields are at [8..9],
+        P3.1 field at [10].
         """
         msg = Float32MultiArray()
         msg.layout.dim.append(MultiArrayDimension(label="rpp_debug",
-                                                  size=10, stride=10))
+                                                  size=11, stride=11))
         msg.data = [
             float(cross_track),     # [0]  cross_track_error_m, signed
             float(heading_err),     # [1]  heading_error_rad
@@ -1371,6 +1376,7 @@ class RPPControllerNode(Node):
             float(state.value),     # [7]  state_code
             float(l_d_raw),         # [8]  l_d_raw_m       (B1)
             float(kappa_speed),     # [9]  kappa_speed     (B1)
+            float(yaw_rate),        # [10] yaw_rate_cmd_rad_s (P3.1)
         ]
         self._dbg_pub.publish(msg)
 

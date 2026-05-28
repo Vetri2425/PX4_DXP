@@ -37,6 +37,7 @@ CSV columns
   v_ned_e_m_s          Velocity setpoint East
   mavros_v_n_m_s       Final MAVROS setpoint vN (from /mavros/setpoint_raw/local)
   mavros_v_e_m_s       Final MAVROS setpoint vE
+  yaw_rate_cmd_rad_s   Body yaw rate command (P3.1 feedforward; 0 if disabled) [from /rpp/debug[10]]
 
 Output path
 -----------
@@ -112,6 +113,7 @@ class XTrackLoggerNode(Node):
             "v_ned_n_m_s", "v_ned_e_m_s",
             "mavros_v_n_m_s", "mavros_v_e_m_s",
             "l_d_raw_m", "kappa_speed",     # B1
+            "yaw_rate_cmd_rad_s",           # P3.1
         ])
         self._csv_file.flush()
 
@@ -204,12 +206,12 @@ class XTrackLoggerNode(Node):
         # --- /rpp/debug fields ---
         # B1: layout is now 10 fields. Tolerate 8-field producers (legacy
         # builds, replays of old bag files) by padding with NaN.
-        if self._debug and len(self._debug.data) >= 10:
+        if self._debug and len(self._debug.data) >= 11:
             dbg = list(self._debug.data)
         elif self._debug and len(self._debug.data) >= 8:
-            dbg = list(self._debug.data) + [float("nan")] * (10 - len(self._debug.data))
+            dbg = list(self._debug.data) + [float("nan")] * (11 - len(self._debug.data))
         else:
-            dbg = [float("nan")] * 10
+            dbg = [float("nan")] * 11
         xtrack_signed_cm = dbg[0] * 100.0 if math.isfinite(dbg[0]) else float("nan")
         heading_err_deg = math.degrees(dbg[1]) if math.isfinite(dbg[1]) else float("nan")
         lookahead = dbg[2]
@@ -220,6 +222,7 @@ class XTrackLoggerNode(Node):
         rpp_state = int(dbg[7]) if math.isfinite(dbg[7]) else -99
         l_d_raw = dbg[8]                         # B1
         kappa_speed = dbg[9]                     # B1
+        yaw_rate_cmd = dbg[10]                   # P3.1
 
         # --- /rpp/velocity_ned ---
         if self._vel_ned:
@@ -246,6 +249,7 @@ class XTrackLoggerNode(Node):
             f"{v_ned_n:.4f}", f"{v_ned_e:.4f}",
             f"{mv_n:.4f}", f"{mv_e:.4f}",
             f"{l_d_raw:.3f}", f"{kappa_speed:.4f}",   # B1
+            f"{yaw_rate_cmd:.4f}",                    # P3.1
         ])
 
         # Flush every ~1s so partial logs survive a Ctrl-C
