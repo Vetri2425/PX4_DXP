@@ -356,15 +356,15 @@ class MissionRunnerNode(Node):
                         f"t={t:.1f}s)...",
                         throttle_duration_sec=3.0,
                     )
-            else:
-                mode_timeout = self.get_parameter("mode_switch_timeout_s").value
-                t = (self.get_clock().now() - self._phase_t0).nanoseconds * 1e-9
-                if t > mode_timeout:
-                    mode = self._fcu_state.mode if self._fcu_state else "unknown"
-                    self.get_logger().error(
-                        f"OFFBOARD not confirmed after {mode_timeout}s (still {mode}) — aborting"
-                    )
-                    self._phase = MissionPhase.ABORTED
+                else:
+                    mode_timeout = self.get_parameter("mode_switch_timeout_s").value
+                    t = (self.get_clock().now() - self._phase_t0).nanoseconds * 1e-9
+                    if t > mode_timeout:
+                        mode = self._fcu_state.mode if self._fcu_state else "unknown"
+                        self.get_logger().error(
+                            f"OFFBOARD not confirmed after {mode_timeout}s (still {mode}) — aborting"
+                        )
+                        self._phase = MissionPhase.ABORTED
 
         elif self._phase == MissionPhase.ARM:
             if self.get_parameter("dry_run").value:
