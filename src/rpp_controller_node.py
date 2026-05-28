@@ -50,6 +50,20 @@ Sprint 2 upgrades vs Sprint 1
           curvature at κ_max = 1/r. Skips vertices where adjacent segments
           are too short to support the radius.
 
+Phase D / P4.1–P4.2 — dynamics-aware speed control
+-----------------------------------------------------
+  P4.1  Lateral acceleration constraint: speed = min(max_v, sqrt(a_lat_max/|κ|)),
+        floored at regulated_linear_scaling_min_speed. Replaces the old linear
+        R/min_radius scaling with the physically correct form. At a_lat_max=0.3:
+        straight→1.0 m/s, R=1m→0.55 m/s, R=0.5m→0.39 m/s, R=0.3m→0.30 m/s.
+        Tune a_lat_max; the old regulated_linear_scaling_min_radius is removed.
+  P4.2  Mission speed — single operator knob (ros2 param set mission_speed X.X).
+        max_linear_vel is the hardware ceiling (never touch per-job).
+        mission_speed is what you set per job: 1.0 for roads, 0.4 for fields.
+        approach_velocity_scaling_dist and ekf_jump_threshold_m auto-derive from
+        mission_speed at runtime (physics: d=v²/2a, thr=v/Hz+σ_RTK). The
+        configured param values act as floors — never silently undersized.
+
 Phase C / P3.1 — opt-in upgrades (default OFF for backward compat)
 -----------------------------------------------------------------------
   P0.5  REMOVED 2026-05-23: yaw is now computed in twist_to_setpoint_node from
@@ -167,15 +181,18 @@ class RPPControllerNode(Node):
         # Parameters (all tunable at launch / runtime via ros2 param)
         # ------------------------------------------------------------------
         # RPP geometry
-        self.declare_parameter("max_linear_vel",                      0.4)
+        self.declare_parameter("max_linear_vel",                      1.0)
         self.declare_parameter("min_linear_vel",                      0.15)
         self.declare_parameter("min_lookahead_dist",                  0.4)
-        self.declare_parameter("max_lookahead_dist",                  0.60)
+        self.declare_parameter("max_lookahead_dist",                  1.5)
         self.declare_parameter("lookahead_time",                      1.5)
 
-        # Curvature regulation
-        self.declare_parameter("regulated_linear_scaling_min_radius", 1.0)
-        self.declare_parameter("regulated_linear_scaling_min_speed",  0.15)
+        # Curvature regulation — lateral acceleration constraint (P4.1)
+        # v_lat_limit = sqrt(a_lat_max / |kappa|); physically correct form.
+        # Replaces the old linear R/min_radius scaling.
+        # At a_lat_max=0.3: R=1m→0.55m/s, R=0.5m→0.39m/s, R=0.3m→0.30m/s.
+        self.declare_parameter("a_lat_max",                           0.3)   # m/s²
+        self.declare_parameter("regulated_linear_scaling_min_speed",  0.3)
 
         # Goal handling
         self.declare_parameter("xy_goal_tolerance",                   0.02)   # 2 cm
@@ -261,6 +278,21 @@ class RPPControllerNode(Node):
         # relies on instantaneous step-to-zero to trigger PX4 P4 yaw freeze
         # at the goal. Set to 0.0 to disable.
         self.declare_parameter("max_linear_accel",                    0.5)  # m/s²
+
+        # P4.2 — Mission speed (operator-facing, set per job via ros2 param set)
+        # This is the single knob the operator touches. It is capped by
+        # max_linear_vel (hardware ceiling). Dependent params — approach distance
+        # and EKF jump threshold — are derived from this value at runtime so the
+        # operator never has to touch them.
+        # Roads/large fields: 1.0 m/s  |  Sports fields/tight marking: 0.3–0.5 m/s
+        self.declare_parameter("mission_speed",                       1.0)  # m/s
+
+        # P4.2 — Deceleration limit used ONLY for braking-distance derivation.
+        # Separate from max_linear_accel because the accel ramp is one-way
+        # (decel is unbounded in the control loop by design — P4 goal freeze).
+        # This param tells the approach-zone calculator how quickly the rover
+        # can realistically stop. Default matches max_linear_accel.
+        self.declare_parameter("max_linear_decel",                    0.5)  # m/s²
 
         # ------------------------------------------------------------------
         # Internal state
@@ -492,15 +524,34 @@ class RPPControllerNode(Node):
         the jump guard and the rover will refuse to drive. Surfacing this at
         boot prevents a 20-minute "why won't it move" debug session.
         """
-        max_v = float(self.get_parameter("max_linear_vel").value)
-        jump_thr = float(self.get_parameter("ekf_jump_threshold_m").value)
-        recommended = max_v / self.CONTROL_HZ + 0.03
-        if recommended > jump_thr:
-            self.get_logger().warn(
-                f"ekf_jump_threshold_m={jump_thr:.3f} m is too tight for "
-                f"max_linear_vel={max_v:.2f} m/s at {self.CONTROL_HZ} Hz. "
-                f"Recommend ekf_jump_threshold_m >= {recommended:.3f} m, "
-                f"or you'll see false-positive JUMP_SKIPs during normal motion."
+        # P4.2: ekf_jump_threshold is auto-derived each cycle as
+        # max(param, mission_speed/Hz + 0.03), so the manual param is
+        # a floor. Log the effective threshold at current mission_speed.
+        mission_v = float(self.get_parameter("mission_speed").value)
+        hw_max_v = float(self.get_parameter("max_linear_vel").value)
+        max_v = min(hw_max_v, mission_v)
+        jump_thr_param = float(self.get_parameter("ekf_jump_threshold_m").value)
+        jump_thr_derived = max_v / self.CONTROL_HZ + 0.03
+        jump_thr_eff = max(jump_thr_param, jump_thr_derived)
+        self.get_logger().info(
+            f"P4.2 jump threshold: param={jump_thr_param:.3f}m, "
+            f"derived={jump_thr_derived:.3f}m (at mission_speed={max_v:.2f}m/s), "
+            f"effective={jump_thr_eff:.3f}m"
+        )
+
+        # P4.1 lateral-accel constraint info: log the effective speed at
+        # representative radii so the operator can verify tuning at boot.
+        a_lat = float(self.get_parameter("a_lat_max").value)
+        min_curv_v = float(self.get_parameter("regulated_linear_scaling_min_speed").value)
+        if a_lat > 0.0:
+            # kappa = 1/R; v_lat = sqrt(a_lat / kappa) = sqrt(a_lat * R)
+            v_r1  = max(min_curv_v, min(max_v, math.sqrt(a_lat * 1.0)))
+            v_r05 = max(min_curv_v, min(max_v, math.sqrt(a_lat * 0.5)))
+            v_r03 = max(min_curv_v, min(max_v, math.sqrt(a_lat * 0.3)))
+            self.get_logger().info(
+                f"P4.1 lat-accel: a_lat_max={a_lat:.2f} m/s² → "
+                f"R=1.0m:{v_r1:.2f}m/s  R=0.5m:{v_r05:.2f}m/s  R=0.3m:{v_r03:.2f}m/s  "
+                f"straight:{max_v:.2f}m/s  floor:{min_curv_v:.2f}m/s"
             )
 
         # Min-approach vs P4-floor invariant: the P4 floor must be BELOW the
@@ -977,22 +1028,40 @@ class RPPControllerNode(Node):
     def _control_loop(self):
         """Compute and publish NED velocity vector."""
         # ---- Read parameters (allows runtime tuning) ----
-        max_v       = self.get_parameter("max_linear_vel").value
+        hw_max_v    = self.get_parameter("max_linear_vel").value           # hardware ceiling
+        mission_v   = self.get_parameter("mission_speed").value           # P4.2 operator knob
+        max_v       = min(hw_max_v, mission_v)                            # effective ceiling
         min_v       = self.get_parameter("min_linear_vel").value
         l_min       = self.get_parameter("min_lookahead_dist").value
         l_max       = self.get_parameter("max_lookahead_dist").value
         ld_gain     = self.get_parameter("lookahead_time").value
-        min_radius  = self.get_parameter("regulated_linear_scaling_min_radius").value
+        a_lat_max   = self.get_parameter("a_lat_max").value               # P4.1
         min_curv_v  = self.get_parameter("regulated_linear_scaling_min_speed").value
         goal_tol    = self.get_parameter("xy_goal_tolerance").value
-        approach_d  = self.get_parameter("approach_velocity_scaling_dist").value
         approach_v  = self.get_parameter("min_approach_linear_velocity").value
         p4_floor    = self.get_parameter("p4_zero_vel_threshold").value
         max_age_s   = self.get_parameter("pose_max_age_s").value
-        jump_thr    = self.get_parameter("ekf_jump_threshold_m").value   # P0.2
-        req_rtk     = self.get_parameter("require_rtk_fix").value        # P0.3
+        req_rtk     = self.get_parameter("require_rtk_fix").value         # P0.3
         n_preview   = int(self.get_parameter("preview_curvature_n").value)  # P1.1
-        xt_ld_gain  = self.get_parameter("xtrack_lookahead_gain").value  # P1.2
+        xt_ld_gain  = self.get_parameter("xtrack_lookahead_gain").value   # P1.2
+
+        # P4.2 — Derive speed-dependent params from mission_speed at runtime.
+        # Operator only sets mission_speed; these follow automatically.
+
+        # Braking distance: d = v² / (2·a_decel) + 0.10m safety margin.
+        # max(param, derived) so the configured value acts as a minimum floor.
+        max_decel   = self.get_parameter("max_linear_decel").value
+        approach_d  = max(
+            self.get_parameter("approach_velocity_scaling_dist").value,
+            (max_v * max_v) / (2.0 * max_decel) + 0.10,
+        )
+
+        # EKF jump threshold: per-cycle physical max = mission_speed / Hz + 3σ_RTK.
+        # max(param, derived) keeps the manual param as a hard floor.
+        jump_thr    = max(                                                # P0.2 + P4.2
+            self.get_parameter("ekf_jump_threshold_m").value,
+            max_v / self.CONTROL_HZ + 0.03,
+        )
 
         # ---- Pose freshness check ----
         # P2.4 fixup: when use_imu_extrapolation is on, allow `pose_age` up to
@@ -1192,12 +1261,14 @@ class RPPControllerNode(Node):
         else:
             kappa_speed = abs(kappa)
 
+        # P4.1 — Lateral acceleration constraint: v ≤ sqrt(a_lat_max / |κ|).
+        # Physically correct form of the curvature speed limit. Replaces the
+        # old linear R/min_radius scaling which underestimated speed at large
+        # radii and was not grounded in vehicle dynamics.
         if kappa_speed > 1e-9:
-            radius = 1.0 / kappa_speed
-            speed_scale = self._clamp(radius / min_radius, 0.0, 1.0)
-            speed = max(min_curv_v, max_v * speed_scale)
+            v_lat_limit = math.sqrt(a_lat_max / kappa_speed)
+            speed = self._clamp(min(max_v, v_lat_limit), min_curv_v, max_v)
         else:
-            radius = float("inf")
             speed = max_v
 
         # ---- Step 6: Approach scaling near goal ----
@@ -1289,10 +1360,11 @@ class RPPControllerNode(Node):
             yaw_rate=yaw_rate_body,            # P3.1
         )
 
+        r_eff = (1.0 / kappa_speed) if kappa_speed > 1e-9 else float("inf")
         self.get_logger().debug(
             f"[{state_code.name}] xtrack={signed_xtrack * 100:+.2f}cm "
             f"ld={l_actual:.2f}m(req={l_d:.2f}) κ={kappa:+.3f} κ_pred={kappa_speed:.3f} "
-            f"R={radius if radius != float('inf') else -1:.2f}m "
+            f"R={r_eff if r_eff != float('inf') else -1:.2f}m "
             f"v=({v_n:+.3f},{v_e:+.3f})m/s speed={speed:.3f} "
             f"θe={math.degrees(theta_e):+.1f}° dgoal={dist_to_goal * 100:.1f}cm "
             f"hint={self._closest_seg_hint} fix={self._gps_fix_type} "
