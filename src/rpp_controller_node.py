@@ -169,12 +169,12 @@ class RPPControllerNode(Node):
         # RPP geometry
         self.declare_parameter("max_linear_vel",                      0.4)
         self.declare_parameter("min_linear_vel",                      0.15)
-        self.declare_parameter("min_lookahead_dist",                  0.25)
+        self.declare_parameter("min_lookahead_dist",                  0.35)
         self.declare_parameter("max_lookahead_dist",                  0.60)
-        self.declare_parameter("lookahead_time",                      0.6)
+        self.declare_parameter("lookahead_time",                      1.5)
 
         # Curvature regulation
-        self.declare_parameter("regulated_linear_scaling_min_radius", 1.5)
+        self.declare_parameter("regulated_linear_scaling_min_radius", 3.0)
         self.declare_parameter("regulated_linear_scaling_min_speed",  0.15)
 
         # Goal handling
@@ -228,7 +228,7 @@ class RPPControllerNode(Node):
         # corner_smooth_arc_pts: number of points used to discretise each
         #   inscribed arc (only used when corner_smooth_radius_m > 0).
         self.declare_parameter("path_resample_spacing_m",             0.0)
-        self.declare_parameter("corner_smooth_radius_m",              0.2)
+        self.declare_parameter("corner_smooth_radius_m",              0.0)
         self.declare_parameter("corner_smooth_arc_pts",               6)
 
         # P2.4 — Velocity-based pose extrapolation (latency closure)
@@ -248,7 +248,7 @@ class RPPControllerNode(Node):
         # via OFFBOARD body-rate mode instead of relying on heading PID.
         # Bypasses spot-turn FSM, smoother corners, better rate tracking.
         # Requires twist_to_setpoint_node to support body-rate output.
-        self.declare_parameter("use_feedforward_yaw_rate",            True)
+        self.declare_parameter("use_feedforward_yaw_rate",            False)
         self.declare_parameter("yaw_rate_feedback_gain",              0.8)  # heading error feedback
         # Clamp on body yaw rate. Match PX4 RO_YAW_RATE_LIM (deg/s) converted
         # to rad/s so RPP doesn't request more than PX4 will honor.
