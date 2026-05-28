@@ -187,7 +187,7 @@ class RPPControllerNode(Node):
         self.declare_parameter("p4_zero_vel_threshold",               0.02)   # m/s; floor speed below this to exactly 0 to trigger PX4 P4
 
         # Safety
-        self.declare_parameter("pose_max_age_s",                      0.3)    # 200 ms staleness threshold
+        self.declare_parameter("pose_max_age_s",                      0.5)    # 200 ms staleness threshold
         self.declare_parameter("path_frame_id",                       "local_ned")
 
         # P0.2 — EKF / position-jump detection
@@ -227,7 +227,7 @@ class RPPControllerNode(Node):
         # corner_smooth_arc_pts: number of points used to discretise each
         #   inscribed arc (only used when corner_smooth_radius_m > 0).
         self.declare_parameter("path_resample_spacing_m",             0.0)
-        self.declare_parameter("corner_smooth_radius_m",              0.0)
+        self.declare_parameter("corner_smooth_radius_m",              0.2)
         self.declare_parameter("corner_smooth_arc_pts",               6)
 
         # P2.4 — Velocity-based pose extrapolation (latency closure)
