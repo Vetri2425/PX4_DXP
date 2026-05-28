@@ -48,7 +48,9 @@ run_capture() {
 source_ros() {
     if [[ -f /opt/ros/humble/setup.bash ]]; then
         # shellcheck disable=SC1091
+        set +u  # ROS setup scripts reference unbound vars internally
         source /opt/ros/humble/setup.bash
+        set -u
     else
         log "WARN: /opt/ros/humble/setup.bash not found"
     fi
