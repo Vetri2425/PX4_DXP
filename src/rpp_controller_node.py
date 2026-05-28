@@ -168,12 +168,12 @@ class RPPControllerNode(Node):
         # RPP geometry
         self.declare_parameter("max_linear_vel",                      0.4)
         self.declare_parameter("min_linear_vel",                      0.15)
-        self.declare_parameter("min_lookahead_dist",                  0.35)
+        self.declare_parameter("min_lookahead_dist",                  0.25)
         self.declare_parameter("max_lookahead_dist",                  0.60)
-        self.declare_parameter("lookahead_time",                      1.5)
+        self.declare_parameter("lookahead_time",                      0.6)
 
         # Curvature regulation
-        self.declare_parameter("regulated_linear_scaling_min_radius", 3.0)
+        self.declare_parameter("regulated_linear_scaling_min_radius", 1.5)
         self.declare_parameter("regulated_linear_scaling_min_speed",  0.15)
 
         # Goal handling
@@ -187,7 +187,7 @@ class RPPControllerNode(Node):
         self.declare_parameter("p4_zero_vel_threshold",               0.02)   # m/s; floor speed below this to exactly 0 to trigger PX4 P4
 
         # Safety
-        self.declare_parameter("pose_max_age_s",                      0.2)    # 200 ms staleness threshold
+        self.declare_parameter("pose_max_age_s",                      0.3)    # 200 ms staleness threshold
         self.declare_parameter("path_frame_id",                       "local_ned")
 
         # P0.2 — EKF / position-jump detection
