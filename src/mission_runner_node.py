@@ -67,6 +67,7 @@ class MissionPhase(Enum):
     SWITCH_OFFBOARD = "SWITCH_OFFBOARD"
     CONFIRM_OFFBOARD = "CONFIRM_OFFBOARD"
     WAIT_OFFBOARD_STATE = "WAIT_OFFBOARD_STATE"
+    WAIT_POSITION = "WAIT_POSITION"   # wait for EKF position valid (RPP TRACKING)
     ARM = "ARM"
     CONFIRM_ARM = "CONFIRM_ARM"
     RUNNING = "RUNNING"
@@ -325,7 +326,36 @@ class MissionRunnerNode(Node):
             if self._fcu_state and self._fcu_state.mode == "OFFBOARD":
                 self.get_logger().info("OFFBOARD confirmed")
                 self._was_offboard = True
+                self._phase_t0 = self.get_clock().now()
+                self._phase = MissionPhase.WAIT_POSITION
+
+        elif self._phase == MissionPhase.WAIT_POSITION:
+            # Wait until RPP reports TRACKING (state=1) — confirms EKF has valid
+            # position. Without this, arming is rejected when EKF hasn't fused
+            # GPS yet (EKF2_REQ_GPS_H timeout). Timeout = mode_switch_timeout_s.
+            rpp_state = int(self._rpp_debug.data[7]) if (
+                self._rpp_debug and len(self._rpp_debug.data) >= 8) else -99
+            if rpp_state == 1:
+                wait_s = (self.get_clock().now() - self._phase_t0).nanoseconds * 1e-9
+                self.get_logger().info(
+                    f"EKF position valid — RPP TRACKING after {wait_s:.1f}s — arming")
                 self._phase = MissionPhase.ARM
+            else:
+                t = (self.get_clock().now() - self._phase_t0).nanoseconds * 1e-9
+                pos_timeout = self.get_parameter("mode_switch_timeout_s").value
+                if t > pos_timeout:
+                    self.get_logger().error(
+                        f"EKF position not valid after {pos_timeout:.0f}s "
+                        f"(RPP state={rpp_state}) — aborting. "
+                        f"Check EKF2_REQ_GPS_H (should be 1.0, not 10.0)."
+                    )
+                    self._phase = MissionPhase.ABORTED
+                elif int(t) % 3 == 0 and t > 0.9:
+                    self.get_logger().info(
+                        f"Waiting for EKF position (RPP state={rpp_state}, "
+                        f"t={t:.1f}s)...",
+                        throttle_duration_sec=3.0,
+                    )
             else:
                 mode_timeout = self.get_parameter("mode_switch_timeout_s").value
                 t = (self.get_clock().now() - self._phase_t0).nanoseconds * 1e-9

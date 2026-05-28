@@ -77,6 +77,18 @@ def _build(context, *args, **kwargs):
     dry_run = LaunchConfiguration("dry_run").perform(context).lower() == "true"
     log_level = LaunchConfiguration("log_level").perform(context)
 
+    # RPP tuning overrides (forwarded to rpp_controller_node)
+    rpp_params = {}
+    for name in (
+        "min_lookahead_dist", "max_lookahead_dist", "lookahead_time",
+        "regulated_linear_scaling_min_radius", "corner_smooth_radius_m",
+        "use_feedforward_yaw_rate", "max_yaw_rate_body",
+        "yaw_rate_feedback_gain", "max_linear_vel", "min_linear_vel",
+    ):
+        val = LaunchConfiguration(name).perform(context)
+        if val != "__unset__":
+            rpp_params[name] = val
+
     # Resolve script directory: this launch file lives at src/launch/, scripts at src/
     launch_dir = os.path.dirname(os.path.abspath(__file__))
     src_dir = os.path.dirname(launch_dir)
@@ -95,6 +107,7 @@ def _build(context, *args, **kwargs):
         cmd=_node_cmd(
             os.path.join(src_dir, "rpp_controller_node.py"),
             log_level,
+            rpp_params if rpp_params else None,
         ),
         name="rpp_controller",
         output="screen",
@@ -152,25 +165,26 @@ def _build(context, *args, **kwargs):
 
 def generate_launch_description():
     return LaunchDescription([
-        DeclareLaunchArgument(
-            "path_name", default_value="straight_5m",
-            description="Test path: straight_5m | arc_quarter_1m5 | lshape_2x2 | square_2x2 | rectangle_3x2 | circle_1m5",
-        ),
-        DeclareLaunchArgument(
-            "auto_run", default_value="false",
-            description="If true, mission_runner auto-switches to OFFBOARD + arms",
-        ),
-        DeclareLaunchArgument(
-            "dry_run", default_value="false",
-            description="If true, mission_runner skips arm/mode commands",
-        ),
-        DeclareLaunchArgument(
-            "auto_origin", default_value="false",
-            description="If true, offset path to start at rover's current EKF position",
-        ),
-        DeclareLaunchArgument(
-            "log_level", default_value="info",
-            description="ROS2 log level (debug, info, warn, error)",
-        ),
+        DeclareLaunchArgument("path_name", default_value="straight_5m",
+            description="Test path name"),
+        DeclareLaunchArgument("auto_run", default_value="false",
+            description="If true, mission_runner auto-switches to OFFBOARD + arms"),
+        DeclareLaunchArgument("dry_run", default_value="false",
+            description="If true, mission_runner skips arm/mode commands"),
+        DeclareLaunchArgument("auto_origin", default_value="false",
+            description="If true, offset path to rover's current EKF position"),
+        DeclareLaunchArgument("log_level", default_value="info",
+            description="ROS2 log level (debug, info, warn, error)"),
+        # RPP tuning overrides — pass any of these to override node defaults
+        DeclareLaunchArgument("min_lookahead_dist",                  default_value="__unset__"),
+        DeclareLaunchArgument("max_lookahead_dist",                  default_value="__unset__"),
+        DeclareLaunchArgument("lookahead_time",                      default_value="__unset__"),
+        DeclareLaunchArgument("regulated_linear_scaling_min_radius", default_value="__unset__"),
+        DeclareLaunchArgument("corner_smooth_radius_m",              default_value="__unset__"),
+        DeclareLaunchArgument("use_feedforward_yaw_rate",            default_value="__unset__"),
+        DeclareLaunchArgument("max_yaw_rate_body",                   default_value="__unset__"),
+        DeclareLaunchArgument("yaw_rate_feedback_gain",              default_value="__unset__"),
+        DeclareLaunchArgument("max_linear_vel",                      default_value="__unset__"),
+        DeclareLaunchArgument("min_linear_vel",                      default_value="__unset__"),
         OpaqueFunction(function=_build),
     ])
