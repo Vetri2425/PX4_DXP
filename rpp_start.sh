@@ -93,7 +93,6 @@ log " Nodes: twist_to_setpoint, rpp_controller, xtrack_logger"
 log "====================================================="
 
 start_node "twist_to_setpoint" "${SRC_DIR}/twist_to_setpoint_node.py"
-sleep 1  # Let the setpoint stream establish before RPP starts
 start_node "rpp_controller" "${SRC_DIR}/rpp_controller_node.py"
 start_node "xtrack_logger" "${SRC_DIR}/xtrack_logger_node.py"
 

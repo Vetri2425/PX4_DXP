@@ -153,12 +153,12 @@ def _build(context, *args, **kwargs):
         rpp_proc,
         xtrack_proc,
         # Phase 2: path publisher waits 2s so subscribers are ready
-        TimerAction(period=2.0, actions=[path_proc]),
+        TimerAction(period=0.3, actions=[path_proc]),
     ]
 
     if auto_run:
         # Phase 3: mission_runner waits 4s — path is up, RPP has started outputting
-        actions.append(TimerAction(period=4.0, actions=[mission_proc]))
+        actions.append(TimerAction(period=0.3, actions=[mission_proc]))
 
     return actions
 

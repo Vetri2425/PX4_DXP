@@ -104,10 +104,10 @@ class MissionRunnerNode(Node):
         # ------------------------------------------------------------------
         self.declare_parameter("mission_timeout_s",  300.0)  # 5 min default
         self.declare_parameter("done_settle_s",       1.0)   # state==DONE held for N s
-        self.declare_parameter("stream_warmup_s",     1.5)   # stream before OFFBOARD
+        self.declare_parameter("stream_warmup_s",     0.5)   # stream before OFFBOARD
         self.declare_parameter("mode_switch_timeout_s", 5.0)
         self.declare_parameter("dry_run",            False)  # if true, never actually arms
-        self.declare_parameter("post_offboard_settle_s", 3.0)  # min wait after OFFBOARD before arm
+        self.declare_parameter("post_offboard_settle_s", 1.0)  # min wait after OFFBOARD before arm
         self.declare_parameter("arm_max_retries",        3)    # retry arm this many times
         self.declare_parameter("arm_retry_delay_s",      5.0)  # seconds between retries
 
