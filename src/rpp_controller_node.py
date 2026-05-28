@@ -248,7 +248,7 @@ class RPPControllerNode(Node):
         # via OFFBOARD body-rate mode instead of relying on heading PID.
         # Bypasses spot-turn FSM, smoother corners, better rate tracking.
         # Requires twist_to_setpoint_node to support body-rate output.
-        self.declare_parameter("use_feedforward_yaw_rate",            False)
+        self.declare_parameter("use_feedforward_yaw_rate",            True)
         self.declare_parameter("yaw_rate_feedback_gain",              0.8)  # heading error feedback
         # Clamp on body yaw rate. Match PX4 RO_YAW_RATE_LIM (deg/s) converted
         # to rad/s so RPP doesn't request more than PX4 will honor.
