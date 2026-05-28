@@ -55,7 +55,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from rclpy.callback_groups import ReentrantCallbackGroup
 
-from mavros_msgs.msg import State
+from mavros_msgs.msg import State, StatusText
 from mavros_msgs.srv import SetMode, CommandBool
 from std_msgs.msg import Float32MultiArray
 
@@ -118,6 +118,7 @@ class MissionRunnerNode(Node):
         self._was_offboard = False  # track external mode changes
         self._pending_future = None   # active service call future
         self._future_t0 = None        # timestamp when future was created
+        self._running_t0: float | None = None  # wall time when RUNNING entered
 
         # ------------------------------------------------------------------
         # QoS
@@ -146,6 +147,7 @@ class MissionRunnerNode(Node):
         # ------------------------------------------------------------------
         self.create_subscription(State, "/mavros/state", self._state_cb, state_qos)
         self.create_subscription(Float32MultiArray, "/rpp/debug", self._debug_cb, be_qos)
+        self.create_subscription(StatusText, "/mavros/statustext", self._statustext_cb, be_qos)
 
         # ------------------------------------------------------------------
         # Service clients (ReentrantCallbackGroup to avoid deadlock)
@@ -173,12 +175,26 @@ class MissionRunnerNode(Node):
         prev = self._fcu_state
         self._fcu_state = msg
 
+        # Log every mode/arm transition (helps diagnose which failsafe fired)
+        if prev and (prev.mode != msg.mode or prev.armed != msg.armed):
+            elapsed = (self.get_clock().now() - self._mission_t0).nanoseconds * 1e-9
+            hint = ""
+            if msg.mode == "AUTO.LAND" and msg.armed:
+                hint = " <-- FAILSAFE (RC loss or OFFBOARD loss — check COM_RCL_EXCEPT)"
+            elif msg.mode == "AUTO.RTL":
+                hint = " <-- FAILSAFE (RTL triggered)"
+            self.get_logger().warn(
+                f"FCU state: {prev.mode}/{prev.armed} -> {msg.mode}/{msg.armed} "
+                f"at t={elapsed:.2f}s{hint}"
+            )
+
         # External OFFBOARD exit detection (e.g. RC override, failsafe)
         if self._phase == MissionPhase.RUNNING:
             if self._was_offboard and msg.mode != "OFFBOARD":
+                run_s = (time.time() - self._running_t0) if self._running_t0 else -1
                 self.get_logger().warn(
                     f"OFFBOARD exited externally (mode={msg.mode!r}, "
-                    f"armed={msg.armed}) — aborting mission"
+                    f"armed={msg.armed}, ran_for={run_s:.1f}s) — aborting mission"
                 )
                 self._phase = MissionPhase.ABORTED
             if prev and prev.armed and not msg.armed:
@@ -187,6 +203,12 @@ class MissionRunnerNode(Node):
 
     def _debug_cb(self, msg: Float32MultiArray):
         self._rpp_debug = msg
+
+    def _statustext_cb(self, msg: StatusText):
+        """Log PX4 statustext during RUNNING — shows exact failsafe reason."""
+        if self._phase in (MissionPhase.RUNNING, MissionPhase.ABORTED):
+            elapsed = (self.get_clock().now() - self._mission_t0).nanoseconds * 1e-9
+            self.get_logger().warn(f"PX4 [{msg.severity}] t={elapsed:.2f}s: {msg.text}")
 
     # ==================================================================
     # Non-blocking service call helpers
@@ -333,6 +355,7 @@ class MissionRunnerNode(Node):
                 ok = bool(r.success) if r else False
                 if ok:
                     self.get_logger().info("Armed — mission running")
+                    self._running_t0 = time.time()
                     self._phase = MissionPhase.RUNNING
                 else:
                     self.get_logger().error("Arm rejected (set COM_ARM_WO_GPS=1 if no fix)")
