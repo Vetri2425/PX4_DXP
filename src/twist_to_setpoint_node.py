@@ -197,7 +197,7 @@ class TwistToSetpointNode(Node):
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = ""  # PX4 ignores; coordinate_frame is what matters
         msg.coordinate_frame = FRAME_LOCAL_NED
-        msg.type_mask = TYPE_MASK_VEL_YAW_YAWRATE  # velocity + yaw + yaw_rate feedforward
+        # type_mask set dynamically below based on whether yaw_rate FF is active
 
         # Default: zero velocity (safe fail-stop)
         v_n = 0.0
@@ -258,16 +258,22 @@ class TwistToSetpointNode(Node):
         msg.acceleration_or_force.y = 0.0
         msg.acceleration_or_force.z = 0.0
 
-        # Yaw_rate feedforward: κ·v from RPP (NED CW+) → ENU CCW+ for MAVROS.
-        # Use only if source is fresh (same staleness window as velocity).
-        # If stale or zero-velocity, send 0 (yaw angle alone is sufficient).
+        # Yaw_rate feedforward from RPP (NED CW+, body frame).
+        # MAVROS LOCAL_NED passes yaw_rate through without negation, so send
+        # the NED value directly (positive = CW = right turn).
+        # Dynamic type_mask: when yaw_rate FF is active use 455 (send yaw_rate);
+        # when FF is zero/stale use 2503 (ignore yaw_rate, let PX4 derive it
+        # from velocity direction). Sending explicit 0 with mask=455 would
+        # command PX4 to hold zero turn rate, blocking arc tracking.
         yaw_rate_age = float("inf")
         if self._yaw_rate_recv_time is not None:
             yaw_rate_age = (self.get_clock().now() - self._yaw_rate_recv_time).nanoseconds * 1e-9
-        if source == "rpp" and yaw_rate_age <= max_age:
-            msg.yaw_rate = -self._latest_yaw_rate_body   # NED CW+ → ENU CCW-
+        if source == "rpp" and yaw_rate_age <= max_age and abs(self._latest_yaw_rate_body) > 1e-4:
+            msg.yaw_rate = self._latest_yaw_rate_body    # NED CW+ passed through directly
+            msg.type_mask = TYPE_MASK_VEL_YAW_YAWRATE   # 455: vel + yaw + yaw_rate
         else:
             msg.yaw_rate = 0.0
+            msg.type_mask = TYPE_MASK_VELOCITY_AND_YAW  # 2503: vel + yaw, ignore yaw_rate
 
         self._sp_pub.publish(msg)
         self._last_yaw_cmd = yaw_enu  # Track for next cycle's zero-speed hold

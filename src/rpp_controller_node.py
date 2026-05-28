@@ -249,7 +249,7 @@ class RPPControllerNode(Node):
         # Bypasses spot-turn FSM, smoother corners, better rate tracking.
         # Requires twist_to_setpoint_node to support body-rate output.
         self.declare_parameter("use_feedforward_yaw_rate",            True)
-        self.declare_parameter("yaw_rate_feedback_gain",              1.2)  # heading error feedback
+        self.declare_parameter("yaw_rate_feedback_gain",              0.0)  # 0=pure FF; tune up once sign confirmed
         # Clamp on body yaw rate. Match PX4 RO_YAW_RATE_LIM (deg/s) converted
         # to rad/s so RPP doesn't request more than PX4 will honor.
         # 0.5 rad/s ≈ 28.6°/s — safe default. Set 0.0 to disable.
