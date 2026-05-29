@@ -30,6 +30,9 @@ Thumbs.db
 # Claude Code local state
 .claude/
 
+# Frontend verification app (not the real GCS app)
+front-end/
+
 # Node / frontend build artifacts
 node_modules/
 .expo/
