@@ -46,6 +46,8 @@ ios/
 # Task planning docs (local scratch, not for tracking)
 task_frontend/
 task_rpp_upgrade/
+docs/Task_SRC/
+docs/Task_server/
 
 # Local analysis and scratch tools (not for tracking)
 docs/Analysis/
