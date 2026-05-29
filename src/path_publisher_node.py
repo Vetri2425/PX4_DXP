@@ -329,6 +329,10 @@ class PathPublisherNode(Node):
         # auto_origin: offset path to start at rover's current EKF position.
         # Waits for /mavros/local_position/pose before publishing.
         self.declare_parameter("auto_origin", False)
+        # forward_offset: additional forward (North) shift from current position
+        # when auto_origin=True. Gives the rover a run-up before starting the
+        # path geometry (e.g. 0.5-0.8 m for arc starts).
+        self.declare_parameter("forward_offset", 0.65)
 
         # TRANSIENT_LOCAL so late-joining subscribers (rpp_controller) get it
         path_qos = QoSProfile(
@@ -358,6 +362,7 @@ class PathPublisherNode(Node):
         self._progress_pub = self.create_publisher(Float32, "/dyx/mission/progress", be_qos)
 
         self._auto_origin = self.get_parameter("auto_origin").value
+        self._forward_offset = self.get_parameter("forward_offset").value
         self._origin_ned: tuple[float, float] | None = None  # (North, East)
         self._start_position: tuple[float, float] | None = None  # For TSP optimization
 
@@ -471,9 +476,33 @@ class PathPublisherNode(Node):
         # Apply auto-origin offset if enabled
         if self._origin_ned is not None:
             offset_n, offset_e = self._origin_ned
-            pts = [(n + offset_n, e + offset_e) for (n, e) in pts]
+            # Add forward_offset in the North direction so the path starts
+            # ahead of the rover's current position (run-up before turning).
+            fwd = self._forward_offset
+            pts = [(n + offset_n + fwd, e + offset_e) for (n, e) in pts]
+
+            # Also extend the path past the last waypoint by forward_offset
+            # in the direction of the final segment. This gives the RPP
+            # controller room to settle at the true endpoint instead of
+            # oscillating or cutting the path short.
+            if fwd > 0.0 and len(pts) >= 2:
+                last_n, last_e = pts[-1]
+                prev_n, prev_e = pts[-2]
+                dx = last_n - prev_n
+                dy = last_e - prev_e
+                seg_len = math.hypot(dx, dy)
+                if seg_len > 1e-6:
+                    ext_n = last_n + (dx / seg_len) * fwd
+                    ext_e = last_e + (dy / seg_len) * fwd
+                    pts.append((ext_n, ext_e))
+                    self.get_logger().info(
+                        f"End-extended by {fwd:.3f}m along final segment "
+                        f"direction: ({ext_n:.3f}N, {ext_e:.3f}E)"
+                    )
+
             self.get_logger().info(
-                f"Auto-origin offset applied: +{offset_n:.3f}N, +{offset_e:.3f}E"
+                f"Auto-origin offset applied: +{offset_n:.3f}N + {fwd:.3f}fwd, "
+                f"+{offset_e:.3f}E"
             )
 
         # Build Path message

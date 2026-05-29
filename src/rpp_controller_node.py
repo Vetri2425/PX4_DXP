@@ -240,6 +240,15 @@ class RPPControllerNode(Node):
         # 1.0 means a 10 cm cross-track adds 10 cm of lookahead.
         self.declare_parameter("xtrack_lookahead_gain",               0.3)
 
+        # P1.5 — L_d low-pass filter.
+        # Smooths step changes in L_d caused by kappa_path alternating between
+        # 0 (collinear triplet at segment boundary) and 1/R (arc interior).
+        # l_d_lpf_alpha=0 disables (raw L_d, original behaviour).
+        # Recommended: 0.7 for arcs — one L_d time-constant ≈ DT/(1-α) = 0.07 s.
+        # Set higher (0.85-0.90) for very smooth marking at cost of slower
+        # xtrack recovery.  Never set ≥ 1.0 (filter becomes non-causal).
+        self.declare_parameter("l_d_lpf_alpha",                       0.0)
+
         # Fix 1 — curvature-aware lookahead minimum.
         # On arcs, ensures l_d >= curvature_ld_factor / kappa_path so the
         # lookahead walk produces a κ close to 1/R.
@@ -344,6 +353,14 @@ class RPPControllerNode(Node):
 
         # P0.1 — closed-loop L_d: persist last commanded speed
         self._last_speed_cmd: float = 0.0
+
+        # P1.5 — L_d low-pass filter state.  Prevents sudden kappa spikes when
+        # kappa_path jumps between path segments (Menger curvature of collinear
+        # triplets returns 0, dropping L_d from the curvature minimum back to the
+        # velocity floor every few waypoints).  Filter is reset to the first
+        # computed L_d on each new path so there is no warm-up transient.
+        self._l_d_filtered: float = 0.0
+        self._l_d_filter_init: bool = False
 
         # P0.5 — explicit yaw_setpoint: persist last commanded yaw for freeze
         self._last_yaw_cmd: float = 0.0
@@ -516,6 +533,8 @@ class RPPControllerNode(Node):
         self._hint_valid = False
         # P0.1 — reset last speed so L_d bootstraps cleanly on new path
         self._last_speed_cmd = 0.0
+        # P1.5 — reset L_d filter; first cycle will seed it to avoid transient
+        self._l_d_filter_init = False
         # P0.2 — reset jump guard; first pose on new path is always "valid"
         self._last_pos = None
         # Reset pose convergence timer for the new path
@@ -1352,6 +1371,17 @@ class RPPControllerNode(Node):
         # spikes to ±20 because pure pursuit breaks down at sub-cm lookaheads.
         if dist_to_goal < approach_d and self._path_travel_m >= approach_d:
             l_d = max(l_d, l_min)
+
+        # P1.5 — L_d low-pass filter.  Applied after all clamps so the filter
+        # smooths the final value sent to the lookahead walk.  Seeded on the
+        # first cycle of a new path to avoid a ramp-up transient.
+        lpf_alpha = float(self.get_parameter("l_d_lpf_alpha").value)
+        if lpf_alpha > 0.0:
+            if not self._l_d_filter_init:
+                self._l_d_filtered = l_d
+                self._l_d_filter_init = True
+            self._l_d_filtered = lpf_alpha * self._l_d_filtered + (1.0 - lpf_alpha) * l_d
+            l_d = self._l_d_filtered
 
         # ---- Step 3: Lookahead point (NED), then body-frame for κ ----
         lh_n, lh_e, hit_end = self._get_lookahead_point(seg_idx, foot_n, foot_e, l_d)

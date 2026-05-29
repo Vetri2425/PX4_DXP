@@ -85,7 +85,7 @@ def _build(context, *args, **kwargs):
         "use_feedforward_yaw_rate", "max_yaw_rate_body",
         "yaw_rate_feedback_gain", "max_linear_vel", "min_linear_vel",
         "curvature_ld_factor", "xtrack_lookahead_gain",
-        "corner_smooth_min_bend_deg",
+        "corner_smooth_min_bend_deg", "l_d_lpf_alpha",
     ):
         val = LaunchConfiguration(name).perform(context)
         if val != "__unset__":
@@ -191,5 +191,6 @@ def generate_launch_description():
         DeclareLaunchArgument("curvature_ld_factor",                 default_value="__unset__"),
         DeclareLaunchArgument("xtrack_lookahead_gain",               default_value="__unset__"),
         DeclareLaunchArgument("corner_smooth_min_bend_deg",          default_value="__unset__"),
+        DeclareLaunchArgument("l_d_lpf_alpha",                       default_value="__unset__"),
         OpaqueFunction(function=_build),
     ])
