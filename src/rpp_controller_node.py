@@ -305,6 +305,8 @@ class RPPControllerNode(Node):
 
         # P1.4 — segment search hint: start projection from previous best seg
         self._closest_seg_hint: int = 0
+        # Track last filtered speed for curvature-aware lookahead smoothing
+        self._filtered_speed: float = 0.0
         # P1.4 (Sprint 2 fixup) — full-scan flag: forces O(n) projection on
         # the first cycle after a path reset OR an EKF jump, then sticks to
         # the windowed O(1) search. Without this, a re-plan that places the
@@ -614,6 +616,32 @@ class RPPControllerNode(Node):
     @staticmethod
     def _dist(ax: float, ay: float, bx: float, by: float) -> float:
         return math.hypot(ax - bx, ay - by)
+
+    def _path_curvature_at(self, seg_idx: int) -> float:
+        """Estimate path curvature at the projection foot using Menger
+        curvature of three consecutive path vertices centred on seg_idx.
+
+        Returns 1/m curvature (0.0 for straight lines, >0 for curves).
+        Used to enforce a curvature-adequate minimum lookahead on arcs.
+        """
+        n_pts = len(self._path)
+        if n_pts < 3:
+            return 0.0
+        i0 = max(0, seg_idx - 1)
+        i1 = seg_idx
+        i2 = min(n_pts - 1, seg_idx + 1)
+        if i2 - i0 < 2:
+            return 0.0
+        a = self._path[i0].pose.position
+        b = self._path[i1].pose.position
+        c = self._path[i2].pose.position
+        ab = math.hypot(b.x - a.x, b.y - a.y)
+        bc = math.hypot(c.x - b.x, c.y - b.y)
+        ca = math.hypot(a.x - c.x, a.y - c.y)
+        if ab < 1e-6 or bc < 1e-6 or ca < 1e-6:
+            return 0.0
+        area2 = abs((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x))
+        return (2.0 * area2) / (ab * bc * ca)
 
     # ==================================================================
     # P1.3 — Path conditioning helpers
@@ -1214,10 +1242,21 @@ class RPPControllerNode(Node):
         # post-stop) the inner expression is max_v * 0.5; the outer max() with
         # min_v only kicks in if the last commanded speed dropped below it
         # (e.g. just exited approach scaling on a tight corner).
+        # Fix 2: low-pass filter v_for_ld (70/30 blend) to prevent 1-step
+        # limit-cycle oscillation between lookahead distance and curvature.
         v_for_ld = max(min_v, self._last_speed_cmd if self._last_speed_cmd > 0.0
                        else max_v * 0.5)
+        v_for_ld = 0.7 * v_for_ld + 0.3 * max_v
         l_d_raw = ld_gain * v_for_ld + xt_ld_gain * abs(signed_xtrack)
         l_d = self._clamp(l_d_raw, l_min, l_max)
+
+        # Fix 1: curvature-aware minimum lookahead — on arcs, ensure l_d
+        # spans at least 1/3 of the radius so the lookahead walk reliably
+        # reaches past the foot. Without this, short lookaheads on tight
+        # arcs can land at the rover position, triggering the IDLE path.
+        kappa_path = self._path_curvature_at(seg_idx)
+        if kappa_path > 1e-6:
+            l_d = max(l_d, 0.35 / kappa_path)
 
         # ---- Step 3: Lookahead point (NED), then body-frame for κ ----
         lh_n, lh_e, hit_end = self._get_lookahead_point(seg_idx, foot_n, foot_e, l_d)
@@ -1238,10 +1277,21 @@ class RPPControllerNode(Node):
         l_actual = math.hypot(x_body, y_body)
 
         if l_actual < 1e-6:
-            # Lookahead landed on top of us; just hold position
-            self._publish_zero(StateCode.IDLE, pose_age_ms=pose_age_s * 1000,
-                               dist_to_goal=dist_to_goal)
-            return
+            # Lookahead landed on top of us — retry with min_lookahead_dist
+            # instead of publishing zero. Without this fallback, a short
+            # adaptive lookahead on a curved path triggers IDLE every other
+            # cycle, producing stop-start motion.
+            lh_n, lh_e, hit_end = self._get_lookahead_point(
+                seg_idx, foot_n, foot_e, l_min)
+            dn = lh_n - pos_n
+            de = lh_e - pos_e
+            x_body = dn * math.cos(yaw_ned) + de * math.sin(yaw_ned)
+            y_body = -dn * math.sin(yaw_ned) + de * math.cos(yaw_ned)
+            l_actual = math.hypot(x_body, y_body)
+            if l_actual < 1e-6:
+                self._publish_zero(StateCode.IDLE, pose_age_ms=pose_age_s * 1000,
+                                   dist_to_goal=dist_to_goal)
+                return
 
         # ---- Step 4: Curvature ----
         kappa = (2.0 * y_body) / (l_actual * l_actual)

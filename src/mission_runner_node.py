@@ -212,8 +212,7 @@ class MissionRunnerNode(Node):
 
     def _statustext_cb(self, msg: StatusText):
         """Log PX4 statustext during any active phase — shows arm rejections and failsafe reasons."""
-        _quiet = (MissionPhase.INIT, MissionPhase.WAIT_FCU, MissionPhase.WAIT_STREAM,
-                  MissionPhase.FINISHED)
+        _quiet = (MissionPhase.INIT, MissionPhase.FINISHED)
         if self._phase not in _quiet:
             elapsed = (self.get_clock().now() - self._mission_t0).nanoseconds * 1e-9
             self.get_logger().warn(
@@ -337,6 +336,13 @@ class MissionRunnerNode(Node):
                 self._was_offboard = True
                 self._phase_t0 = self.get_clock().now()
                 self._phase = MissionPhase.WAIT_POSITION
+            else:
+                wait_s = (self.get_clock().now() - self._phase_t0).nanoseconds * 1e-9
+                timeout = self.get_parameter("mode_switch_timeout_s").value
+                if wait_s > timeout:
+                    self.get_logger().error(
+                        f"OFFBOARD not confirmed after {timeout:.0f}s — aborting")
+                    self._phase = MissionPhase.ABORTED
 
         elif self._phase == MissionPhase.WAIT_POSITION:
             # Wait until (a) RPP reports TRACKING (state=1) and (b) post_offboard_settle_s
