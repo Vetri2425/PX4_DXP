@@ -31,13 +31,32 @@ git pull                          # 1. Get latest code
                                   #    First run: prompts for NTRIP credentials
                                   #    Later runs: skips if already set up
 
-# 3. Restart service to pick up changes
-sudo systemctl restart px4-dxp.service
+# 3. Restart ONLY the service whose code changed (see table below)
+sudo systemctl restart rpp-pipeline.service   # for controller code changes
 
 # 4. Verify
 systemctl status px4-dxp.service   # should show "active (running)"
 ros2 topic echo /mavros/state --once  # should show "connected: true"
 ```
+
+### Which service to restart (the bridge and controllers are decoupled)
+
+Restart the **narrowest** service for what you changed — do NOT reflexively
+restart `px4-dxp` (that drops the MAVROS+NTRIP link and QGC, ~11s bringup,
+and cascades to `rpp-pipeline` via `PartOf`).
+
+| You changed | Restart | Cost | Drops MAVROS/QGC? |
+|---|---|---|---|
+| `src/*.py` (rpp_controller, twist_to_setpoint, xtrack_logger) | `sudo systemctl restart rpp-pipeline` | ~2s | **No** |
+| `server/**` (FastAPI) | `sudo systemctl restart rover-server` | ~2s | **No** |
+| `px4_start_service.sh`, pluginlist, NTRIP, FCU link | `sudo systemctl restart px4-dxp` | ~11s | Yes (also restarts rpp-pipeline via PartOf) |
+| `*.service` files or added new files | `./deploy.sh` (daemon-reload + symlinks) | — | — |
+
+`rpp-pipeline` `PartOf=px4-dxp` is intentional and one-directional: a
+px4-dxp restart pulls the controllers down with it (they're useless and
+unsafe without live MAVROS topics), but restarting `rpp-pipeline` leaves
+the MAVROS bridge untouched. That's the fast inner loop for controller
+tuning — verified: rpp-pipeline restart keeps px4-dxp's PID unchanged.
 
 **What `deploy.sh` does:**
 - Symlinks `px4-dxp.service` → `/etc/systemd/system/` (future `git pull` auto-updates)
