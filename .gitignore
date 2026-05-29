@@ -43,6 +43,10 @@ dist/
 android/
 ios/
 
+# Task planning docs (local scratch, not for tracking)
+task_frontend/
+task_rpp_upgrade/
+
 # Local analysis and scratch tools (not for tracking)
 docs/Analysis/
 tools/scp_tool.md
