@@ -183,7 +183,7 @@ class RPPControllerNode(Node):
         # RPP geometry
         self.declare_parameter("max_linear_vel",                      1.0)
         self.declare_parameter("min_linear_vel",                      0.15)
-        self.declare_parameter("min_lookahead_dist",                  0.4)
+        self.declare_parameter("min_lookahead_dist",                  0.5)
         self.declare_parameter("max_lookahead_dist",                  1.5)
         self.declare_parameter("lookahead_time",                      1.5)
 
@@ -206,6 +206,13 @@ class RPPControllerNode(Node):
 
         # Safety
         self.declare_parameter("pose_max_age_s",                      0.5)    # 200 ms staleness threshold
+
+        # Pose convergence gate: refuse to track until pose has been fresher
+        # than pose_converge_age_ms continuously for pose_converge_time_s.
+        # Prevents tracking against an EKF that hasn't settled yet (common at
+        # startup after a static→moving transition).
+        self.declare_parameter("pose_converge_age_ms",                 50.0)   # ms
+        self.declare_parameter("pose_converge_time_s",                 1.0)    # s
         self.declare_parameter("path_frame_id",                       "local_ned")
 
         # P0.2 — EKF / position-jump detection
@@ -337,6 +344,12 @@ class RPPControllerNode(Node):
         # P0.3 — RTK fix tracking
         self._gps_fix_type: int = 0  # 0 = no fix; 6 = RTK_FIXED
 
+        # Pose convergence guard: prevent tracking from starting against a
+        # stale/diverged EKF estimate.  Tracks the first time pose_age dropped
+        # below the convergence threshold; tracking is gated until at least
+        # `pose_converge_time_s` seconds have elapsed since that moment.
+        self._pose_first_good_t: float = float("inf")
+
         # ------------------------------------------------------------------
         # QoS profiles
         # ------------------------------------------------------------------
@@ -427,6 +440,20 @@ class RPPControllerNode(Node):
             )
             return
 
+        # Guard: if path content is identical to the existing path, skip
+        # the full state reset to avoid unnecessary _path_travel_m = 0,
+        # which causes IDLE↔TRACKING flicker when TRANSIENT_LOCAL QoS
+        # re-delivers the same path message.
+        if self._path and len(msg.poses) == len(self._path):
+            same = True
+            for new_ps, old_ps in zip(msg.poses, self._path):
+                if (abs(new_ps.pose.position.x - old_ps.pose.position.x) > 1e-4
+                        or abs(new_ps.pose.position.y - old_ps.pose.position.y) > 1e-4):
+                    same = False
+                    break
+            if same:
+                return
+
         # P1.3 — Path conditioning (linear resample + corner smoothing).
         # Operates on (north, east) tuples to keep the geometry code simple,
         # then converts back to PoseStamped at the end.
@@ -467,6 +494,8 @@ class RPPControllerNode(Node):
         self._last_speed_cmd = 0.0
         # P0.2 — reset jump guard; first pose on new path is always "valid"
         self._last_pos = None
+        # Reset pose convergence timer for the new path
+        self._pose_first_good_t = float("inf")
 
         first = self._path[0].pose.position
         last = self._path[-1].pose.position
@@ -1159,6 +1188,31 @@ class RPPControllerNode(Node):
             self._publish_zero(StateCode.RTK_WAIT, pose_age_ms=pose_age_s * 1000)
             return
 
+        # ---- Pose convergence guard ----
+        # Gate tracking until the EKF pose has been consistently fresh for at
+        # least 1 second, preventing the controller from tracking against a
+        # stale/diverged pose that reports CTE = 0.8 m and 50° heading error.
+        converge_thr_ms = float(self.get_parameter("pose_converge_age_ms").value)
+        converge_time_s = float(self.get_parameter("pose_converge_time_s").value)
+        pose_age_ms_val = pose_age_s * 1000.0
+        if pose_age_ms_val < converge_thr_ms:
+            if self._pose_first_good_t == float("inf"):
+                self._pose_first_good_t = (
+                    self.get_clock().now().nanoseconds * 1e-9)
+                self.get_logger().info(
+                    f"Pose converging — age={pose_age_ms_val:.1f}ms < "
+                    f"{converge_thr_ms:.0f}ms threshold; stabilising for "
+                    f"{converge_time_s:.1f}s before tracking"
+                )
+        elif pose_age_ms_val > converge_thr_ms * 3.0:
+            self._pose_first_good_t = float("inf")
+
+        if (self._pose_first_good_t != float("inf")
+                and (self.get_clock().now().nanoseconds * 1e-9
+                     - self._pose_first_good_t) < converge_time_s):
+            self._publish_zero(StateCode.IDLE, pose_age_ms=pose_age_ms_val)
+            return
+
         # ---- Path readiness check ----
         if not self._path:
             self._publish_zero(StateCode.IDLE, pose_age_ms=pose_age_s * 1000)
@@ -1251,12 +1305,20 @@ class RPPControllerNode(Node):
         l_d = self._clamp(l_d_raw, l_min, l_max)
 
         # Fix 1: curvature-aware minimum lookahead — on arcs, ensure l_d
-        # spans at least 1/3 of the radius so the lookahead walk reliably
-        # reaches past the foot. Without this, short lookaheads on tight
-        # arcs can land at the rover position, triggering the IDLE path.
+        # spans at least 75% of the radius so the lookahead walk reliably
+        # produces the correct κ ≈ 1/R.  The 0.75 factor was calibrated
+        # empirically (0.35 under-shot; below 0.5 produced κ oscillation).
+        # Falls back to l_min when _path_curvature_at returns 0 (boundary
+        # segments where i2-i0 < 2 — the clamp already guarantees l_min).
         kappa_path = self._path_curvature_at(seg_idx)
         if kappa_path > 1e-6:
-            l_d = max(l_d, 0.35 / kappa_path)
+            l_d = max(l_d, 0.75 / kappa_path)
+
+        # Fix 4a: hard-floor lookahead in the approach zone to prevent κ
+        # collapse.  As dist_goal → 0, v_path → 0 → l_d → 0 → κ = 2·y_body/lh²
+        # spikes to ±20 because pure pursuit breaks down at sub-cm lookaheads.
+        if dist_to_goal < approach_d and self._path_travel_m >= approach_d:
+            l_d = max(l_d, l_min)
 
         # ---- Step 3: Lookahead point (NED), then body-frame for κ ----
         lh_n, lh_e, hit_end = self._get_lookahead_point(seg_idx, foot_n, foot_e, l_d)
@@ -1295,6 +1357,15 @@ class RPPControllerNode(Node):
 
         # ---- Step 4: Curvature ----
         kappa = (2.0 * y_body) / (l_actual * l_actual)
+
+        # Fix 4b: clamp κ to a physically meaningful maximum so the goal
+        # approach doesn't produce κ = ±20 when the lookahead collapses
+        # below 2 cm.  κ_max = 3 / max(l_actual, l_min) bounds the yaw
+        # rate to something the vehicle can actually achieve.
+        kappa = self._clamp(
+            kappa,
+            -3.0 / max(l_actual, l_min),
+            +3.0 / max(l_actual, l_min))
 
         # Heading error to lookahead in body frame (signed; for diagnostics)
         theta_e = math.atan2(y_body, x_body)
