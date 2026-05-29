@@ -38,18 +38,44 @@ export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
 declare -A NODE_PIDS=()
 FAIL_TIMES=()
 
+SHUTTING_DOWN=0
+
 cleanup() {
+    SHUTTING_DOWN=1
     log "Shutting down RPP pipeline..."
+    # Phase 1: polite SIGTERM to every node.
     for name in "${!NODE_PIDS[@]}"; do
-        local pid="${NODE_PIDS[$name]}"
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
-        fi
+        local pid="${NODE_PIDS[$name]:-}"
+        [[ -n "$pid" ]] && kill -TERM "$pid" 2>/dev/null || true
+    done
+    # Phase 2: brief grace, then force-kill any straggler. We do NOT `wait`
+    # on the nodes: an rclpy node blocked in a spin C-call may not honour
+    # SIGTERM promptly, and waiting on it is what made systemd hit
+    # TimeoutStopSec and SIGKILL the whole service after 15 s (Result:
+    # timeout). These are stateless setpoint/logger nodes — a hard kill on
+    # shutdown is safe and the next start resumes the zero-velocity heartbeat.
+    sleep 0.5
+    for name in "${!NODE_PIDS[@]}"; do
+        local pid="${NODE_PIDS[$name]:-}"
+        [[ -n "$pid" ]] && kill -KILL "$pid" 2>/dev/null || true
     done
 }
 
-trap cleanup EXIT INT TERM
+# handle_exit runs cleanup and then EXITS. The previous code trapped `cleanup`
+# directly with no exit, so on SIGTERM the trap cleaned up but execution
+# resumed in the watchdog loop below, which promptly restarted the nodes —
+# the script never terminated and systemd killed it on timeout. Exiting here
+# is what makes `systemctl stop/restart rpp-pipeline` fast (sub-second).
+handle_exit() {
+    local code="$1"
+    trap - EXIT INT TERM
+    cleanup
+    exit "$code"
+}
+
+trap 'handle_exit 143' TERM
+trap 'handle_exit 130' INT
+trap 'handle_exit $?' EXIT
 
 # ── Node launcher ─────────────────────────────────────────────────────────────
 start_node() {
@@ -101,6 +127,9 @@ log "All RPP nodes started. Entering watchdog loop..."
 # ── Watchdog loop ─────────────────────────────────────────────────────────────
 while true; do
     sleep 2
+    # If a shutdown signal arrived during the sleep, stop — never resurrect
+    # nodes that cleanup() is tearing down.
+    [[ "$SHUTTING_DOWN" -eq 1 ]] && break
     for name in "twist_to_setpoint" "rpp_controller" "xtrack_logger"; do
         local_pid="${NODE_PIDS[$name]:-}"
         if [[ -z "$local_pid" ]] || ! kill -0 "$local_pid" 2>/dev/null; then
