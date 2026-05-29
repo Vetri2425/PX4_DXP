@@ -240,6 +240,19 @@ class RPPControllerNode(Node):
         # 1.0 means a 10 cm cross-track adds 10 cm of lookahead.
         self.declare_parameter("xtrack_lookahead_gain",               0.3)
 
+        # Fix 1 — curvature-aware lookahead minimum.
+        # On arcs, ensures l_d >= curvature_ld_factor / kappa_path so the
+        # lookahead walk produces a κ close to 1/R.
+        # Official Nav2 RPP uses no such term; L_d is purely velocity-scaled
+        # and max_lookahead_dist is a hard ceiling (navigation2 source:
+        # regulated_pure_pursuit_controller.cpp, getLookAheadDistance()).
+        # Here the result is bounded by max_lookahead_dist to honour that
+        # contract. Set 0.0 to match Nav2 behaviour exactly (pure velocity-
+        # scaled lookahead). 0.75 was the original calibrated value;
+        # 0.45 is recommended for R ≥ 1.5 m paths where the 0.75 value
+        # forces L_d = 1.125 m and reduces xtrack correction gain 3.5×.
+        self.declare_parameter("curvature_ld_factor",                 0.75)
+
         # P1.3 — Path conditioning on receipt
         # path_resample_spacing_m: if > 0, linearly resample the path to this
         #   uniform spacing on receipt. Densifies sparse polylines so the
@@ -1305,14 +1318,14 @@ class RPPControllerNode(Node):
         l_d = self._clamp(l_d_raw, l_min, l_max)
 
         # Fix 1: curvature-aware minimum lookahead — on arcs, ensure l_d
-        # spans at least 75% of the radius so the lookahead walk reliably
-        # produces the correct κ ≈ 1/R.  The 0.75 factor was calibrated
-        # empirically (0.35 under-shot; below 0.5 produced κ oscillation).
-        # Falls back to l_min when _path_curvature_at returns 0 (boundary
-        # segments where i2-i0 < 2 — the clamp already guarantees l_min).
+        # spans at least curvature_ld_factor / kappa_path so the lookahead
+        # walk produces κ ≈ 1/R.  Result is clamped to l_max so that
+        # max_lookahead_dist remains a hard ceiling (per Nav2 RPP contract).
+        # Set curvature_ld_factor=0.0 to disable (pure velocity-scaled L_d).
+        curv_ld_factor = self.get_parameter("curvature_ld_factor").value
         kappa_path = self._path_curvature_at(seg_idx)
-        if kappa_path > 1e-6:
-            l_d = max(l_d, 0.75 / kappa_path)
+        if curv_ld_factor > 0.0 and kappa_path > 1e-6:
+            l_d = min(l_max, max(l_d, curv_ld_factor / kappa_path))
 
         # Fix 4a: hard-floor lookahead in the approach zone to prevent κ
         # collapse.  As dist_goal → 0, v_path → 0 → l_d → 0 → κ = 2·y_body/lh²
