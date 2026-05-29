@@ -52,18 +52,10 @@ handle_exit() {
     exit "$code"
 }
 
-mavros_ready_check() {
-    # Functional readiness: a *published* /mavros/state message proves the node
-    # is alive AND publishing. A ghost /mavros left in a stale daemon's graph
-    # lists in `ros2 node list` but never publishes — so this check (unlike
-    # node-presence) cannot be fooled into a false "ready". That is exactly what
-    # lets us keep the ROS2 daemon warm (no `ros2 daemon stop`) for fast
-    # restarts: the old code stopped the daemon to flush ghosts, which forced
-    # the next `ros2` call to cold-respawn it (a 2-3s discovery scan on the
-    # Orin) and dominated restart latency.
-    # timeout 3: bounds each not-yet-ready poll; returns in ~0.1-1s once MAVROS
-    # starts publishing /mavros/state at ~1 Hz.
-    timeout 3 ros2 topic echo --once /mavros/state >/dev/null 2>&1
+check_ros_node() {
+    # timeout 5: prevents an indefinitely-hung ROS2 daemon from blocking
+    # the watchdog restart loop for up to MAVROS_READY_WAIT × ∞ seconds.
+    timeout 5 ros2 node list 2>/dev/null | grep -q "$1"
 }
 
 free_port() {
@@ -90,10 +82,9 @@ mavros_watchdog() {
 
     while true; do
         log "Watchdog: starting MAVROS (PX4)..."
-        # No `ros2 daemon stop` here — see the note in mavros_ready_check().
-        # The functional readiness check (a *published* /mavros/state, not mere
-        # node presence) is immune to ghost nodes, so we keep the daemon warm
-        # and avoid the cold-respawn latency that dominated restart time.
+        # Flush stale ROS2 daemon entries so check_ros_node doesn't
+        # return true from a dead /mavros node left over from the crash.
+        timeout 5 ros2 daemon stop >/dev/null 2>&1 || true
         free_port 14550
         sleep 1
 
@@ -111,7 +102,7 @@ mavros_watchdog() {
 
         local ready=0
         for i in $(seq 1 "$MAVROS_READY_WAIT"); do
-            if mavros_ready_check; then
+            if check_ros_node "/mavros"; then
                 ready=1
                 break
             fi
@@ -178,16 +169,11 @@ if [[ ! -f "$ROS_SETUP" ]]; then
 fi
 set +u; source "$ROS_SETUP"; set -u
 
-# Kill stale processes from a previous run — best-effort, explicitly bracketed.
+# Stop daemon and kill stale processes — all best-effort, explicitly bracketed.
 # `set -e` would abort the script if any of these fail, which is wrong here
 # (they're cleanup ops; non-zero exit is expected when nothing is running).
-# We deliberately do NOT `ros2 daemon stop` here: stopping the daemon forces
-# the next `ros2` call to cold-respawn it (a 2-3s discovery scan on the Orin),
-# which was the single biggest restart-latency cost. The daemon is kept warm;
-# ghost /mavros entries from a stale daemon are handled by the functional
-# readiness check (mavros_ready_check polls for a *published* /mavros/state,
-# which a ghost node never produces).
 set +e
+timeout 5 ros2 daemon stop >/dev/null 2>&1
 pkill -f "mavros.*node.launch" 2>/dev/null
 pkill -f "ntrip_rtcm_node" 2>/dev/null
 set -e
