@@ -43,6 +43,10 @@ dist/
 android/
 ios/
 
+# Local analysis and scratch tools (not for tracking)
+docs/Analysis/
+tools/scp_tool.md
+
 # Misc
 nul
 .grok/
