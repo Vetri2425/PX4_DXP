@@ -264,9 +264,17 @@ class RPPControllerNode(Node):
         #   corners with a warning. 0.0 disables.
         # corner_smooth_arc_pts: number of points used to discretise each
         #   inscribed arc (only used when corner_smooth_radius_m > 0).
+        # corner_smooth_min_bend_deg: minimum bend angle at a vertex before
+        #   smoothing is applied.  Vertices with a smaller bend are kept as-is.
+        #   Default 10 deg prevents the smoother from inserting spurious high-κ
+        #   arcs at the shallow bends of a polygon-arc path (e.g. 3.83 deg/step
+        #   for arc_half_1m5), which would otherwise cause L_d oscillation and
+        #   visible "spot turns" in the kappa command. Set 0.0 to restore the
+        #   original behaviour (smooth every non-collinear vertex).
         self.declare_parameter("path_resample_spacing_m",             0.08)
         self.declare_parameter("corner_smooth_radius_m",              0.5)
         self.declare_parameter("corner_smooth_arc_pts",               6)
+        self.declare_parameter("corner_smooth_min_bend_deg",          10.0)
 
         # P2.4 — Velocity-based pose extrapolation (latency closure)
         # When enabled, dead-reckon the pose forward by `vel_ned * pose_age`
@@ -473,13 +481,16 @@ class RPPControllerNode(Node):
         raw_pts = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
         n_raw = len(raw_pts)
 
-        resample_dx = float(self.get_parameter("path_resample_spacing_m").value)
-        corner_r    = float(self.get_parameter("corner_smooth_radius_m").value)
-        arc_pts     = int(self.get_parameter("corner_smooth_arc_pts").value)
+        resample_dx   = float(self.get_parameter("path_resample_spacing_m").value)
+        corner_r      = float(self.get_parameter("corner_smooth_radius_m").value)
+        arc_pts       = int(self.get_parameter("corner_smooth_arc_pts").value)
+        min_bend_rad  = math.radians(
+            float(self.get_parameter("corner_smooth_min_bend_deg").value))
 
         cond_pts = raw_pts
         if corner_r > 0.0 and len(cond_pts) >= 3:
-            cond_pts = self._smooth_corners(cond_pts, corner_r, max(2, arc_pts))
+            cond_pts = self._smooth_corners(
+                cond_pts, corner_r, max(2, arc_pts), min_bend_rad)
         if resample_dx > 0.0 and len(cond_pts) >= 2:
             cond_pts = self._resample_path(cond_pts, resample_dx)
 
@@ -733,7 +744,8 @@ class RPPControllerNode(Node):
 
     def _smooth_corners(self, pts: list[tuple[float, float]],
                         radius: float,
-                        arc_pts: int) -> list[tuple[float, float]]:
+                        arc_pts: int,
+                        min_bend_rad: float = 0.0) -> list[tuple[float, float]]:
         """Replace each interior vertex with an inscribed circular arc.
 
         Bounds path curvature at κ_max = 1/radius.
@@ -743,6 +755,9 @@ class RPPControllerNode(Node):
         d = radius / tan(theta/2), where theta is the interior angle.
         Vertices where d > 0.45 * min(|AP|, |PB|) are skipped (segments too
         short to support the arc) and a warning is logged.
+        Vertices whose bend angle (pi - theta) is below min_bend_rad are kept
+        as-is — this prevents inserting spurious high-κ arcs at the shallow
+        bends of a polygon-arc path, which would cause L_d oscillation.
         Endpoints are always kept.
         """
         n = len(pts)
@@ -770,8 +785,13 @@ class RPPControllerNode(Node):
             dot = u1n * u2n + u1e * u2e
             dot = max(-1.0, min(1.0, dot))
             theta = math.acos(dot)             # interior angle, 0..pi
-            if theta < 1e-3 or math.pi - theta < 1e-3:
-                # Nearly collinear; no smoothing needed, no chord taken
+            bend  = math.pi - theta            # actual turn angle, 0..pi
+            if theta < 1e-3 or bend < 1e-3:
+                # Nearly collinear or full U-turn; keep vertex as-is
+                out.append(pts[i])
+                continue
+            if min_bend_rad > 0.0 and bend < min_bend_rad:
+                # Bend too shallow — preserve vertex, do not insert arc
                 out.append(pts[i])
                 continue
 
