@@ -80,19 +80,19 @@ _logger = logging.getLogger("path_publisher")
 # ---------------------------------------------------------------------------
 # Path generators (hardcoded shapes for SITL)
 # ---------------------------------------------------------------------------
-def gen_straight_5m(spacing: float = 0.5) -> list[tuple[float, float]]:
+def gen_straight_5m(spacing: float = 0.1) -> list[tuple[float, float]]:
     """5 m straight north, points at `spacing` intervals."""
     n_steps = int(5.0 / spacing) + 1
     return [(i * spacing, 0.0) for i in range(n_steps)]
 
 
-def gen_straight_3m(spacing: float = 0.5) -> list[tuple[float, float]]:
+def gen_straight_3m(spacing: float = 0.1) -> list[tuple[float, float]]:
     """3 m straight north, points at `spacing` intervals."""
     n_steps = int(3.0 / spacing) + 1
     return [(i * spacing, 0.0) for i in range(n_steps)]
 
 
-def gen_arc_quarter_1m5(radius: float = 1.5, arc_spacing: float = 0.1) \
+def gen_arc_quarter_1m5(radius: float = 1.5, arc_spacing: float = 0.05) \
         -> list[tuple[float, float]]:
     """Quarter circle, radius 1.5 m. Starts heading north at origin,
     sweeps to the east (right turn). Centre of circle is at (0, +R)."""
@@ -107,7 +107,7 @@ def gen_arc_quarter_1m5(radius: float = 1.5, arc_spacing: float = 0.1) \
     return pts
 
 
-def gen_arc_half_1m5(radius: float = 1.5, arc_spacing: float = 0.1) \
+def gen_arc_half_1m5(radius: float = 1.5, arc_spacing: float = 0.05) \
         -> list[tuple[float, float]]:
     """Half circle, radius 1.5 m. Starts heading north at origin,
     sweeps to the east (right turn). Centre of circle is at (0, +R)."""
@@ -122,7 +122,7 @@ def gen_arc_half_1m5(radius: float = 1.5, arc_spacing: float = 0.1) \
     return pts
 
 
-def gen_lshape_2x2(spacing: float = 0.25) -> list[tuple[float, float]]:
+def gen_lshape_2x2(spacing: float = 0.15) -> list[tuple[float, float]]:
     """2 m north, then 2 m east. Sharp 90° corner."""
     pts = []
     n_steps_1 = int(2.0 / spacing) + 1
@@ -134,7 +134,7 @@ def gen_lshape_2x2(spacing: float = 0.25) -> list[tuple[float, float]]:
     return pts
 
 
-def gen_square_2x2(spacing: float = 0.25) -> list[tuple[float, float]]:
+def gen_square_2x2(spacing: float = 0.15) -> list[tuple[float, float]]:
     """2 m × 2 m square starting at origin, clockwise, closed loop."""
     side = 2.0
     pts = []
@@ -151,7 +151,7 @@ def gen_square_2x2(spacing: float = 0.25) -> list[tuple[float, float]]:
     return pts
 
 
-def gen_rectangle_3x2(spacing: float = 0.25) -> list[tuple[float, float]]:
+def gen_rectangle_3x2(spacing: float = 0.15) -> list[tuple[float, float]]:
     """3 m north × 2 m east rectangle, clockwise."""
     len_n, len_e = 3.0, 2.0
     pts = []
@@ -170,7 +170,7 @@ def gen_rectangle_3x2(spacing: float = 0.25) -> list[tuple[float, float]]:
     return pts
 
 
-def gen_circle_1m5(radius: float = 1.5, arc_spacing: float = 0.1) \
+def gen_circle_1m5(radius: float = 1.5, arc_spacing: float = 0.05) \
         -> list[tuple[float, float]]:
     """Full circle, radius 1.5 m, starts north at origin, closed loop."""
     circ_len = radius * 2.0 * math.pi

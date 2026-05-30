@@ -1029,17 +1029,19 @@ class RPPControllerNode(Node):
             d = self._dist(pos_n, pos_e, wp.x, wp.y)
             return 0, 0.0, wp.x, wp.y, d  # sign undefined for single point
 
-        # P1.4: windowed search centred on the previous closest segment.
-        # Window: [hint-2, hint+4) — wide enough to handle 0.4 m/s at 50 Hz
-        # (0.008 m per cycle; a 25 cm segment takes ~30 cycles to traverse).
+        # P1.4: forward-only windowed search from the previous closest segment.
+        # Window: [hint, hint+4) — no backward search to prevent foot-jitter on
+        # arcs where adjacent segments are nearly equidistant and the foot
+        # would otherwise alternate segments every cycle (see arc_fix_08 analysis).
+        # At 0.4 m/s and 50 Hz the rover moves 0.008 m/cycle; hint+4 covers
+        # every reachable segment without ever looking behind.
         # On the very first cycle after a path reset or EKF jump
         # (_hint_valid=False), do a full O(n) scan so we lock onto the correct
-        # segment immediately. After that, windowed search is O(1) in steady
-        # state.
+        # segment immediately. After that, the forward-only window is O(1).
         if not self._hint_valid:
             lo, hi = 0, n_pts - 1
         else:
-            lo = max(0, self._closest_seg_hint - 2)
+            lo = self._closest_seg_hint  # no backward search — prevents foot-jitter on arcs
             hi = min(n_pts - 1, self._closest_seg_hint + 4)
             # Widen to full scan when window is too narrow (short paths)
             if hi - lo < 3:
