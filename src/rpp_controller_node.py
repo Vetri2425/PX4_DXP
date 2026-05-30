@@ -342,6 +342,11 @@ class RPPControllerNode(Node):
 
         # P1.4 — segment search hint: start projection from previous best seg
         self._closest_seg_hint: int = 0
+        # Pre-computed nominal path curvature — median of interior-segment Menger
+        # curvatures. Used as a floor in the curvature-aware lookahead minimum
+        # to prevent edge segments (first/last few) from collapsing kappa_path
+        # to ~0 and dropping the curvature minimum mid-arc.
+        self._path_nominal_kappa: float = 0.0
         # Track last filtered speed for curvature-aware lookahead smoothing
         self._filtered_speed: float = 0.0
         # P1.4 (Sprint 2 fixup) — full-scan flag: forces O(n) projection on
@@ -529,6 +534,11 @@ class RPPControllerNode(Node):
         self._path_travel_m = 0.0   # reset travel distance on new path
         # P1.4 — reset hint so search starts from beginning of new path
         self._closest_seg_hint = 0
+        # Pre-compute nominal path curvature (median of interior-segment Menger
+        # curvatures). Skip first 2 and last 2 segments which have edge effects.
+        _kappas = sorted(
+            self._path_curvature_at(i) for i in range(2, len(new_path) - 2))
+        self._path_nominal_kappa = _kappas[len(_kappas) // 2] if _kappas else 0.0
         # P1.4 fixup — force full scan on first projection after re-plan
         self._hint_valid = False
         # P0.1 — reset last speed so L_d bootstraps cleanly on new path
@@ -1365,6 +1375,13 @@ class RPPControllerNode(Node):
         # Set curvature_ld_factor=0.0 to disable (pure velocity-scaled L_d).
         curv_ld_factor = self.get_parameter("curvature_ld_factor").value
         kappa_path = self._path_curvature_at(seg_idx)
+        # Fix 1a: Floor kappa_path to prevent edge-segment collapse. The
+        # Menger curvature at the first/last few segments returns ~0 or
+        # underestimates the true arc curvature, causing the curvature
+        # minimum to drop out or oscillate at arc boundaries (~4 segments
+        # per end = "7-8 transitions" across a semicircle).
+        if self._path_nominal_kappa > 1e-6:
+            kappa_path = max(kappa_path, self._path_nominal_kappa * 0.5)
         if curv_ld_factor > 0.0 and kappa_path > 1e-6:
             l_d = min(l_max, max(l_d, curv_ld_factor / kappa_path))
 
