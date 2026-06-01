@@ -181,7 +181,12 @@ class RPPControllerNode(Node):
         # Parameters (all tunable at launch / runtime via ros2 param)
         # ------------------------------------------------------------------
         # RPP geometry
-        self.declare_parameter("max_linear_vel",                      1.0)
+        # max_linear_vel is the rover's true hardware ceiling. PX4 caps actual
+        # speed at RO_SPEED_LIM=0.3 m/s, so 0.3 matches reality. Sizing RPP to
+        # 0.3 keeps the lookahead (lookahead_time*v) honest (~0.45 m) instead of
+        # ~1.1 m when sized for an unreachable 0.67 m/s — which made the arc
+        # track ~7 cm wide (arc_fix_13). Tune mission_speed below this per job.
+        self.declare_parameter("max_linear_vel",                      0.3)
         self.declare_parameter("min_linear_vel",                      0.15)
         self.declare_parameter("min_lookahead_dist",                  0.4)
         self.declare_parameter("max_lookahead_dist",                  1.5)
