@@ -83,7 +83,8 @@ def _build(context, *args, **kwargs):
         "min_lookahead_dist", "max_lookahead_dist", "lookahead_time",
         "regulated_linear_scaling_min_radius", "corner_smooth_radius_m",
         "use_feedforward_yaw_rate", "max_yaw_rate_body",
-        "yaw_rate_feedback_gain", "max_linear_vel", "min_linear_vel",
+        "yaw_rate_feedback_gain", "stanley_softening",
+        "max_linear_vel", "min_linear_vel",
         "curvature_ld_factor", "xtrack_lookahead_gain",
         "corner_smooth_min_bend_deg", "l_d_lpf_alpha",
     ):
@@ -177,7 +178,9 @@ def generate_launch_description():
             description="If true, offset path to rover's current EKF position"),
         DeclareLaunchArgument("log_level", default_value="info",
             description="ROS2 log level (debug, info, warn, error)"),
-        # RPP tuning overrides — pass any of these to override node defaults
+        # RPP tuning overrides — pass any of these to override node defaults.
+        # Current node defaults (as of 2026-05-31) are tuned for 1.5 m radius arcs:
+        #   curvature_ld_factor=0.45, l_d_lpf_alpha=0.85, xtrack_lookahead_gain=0.0
         DeclareLaunchArgument("min_lookahead_dist",                  default_value="__unset__"),
         DeclareLaunchArgument("max_lookahead_dist",                  default_value="__unset__"),
         DeclareLaunchArgument("lookahead_time",                      default_value="__unset__"),
@@ -185,7 +188,12 @@ def generate_launch_description():
         DeclareLaunchArgument("corner_smooth_radius_m",              default_value="__unset__"),
         DeclareLaunchArgument("use_feedforward_yaw_rate",            default_value="true"),
         DeclareLaunchArgument("max_yaw_rate_body",                   default_value="1.0"),
-        DeclareLaunchArgument("yaw_rate_feedback_gain",              default_value="1.2"),
+        # Plotter steering: yaw_rate_feedback_gain is now the Stanley cross-track
+        # gain. Default 0.5 matches the node default (conservative); raise toward
+        # 1.0 if a steady line offset persists. stanley_softening defaults to the
+        # node value (0.15) unless overridden.
+        DeclareLaunchArgument("yaw_rate_feedback_gain",              default_value="0.5"),
+        DeclareLaunchArgument("stanley_softening",                   default_value="__unset__"),
         DeclareLaunchArgument("max_linear_vel",                      default_value="__unset__"),
         DeclareLaunchArgument("min_linear_vel",                      default_value="__unset__"),
         DeclareLaunchArgument("curvature_ld_factor",                 default_value="__unset__"),

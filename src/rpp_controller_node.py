@@ -78,17 +78,29 @@ Phase C / P3.1 — opt-in upgrades (default OFF for backward compat)
         of tripping STALE. We deliberately omit the 0.5·a·dt² term: it's
         sub-mm at typical bench accelerations and pulling raw IMU `a` would
         leak gravity bias through any non-zero pitch/roll.
-  P3.1  Feedforward yaw rate: publishes /rpp/yaw_rate_body (Float32) with
-        ω = κ·v + k_ψ·θ_e for body-rate OFFBOARD mode. Bypasses PX4 spot-turn
-        FSM for smoother corners. Requires twist_to_setpoint_node to forward
-        the rate.
+  P3.1  Feedforward yaw rate: publishes /rpp/yaw_rate_body (Float32) with a
+        SIGNED curvature feedforward ω = κ_path·v so PX4's yaw controller leads
+        the rotating arc tangent. twist_to_setpoint_node forwards it (mask 455).
+
+Plotter steering (2026-05-31) — replaces pure-pursuit κ steering
+----------------------------------------------------------------
+  The velocity vector no longer points at the lookahead point. It points along
+  a COMMANDED HEADING computed from a classic Stanley law:
+        θ_cmd = θ_path + atan2(-k_stanley·e_⊥, v + softening)
+  where θ_path is the path tangent bearing at the projection segment and e_⊥ is
+  the signed cross-track error. PX4's yaw setpoint = atan2(v_n, v_e) = θ_cmd
+  (via twist_to_setpoint), so the heading loop closes through the proven
+  velocity-direction channel. A signed feedforward κ_path·v on /rpp/yaw_rate_body
+  supplies curvature anticipation. This removes the κ=2·y_body/L² spikes and the
+  arc heading lag that the old lookahead-direction velocity vector suffered.
+  k_stanley = yaw_rate_feedback_gain (name kept for launch compatibility).
 
 What this node does NOT do
 --------------------------
-- Does NOT (by default) compute angular velocity ω. PX4 v1.16+ ignores
-  yawspeed in the OFFBOARD velocity branch and derives target yaw from
-  atan2(vE, vN) of the velocity vector. P3.1 publishes ω opt-in for the
-  body-rate path; the velocity path is unchanged.
+- Does NOT point the velocity vector at the lookahead. The lookahead/κ are still
+  computed (κ feeds the speed regulator), but steering uses the Stanley-commanded
+  heading above. PX4 v1.16+ derives target yaw from atan2(vE, vN) of the velocity
+  vector, which is exactly the commanded heading we encode there.
 - Does NOT implement rotate-to-heading. PX4's spot-turn FSM does this
   automatically; tune RD_TRANS_DRV_TRN (≈30°) and RD_TRANS_TRN_DRV (≈5°).
 - Does NOT do body→NED rotation of pose. Output is already in NED.
@@ -238,16 +250,21 @@ class RPPControllerNode(Node):
         # L_d = clamp(lookahead_time * v + xtrack_lookahead_gain * |e_⊥|, L_min, L_max)
         # Set 0.0 to disable the cross-track term (pure velocity-scaled).
         # 1.0 means a 10 cm cross-track adds 10 cm of lookahead.
-        self.declare_parameter("xtrack_lookahead_gain",               0.3)
+        #
+        # Default changed to 0.0 after arc_half_1m5 / circle validation (Fix 11).
+        # Adding the xtrack term made L_d too variable on constant-curvature arcs.
+        self.declare_parameter("xtrack_lookahead_gain",               0.0)
 
         # P1.5 — L_d low-pass filter.
         # Smooths step changes in L_d caused by kappa_path alternating between
         # 0 (collinear triplet at segment boundary) and 1/R (arc interior).
         # l_d_lpf_alpha=0 disables (raw L_d, original behaviour).
-        # Recommended: 0.7 for arcs — one L_d time-constant ≈ DT/(1-α) = 0.07 s.
-        # Set higher (0.85-0.90) for very smooth marking at cost of slower
-        # xtrack recovery.  Never set ≥ 1.0 (filter becomes non-causal).
-        self.declare_parameter("l_d_lpf_alpha",                       0.0)
+        #
+        # Default raised to 0.85 after arc validation (Fix 11 series).
+        # 0.85 provides good smoothing on arcs while still allowing reasonable
+        # xtrack recovery. 0.7–0.9 range validated for R=1.5 m paths.
+        # Never set ≥ 1.0 (filter becomes non-causal).
+        self.declare_parameter("l_d_lpf_alpha",                       0.85)
 
         # Fix 1 — curvature-aware lookahead minimum.
         # On arcs, ensures l_d >= curvature_ld_factor / kappa_path so the
@@ -257,10 +274,13 @@ class RPPControllerNode(Node):
         # regulated_pure_pursuit_controller.cpp, getLookAheadDistance()).
         # Here the result is bounded by max_lookahead_dist to honour that
         # contract. Set 0.0 to match Nav2 behaviour exactly (pure velocity-
-        # scaled lookahead). 0.75 was the original calibrated value;
-        # 0.45 is recommended for R ≥ 1.5 m paths where the 0.75 value
-        # forces L_d = 1.125 m and reduces xtrack correction gain 3.5×.
-        self.declare_parameter("curvature_ld_factor",                 0.75)
+        # scaled lookahead).
+        #
+        # Default set to 0.45 after arc_half_1m5 / circle_1m5 validation (Fix 11).
+        # 0.75 forces L_d ≈ 1.125 m on R=1.5 m arcs and reduces xtrack authority
+        # too much. 0.45 gives a healthier floor (~0.67 m on R=1.5 m) while still
+        # preventing collapse. Validated range for marking: 0.35–0.55.
+        self.declare_parameter("curvature_ld_factor",                 0.45)
 
         # P1.3 — Path conditioning on receipt
         # path_resample_spacing_m: if > 0, linearly resample the path to this
@@ -297,13 +317,25 @@ class RPPControllerNode(Node):
         # 0.10 s + the existing 0.20 s pose_max_age = 300 ms total budget.
         self.declare_parameter("imu_max_extrap_age_s",                0.10)
 
-        # P3.1 — Feedforward yaw rate via body-rate mode
-        # When enabled, RPP computes ω_ff = κ·v and sends it directly to PX4
-        # via OFFBOARD body-rate mode instead of relying on heading PID.
-        # Bypasses spot-turn FSM, smoother corners, better rate tracking.
-        # Requires twist_to_setpoint_node to support body-rate output.
+        # Plotter steering — geometric curvature feedforward + Stanley feedback
+        # (replaces the old pure-pursuit κ steering, 2026-05-31).
+        # When use_feedforward_yaw_rate is True, RPP sends a SIGNED curvature
+        # feedforward ω_ff = κ_path·v on /rpp/yaw_rate_body so PX4's yaw
+        # controller leads the continuously-rotating arc tangent instead of
+        # lagging it (eliminates entry chord-cut). Steering itself rides the
+        # proven velocity-direction → yaw channel: the velocity vector points
+        # along the Stanley-commanded heading (theta_path + cross-track corr).
         self.declare_parameter("use_feedforward_yaw_rate",            True)
-        self.declare_parameter("yaw_rate_feedback_gain",              0.0)  # 0=pure FF; tune up once sign confirmed
+        # Stanley cross-track gain (k_stanley). Heading correction toward the
+        # path is atan2(-k·e_⊥, v + softening). 0.5 = conservative start;
+        # raise toward 1.0 if a steady line offset persists. 0.0 disables the
+        # cross-track term (heading then follows the bare path tangent).
+        # NOTE: param name kept as yaw_rate_feedback_gain for launch-file
+        # compatibility; its role is now the Stanley CTE gain, not a yaw-rate FB.
+        self.declare_parameter("yaw_rate_feedback_gain",              0.5)
+        # Stanley low-speed softening: keeps the atan2 denominator > 0 as speed
+        # → 0 so the cross-track correction stays bounded near the goal.
+        self.declare_parameter("stanley_softening",                   0.15)
         # Clamp on body yaw rate. Match PX4 RO_YAW_RATE_LIM (deg/s) converted
         # to rad/s so RPP doesn't request more than PX4 will honor.
         # 0.5 rad/s ≈ 28.6°/s — safe default. Set 0.0 to disable.
@@ -724,6 +756,27 @@ class RPPControllerNode(Node):
             return 0.0
         area2 = abs((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x))
         return (2.0 * area2) / (ab * bc * ca)
+
+    def _path_turn_sign(self, seg_idx: int) -> float:
+        """Direction the path turns at seg_idx: +1 = CW (yaw increasing),
+        -1 = CCW. _path_curvature_at returns an unsigned magnitude, so the
+        plotter feedforward needs this sign to turn the correct way.
+
+        Sign is the z-component of the cross product of the two consecutive
+        segment vectors centred on seg_idx. In NED top-down (x=North, y=East)
+        a positive cross product is a clockwise (right) turn → +yaw_rate, which
+        matches twist_to_setpoint_node passing yaw_rate through as NED CW+.
+        Returns +1.0 for straight / degenerate triplets (sign-neutral; the
+        curvature magnitude is ~0 there so the feedforward vanishes anyway).
+        """
+        n = len(self._path)
+        if n < 3:
+            return 1.0
+        a = self._path[max(0, seg_idx - 1)].pose.position
+        b = self._path[seg_idx].pose.position
+        c = self._path[min(n - 1, seg_idx + 1)].pose.position
+        cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x)
+        return 1.0 if cross >= 0.0 else -1.0
 
     # ==================================================================
     # P1.3 — Path conditioning helpers
@@ -1508,38 +1561,63 @@ class RPPControllerNode(Node):
         # ---- P0.1: persist commanded speed for next cycle's L_d ----
         self._last_speed_cmd = speed
 
-        # ---- P3.1 — Feedforward yaw rate (body-rate mode) ----
-        # Must run AFTER all speed modifications (approach scaling, accel ramp, P4 floor)
-        # so that yaw_rate_ff = κ·v uses the same speed that will actually be commanded.
-        # Computing before approach scaling caused 4× over-command during deceleration.
+        # ---- Plotter steering — geometric heading command + Stanley feedback ----
+        # Replaces the old pure-pursuit κ steering (which produced 9× κ spikes and
+        # a ~12° heading lag on arcs). The steering law is classic Stanley expressed
+        # as a COMMANDED HEADING, fed to PX4 through the proven velocity-direction →
+        # yaw channel in twist_to_setpoint_node (msg.yaw = atan2(v_n, v_e)). A signed
+        # curvature feedforward κ_path·v is published on /rpp/yaw_rate_body so PX4's
+        # yaw controller leads the rotating tangent instead of lagging it.
+        # Must run AFTER all speed modifications (approach scaling, accel ramp, P4
+        # floor) so the feedforward uses the speed that will actually be commanded.
+
+        # Path tangent at the projection segment (NED bearing: 0=North, CW+).
+        # Use the prior segment near the path end so the tangent never collapses
+        # to atan2(0,0); by then speed→0 so the exact value is immaterial.
+        if seg_idx + 1 < len(self._path):
+            p1 = self._path[seg_idx].pose.position
+            p2 = self._path[seg_idx + 1].pose.position
+        else:
+            p1 = self._path[max(0, seg_idx - 1)].pose.position
+            p2 = self._path[seg_idx].pose.position
+        theta_path = math.atan2(p2.y - p1.y, p2.x - p1.x)
+
+        # Stanley cross-track correction (heading offset, rad). signed_xtrack:
+        # + = rover right of path → steer left → negative heading offset. The
+        # softening term keeps the atan2 bounded as speed → 0 near the goal.
+        k_stanley = self.get_parameter("yaw_rate_feedback_gain").value
+        soften    = self.get_parameter("stanley_softening").value
+        cte_corr  = math.atan2(-k_stanley * signed_xtrack, speed + soften)
+
+        # Commanded heading = path tangent + Stanley correction.
+        desired_yaw_ned = theta_path + cte_corr
+        desired_yaw_ned = (desired_yaw_ned + math.pi) % (2.0 * math.pi) - math.pi
+
+        # Signed curvature feedforward (kappa_path from Step 2 is an unsigned
+        # magnitude; _path_turn_sign supplies the turn direction).
         use_ff_yaw_rate = self.get_parameter("use_feedforward_yaw_rate").value
         if use_ff_yaw_rate:
-            yaw_rate_ff = kappa * speed  # feedforward: κ·v (speed is now fully resolved)
-            yaw_rate_fb = self.get_parameter("yaw_rate_feedback_gain").value * theta_e
-            yaw_rate_body = yaw_rate_ff + yaw_rate_fb
+            kappa_path_signed = math.copysign(
+                kappa_path, self._path_turn_sign(seg_idx))
+            yaw_rate_body = kappa_path_signed * speed  # ω_ff = κ·v (CW+)
             max_yr = self.get_parameter("max_yaw_rate_body").value
             if max_yr > 0.0:
                 yaw_rate_body = self._clamp(yaw_rate_body, -max_yr, max_yr)
         else:
             yaw_rate_body = 0.0
 
-        # ---- Step 8: Build NED velocity vector ----
-        # Direction: unit vector from rover to lookahead point, in NED.
-        # PX4 computes target_yaw = atan2(vE, vN) and aligns the rover with
-        # that direction via its internal heading PID + spot-turn FSM.
-        # P0.5: if enabled in twist_to_setpoint_node, we also publish an
-        # explicit yaw setpoint that gives RPP authority over heading.
-        unit_n = dn / l_actual if l_actual > 1e-9 else 0.0
-        unit_e = de / l_actual if l_actual > 1e-9 else 0.0
-        v_n = speed * unit_n
-        v_e = speed * unit_e
-        
-        # P0.5: compute target yaw (NED: 0=North, CW+).
-        # When |v| < 1 cm/s, freeze at last commanded yaw to avoid snapping
-        # to North on stop (matches PX4 P4 patch behavior).
+        # ---- Step 8: Build NED velocity vector ALONG the commanded heading ----
+        # Steering reaches PX4 via twist_to_setpoint_node's velocity-direction →
+        # absolute-yaw derivation: pointing the velocity along desired_yaw_ned makes
+        # PX4's yaw setpoint = tangent + Stanley correction, closing the heading loop.
+        v_n = speed * math.cos(desired_yaw_ned)
+        v_e = speed * math.sin(desired_yaw_ned)
+
+        # When |v| < 1 cm/s, freeze at last commanded yaw to avoid snapping to
+        # North on stop (matches PX4 P4 patch behavior).
         speed_mag = math.hypot(v_n, v_e)
         if speed_mag > 0.01:
-            yaw_target_ned = math.atan2(v_e, v_n)
+            yaw_target_ned = desired_yaw_ned
         else:
             yaw_target_ned = self._last_yaw_cmd
         self._last_yaw_cmd = yaw_target_ned
