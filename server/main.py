@@ -16,6 +16,7 @@ Shutdown reverses the order. Telemetry loop catches and logs every exception
 without dying. Beacon and rclpy threads use Event-based stop signals so
 shutdown completes within ~1 s.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -32,10 +33,19 @@ from starlette.middleware.gzip import GZipMiddleware
 
 from auth import init_auth
 from config import (
-    BEACON_INTERVAL, BEACON_PORT, CORS_ALLOW_CREDENTIALS, CORS_ALLOW_ORIGINS,
-    DEFAULT_PORT, MAX_ACTIVITY_LOG, MISSION_DIR, POSE_STALE_MS, ROVER_ID,
-    RPP_STATE_NAMES, RPP_UNHEALTHY_CODES,
-    SAFETY_STALE_GRACE_S, TELEMETRY_HZ,
+    BEACON_INTERVAL,
+    BEACON_PORT,
+    CORS_ALLOW_CREDENTIALS,
+    CORS_ALLOW_ORIGINS,
+    DEFAULT_PORT,
+    MAX_ACTIVITY_LOG,
+    MISSION_DIR,
+    POSE_STALE_MS,
+    ROVER_ID,
+    RPP_STATE_NAMES,
+    RPP_UNHEALTHY_CODES,
+    SAFETY_STALE_GRACE_S,
+    TELEMETRY_HZ,
 )
 from logging_setup import configure_logging, get_logger
 from models import MissionState
@@ -44,19 +54,20 @@ from models import MissionState
 _sd_notifier = None
 try:
     import sdnotify
+
     _sd_notifier = sdnotify.SystemdNotifier()
 except ImportError:
     pass
 
 # ── Module-level singletons (populated in lifespan) ───────────────────────────
-ros_node:          Optional["object"] = None
-offboard_ctrl:     Optional["object"] = None
-path_mgr:          Optional["object"] = None
+ros_node: Optional["object"] = None
+offboard_ctrl: Optional["object"] = None
+path_mgr: Optional["object"] = None
 emergency_handler: Optional["object"] = None
-_executor:         Optional["object"] = None
-_beacon:           Optional["object"] = None
-_listener:         Optional["object"] = None
-_telemetry_task:   Optional[asyncio.Task] = None
+_executor: Optional["object"] = None
+_beacon: Optional["object"] = None
+_listener: Optional["object"] = None
+_telemetry_task: Optional[asyncio.Task] = None
 
 # Bounded, thread-safe ring buffer (deque maxlen). All log appends are atomic
 # under the GIL; bounded eviction is built in. Replaces the racy list+trim.
@@ -77,6 +88,7 @@ socket_app = socketio.ASGIApp(sio)
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global ros_node, offboard_ctrl, path_mgr, emergency_handler
@@ -89,6 +101,7 @@ async def lifespan(app: FastAPI):
     try:
         import rclpy
         from ros_node import RosBridgeNode, RosExecutorThread
+
         if not rclpy.ok():
             rclpy.init()
         ros_node = RosBridgeNode()
@@ -98,8 +111,7 @@ async def lifespan(app: FastAPI):
         _record("info", "ROS2 bridge started")
     except Exception as exc:
         log.exception("ROS2 startup failed — continuing without MAVROS")
-        _record("warning",
-                f"ROS2 unavailable — server running without MAVROS: {exc}")
+        _record("warning", f"ROS2 unavailable — server running without MAVROS: {exc}")
 
     # ── Build shared objects ──────────────────────────────────────────────────
     from beacon import RoverBeacon, BeaconListener
@@ -107,22 +119,24 @@ async def lifespan(app: FastAPI):
     from offboard_controller import OffboardController
     from path_manager import PathManager
 
-    path_mgr          = PathManager(MISSION_DIR)
-    offboard_ctrl     = OffboardController(ros_node, activity_log)
+    path_mgr = PathManager(MISSION_DIR)
+    offboard_ctrl = OffboardController(ros_node, activity_log)
     emergency_handler = EmergencyHandler(ros_node, offboard_ctrl, activity_log)
 
     # ── Register Socket.IO handlers ───────────────────────────────────────────
     from sockets.events import register_handlers
+
     register_handlers(sio)
 
     # ── Start telemetry + watchdog loop ───────────────────────────────────────
-    _telemetry_task = asyncio.create_task(_telemetry_loop(),
-                                          name="telemetry-loop")
+    _telemetry_task = asyncio.create_task(_telemetry_loop(), name="telemetry-loop")
 
     # ── Start UDP discovery beacon ────────────────────────────────────────────
     _beacon = RoverBeacon(
-        port=BEACON_PORT, interval=BEACON_INTERVAL,
-        rover_id=ROVER_ID, server_port=DEFAULT_PORT,
+        port=BEACON_PORT,
+        interval=BEACON_INTERVAL,
+        rover_id=ROVER_ID,
+        server_port=DEFAULT_PORT,
     )
     _beacon.start()
     _listener = BeaconListener(port=BEACON_PORT)
@@ -162,6 +176,7 @@ async def lifespan(app: FastAPI):
             log.exception("destroy_node raised")
     try:
         import rclpy
+
         rclpy.try_shutdown()
     except Exception:
         pass
@@ -170,6 +185,7 @@ async def lifespan(app: FastAPI):
 
 
 # ── FastAPI app factory ───────────────────────────────────────────────────────
+
 
 def create_app() -> FastAPI:
     app = FastAPI(
@@ -187,20 +203,22 @@ def create_app() -> FastAPI:
     )
 
     # REST routers
-    from routes.system    import router as sys_router
-    from routes.vehicle   import router as veh_router
-    from routes.mission   import router as mis_router
-    from routes.path      import paths_router, path_router
-    from routes.params    import router as par_router
+    from routes.system import router as sys_router
+    from routes.vehicle import router as veh_router
+    from routes.mission import router as mis_router
+    from routes.path import paths_router, path_router
+    from routes.params import router as par_router
+    from routes.rpp_params import router as rpp_par_router
     from routes.telemetry import router as tel_router
 
-    app.include_router(sys_router,  prefix="/api")
-    app.include_router(veh_router,  prefix="/api")
-    app.include_router(mis_router,  prefix="/api")
-    app.include_router(paths_router, prefix="/api")   # → /api/paths
-    app.include_router(path_router,  prefix="/api")   # → /api/path/*
-    app.include_router(par_router,  prefix="/api")
-    app.include_router(tel_router,  prefix="/api")
+    app.include_router(sys_router, prefix="/api")
+    app.include_router(veh_router, prefix="/api")
+    app.include_router(mis_router, prefix="/api")
+    app.include_router(paths_router, prefix="/api")  # → /api/paths
+    app.include_router(path_router, prefix="/api")  # → /api/path/*
+    app.include_router(par_router, prefix="/api")
+    app.include_router(rpp_par_router, prefix="/api")
+    app.include_router(tel_router, prefix="/api")
 
     # Socket.IO
     app.mount("/socket.io", socket_app)
@@ -211,6 +229,7 @@ app = create_app()
 
 
 # ── Telemetry loop with watchdog and auto-completion ──────────────────────────
+
 
 async def _telemetry_loop() -> None:
     interval = 1.0 / TELEMETRY_HZ
@@ -228,64 +247,71 @@ async def _telemetry_loop() -> None:
                 if ros_node is None:
                     continue
 
-                s    = ros_node.get_state()
+                s = ros_node.get_state()
                 code = s.get("rpp_state", 0)
-                now  = time.time()
+                now = time.time()
 
                 # ── 1. Push telemetry ──────────────────────────────────────────
                 telem = {
-                    "pos_n":           s.get("pos_n"),
-                    "pos_e":           s.get("pos_e"),
+                    "pos_n": s.get("pos_n"),
+                    "pos_e": s.get("pos_e"),
                     "heading_ned_deg": s.get("heading_ned_deg"),
-                    "xtrack_m":        s.get("xtrack_m"),
+                    "xtrack_m": s.get("xtrack_m"),
                     "heading_err_deg": s.get("heading_err_deg"),
-                    "lookahead_m":     s.get("lookahead_m"),
-                    "speed_m_s":       s.get("speed_m_s"),
-                    "kappa":           s.get("kappa"),
-                    "dist_to_goal_m":  s.get("dist_to_goal_m"),
-                    "pose_age_ms":     s.get("pose_age_ms"),
-                    "rpp_state":       code,
-                    "rpp_state_name":  RPP_STATE_NAMES.get(code, "UNKNOWN"),
-                    "armed":           s.get("armed"),
-                    "mode":            s.get("mode"),
-                    "connected":       s.get("connected"),
-                    "battery_v":       s.get("battery_v"),
-                    "battery_pct":     s.get("battery_pct"),
-                    "gps_fix":         s.get("gps_fix"),
-                    "gps_sat":         s.get("gps_sat"),
-                    "lat":             s.get("lat"),
-                    "lon":             s.get("lon"),
-                    "alt":             s.get("alt"),
+                    "lookahead_m": s.get("lookahead_m"),
+                    "speed_m_s": s.get("speed_m_s"),
+                    "kappa": s.get("kappa"),
+                    "dist_to_goal_m": s.get("dist_to_goal_m"),
+                    "pose_age_ms": s.get("pose_age_ms"),
+                    "rpp_state": code,
+                    "rpp_state_name": RPP_STATE_NAMES.get(code, "UNKNOWN"),
+                    "armed": s.get("armed"),
+                    "mode": s.get("mode"),
+                    "connected": s.get("connected"),
+                    "battery_v": s.get("battery_v"),
+                    "battery_pct": s.get("battery_pct"),
+                    "gps_fix": s.get("gps_fix"),
+                    "gps_sat": s.get("gps_sat"),
+                    "lat": s.get("lat"),
+                    "lon": s.get("lon"),
+                    "alt": s.get("alt"),
                 }
                 await sio.emit("telemetry", telem)
 
                 mission_status = {
-                    "state":          (offboard_ctrl.state.value
-                                       if offboard_ctrl else "idle"),
-                    "rpp_state":      code,
+                    "state": (offboard_ctrl.state.value if offboard_ctrl else "idle"),
+                    "rpp_state": code,
                     "rpp_state_name": RPP_STATE_NAMES.get(code, "UNKNOWN"),
-                    "dist_to_goal":   s.get("dist_to_goal_m"),
-                    "speed":          s.get("speed_m_s"),
-                    "xtrack":         s.get("xtrack_m"),
+                    "dist_to_goal": s.get("dist_to_goal_m"),
+                    "speed": s.get("speed_m_s"),
+                    "xtrack": s.get("xtrack_m"),
                 }
                 await sio.emit("mission_status", mission_status)
 
                 # ── 2. Auto-completion: RUNNING + DONE settled → COMPLETED ─────
-                if (offboard_ctrl is not None
-                        and offboard_ctrl.state == MissionState.RUNNING
-                        and ros_node.get_rpp_monitor().is_done()):
+                if (
+                    offboard_ctrl is not None
+                    and offboard_ctrl.state == MissionState.RUNNING
+                    and ros_node.get_rpp_monitor().is_done()
+                ):
                     offboard_ctrl.mark_completed()
-                    await sio.emit("mission_completed",
-                                   {"state": offboard_ctrl.state.value,
-                                    "name":  offboard_ctrl.loaded_path_name})
+                    await sio.emit(
+                        "mission_completed",
+                        {
+                            "state": offboard_ctrl.state.value,
+                            "name": offboard_ctrl.loaded_path_name,
+                        },
+                    )
 
                 # ── 3. Watchdog: RUNNING + unhealthy/disconnected → estop ──────
                 # B2: RPP_UNHEALTHY_CODES covers STALE (-1), RTK_WAIT (4),
                 # JUMP_SKIP (5). All three mean "controller is publishing
                 # zero velocity for a safety reason" — same response.
                 pose_age = s.get("pose_age_ms") or 0.0
-                running  = (offboard_ctrl is not None
-                            and offboard_ctrl.state == MissionState.RUNNING)
+                running = (
+                    offboard_ctrl is not None
+                    and offboard_ctrl.state == MissionState.RUNNING
+                )
                 unhealthy = (
                     code in RPP_UNHEALTHY_CODES
                     or pose_age > POSE_STALE_MS
@@ -299,16 +325,24 @@ async def _telemetry_loop() -> None:
                             rpp_name = RPP_STATE_NAMES.get(code, f"?{code}")
                             log.warning(
                                 "safety abort: stale=%.0fms rpp=%s(%s) connected=%s",
-                                pose_age, code, rpp_name, s.get("connected"),
+                                pose_age,
+                                code,
+                                rpp_name,
+                                s.get("connected"),
                             )
                             await emergency_handler.estop_async()
-                            await sio.emit("safety_abort", {
-                                "reason":         "pose stale or FCU disconnected",
-                                "pose_age_ms":    pose_age,
-                                "rpp_state":      code,
-                                "rpp_state_name": RPP_STATE_NAMES.get(code, "UNKNOWN"),
-                                "connected":      s.get("connected"),
-                            })
+                            await sio.emit(
+                                "safety_abort",
+                                {
+                                    "reason": "pose stale or FCU disconnected",
+                                    "pose_age_ms": pose_age,
+                                    "rpp_state": code,
+                                    "rpp_state_name": RPP_STATE_NAMES.get(
+                                        code, "UNKNOWN"
+                                    ),
+                                    "connected": s.get("connected"),
+                                },
+                            )
                         stale_since = None
                 else:
                     stale_since = None
@@ -332,8 +366,9 @@ async def _telemetry_loop() -> None:
                 raise
             except Exception:
                 consecutive_errors += 1
-                log.exception("telemetry loop iteration failed (n=%d)",
-                              consecutive_errors)
+                log.exception(
+                    "telemetry loop iteration failed (n=%d)", consecutive_errors
+                )
                 # Exponential back-off on repeated failures, capped at 1 s
                 await asyncio.sleep(min(1.0, 0.05 * consecutive_errors))
     finally:
@@ -342,12 +377,15 @@ async def _telemetry_loop() -> None:
 
 # ── Internal helper ───────────────────────────────────────────────────────────
 
+
 def _record(level: str, message: str) -> None:
-    activity_log.append({
-        "timestamp": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "level":     level,
-        "message":   message,
-    })
+    activity_log.append(
+        {
+            "timestamp": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "level": level,
+            "message": message,
+        }
+    )
     getattr(log, level if level in ("info", "warning", "error", "debug") else "info")(
         message
     )

@@ -104,12 +104,20 @@ waypoint for `done_settle_s` (default 1 s).
 
 ## Tuning entry points
 
+**Current recommended defaults for 1.5 m radius arc marking** (validated on `arc_half_1m5` + `circle_1m5`):
+
+- `curvature_ld_factor=0.45`
+- `l_d_lpf_alpha=0.85`
+- `xtrack_lookahead_gain=0.0`
+
+These are now the node defaults (as of late May 2026).
+
 Order matters — change one parameter at a time, capture a CSV, plot, repeat.
 
 | Symptom | Try |
 |---|---|
 | Wobbles on straight line | Increase `min_lookahead_dist` (0.30 → 0.40) or decrease `lookahead_time` (1.2 → 1.0) |
-| Cuts arcs significantly | Decrease `regulated_linear_scaling_min_radius` (0.6 → 0.4) so curvature kicks in earlier |
+| Cuts arcs significantly | Increase `curvature_ld_factor` (0.35 → 0.45–0.55) or lower `lookahead_time` |
 | Overshoots goal | Decrease `approach_velocity_scaling_dist` (0.6 → 0.4) |
 | Stops short of goal | Decrease `xy_goal_tolerance` (0.02 → 0.01); also check P4 `p4_zero_vel_threshold` |
 | Velocity step ringing on hardware | Reduce PX4 `RO_SPEED_P` from 0.5 → 0.2-0.3 (post-QPPS plant is much stiffer) |

@@ -14,6 +14,7 @@ methods `arm()` / `set_mode()` are kept as thin wrappers that block the
 caller's thread (used only by the offboard controller's sync `start()`
 shim if ever needed) but **must not** be called from the asyncio loop.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -37,6 +38,7 @@ from geometry_msgs.msg import PoseStamped, Vector3Stamped
 from nav_msgs.msg import Path
 from std_msgs.msg import Float32MultiArray
 
+from config import SRV_RPP_GET_PARAMS, SRV_RPP_LIST_PARAMS, SRV_RPP_SET_PARAMS
 from logging_setup import get_logger
 from rpp_status import RppStatusMonitor
 
@@ -47,6 +49,7 @@ try:
     from mavros_msgs.msg import State
     from sensor_msgs.msg import BatteryState, NavSatFix
     from mavros_msgs.srv import CommandBool, SetMode
+
     _HAS_MAVROS = True
 except ImportError:
     _HAS_MAVROS = False
@@ -54,6 +57,7 @@ except ImportError:
 
 try:
     from mavros_msgs.msg import GPSRAW
+
     _HAS_GPSRAW = True
 except ImportError:
     _HAS_GPSRAW = False
@@ -61,15 +65,18 @@ except ImportError:
 
 # Standard rcl_interfaces param services (always available with ROS2)
 try:
-    from rcl_interfaces.srv import GetParameters, SetParameters
+    from rcl_interfaces.srv import GetParameters, SetParameters, ListParameters
     from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
+
     _HAS_PARAM_SRV = True
 except ImportError:
     _HAS_PARAM_SRV = False
-    GetParameters = SetParameters = Parameter = ParameterValue = ParameterType = None  # type: ignore
+    GetParameters = SetParameters = ListParameters = None  # type: ignore
+    Parameter = ParameterValue = ParameterType = None  # type: ignore
 
 
 # ── QoS helpers ───────────────────────────────────────────────────────────────
+
 
 def _qos_reliable_tl(depth: int = 1) -> QoSProfile:
     return QoSProfile(
@@ -90,6 +97,7 @@ def _qos_best_effort(depth: int = 1) -> QoSProfile:
 
 
 # ── Executor lifecycle helper ─────────────────────────────────────────────────
+
 
 class RosExecutorThread:
     """Owns a MultiThreadedExecutor, drains it cooperatively in a thread."""
@@ -131,22 +139,37 @@ class RosExecutorThread:
 
 # ── Node ──────────────────────────────────────────────────────────────────────
 
+
 class RosBridgeNode(Node):
     """Single rclpy node; thread-safe shared state dict."""
 
     _DEFAULT_STATE: dict[str, Any] = {
-        "armed": False, "mode": "UNKNOWN", "connected": False,
-        "pos_n": 0.0, "pos_e": 0.0, "heading_ned_deg": 0.0,
-        "battery_v": 0.0, "battery_pct": 0.0,
-        "lat": 0.0, "lon": 0.0, "alt": 0.0,
-        "gps_fix": 0, "gps_sat": 0,
-        "xtrack_m": 0.0, "heading_err_deg": 0.0,
-        "lookahead_m": 0.0, "speed_m_s": 0.0,
-        "kappa": 0.0, "dist_to_goal_m": 0.0,
-        "pose_age_ms": 0.0, "rpp_state": 0,
-        "v_north": 0.0, "v_east": 0.0,
+        "armed": False,
+        "mode": "UNKNOWN",
+        "connected": False,
+        "pos_n": 0.0,
+        "pos_e": 0.0,
+        "heading_ned_deg": 0.0,
+        "battery_v": 0.0,
+        "battery_pct": 0.0,
+        "lat": 0.0,
+        "lon": 0.0,
+        "alt": 0.0,
+        "gps_fix": 0,
+        "gps_sat": 0,
+        "xtrack_m": 0.0,
+        "heading_err_deg": 0.0,
+        "lookahead_m": 0.0,
+        "speed_m_s": 0.0,
+        "kappa": 0.0,
+        "dist_to_goal_m": 0.0,
+        "pose_age_ms": 0.0,
+        "rpp_state": 0,
+        "v_north": 0.0,
+        "v_east": 0.0,
         # B1 — predictive κ and pre-clamp Ld for tuning analysis
-        "l_d_raw_m": 0.0, "kappa_speed": 0.0,
+        "l_d_raw_m": 0.0,
+        "kappa_speed": 0.0,
     }
 
     def __init__(self) -> None:
@@ -159,7 +182,7 @@ class RosBridgeNode(Node):
         # messages; connected stays "True" forever from cached value.
         # We expose this timestamp so callers can detect true process death.
         self._state_recv_time: float | None = None
-        self._MAVROS_STATE_TIMEOUT_S = 2.0   # MAVROS publishes /state ~10 Hz
+        self._MAVROS_STATE_TIMEOUT_S = 2.0  # MAVROS publishes /state ~10 Hz
 
         # Callback groups: subs mutually exclusive, services reentrant
         self._sub_group = MutuallyExclusiveCallbackGroup()
@@ -170,29 +193,57 @@ class RosBridgeNode(Node):
 
         # ── Subscribers ───────────────────────────────────────────────────────
         if _HAS_MAVROS:
-            self.create_subscription(State, "/mavros/state",
-                                     self._cb_state, _qos_reliable_tl(),
-                                     callback_group=self._sub_group)
-            self.create_subscription(PoseStamped, "/mavros/local_position/pose",
-                                     self._cb_pose, _qos_best_effort(),
-                                     callback_group=self._sub_group)
-            self.create_subscription(BatteryState, "/mavros/battery",
-                                     self._cb_battery, _qos_best_effort(),
-                                     callback_group=self._sub_group)
-            self.create_subscription(NavSatFix, "/mavros/global_position/global",
-                                     self._cb_global_pos, _qos_best_effort(),
-                                     callback_group=self._sub_group)
+            self.create_subscription(
+                State,
+                "/mavros/state",
+                self._cb_state,
+                _qos_reliable_tl(),
+                callback_group=self._sub_group,
+            )
+            self.create_subscription(
+                PoseStamped,
+                "/mavros/local_position/pose",
+                self._cb_pose,
+                _qos_best_effort(),
+                callback_group=self._sub_group,
+            )
+            self.create_subscription(
+                BatteryState,
+                "/mavros/battery",
+                self._cb_battery,
+                _qos_best_effort(),
+                callback_group=self._sub_group,
+            )
+            self.create_subscription(
+                NavSatFix,
+                "/mavros/global_position/global",
+                self._cb_global_pos,
+                _qos_best_effort(),
+                callback_group=self._sub_group,
+            )
             if _HAS_GPSRAW:
-                self.create_subscription(GPSRAW, "/mavros/gpsstatus/gps1/raw",
-                                         self._cb_gps_raw, _qos_best_effort(),
-                                         callback_group=self._sub_group)
+                self.create_subscription(
+                    GPSRAW,
+                    "/mavros/gpsstatus/gps1/raw",
+                    self._cb_gps_raw,
+                    _qos_best_effort(),
+                    callback_group=self._sub_group,
+                )
 
-        self.create_subscription(Float32MultiArray, "/rpp/debug",
-                                 self._cb_rpp_debug, _qos_best_effort(),
-                                 callback_group=self._sub_group)
-        self.create_subscription(Vector3Stamped, "/rpp/velocity_ned",
-                                 self._cb_rpp_velocity, _qos_best_effort(),
-                                 callback_group=self._sub_group)
+        self.create_subscription(
+            Float32MultiArray,
+            "/rpp/debug",
+            self._cb_rpp_debug,
+            _qos_best_effort(),
+            callback_group=self._sub_group,
+        )
+        self.create_subscription(
+            Vector3Stamped,
+            "/rpp/velocity_ned",
+            self._cb_rpp_velocity,
+            _qos_best_effort(),
+            callback_group=self._sub_group,
+        )
 
         # ── Publishers ────────────────────────────────────────────────────────
         self._path_pub = self.create_publisher(Path, "/path", _qos_reliable_tl())
@@ -211,20 +262,50 @@ class RosBridgeNode(Node):
             )
         if _HAS_PARAM_SRV:
             self._param_get_cli = self.create_client(
-                GetParameters, "/mavros/param/get_parameters",
+                GetParameters,
+                "/mavros/param/get_parameters",
                 callback_group=self._svc_group,
             )
             self._param_set_cli = self.create_client(
-                SetParameters, "/mavros/param/set_parameters",
+                SetParameters,
+                "/mavros/param/set_parameters",
+                callback_group=self._svc_group,
+            )
+
+        # ── RPP controller param service clients ──────────────────────────────
+        # These talk to the running rpp_controller node via standard ROS2
+        # rcl_interfaces services. The controller starts independently and may
+        # not be up when the bridge starts; wait_for_service is deferred to
+        # each call site.
+        self._rpp_param_get_cli: GetParameters.Request | None = None
+        self._rpp_param_set_cli: SetParameters.Request | None = None
+        self._rpp_param_list_cli: ListParameters.Request | None = None
+        if _HAS_PARAM_SRV:
+            self._rpp_param_get_cli = self.create_client(
+                GetParameters,
+                SRV_RPP_GET_PARAMS,
+                callback_group=self._svc_group,
+            )
+            self._rpp_param_set_cli = self.create_client(
+                SetParameters,
+                SRV_RPP_SET_PARAMS,
+                callback_group=self._svc_group,
+            )
+            self._rpp_param_list_cli = self.create_client(
+                ListParameters,
+                SRV_RPP_LIST_PARAMS,
                 callback_group=self._svc_group,
             )
 
         # Non-blocking startup wait — services may come up after us
         for cli, name in (
-            (self._arming_cli,    "/mavros/cmd/arming"),
-            (self._set_mode_cli,  "/mavros/set_mode"),
+            (self._arming_cli, "/mavros/cmd/arming"),
+            (self._set_mode_cli, "/mavros/set_mode"),
             (self._param_get_cli, "/mavros/param/get_parameters"),
             (self._param_set_cli, "/mavros/param/set_parameters"),
+            (self._rpp_param_get_cli, SRV_RPP_GET_PARAMS),
+            (self._rpp_param_set_cli, SRV_RPP_SET_PARAMS),
+            (self._rpp_param_list_cli, SRV_RPP_LIST_PARAMS),
         ):
             if cli is not None and not cli.wait_for_service(timeout_sec=2.0):
                 log.warning("service %s not yet available — will retry on demand", name)
@@ -236,8 +317,8 @@ class RosBridgeNode(Node):
     def _cb_state(self, msg) -> None:
         self._state_recv_time = time.monotonic()
         with self._lock:
-            self._state["armed"]     = msg.armed
-            self._state["mode"]      = msg.mode
+            self._state["armed"] = msg.armed
+            self._state["mode"] = msg.mode
             self._state["connected"] = msg.connected
 
     def _cb_pose(self, msg) -> None:
@@ -258,7 +339,7 @@ class RosBridgeNode(Node):
         if pct is not None and 0.0 <= pct <= 1.0:
             pct = pct * 100.0
         with self._lock:
-            self._state["battery_v"]   = msg.voltage
+            self._state["battery_v"] = msg.voltage
             self._state["battery_pct"] = pct if pct is not None else 0.0
 
     def _cb_global_pos(self, msg) -> None:
@@ -279,22 +360,24 @@ class RosBridgeNode(Node):
             data = list(msg.data)
             self._rpp_monitor.update(data)
             with self._lock:
-                self._state["xtrack_m"]        = data[0]
+                self._state["xtrack_m"] = data[0]
                 self._state["heading_err_deg"] = math.degrees(data[1])
-                self._state["lookahead_m"]     = data[2]
-                self._state["speed_m_s"]       = data[3]
-                self._state["kappa"]           = data[4]
-                self._state["dist_to_goal_m"]  = data[5]
-                self._state["pose_age_ms"]     = data[6]
-                self._state["rpp_state"]       = int(data[7])
+                self._state["lookahead_m"] = data[2]
+                self._state["speed_m_s"] = data[3]
+                self._state["kappa"] = data[4]
+                self._state["dist_to_goal_m"] = data[5]
+                self._state["pose_age_ms"] = data[6]
+                self._state["rpp_state"] = int(data[7])
                 # B1 — only populate if the producer is the new version
-                self._state["l_d_raw_m"]   = data[8] if len(data) >= 9  else float("nan")
-                self._state["kappa_speed"] = data[9] if len(data) >= 10 else float("nan")
+                self._state["l_d_raw_m"] = data[8] if len(data) >= 9 else float("nan")
+                self._state["kappa_speed"] = (
+                    data[9] if len(data) >= 10 else float("nan")
+                )
 
     def _cb_rpp_velocity(self, msg: Vector3Stamped) -> None:
         with self._lock:
             self._state["v_north"] = msg.vector.x
-            self._state["v_east"]  = msg.vector.y
+            self._state["v_east"] = msg.vector.y
 
     # ── Public API: state ─────────────────────────────────────────────────────
 
@@ -377,9 +460,7 @@ class RosBridgeNode(Node):
         req.value = arm
         return await self._call_async(self._arming_cli, req, timeout, "success")
 
-    async def set_mode_async(
-        self, mode: str, timeout: float = 5.0
-    ) -> tuple[bool, str]:
+    async def set_mode_async(self, mode: str, timeout: float = 5.0) -> tuple[bool, str]:
         if self._set_mode_cli is None:
             return False, "mavros not available"
         req = SetMode.Request()
@@ -426,9 +507,7 @@ class RosBridgeNode(Node):
         ok, _, msg = await self._call_set_param(req, timeout)
         return ok, msg
 
-    async def _call_set_param(
-        self, req, timeout: float
-    ) -> tuple[bool, list, str]:
+    async def _call_set_param(self, req, timeout: float) -> tuple[bool, list, str]:
         if not self._param_set_cli.service_is_ready():
             if not self._param_set_cli.wait_for_service(timeout_sec=0.5):
                 return False, [], "param set service not ready"
@@ -448,6 +527,179 @@ class RosBridgeNode(Node):
         if results and not results[0].successful:
             return False, results, results[0].reason or "param set rejected"
         return True, results, ""
+
+    # ── Public API: RPP controller params (via rcl_interfaces) ───────────────
+
+    async def get_rpp_param_async(
+        self, name: str, timeout: float = 5.0
+    ) -> tuple[bool, Any, str]:
+        """Returns (ok, value, message) for a single RPP controller param."""
+        if self._rpp_param_get_cli is None:
+            return False, None, "RPP param service not available"
+        req = GetParameters.Request()
+        req.names = [name]
+        if not self._rpp_param_get_cli.service_is_ready():
+            if not self._rpp_param_get_cli.wait_for_service(timeout_sec=0.5):
+                return False, None, "RPP controller not running"
+        future = self._rpp_param_get_cli.call_async(req)
+        loop = asyncio.get_running_loop()
+        af: asyncio.Future = loop.create_future()
+
+        def _done_cb(f) -> None:
+            try:
+                loop.call_soon_threadsafe(af.set_result, f.result())
+            except Exception as exc:
+                loop.call_soon_threadsafe(af.set_exception, exc)
+
+        future.add_done_callback(_done_cb)
+        try:
+            result = await asyncio.wait_for(af, timeout=timeout)
+        except asyncio.TimeoutError:
+            return False, None, "RPP param get timed out"
+        except Exception as exc:
+            return False, None, f"RPP param get failed: {exc}"
+        if result is None or not result.values:
+            return False, None, f"param '{name}' not found on RPP controller"
+        return True, _param_value_to_python(result.values[0]), ""
+
+    async def get_rpp_params_bulk_async(
+        self, names: list[str], timeout: float = 5.0
+    ) -> tuple[bool, dict[str, Any], str]:
+        """Returns (ok, {name: value, ...}, message) for multiple params."""
+        if self._rpp_param_get_cli is None:
+            return False, {}, "RPP param service not available"
+        req = GetParameters.Request()
+        req.names = names
+        if not self._rpp_param_get_cli.service_is_ready():
+            if not self._rpp_param_get_cli.wait_for_service(timeout_sec=0.5):
+                return False, {}, "RPP controller not running"
+        future = self._rpp_param_get_cli.call_async(req)
+        loop = asyncio.get_running_loop()
+        af: asyncio.Future = loop.create_future()
+
+        def _done_cb(f) -> None:
+            try:
+                loop.call_soon_threadsafe(af.set_result, f.result())
+            except Exception as exc:
+                loop.call_soon_threadsafe(af.set_exception, exc)
+
+        future.add_done_callback(_done_cb)
+        try:
+            result = await asyncio.wait_for(af, timeout=timeout)
+        except asyncio.TimeoutError:
+            return False, {}, "RPP param get timed out"
+        except Exception as exc:
+            return False, {}, f"RPP param get failed: {exc}"
+        if result is None:
+            return False, {}, "RPP param get returned None"
+        if len(result.values) != len(names):
+            log.warning(
+                "RPP bulk get: expected %d values, got %d — some params missing",
+                len(names),
+                len(result.values),
+            )
+        values = {}
+        for n, v in zip(names, result.values):
+            values[n] = _param_value_to_python(v)
+        return True, values, ""
+
+    async def set_rpp_param_async(
+        self, name: str, value: float | int | bool | str, timeout: float = 5.0
+    ) -> tuple[bool, str]:
+        """Set a single RPP controller parameter at runtime."""
+        if self._rpp_param_set_cli is None:
+            return False, "RPP param service not available"
+        req = SetParameters.Request()
+        param = Parameter()
+        param.name = name
+        param.value = _python_to_param_value(value)
+        req.parameters = [param]
+        ok, _, msg = await self._call_rpp_set_param(req, timeout)
+        return ok, msg
+
+    async def set_rpp_params_bulk_async(
+        self, params: dict[str, float | int | bool | str], timeout: float = 5.0
+    ) -> tuple[bool, list[bool], str]:
+        """Set multiple RPP controller params atomically.
+
+        Returns (ok, per_param_success_flags, message). When one param fails
+        the entire batch is rejected by the RPP controller.
+        """
+        if self._rpp_param_set_cli is None:
+            return False, [], "RPP param service not available"
+        req = SetParameters.Request()
+        for name, value in params.items():
+            param = Parameter()
+            param.name = name
+            param.value = _python_to_param_value(value)
+            req.parameters.append(param)
+        ok, results, msg = await self._call_rpp_set_param(req, timeout)
+        flags = [r.successful for r in results] if results else []
+        return ok, flags, msg
+
+    async def _call_rpp_set_param(self, req, timeout: float) -> tuple[bool, list, str]:
+        """Shared rcl SetParameters call wrapper for RPP controller."""
+        if not self._rpp_param_set_cli.service_is_ready():
+            if not self._rpp_param_set_cli.wait_for_service(timeout_sec=0.5):
+                return False, [], "RPP controller not running"
+        future = self._rpp_param_set_cli.call_async(req)
+        loop = asyncio.get_running_loop()
+        af: asyncio.Future = loop.create_future()
+
+        def _done_cb(f) -> None:
+            try:
+                loop.call_soon_threadsafe(af.set_result, f.result())
+            except Exception as exc:
+                loop.call_soon_threadsafe(af.set_exception, exc)
+
+        future.add_done_callback(_done_cb)
+        try:
+            result = await asyncio.wait_for(af, timeout=timeout)
+        except asyncio.TimeoutError:
+            return False, [], "RPP param set timed out"
+        except Exception as exc:
+            return False, [], f"RPP param set failed: {exc}"
+        if result is None:
+            return False, [], "RPP param set returned None"
+        results = list(result.results)
+        if results and not results[0].successful:
+            return False, results, results[0].reason or "RPP param set rejected"
+        return True, results, ""
+
+    async def list_rpp_params_async(
+        self, timeout: float = 5.0
+    ) -> tuple[bool, list[str], str]:
+        """List all parameter names on the RPP controller node."""
+        if self._rpp_param_list_cli is None:
+            return False, [], "RPP param service not available"
+        req = ListParameters.Request()
+        req.depth = 0  # 0 = unlimited recursion (flat list)
+        if not self._rpp_param_list_cli.service_is_ready():
+            if not self._rpp_param_list_cli.wait_for_service(timeout_sec=0.5):
+                return False, [], "RPP controller not running"
+        future = self._rpp_param_list_cli.call_async(req)
+        loop = asyncio.get_running_loop()
+        af: asyncio.Future = loop.create_future()
+
+        def _done_cb(f) -> None:
+            try:
+                loop.call_soon_threadsafe(af.set_result, f.result())
+            except Exception as exc:
+                loop.call_soon_threadsafe(af.set_exception, exc)
+
+        future.add_done_callback(_done_cb)
+        try:
+            result = await asyncio.wait_for(af, timeout=timeout)
+        except asyncio.TimeoutError:
+            return False, [], "RPP list params timed out"
+        except Exception as exc:
+            return False, [], f"RPP list params failed: {exc}"
+        if result is None:
+            return False, [], "RPP list params returned None"
+        if result.result is None:
+            return False, [], "RPP list params returned null result (service bug)"
+        names = list(result.result.names)
+        return True, names, ""
 
     # ── Public API: path publishing ───────────────────────────────────────────
 
@@ -500,6 +752,7 @@ class RosBridgeNode(Node):
 
 
 # ── Param value <-> Python helpers ────────────────────────────────────────────
+
 
 def _param_value_to_python(pv) -> Any:
     if not _HAS_PARAM_SRV:
