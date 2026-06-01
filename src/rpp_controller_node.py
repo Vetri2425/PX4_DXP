@@ -78,29 +78,17 @@ Phase C / P3.1 — opt-in upgrades (default OFF for backward compat)
         of tripping STALE. We deliberately omit the 0.5·a·dt² term: it's
         sub-mm at typical bench accelerations and pulling raw IMU `a` would
         leak gravity bias through any non-zero pitch/roll.
-  P3.1  Feedforward yaw rate: publishes /rpp/yaw_rate_body (Float32) with a
-        SIGNED curvature feedforward ω = κ_path·v so PX4's yaw controller leads
-        the rotating arc tangent. twist_to_setpoint_node forwards it (mask 455).
-
-Plotter steering (2026-05-31) — replaces pure-pursuit κ steering
-----------------------------------------------------------------
-  The velocity vector no longer points at the lookahead point. It points along
-  a COMMANDED HEADING computed from a classic Stanley law:
-        θ_cmd = θ_path + atan2(-k_stanley·e_⊥, v + softening)
-  where θ_path is the path tangent bearing at the projection segment and e_⊥ is
-  the signed cross-track error. PX4's yaw setpoint = atan2(v_n, v_e) = θ_cmd
-  (via twist_to_setpoint), so the heading loop closes through the proven
-  velocity-direction channel. A signed feedforward κ_path·v on /rpp/yaw_rate_body
-  supplies curvature anticipation. This removes the κ=2·y_body/L² spikes and the
-  arc heading lag that the old lookahead-direction velocity vector suffered.
-  k_stanley = yaw_rate_feedback_gain (name kept for launch compatibility).
+  P3.1  Feedforward yaw rate: publishes /rpp/yaw_rate_body (Float32) with
+        ω = κ·v + k_ψ·θ_e for body-rate OFFBOARD mode. Bypasses PX4 spot-turn
+        FSM for smoother corners. Requires twist_to_setpoint_node to forward
+        the rate.
 
 What this node does NOT do
 --------------------------
-- Does NOT point the velocity vector at the lookahead. The lookahead/κ are still
-  computed (κ feeds the speed regulator), but steering uses the Stanley-commanded
-  heading above. PX4 v1.16+ derives target yaw from atan2(vE, vN) of the velocity
-  vector, which is exactly the commanded heading we encode there.
+- Does NOT (by default) compute angular velocity ω. PX4 v1.16+ ignores
+  yawspeed in the OFFBOARD velocity branch and derives target yaw from
+  atan2(vE, vN) of the velocity vector. P3.1 publishes ω opt-in for the
+  body-rate path; the velocity path is unchanged.
 - Does NOT implement rotate-to-heading. PX4's spot-turn FSM does this
   automatically; tune RD_TRANS_DRV_TRN (≈30°) and RD_TRANS_TRN_DRV (≈5°).
 - Does NOT do body→NED rotation of pose. Output is already in NED.
@@ -195,7 +183,7 @@ class RPPControllerNode(Node):
         # RPP geometry
         self.declare_parameter("max_linear_vel",                      1.0)
         self.declare_parameter("min_linear_vel",                      0.15)
-        self.declare_parameter("min_lookahead_dist",                  0.5)
+        self.declare_parameter("min_lookahead_dist",                  0.4)
         self.declare_parameter("max_lookahead_dist",                  1.5)
         self.declare_parameter("lookahead_time",                      1.5)
 
@@ -218,13 +206,6 @@ class RPPControllerNode(Node):
 
         # Safety
         self.declare_parameter("pose_max_age_s",                      0.5)    # 200 ms staleness threshold
-
-        # Pose convergence gate: refuse to track until pose has been fresher
-        # than pose_converge_age_ms continuously for pose_converge_time_s.
-        # Prevents tracking against an EKF that hasn't settled yet (common at
-        # startup after a static→moving transition).
-        self.declare_parameter("pose_converge_age_ms",                 50.0)   # ms
-        self.declare_parameter("pose_converge_time_s",                 1.0)    # s
         self.declare_parameter("path_frame_id",                       "local_ned")
 
         # P0.2 — EKF / position-jump detection
@@ -250,37 +231,7 @@ class RPPControllerNode(Node):
         # L_d = clamp(lookahead_time * v + xtrack_lookahead_gain * |e_⊥|, L_min, L_max)
         # Set 0.0 to disable the cross-track term (pure velocity-scaled).
         # 1.0 means a 10 cm cross-track adds 10 cm of lookahead.
-        #
-        # Default changed to 0.0 after arc_half_1m5 / circle validation (Fix 11).
-        # Adding the xtrack term made L_d too variable on constant-curvature arcs.
-        self.declare_parameter("xtrack_lookahead_gain",               0.0)
-
-        # P1.5 — L_d low-pass filter.
-        # Smooths step changes in L_d caused by kappa_path alternating between
-        # 0 (collinear triplet at segment boundary) and 1/R (arc interior).
-        # l_d_lpf_alpha=0 disables (raw L_d, original behaviour).
-        #
-        # Default raised to 0.85 after arc validation (Fix 11 series).
-        # 0.85 provides good smoothing on arcs while still allowing reasonable
-        # xtrack recovery. 0.7–0.9 range validated for R=1.5 m paths.
-        # Never set ≥ 1.0 (filter becomes non-causal).
-        self.declare_parameter("l_d_lpf_alpha",                       0.85)
-
-        # Fix 1 — curvature-aware lookahead minimum.
-        # On arcs, ensures l_d >= curvature_ld_factor / kappa_path so the
-        # lookahead walk produces a κ close to 1/R.
-        # Official Nav2 RPP uses no such term; L_d is purely velocity-scaled
-        # and max_lookahead_dist is a hard ceiling (navigation2 source:
-        # regulated_pure_pursuit_controller.cpp, getLookAheadDistance()).
-        # Here the result is bounded by max_lookahead_dist to honour that
-        # contract. Set 0.0 to match Nav2 behaviour exactly (pure velocity-
-        # scaled lookahead).
-        #
-        # Default set to 0.45 after arc_half_1m5 / circle_1m5 validation (Fix 11).
-        # 0.75 forces L_d ≈ 1.125 m on R=1.5 m arcs and reduces xtrack authority
-        # too much. 0.45 gives a healthier floor (~0.67 m on R=1.5 m) while still
-        # preventing collapse. Validated range for marking: 0.35–0.55.
-        self.declare_parameter("curvature_ld_factor",                 0.45)
+        self.declare_parameter("xtrack_lookahead_gain",               0.3)
 
         # P1.3 — Path conditioning on receipt
         # path_resample_spacing_m: if > 0, linearly resample the path to this
@@ -293,17 +244,9 @@ class RPPControllerNode(Node):
         #   corners with a warning. 0.0 disables.
         # corner_smooth_arc_pts: number of points used to discretise each
         #   inscribed arc (only used when corner_smooth_radius_m > 0).
-        # corner_smooth_min_bend_deg: minimum bend angle at a vertex before
-        #   smoothing is applied.  Vertices with a smaller bend are kept as-is.
-        #   Default 10 deg prevents the smoother from inserting spurious high-κ
-        #   arcs at the shallow bends of a polygon-arc path (e.g. 3.83 deg/step
-        #   for arc_half_1m5), which would otherwise cause L_d oscillation and
-        #   visible "spot turns" in the kappa command. Set 0.0 to restore the
-        #   original behaviour (smooth every non-collinear vertex).
         self.declare_parameter("path_resample_spacing_m",             0.08)
         self.declare_parameter("corner_smooth_radius_m",              0.5)
         self.declare_parameter("corner_smooth_arc_pts",               6)
-        self.declare_parameter("corner_smooth_min_bend_deg",          10.0)
 
         # P2.4 — Velocity-based pose extrapolation (latency closure)
         # When enabled, dead-reckon the pose forward by `vel_ned * pose_age`
@@ -317,25 +260,13 @@ class RPPControllerNode(Node):
         # 0.10 s + the existing 0.20 s pose_max_age = 300 ms total budget.
         self.declare_parameter("imu_max_extrap_age_s",                0.10)
 
-        # Plotter steering — geometric curvature feedforward + Stanley feedback
-        # (replaces the old pure-pursuit κ steering, 2026-05-31).
-        # When use_feedforward_yaw_rate is True, RPP sends a SIGNED curvature
-        # feedforward ω_ff = κ_path·v on /rpp/yaw_rate_body so PX4's yaw
-        # controller leads the continuously-rotating arc tangent instead of
-        # lagging it (eliminates entry chord-cut). Steering itself rides the
-        # proven velocity-direction → yaw channel: the velocity vector points
-        # along the Stanley-commanded heading (theta_path + cross-track corr).
+        # P3.1 — Feedforward yaw rate via body-rate mode
+        # When enabled, RPP computes ω_ff = κ·v and sends it directly to PX4
+        # via OFFBOARD body-rate mode instead of relying on heading PID.
+        # Bypasses spot-turn FSM, smoother corners, better rate tracking.
+        # Requires twist_to_setpoint_node to support body-rate output.
         self.declare_parameter("use_feedforward_yaw_rate",            True)
-        # Stanley cross-track gain (k_stanley). Heading correction toward the
-        # path is atan2(-k·e_⊥, v + softening). 0.5 = conservative start;
-        # raise toward 1.0 if a steady line offset persists. 0.0 disables the
-        # cross-track term (heading then follows the bare path tangent).
-        # NOTE: param name kept as yaw_rate_feedback_gain for launch-file
-        # compatibility; its role is now the Stanley CTE gain, not a yaw-rate FB.
-        self.declare_parameter("yaw_rate_feedback_gain",              0.5)
-        # Stanley low-speed softening: keeps the atan2 denominator > 0 as speed
-        # → 0 so the cross-track correction stays bounded near the goal.
-        self.declare_parameter("stanley_softening",                   0.15)
+        self.declare_parameter("yaw_rate_feedback_gain",              0.0)  # 0=pure FF; tune up once sign confirmed
         # Clamp on body yaw rate. Match PX4 RO_YAW_RATE_LIM (deg/s) converted
         # to rad/s so RPP doesn't request more than PX4 will honor.
         # 0.5 rad/s ≈ 28.6°/s — safe default. Set 0.0 to disable.
@@ -354,7 +285,7 @@ class RPPControllerNode(Node):
         # and EKF jump threshold — are derived from this value at runtime so the
         # operator never has to touch them.
         # Roads/large fields: 1.0 m/s  |  Sports fields/tight marking: 0.3–0.5 m/s
-        self.declare_parameter("mission_speed",                       0.4)  # m/s
+        self.declare_parameter("mission_speed",                       1.0)  # m/s
 
         # P4.2 — Deceleration limit used ONLY for braking-distance derivation.
         # Separate from max_linear_accel because the accel ramp is one-way
@@ -374,11 +305,6 @@ class RPPControllerNode(Node):
 
         # P1.4 — segment search hint: start projection from previous best seg
         self._closest_seg_hint: int = 0
-        # Pre-computed nominal path curvature — median of interior-segment Menger
-        # curvatures. Used as a floor in the curvature-aware lookahead minimum
-        # to prevent edge segments (first/last few) from collapsing kappa_path
-        # to ~0 and dropping the curvature minimum mid-arc.
-        self._path_nominal_kappa: float = 0.0
         # Track last filtered speed for curvature-aware lookahead smoothing
         self._filtered_speed: float = 0.0
         # P1.4 (Sprint 2 fixup) — full-scan flag: forces O(n) projection on
@@ -390,14 +316,6 @@ class RPPControllerNode(Node):
 
         # P0.1 — closed-loop L_d: persist last commanded speed
         self._last_speed_cmd: float = 0.0
-
-        # P1.5 — L_d low-pass filter state.  Prevents sudden kappa spikes when
-        # kappa_path jumps between path segments (Menger curvature of collinear
-        # triplets returns 0, dropping L_d from the curvature minimum back to the
-        # velocity floor every few waypoints).  Filter is reset to the first
-        # computed L_d on each new path so there is no warm-up transient.
-        self._l_d_filtered: float = 0.0
-        self._l_d_filter_init: bool = False
 
         # P0.5 — explicit yaw_setpoint: persist last commanded yaw for freeze
         self._last_yaw_cmd: float = 0.0
@@ -418,12 +336,6 @@ class RPPControllerNode(Node):
 
         # P0.3 — RTK fix tracking
         self._gps_fix_type: int = 0  # 0 = no fix; 6 = RTK_FIXED
-
-        # Pose convergence guard: prevent tracking from starting against a
-        # stale/diverged EKF estimate.  Tracks the first time pose_age dropped
-        # below the convergence threshold; tracking is gated until at least
-        # `pose_converge_time_s` seconds have elapsed since that moment.
-        self._pose_first_good_t: float = float("inf")
 
         # ------------------------------------------------------------------
         # QoS profiles
@@ -515,36 +427,19 @@ class RPPControllerNode(Node):
             )
             return
 
-        # Guard: if path content is identical to the existing path, skip
-        # the full state reset to avoid unnecessary _path_travel_m = 0,
-        # which causes IDLE↔TRACKING flicker when TRANSIENT_LOCAL QoS
-        # re-delivers the same path message.
-        if self._path and len(msg.poses) == len(self._path):
-            same = True
-            for new_ps, old_ps in zip(msg.poses, self._path):
-                if (abs(new_ps.pose.position.x - old_ps.pose.position.x) > 1e-4
-                        or abs(new_ps.pose.position.y - old_ps.pose.position.y) > 1e-4):
-                    same = False
-                    break
-            if same:
-                return
-
         # P1.3 — Path conditioning (linear resample + corner smoothing).
         # Operates on (north, east) tuples to keep the geometry code simple,
         # then converts back to PoseStamped at the end.
         raw_pts = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
         n_raw = len(raw_pts)
 
-        resample_dx   = float(self.get_parameter("path_resample_spacing_m").value)
-        corner_r      = float(self.get_parameter("corner_smooth_radius_m").value)
-        arc_pts       = int(self.get_parameter("corner_smooth_arc_pts").value)
-        min_bend_rad  = math.radians(
-            float(self.get_parameter("corner_smooth_min_bend_deg").value))
+        resample_dx = float(self.get_parameter("path_resample_spacing_m").value)
+        corner_r    = float(self.get_parameter("corner_smooth_radius_m").value)
+        arc_pts     = int(self.get_parameter("corner_smooth_arc_pts").value)
 
         cond_pts = raw_pts
         if corner_r > 0.0 and len(cond_pts) >= 3:
-            cond_pts = self._smooth_corners(
-                cond_pts, corner_r, max(2, arc_pts), min_bend_rad)
+            cond_pts = self._smooth_corners(cond_pts, corner_r, max(2, arc_pts))
         if resample_dx > 0.0 and len(cond_pts) >= 2:
             cond_pts = self._resample_path(cond_pts, resample_dx)
 
@@ -566,21 +461,12 @@ class RPPControllerNode(Node):
         self._path_travel_m = 0.0   # reset travel distance on new path
         # P1.4 — reset hint so search starts from beginning of new path
         self._closest_seg_hint = 0
-        # Pre-compute nominal path curvature (median of interior-segment Menger
-        # curvatures). Skip first 2 and last 2 segments which have edge effects.
-        _kappas = sorted(
-            self._path_curvature_at(i) for i in range(2, len(new_path) - 2))
-        self._path_nominal_kappa = _kappas[len(_kappas) // 2] if _kappas else 0.0
         # P1.4 fixup — force full scan on first projection after re-plan
         self._hint_valid = False
         # P0.1 — reset last speed so L_d bootstraps cleanly on new path
         self._last_speed_cmd = 0.0
-        # P1.5 — reset L_d filter; first cycle will seed it to avoid transient
-        self._l_d_filter_init = False
         # P0.2 — reset jump guard; first pose on new path is always "valid"
         self._last_pos = None
-        # Reset pose convergence timer for the new path
-        self._pose_first_good_t = float("inf")
 
         first = self._path[0].pose.position
         last = self._path[-1].pose.position
@@ -757,27 +643,6 @@ class RPPControllerNode(Node):
         area2 = abs((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x))
         return (2.0 * area2) / (ab * bc * ca)
 
-    def _path_turn_sign(self, seg_idx: int) -> float:
-        """Direction the path turns at seg_idx: +1 = CW (yaw increasing),
-        -1 = CCW. _path_curvature_at returns an unsigned magnitude, so the
-        plotter feedforward needs this sign to turn the correct way.
-
-        Sign is the z-component of the cross product of the two consecutive
-        segment vectors centred on seg_idx. In NED top-down (x=North, y=East)
-        a positive cross product is a clockwise (right) turn → +yaw_rate, which
-        matches twist_to_setpoint_node passing yaw_rate through as NED CW+.
-        Returns +1.0 for straight / degenerate triplets (sign-neutral; the
-        curvature magnitude is ~0 there so the feedforward vanishes anyway).
-        """
-        n = len(self._path)
-        if n < 3:
-            return 1.0
-        a = self._path[max(0, seg_idx - 1)].pose.position
-        b = self._path[seg_idx].pose.position
-        c = self._path[min(n - 1, seg_idx + 1)].pose.position
-        cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x)
-        return 1.0 if cross >= 0.0 else -1.0
-
     # ==================================================================
     # P1.3 — Path conditioning helpers
     # ==================================================================
@@ -826,8 +691,7 @@ class RPPControllerNode(Node):
 
     def _smooth_corners(self, pts: list[tuple[float, float]],
                         radius: float,
-                        arc_pts: int,
-                        min_bend_rad: float = 0.0) -> list[tuple[float, float]]:
+                        arc_pts: int) -> list[tuple[float, float]]:
         """Replace each interior vertex with an inscribed circular arc.
 
         Bounds path curvature at κ_max = 1/radius.
@@ -837,9 +701,6 @@ class RPPControllerNode(Node):
         d = radius / tan(theta/2), where theta is the interior angle.
         Vertices where d > 0.45 * min(|AP|, |PB|) are skipped (segments too
         short to support the arc) and a warning is logged.
-        Vertices whose bend angle (pi - theta) is below min_bend_rad are kept
-        as-is — this prevents inserting spurious high-κ arcs at the shallow
-        bends of a polygon-arc path, which would cause L_d oscillation.
         Endpoints are always kept.
         """
         n = len(pts)
@@ -867,13 +728,8 @@ class RPPControllerNode(Node):
             dot = u1n * u2n + u1e * u2e
             dot = max(-1.0, min(1.0, dot))
             theta = math.acos(dot)             # interior angle, 0..pi
-            bend  = math.pi - theta            # actual turn angle, 0..pi
-            if theta < 1e-3 or bend < 1e-3:
-                # Nearly collinear or full U-turn; keep vertex as-is
-                out.append(pts[i])
-                continue
-            if min_bend_rad > 0.0 and bend < min_bend_rad:
-                # Bend too shallow — preserve vertex, do not insert arc
+            if theta < 1e-3 or math.pi - theta < 1e-3:
+                # Nearly collinear; no smoothing needed, no chord taken
                 out.append(pts[i])
                 continue
 
@@ -1092,19 +948,17 @@ class RPPControllerNode(Node):
             d = self._dist(pos_n, pos_e, wp.x, wp.y)
             return 0, 0.0, wp.x, wp.y, d  # sign undefined for single point
 
-        # P1.4: forward-only windowed search from the previous closest segment.
-        # Window: [hint, hint+4) — no backward search to prevent foot-jitter on
-        # arcs where adjacent segments are nearly equidistant and the foot
-        # would otherwise alternate segments every cycle (see arc_fix_08 analysis).
-        # At 0.4 m/s and 50 Hz the rover moves 0.008 m/cycle; hint+4 covers
-        # every reachable segment without ever looking behind.
+        # P1.4: windowed search centred on the previous closest segment.
+        # Window: [hint-2, hint+4) — wide enough to handle 0.4 m/s at 50 Hz
+        # (0.008 m per cycle; a 25 cm segment takes ~30 cycles to traverse).
         # On the very first cycle after a path reset or EKF jump
         # (_hint_valid=False), do a full O(n) scan so we lock onto the correct
-        # segment immediately. After that, the forward-only window is O(1).
+        # segment immediately. After that, windowed search is O(1) in steady
+        # state.
         if not self._hint_valid:
             lo, hi = 0, n_pts - 1
         else:
-            lo = self._closest_seg_hint  # no backward search — prevents foot-jitter on arcs
+            lo = max(0, self._closest_seg_hint - 2)
             hi = min(n_pts - 1, self._closest_seg_hint + 4)
             # Widen to full scan when window is too narrow (short paths)
             if hi - lo < 3:
@@ -1305,31 +1159,6 @@ class RPPControllerNode(Node):
             self._publish_zero(StateCode.RTK_WAIT, pose_age_ms=pose_age_s * 1000)
             return
 
-        # ---- Pose convergence guard ----
-        # Gate tracking until the EKF pose has been consistently fresh for at
-        # least 1 second, preventing the controller from tracking against a
-        # stale/diverged pose that reports CTE = 0.8 m and 50° heading error.
-        converge_thr_ms = float(self.get_parameter("pose_converge_age_ms").value)
-        converge_time_s = float(self.get_parameter("pose_converge_time_s").value)
-        pose_age_ms_val = pose_age_s * 1000.0
-        if pose_age_ms_val < converge_thr_ms:
-            if self._pose_first_good_t == float("inf"):
-                self._pose_first_good_t = (
-                    self.get_clock().now().nanoseconds * 1e-9)
-                self.get_logger().info(
-                    f"Pose converging — age={pose_age_ms_val:.1f}ms < "
-                    f"{converge_thr_ms:.0f}ms threshold; stabilising for "
-                    f"{converge_time_s:.1f}s before tracking"
-                )
-        elif pose_age_ms_val > converge_thr_ms * 3.0:
-            self._pose_first_good_t = float("inf")
-
-        if (self._pose_first_good_t != float("inf")
-                and (self.get_clock().now().nanoseconds * 1e-9
-                     - self._pose_first_good_t) < converge_time_s):
-            self._publish_zero(StateCode.IDLE, pose_age_ms=pose_age_ms_val)
-            return
-
         # ---- Path readiness check ----
         if not self._path:
             self._publish_zero(StateCode.IDLE, pose_age_ms=pose_age_s * 1000)
@@ -1422,38 +1251,12 @@ class RPPControllerNode(Node):
         l_d = self._clamp(l_d_raw, l_min, l_max)
 
         # Fix 1: curvature-aware minimum lookahead — on arcs, ensure l_d
-        # spans at least curvature_ld_factor / kappa_path so the lookahead
-        # walk produces κ ≈ 1/R.  Result is clamped to l_max so that
-        # max_lookahead_dist remains a hard ceiling (per Nav2 RPP contract).
-        # Set curvature_ld_factor=0.0 to disable (pure velocity-scaled L_d).
-        curv_ld_factor = self.get_parameter("curvature_ld_factor").value
+        # spans at least 1/3 of the radius so the lookahead walk reliably
+        # reaches past the foot. Without this, short lookaheads on tight
+        # arcs can land at the rover position, triggering the IDLE path.
         kappa_path = self._path_curvature_at(seg_idx)
-        # Fix 1a: Floor kappa_path to prevent edge-segment collapse. The
-        # Menger curvature at the first/last few segments returns ~0 or
-        # underestimates the true arc curvature, causing the curvature
-        # minimum to drop out or oscillate at arc boundaries (~4 segments
-        # per end = "7-8 transitions" across a semicircle).
-        if self._path_nominal_kappa > 1e-6:
-            kappa_path = max(kappa_path, self._path_nominal_kappa * 0.5)
-        if curv_ld_factor > 0.0 and kappa_path > 1e-6:
-            l_d = min(l_max, max(l_d, curv_ld_factor / kappa_path))
-
-        # Fix 4a: hard-floor lookahead in the approach zone to prevent κ
-        # collapse.  As dist_goal → 0, v_path → 0 → l_d → 0 → κ = 2·y_body/lh²
-        # spikes to ±20 because pure pursuit breaks down at sub-cm lookaheads.
-        if dist_to_goal < approach_d and self._path_travel_m >= approach_d:
-            l_d = max(l_d, l_min)
-
-        # P1.5 — L_d low-pass filter.  Applied after all clamps so the filter
-        # smooths the final value sent to the lookahead walk.  Seeded on the
-        # first cycle of a new path to avoid a ramp-up transient.
-        lpf_alpha = float(self.get_parameter("l_d_lpf_alpha").value)
-        if lpf_alpha > 0.0:
-            if not self._l_d_filter_init:
-                self._l_d_filtered = l_d
-                self._l_d_filter_init = True
-            self._l_d_filtered = lpf_alpha * self._l_d_filtered + (1.0 - lpf_alpha) * l_d
-            l_d = self._l_d_filtered
+        if kappa_path > 1e-6:
+            l_d = max(l_d, 0.35 / kappa_path)
 
         # ---- Step 3: Lookahead point (NED), then body-frame for κ ----
         lh_n, lh_e, hit_end = self._get_lookahead_point(seg_idx, foot_n, foot_e, l_d)
@@ -1492,15 +1295,6 @@ class RPPControllerNode(Node):
 
         # ---- Step 4: Curvature ----
         kappa = (2.0 * y_body) / (l_actual * l_actual)
-
-        # Fix 4b: clamp κ to a physically meaningful maximum so the goal
-        # approach doesn't produce κ = ±20 when the lookahead collapses
-        # below 2 cm.  κ_max = 3 / max(l_actual, l_min) bounds the yaw
-        # rate to something the vehicle can actually achieve.
-        kappa = self._clamp(
-            kappa,
-            -3.0 / max(l_actual, l_min),
-            +3.0 / max(l_actual, l_min))
 
         # Heading error to lookahead in body frame (signed; for diagnostics)
         theta_e = math.atan2(y_body, x_body)
@@ -1561,63 +1355,38 @@ class RPPControllerNode(Node):
         # ---- P0.1: persist commanded speed for next cycle's L_d ----
         self._last_speed_cmd = speed
 
-        # ---- Plotter steering — geometric heading command + Stanley feedback ----
-        # Replaces the old pure-pursuit κ steering (which produced 9× κ spikes and
-        # a ~12° heading lag on arcs). The steering law is classic Stanley expressed
-        # as a COMMANDED HEADING, fed to PX4 through the proven velocity-direction →
-        # yaw channel in twist_to_setpoint_node (msg.yaw = atan2(v_n, v_e)). A signed
-        # curvature feedforward κ_path·v is published on /rpp/yaw_rate_body so PX4's
-        # yaw controller leads the rotating tangent instead of lagging it.
-        # Must run AFTER all speed modifications (approach scaling, accel ramp, P4
-        # floor) so the feedforward uses the speed that will actually be commanded.
-
-        # Path tangent at the projection segment (NED bearing: 0=North, CW+).
-        # Use the prior segment near the path end so the tangent never collapses
-        # to atan2(0,0); by then speed→0 so the exact value is immaterial.
-        if seg_idx + 1 < len(self._path):
-            p1 = self._path[seg_idx].pose.position
-            p2 = self._path[seg_idx + 1].pose.position
-        else:
-            p1 = self._path[max(0, seg_idx - 1)].pose.position
-            p2 = self._path[seg_idx].pose.position
-        theta_path = math.atan2(p2.y - p1.y, p2.x - p1.x)
-
-        # Stanley cross-track correction (heading offset, rad). signed_xtrack:
-        # + = rover right of path → steer left → negative heading offset. The
-        # softening term keeps the atan2 bounded as speed → 0 near the goal.
-        k_stanley = self.get_parameter("yaw_rate_feedback_gain").value
-        soften    = self.get_parameter("stanley_softening").value
-        cte_corr  = math.atan2(-k_stanley * signed_xtrack, speed + soften)
-
-        # Commanded heading = path tangent + Stanley correction.
-        desired_yaw_ned = theta_path + cte_corr
-        desired_yaw_ned = (desired_yaw_ned + math.pi) % (2.0 * math.pi) - math.pi
-
-        # Signed curvature feedforward (kappa_path from Step 2 is an unsigned
-        # magnitude; _path_turn_sign supplies the turn direction).
+        # ---- P3.1 — Feedforward yaw rate (body-rate mode) ----
+        # Must run AFTER all speed modifications (approach scaling, accel ramp, P4 floor)
+        # so that yaw_rate_ff = κ·v uses the same speed that will actually be commanded.
+        # Computing before approach scaling caused 4× over-command during deceleration.
         use_ff_yaw_rate = self.get_parameter("use_feedforward_yaw_rate").value
         if use_ff_yaw_rate:
-            kappa_path_signed = math.copysign(
-                kappa_path, self._path_turn_sign(seg_idx))
-            yaw_rate_body = kappa_path_signed * speed  # ω_ff = κ·v (CW+)
+            yaw_rate_ff = kappa * speed  # feedforward: κ·v (speed is now fully resolved)
+            yaw_rate_fb = self.get_parameter("yaw_rate_feedback_gain").value * theta_e
+            yaw_rate_body = yaw_rate_ff + yaw_rate_fb
             max_yr = self.get_parameter("max_yaw_rate_body").value
             if max_yr > 0.0:
                 yaw_rate_body = self._clamp(yaw_rate_body, -max_yr, max_yr)
         else:
             yaw_rate_body = 0.0
 
-        # ---- Step 8: Build NED velocity vector ALONG the commanded heading ----
-        # Steering reaches PX4 via twist_to_setpoint_node's velocity-direction →
-        # absolute-yaw derivation: pointing the velocity along desired_yaw_ned makes
-        # PX4's yaw setpoint = tangent + Stanley correction, closing the heading loop.
-        v_n = speed * math.cos(desired_yaw_ned)
-        v_e = speed * math.sin(desired_yaw_ned)
-
-        # When |v| < 1 cm/s, freeze at last commanded yaw to avoid snapping to
-        # North on stop (matches PX4 P4 patch behavior).
+        # ---- Step 8: Build NED velocity vector ----
+        # Direction: unit vector from rover to lookahead point, in NED.
+        # PX4 computes target_yaw = atan2(vE, vN) and aligns the rover with
+        # that direction via its internal heading PID + spot-turn FSM.
+        # P0.5: if enabled in twist_to_setpoint_node, we also publish an
+        # explicit yaw setpoint that gives RPP authority over heading.
+        unit_n = dn / l_actual if l_actual > 1e-9 else 0.0
+        unit_e = de / l_actual if l_actual > 1e-9 else 0.0
+        v_n = speed * unit_n
+        v_e = speed * unit_e
+        
+        # P0.5: compute target yaw (NED: 0=North, CW+).
+        # When |v| < 1 cm/s, freeze at last commanded yaw to avoid snapping
+        # to North on stop (matches PX4 P4 patch behavior).
         speed_mag = math.hypot(v_n, v_e)
         if speed_mag > 0.01:
-            yaw_target_ned = desired_yaw_ned
+            yaw_target_ned = math.atan2(v_e, v_n)
         else:
             yaw_target_ned = self._last_yaw_cmd
         self._last_yaw_cmd = yaw_target_ned
