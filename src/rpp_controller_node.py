@@ -215,9 +215,13 @@ class RPPControllerNode(Node):
         # Tune mission_speed per job to further cap; this is the hw ceiling.
         self.declare_parameter("max_linear_vel",                      0.8)
         self.declare_parameter("min_linear_vel",                      0.15)
-        self.declare_parameter("min_lookahead_dist",                  0.4)
-        self.declare_parameter("max_lookahead_dist",                  1.5)
-        self.declare_parameter("lookahead_time",                      1.5)
+        # 1.5 m arc baseline:
+        # k_path = 1/1.5 = 0.667 1/m, curvature floor below enforces
+        # Ld >= 0.35 / k_path = 0.525 m. Keep the explicit minimum aligned
+        # with that floor so the debugged Ld is stable and predictable.
+        self.declare_parameter("min_lookahead_dist",                  0.52)
+        self.declare_parameter("max_lookahead_dist",                  1.0)
+        self.declare_parameter("lookahead_time",                      1.6)
 
         # Curvature regulation — lateral acceleration constraint (P4.1)
         # v_lat_limit = sqrt(a_lat_max / |kappa|); physically correct form.
@@ -263,7 +267,7 @@ class RPPControllerNode(Node):
         # L_d = clamp(lookahead_time * v + xtrack_lookahead_gain * |e_⊥|, L_min, L_max)
         # Set 0.0 to disable the cross-track term (pure velocity-scaled).
         # 1.0 means a 10 cm cross-track adds 10 cm of lookahead.
-        self.declare_parameter("xtrack_lookahead_gain",               0.3)
+        self.declare_parameter("xtrack_lookahead_gain",               0.05)
 
         # P1.3 — Path conditioning on receipt
         # path_resample_spacing_m: if > 0, linearly resample the path to this
@@ -298,18 +302,20 @@ class RPPControllerNode(Node):
         # Bypasses spot-turn FSM, smoother corners, better rate tracking.
         # Requires twist_to_setpoint_node to support body-rate output.
         self.declare_parameter("use_feedforward_yaw_rate",            True)
-        self.declare_parameter("yaw_rate_feedback_gain",              0.3)  # arc_fix_18 baseline (launch file overrides to 1.2)
+        # For the 1.5 m arc, start with pure kappa*v feedforward. Outer yaw
+        # feedback had been over-commanding yaw rate in arc_fix_28.
+        self.declare_parameter("yaw_rate_feedback_gain",              0.0)
         # Clamp on body yaw rate. Match PX4 RO_YAW_RATE_LIM (deg/s) converted
         # to rad/s so RPP doesn't request more than PX4 will honor.
         # 0.5 rad/s ≈ 28.6°/s — safe default. Set 0.0 to disable.
-        self.declare_parameter("max_yaw_rate_body",                   1.0)
+        self.declare_parameter("max_yaw_rate_body",                   0.45)
 
         # Acceleration ramp (P0 polish): cap how fast `speed` can RAMP UP
         # cycle-to-cycle. Prevents motor jerk on mission start and after a
         # stop/re-plan. Decel is intentionally NOT limited — the P4 floor
         # relies on instantaneous step-to-zero to trigger PX4 P4 yaw freeze
         # at the goal. Set to 0.0 to disable.
-        self.declare_parameter("max_linear_accel",                    0.5)  # m/s²
+        self.declare_parameter("max_linear_accel",                    0.35)  # m/s²
 
         # P4.2 — Mission speed (operator-facing, set per job via ros2 param set)
         # This is the single knob the operator touches. It is capped by
@@ -317,7 +323,7 @@ class RPPControllerNode(Node):
         # and EKF jump threshold — are derived from this value at runtime so the
         # operator never has to touch them.
         # Roads/large fields: 1.0 m/s  |  Sports fields/tight marking: 0.3–0.5 m/s
-        self.declare_parameter("mission_speed",                       0.5)  # m/s
+        self.declare_parameter("mission_speed",                       0.35)  # m/s
 
         # P4.2 — Deceleration limit used ONLY for braking-distance derivation.
         # Separate from max_linear_accel because the accel ramp is one-way

@@ -81,9 +81,10 @@ def _build(context, *args, **kwargs):
     rpp_params = {}
     for name in (
         "min_lookahead_dist", "max_lookahead_dist", "lookahead_time",
-        "regulated_linear_scaling_min_radius", "corner_smooth_radius_m",
-        "use_feedforward_yaw_rate", "max_yaw_rate_body",
-        "yaw_rate_feedback_gain", "max_linear_vel", "min_linear_vel",
+        "corner_smooth_radius_m", "use_feedforward_yaw_rate",
+        "max_yaw_rate_body", "yaw_rate_feedback_gain",
+        "max_linear_vel", "min_linear_vel", "mission_speed",
+        "xtrack_lookahead_gain", "max_linear_accel",
     ):
         val = LaunchConfiguration(name).perform(context)
         if val != "__unset__":
@@ -179,12 +180,14 @@ def generate_launch_description():
         DeclareLaunchArgument("min_lookahead_dist",                  default_value="__unset__"),
         DeclareLaunchArgument("max_lookahead_dist",                  default_value="__unset__"),
         DeclareLaunchArgument("lookahead_time",                      default_value="__unset__"),
-        DeclareLaunchArgument("regulated_linear_scaling_min_radius", default_value="1.0"),
         DeclareLaunchArgument("corner_smooth_radius_m",              default_value="__unset__"),
-        DeclareLaunchArgument("use_feedforward_yaw_rate",            default_value="true"),
-        DeclareLaunchArgument("max_yaw_rate_body",                   default_value="1.5"),
-        DeclareLaunchArgument("yaw_rate_feedback_gain",              default_value="0.6"),
+        DeclareLaunchArgument("use_feedforward_yaw_rate",            default_value="__unset__"),
+        DeclareLaunchArgument("max_yaw_rate_body",                   default_value="__unset__"),
+        DeclareLaunchArgument("yaw_rate_feedback_gain",              default_value="__unset__"),
         DeclareLaunchArgument("max_linear_vel",                      default_value="__unset__"),
         DeclareLaunchArgument("min_linear_vel",                      default_value="__unset__"),
+        DeclareLaunchArgument("mission_speed",                       default_value="__unset__"),
+        DeclareLaunchArgument("xtrack_lookahead_gain",               default_value="__unset__"),
+        DeclareLaunchArgument("max_linear_accel",                    default_value="__unset__"),
         OpaqueFunction(function=_build),
     ])
