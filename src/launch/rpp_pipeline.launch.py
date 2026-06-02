@@ -183,7 +183,7 @@ def generate_launch_description():
         DeclareLaunchArgument("corner_smooth_radius_m",              default_value="__unset__"),
         DeclareLaunchArgument("use_feedforward_yaw_rate",            default_value="true"),
         DeclareLaunchArgument("max_yaw_rate_body",                   default_value="1.5"),
-        DeclareLaunchArgument("yaw_rate_feedback_gain",              default_value="0.4"),
+        DeclareLaunchArgument("yaw_rate_feedback_gain",              default_value="0.6"),
         DeclareLaunchArgument("max_linear_vel",                      default_value="__unset__"),
         DeclareLaunchArgument("min_linear_vel",                      default_value="__unset__"),
         OpaqueFunction(function=_build),
