@@ -181,12 +181,11 @@ class RPPControllerNode(Node):
         # Parameters (all tunable at launch / runtime via ros2 param)
         # ------------------------------------------------------------------
         # RPP geometry
-        # max_linear_vel is the rover's true hardware ceiling. PX4 caps actual
-        # speed at RO_SPEED_LIM=0.3 m/s, so 0.3 matches reality. Sizing RPP to
-        # 0.3 keeps the lookahead (lookahead_time*v) honest (~0.45 m) instead of
-        # ~1.1 m when sized for an unreachable 0.67 m/s — which made the arc
-        # track ~7 cm wide (arc_fix_13). Tune mission_speed below this per job.
-        self.declare_parameter("max_linear_vel",                      0.3)
+        # max_linear_vel is the rover's true hardware ceiling.
+        # arc_fix_18 validated: 0.8 with a_lat_max=0.3 constrains arc speed to
+        # sqrt(0.3/kappa). For R=1.5m kappa=0.667 → 0.671 m/s effective speed.
+        # Tune mission_speed per job to further cap; this is the hw ceiling.
+        self.declare_parameter("max_linear_vel",                      0.8)
         self.declare_parameter("min_linear_vel",                      0.15)
         self.declare_parameter("min_lookahead_dist",                  0.4)
         self.declare_parameter("max_lookahead_dist",                  1.5)
@@ -271,7 +270,7 @@ class RPPControllerNode(Node):
         # Bypasses spot-turn FSM, smoother corners, better rate tracking.
         # Requires twist_to_setpoint_node to support body-rate output.
         self.declare_parameter("use_feedforward_yaw_rate",            True)
-        self.declare_parameter("yaw_rate_feedback_gain",              0.0)  # 0=pure FF; tune up once sign confirmed
+        self.declare_parameter("yaw_rate_feedback_gain",              0.3)  # arc_fix_18 baseline (launch file overrides to 1.2)
         # Clamp on body yaw rate. Match PX4 RO_YAW_RATE_LIM (deg/s) converted
         # to rad/s so RPP doesn't request more than PX4 will honor.
         # 0.5 rad/s ≈ 28.6°/s — safe default. Set 0.0 to disable.
@@ -290,7 +289,7 @@ class RPPControllerNode(Node):
         # and EKF jump threshold — are derived from this value at runtime so the
         # operator never has to touch them.
         # Roads/large fields: 1.0 m/s  |  Sports fields/tight marking: 0.3–0.5 m/s
-        self.declare_parameter("mission_speed",                       1.0)  # m/s
+        self.declare_parameter("mission_speed",                       0.5)  # m/s
 
         # P4.2 — Deceleration limit used ONLY for braking-distance derivation.
         # Separate from max_linear_accel because the accel ramp is one-way
