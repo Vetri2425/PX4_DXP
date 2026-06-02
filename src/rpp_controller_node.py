@@ -122,6 +122,34 @@ Topic:  /rpp/debug   (std_msgs/Float32MultiArray, layout encoded below)
         [8]  l_d_raw_m            (B1: requested Ld before clamp; saturation visible)
         [9]  kappa_speed          (B1: worst preview κ used for speed scaling)
         [10] yaw_rate_cmd_rad_s   (P3.1: final clamped body yaw rate cmd; 0 if FF disabled)
+        [11] max_linear_vel       (param snapshot — hardware ceiling m/s)
+        [12] min_linear_vel       (param)
+        [13] min_lookahead_dist   (param)
+        [14] max_lookahead_dist   (param)
+        [15] lookahead_time       (param)
+        [16] a_lat_max            (param — m/s²)
+        [17] regulated_linear_scaling_min_speed (param)
+        [18] xy_goal_tolerance    (param — m)
+        [19] min_goal_travel_m    (param — m)
+        [20] approach_velocity_scaling_dist (param — m)
+        [21] min_approach_linear_velocity (param — m/s)
+        [22] p4_zero_vel_threshold (param — m/s)
+        [23] pose_max_age_s       (param — s)
+        [24] ekf_jump_threshold_m (param — m)
+        [25] require_rtk_fix      (param — 0/1 boolean)
+        [26] preview_curvature_n  (param — integer count)
+        [27] xtrack_lookahead_gain (param)
+        [28] path_resample_spacing_m (param — m)
+        [29] corner_smooth_radius_m  (param — m)
+        [30] corner_smooth_arc_pts   (param — integer count)
+        [31] use_imu_extrapolation   (param — 0/1 boolean)
+        [32] imu_max_extrap_age_s    (param — s)
+        [33] use_feedforward_yaw_rate (param — 0/1 boolean)
+        [34] yaw_rate_feedback_gain   (param)
+        [35] max_yaw_rate_body        (param — rad/s)
+        [36] max_linear_accel         (param — m/s²)
+        [37] max_linear_decel         (param — m/s²)
+        [38] mission_speed            (param — m/s)
 Layout is append-only: indices [0..7] keep their meaning forever. Consumers
 that only read [0..7] continue to work.
 
@@ -1482,27 +1510,86 @@ class RPPControllerNode(Node):
     ):
         """Publish /rpp/debug Float32MultiArray.
 
-        Layout is append-only — indices [0..7] retained verbatim from the
-        original 8-field schema so existing consumers (xtrack_logger,
-        mission_runner, server/ros_node, server/main, server/rpp_status)
-        continue to work without changes. New B1 fields are at [8..9],
-        P3.1 field at [10].
+        Indices [0..10]: runtime tracking state (backward-compatible with
+        existing consumers that only read [0..7]).
+        Indices [11..38]: snapshot of all tunable RPP parameters. Every bag
+        message is self-contained — you can replay and correlate parameter
+        values with tracking performance without needing a separate param dump.
         """
         msg = Float32MultiArray()
         msg.layout.dim.append(MultiArrayDimension(label="rpp_debug",
-                                                  size=11, stride=11))
+                                                  size=39, stride=39))
+
+        # ---- Snapshot all parameters once for this cycle ----
+        p_max_linear_vel = float(self.get_parameter("max_linear_vel").value)
+        p_min_linear_vel = float(self.get_parameter("min_linear_vel").value)
+        p_min_lookahead = float(self.get_parameter("min_lookahead_dist").value)
+        p_max_lookahead = float(self.get_parameter("max_lookahead_dist").value)
+        p_lookahead_time = float(self.get_parameter("lookahead_time").value)
+        p_a_lat_max = float(self.get_parameter("a_lat_max").value)
+        p_reg_scale_min = float(self.get_parameter("regulated_linear_scaling_min_speed").value)
+        p_goal_tol = float(self.get_parameter("xy_goal_tolerance").value)
+        p_min_goal_travel = float(self.get_parameter("min_goal_travel_m").value)
+        p_approach_dist = float(self.get_parameter("approach_velocity_scaling_dist").value)
+        p_min_approach_v = float(self.get_parameter("min_approach_linear_velocity").value)
+        p_p4_floor = float(self.get_parameter("p4_zero_vel_threshold").value)
+        p_pose_max_age = float(self.get_parameter("pose_max_age_s").value)
+        p_ekf_jump = float(self.get_parameter("ekf_jump_threshold_m").value)
+        p_req_rtk = 1.0 if self.get_parameter("require_rtk_fix").value else 0.0
+        p_preview_n = float(int(self.get_parameter("preview_curvature_n").value))
+        p_xt_ld_gain = float(self.get_parameter("xtrack_lookahead_gain").value)
+        p_resample = float(self.get_parameter("path_resample_spacing_m").value)
+        p_corner_r = float(self.get_parameter("corner_smooth_radius_m").value)
+        p_corner_pts = float(int(self.get_parameter("corner_smooth_arc_pts").value))
+        p_use_extrap = 1.0 if self.get_parameter("use_imu_extrapolation").value else 0.0
+        p_extrap_age = float(self.get_parameter("imu_max_extrap_age_s").value)
+        p_ff_yaw = 1.0 if self.get_parameter("use_feedforward_yaw_rate").value else 0.0
+        p_yr_fb_gain = float(self.get_parameter("yaw_rate_feedback_gain").value)
+        p_max_yr = float(self.get_parameter("max_yaw_rate_body").value)
+        p_max_accel = float(self.get_parameter("max_linear_accel").value)
+        p_max_decel = float(self.get_parameter("max_linear_decel").value)
+        p_mission_speed = float(self.get_parameter("mission_speed").value)
+
         msg.data = [
-            float(cross_track),     # [0]  cross_track_error_m, signed
-            float(heading_err),     # [1]  heading_error_rad
-            float(lookahead),       # [2]  lookahead_dist_m (actual)
-            float(speed),           # [3]  speed_cmd_m_s
-            float(kappa),           # [4]  curvature_kappa (steering)
-            float(dist_goal),       # [5]  dist_to_goal_m
-            float(pose_age_ms),     # [6]  pose_age_ms
-            float(state.value),     # [7]  state_code
-            float(l_d_raw),         # [8]  l_d_raw_m       (B1)
-            float(kappa_speed),     # [9]  kappa_speed     (B1)
-            float(yaw_rate),        # [10] yaw_rate_cmd_rad_s (P3.1)
+            float(cross_track),        # [0]  cross_track_error_m, signed
+            float(heading_err),        # [1]  heading_error_rad
+            float(lookahead),          # [2]  lookahead_dist_m (actual)
+            float(speed),              # [3]  speed_cmd_m_s
+            float(kappa),              # [4]  curvature_kappa (steering)
+            float(dist_goal),          # [5]  dist_to_goal_m
+            float(pose_age_ms),        # [6]  pose_age_ms
+            float(state.value),        # [7]  state_code
+            float(l_d_raw),            # [8]  l_d_raw_m       (B1)
+            float(kappa_speed),        # [9]  kappa_speed     (B1)
+            float(yaw_rate),           # [10] yaw_rate_cmd_rad_s (P3.1)
+            p_max_linear_vel,          # [11] max_linear_vel
+            p_min_linear_vel,          # [12] min_linear_vel
+            p_min_lookahead,           # [13] min_lookahead_dist
+            p_max_lookahead,           # [14] max_lookahead_dist
+            p_lookahead_time,          # [15] lookahead_time
+            p_a_lat_max,               # [16] a_lat_max
+            p_reg_scale_min,           # [17] regulated_linear_scaling_min_speed
+            p_goal_tol,                # [18] xy_goal_tolerance
+            p_min_goal_travel,         # [19] min_goal_travel_m
+            p_approach_dist,           # [20] approach_velocity_scaling_dist
+            p_min_approach_v,          # [21] min_approach_linear_velocity
+            p_p4_floor,                # [22] p4_zero_vel_threshold
+            p_pose_max_age,            # [23] pose_max_age_s
+            p_ekf_jump,                # [24] ekf_jump_threshold_m
+            p_req_rtk,                 # [25] require_rtk_fix
+            p_preview_n,               # [26] preview_curvature_n
+            p_xt_ld_gain,              # [27] xtrack_lookahead_gain
+            p_resample,                # [28] path_resample_spacing_m
+            p_corner_r,                # [29] corner_smooth_radius_m
+            p_corner_pts,              # [30] corner_smooth_arc_pts
+            p_use_extrap,              # [31] use_imu_extrapolation
+            p_extrap_age,              # [32] imu_max_extrap_age_s
+            p_ff_yaw,                  # [33] use_feedforward_yaw_rate
+            p_yr_fb_gain,              # [34] yaw_rate_feedback_gain
+            p_max_yr,                  # [35] max_yaw_rate_body
+            p_max_accel,               # [36] max_linear_accel
+            p_max_decel,               # [37] max_linear_decel
+            p_mission_speed,           # [38] mission_speed
         ]
         self._dbg_pub.publish(msg)
 
