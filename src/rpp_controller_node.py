@@ -307,7 +307,10 @@ class RPPControllerNode(Node):
         self.declare_parameter("yaw_rate_feedback_gain",              0.0)
         # Clamp on body yaw rate. Match PX4 RO_YAW_RATE_LIM (deg/s) converted
         # to rad/s so RPP doesn't request more than PX4 will honor.
-        # 0.5 rad/s ≈ 28.6°/s — safe default. Set 0.0 to disable.
+        # 0.45 rad/s ≈ 25.8°/s — validated baseline (arc_fix_16, 2026-06-03):
+        # with the PX4 yaw feedforward enabled (RD_MAX_THR_YAW_R=0.95) the arc
+        # peaks at ~0.34 rad/s, so 0.45 leaves headroom and never saturates.
+        # Set 0.0 to disable.
         self.declare_parameter("max_yaw_rate_body",                   0.45)
 
         # Acceleration ramp (P0 polish): cap how fast `speed` can RAMP UP
