@@ -330,8 +330,8 @@ class RosBridgeNode(Node):
         yaw_ned = math.pi / 2.0 - yaw_enu
         yaw_ned = math.atan2(math.sin(yaw_ned), math.cos(yaw_ned))
         with self._lock:
-            self._state["pos_n"] = msg.pose.position.y
-            self._state["pos_e"] = msg.pose.position.x
+            self._state["pos_n"] = msg.pose.position.y  # ENU y = North → pos_n
+            self._state["pos_e"] = msg.pose.position.x  # ENU x = East  → pos_e
             self._state["heading_ned_deg"] = math.degrees(yaw_ned)
 
     def _cb_battery(self, msg) -> None:
@@ -482,9 +482,16 @@ class RosBridgeNode(Node):
         future = self._param_get_cli.call_async(req)
         loop = asyncio.get_running_loop()
         af: asyncio.Future = loop.create_future()
-        future.add_done_callback(
-            lambda f: loop.call_soon_threadsafe(af.set_result, f.result())
-        )
+
+        def _done_cb(f) -> None:
+            try:
+                result = f.result()
+            except Exception as exc:
+                loop.call_soon_threadsafe(af.set_exception, exc)
+                return
+            loop.call_soon_threadsafe(af.set_result, result)
+
+        future.add_done_callback(_done_cb)
         try:
             result = await asyncio.wait_for(af, timeout=timeout)
         except asyncio.TimeoutError:
@@ -514,9 +521,16 @@ class RosBridgeNode(Node):
         future = self._param_set_cli.call_async(req)
         loop = asyncio.get_running_loop()
         af: asyncio.Future = loop.create_future()
-        future.add_done_callback(
-            lambda f: loop.call_soon_threadsafe(af.set_result, f.result())
-        )
+
+        def _done_cb(f) -> None:
+            try:
+                result = f.result()
+            except Exception as exc:
+                loop.call_soon_threadsafe(af.set_exception, exc)
+                return
+            loop.call_soon_threadsafe(af.set_result, result)
+
+        future.add_done_callback(_done_cb)
         try:
             result = await asyncio.wait_for(af, timeout=timeout)
         except asyncio.TimeoutError:

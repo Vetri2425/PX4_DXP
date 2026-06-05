@@ -21,6 +21,8 @@ router = APIRouter(prefix="/mission", tags=["mission"],
 @router.post("/load")
 async def load_mission(req: MissionLoadRequest):
     from main import offboard_ctrl, path_mgr
+    if offboard_ctrl is None:
+        raise HTTPException(503, "Controller not ready")
     name = req.path_name or req.mission_file
     if not name:
         raise HTTPException(400, "Provide path_name or mission_file")
@@ -37,6 +39,8 @@ async def load_mission(req: MissionLoadRequest):
 @router.post("/start")
 async def start_mission(req: MissionStartRequest | None = None):
     from main import offboard_ctrl, path_mgr
+    if offboard_ctrl is None:
+        raise HTTPException(503, "Controller not ready")
     if req and (req.path_name or req.mission_file):
         name = req.path_name or req.mission_file
         try:
@@ -55,6 +59,8 @@ async def start_mission(req: MissionStartRequest | None = None):
 @router.post("/stop")
 async def stop_mission():
     from main import offboard_ctrl
+    if offboard_ctrl is None:
+        raise HTTPException(503, "Controller not ready")
     await offboard_ctrl.stop_async()
     return {"state": offboard_ctrl.state.value}
 
@@ -62,6 +68,8 @@ async def stop_mission():
 @router.post("/abort")
 async def abort_mission():
     from main import offboard_ctrl
+    if offboard_ctrl is None:
+        raise HTTPException(503, "Controller not ready")
     await offboard_ctrl.abort_async()
     return {"state": offboard_ctrl.state.value}
 
@@ -69,6 +77,8 @@ async def abort_mission():
 @router.get("/status", response_model=MissionStatus)
 async def mission_status():
     from main import offboard_ctrl, ros_node
+    if offboard_ctrl is None:
+        raise HTTPException(503, "Controller not ready")
     s = ros_node.get_state() if ros_node else {}
     code = s.get("rpp_state", 0)
     return MissionStatus(

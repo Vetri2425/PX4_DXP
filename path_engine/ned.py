@@ -7,7 +7,10 @@ use the same implementation.
 
 from __future__ import annotations
 
+import logging
 import math
+
+log = logging.getLogger(__name__)
 
 try:
     from geographiclib.geodesic import Geodesic
@@ -76,6 +79,13 @@ def dxf_to_ned_affine(
     """
     if len(dxf_points) < 2 or len(ref_ned_points) < 2:
         raise ValueError("Need at least 2 reference point pairs for affine transform")
+
+    if len(dxf_points) > 2 or len(ref_ned_points) > 2:
+        log.warning(
+            "dxf_to_ned_affine: %d reference point pairs provided; only the "
+            "first 2 are used (no least-squares fit). Extra points ignored.",
+            max(len(dxf_points), len(ref_ned_points)),
+        )
 
     # Vector in DXF space
     dx = dxf_points[1][0] - dxf_points[0][0]

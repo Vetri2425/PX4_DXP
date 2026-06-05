@@ -6,6 +6,7 @@ import math
 
 from path_engine.core import PathSegment, SegmentType, PlannedPath
 from path_engine.engine import PathEngine
+from path_engine.parsers.dxf_parser import _HAS_EZDXF
 
 
 def test_engine_defaults():
@@ -415,7 +416,7 @@ def test_spray_flags_mark_transit_alternation():
 
 def test_engine_dxf_full_pipeline_with_start_position():
     """Full DXF pipeline with start_position produces valid plan."""
-    if not _HAS_EZDXF():
+    if not _HAS_EZDXF:
         return
 
     import ezdxf
@@ -436,14 +437,6 @@ def test_engine_dxf_full_pipeline_with_start_position():
         assert plan.total_mark_length > 0
     finally:
         os.unlink(fpath)
-
-
-def _HAS_EZDXF():
-    try:
-        import ezdxf
-        return True
-    except ImportError:
-        return False
 
 
 # ── Spray toggle simulation tests ──────────────────────────────────────────────
@@ -530,7 +523,7 @@ def test_spray_toggle_progress_increments_with_pose():
 
 def test_insunits_yards_scaling():
     """DXF with $INSUNITS=10 (yards) scales correctly: 1 yard = 0.9144 m."""
-    if not _HAS_EZDXF():
+    if not _HAS_EZDXF:
         return
 
     from path_engine.parsers.dxf_parser import _INSUNITS_TO_METRES
@@ -539,7 +532,7 @@ def test_insunits_yards_scaling():
 
 def test_insunits_km_scaling():
     """DXF with $INSUNITS=7 (km) scales correctly: 1 km = 1000 m."""
-    if not _HAS_EZDXF():
+    if not _HAS_EZDXF:
         return
 
     from path_engine.parsers.dxf_parser import _INSUNITS_TO_METRES
@@ -548,7 +541,7 @@ def test_insunits_km_scaling():
 
 def test_insunits_miles_scaling():
     """DXF with $INSUNITS=3 (miles) scales correctly: 1 mile = 1609.344 m."""
-    if not _HAS_EZDXF():
+    if not _HAS_EZDXF:
         return
 
     from path_engine.parsers.dxf_parser import _INSUNITS_TO_METRES
@@ -557,7 +550,7 @@ def test_insunits_miles_scaling():
 
 def test_insunits_mils_scaling():
     """DXF with $INSUNITS=9 (mils) scales correctly: 1 mil = 2.54e-5 m."""
-    if not _HAS_EZDXF():
+    if not _HAS_EZDXF:
         return
 
     from path_engine.parsers.dxf_parser import _INSUNITS_TO_METRES
@@ -566,7 +559,7 @@ def test_insunits_mils_scaling():
 
 def test_insunits_hectometers_scaling():
     """DXF with $INSUNITS=15 (hectometers) scales correctly: 1 hm = 100 m."""
-    if not _HAS_EZDXF():
+    if not _HAS_EZDXF:
         return
 
     from path_engine.parsers.dxf_parser import _INSUNITS_TO_METRES
@@ -575,7 +568,7 @@ def test_insunits_hectometers_scaling():
 
 def test_insunits_microinches_scaling():
     """DXF with $INSUNITS=8 (microinches) scales correctly."""
-    if not _HAS_EZDXF():
+    if not _HAS_EZDXF:
         return
 
     from path_engine.parsers.dxf_parser import _INSUNITS_TO_METRES
@@ -584,7 +577,7 @@ def test_insunits_microinches_scaling():
 
 def test_insunits_decimeters_scaling():
     """DXF with $INSUNITS=14 (decimeters) scales correctly: 1 dm = 0.1 m."""
-    if not _HAS_EZDXF():
+    if not _HAS_EZDXF:
         return
 
     from path_engine.parsers.dxf_parser import _INSUNITS_TO_METRES

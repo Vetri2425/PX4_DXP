@@ -75,6 +75,9 @@ class OffboardController:
 
     async def start_async(self) -> tuple[bool, str]:
         async with self._lock:
+            if self._node is None:
+                return False, "ROS node not available"
+
             # Guard: re-starting while already running re-arms and re-switches
             # OFFBOARD, which is wrong. Operator must stop first.
             if self._state == MissionState.RUNNING:
@@ -151,6 +154,10 @@ class OffboardController:
         as DONE immediately and outputs zero velocity. Vehicle stays armed.
         """
         async with self._lock:
+            if self._node is None:
+                self._log_entry("warning", "stop: ROS node not available")
+                return
+
             self._state = MissionState.STOPPING
             self._node.publish_stop_path()
             self._state = MissionState.IDLE
@@ -159,6 +166,10 @@ class OffboardController:
     async def abort_async(self) -> None:
         """Hard abort: stop-path + MANUAL + disarm."""
         async with self._lock:
+            if self._node is None:
+                self._log_entry("warning", "abort: ROS node not available")
+                return
+
             if self._state == MissionState.IDLE:
                 self._log_entry("warning", "abort called from IDLE — no mission to abort")
                 return
@@ -170,6 +181,10 @@ class OffboardController:
 
     async def disarm_async(self) -> bool:
         async with self._lock:
+            if self._node is None:
+                self._log_entry("warning", "disarm: ROS node not available")
+                return False
+
             ok, why = await self._node.arm_async(False)
             self._state = MissionState.IDLE
             self._log_entry(

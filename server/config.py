@@ -78,7 +78,10 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MiB (DXF files can be large)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 if os.environ.get("ROVER_DISABLE_AUTH"):
-    CORS_ALLOW_ORIGINS = ["*"]
+    CORS_ALLOW_ORIGINS = [
+        "http://localhost:3000", "http://127.0.0.1:3000",
+        "http://localhost:5001", "http://127.0.0.1:5001",
+    ]
     DEFAULT_HOST = "127.0.0.1"
 else:
     CORS_ALLOW_ORIGINS = ["*"]

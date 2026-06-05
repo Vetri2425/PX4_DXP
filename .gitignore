@@ -56,3 +56,6 @@ tools/scp_tool.md
 # Misc
 nul
 .grok/
+
+# Mac dev-flow virtualenv (no-hardware testing — see docs/SESSION_STARTUP_MAC_NO_HARDWARE.md)
+.venv-dev/

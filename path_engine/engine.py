@@ -198,7 +198,7 @@ class PathEngine:
         for seg in segments:
             densified.append(densify_segment(seg, self.mark_spacing, self.transit_spacing))
 
-        # Resolve start position for TSP: explicit → origin → first segment start
+        # Resolve start position for TSP: explicit start_position (de-offset) → first segment start → None
         resolved_start = self._resolve_start_position(densified, origin, start_position)
 
         # Step 2: Optimize segment order (nearest-neighbor TSP with endpoint reversal)

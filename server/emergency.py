@@ -31,6 +31,14 @@ class EmergencyHandler:
 
     async def estop_async(self) -> dict:
         """Execute emergency stop. Returns {success, message}."""
+        # Guard: if ROS node is unavailable, short-circuit cleanly
+        if self._node is None:
+            msg = "ROS node not available — e-stop cannot reach FCU"
+            ts = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            self._log.append({"timestamp": ts, "level": "error", "message": msg})
+            log.error(msg)
+            return {"success": False, "message": msg}
+
         errors: list[str] = []
 
         # 1. Stop-path → RPP IDLE
@@ -58,8 +66,10 @@ class EmergencyHandler:
             errors.append(f"arm(False) raised: {exc}")
             log.exception("arm(False) raised")
 
-        # 4. Update mission state
-        self._controller.state = MissionState.ABORTED
+        # 4. Update mission state (hold lock only for the write, not around awaits)
+        if self._controller is not None:
+            async with self._controller._lock:
+                self._controller.state = MissionState.ABORTED
 
         msg = "EMERGENCY STOP executed"
         if errors:

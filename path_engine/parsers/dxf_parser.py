@@ -130,6 +130,9 @@ def parse_dxf(
                 log.warning("$INSUNITS is 0 (unspecified) — using fallback scale 0.01")
             unit_scale = 0.01
 
+    if unit_scale <= 0:
+        raise ValueError(f"Invalid unit_scale: {unit_scale}")
+
     entities: list[DXFEntity] = []
 
     for entity in msp:

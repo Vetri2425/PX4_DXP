@@ -9,6 +9,7 @@ DELETE /api/path/{filename}    — delete uploaded file
 """
 from __future__ import annotations
 
+import math
 import os
 
 import tempfile
@@ -87,7 +88,7 @@ async def parse_dxf_file(file: UploadFile = File(...)):
 
     # Write to temp file first — only persist to missions dir on successful parse
     safe = os.path.basename(filename)
-    tmp = tempfile.NamedTemporaryFile(suffix=".dxf", delete=False, dir=MISSION_DIR)
+    tmp = tempfile.NamedTemporaryFile(suffix=".dxf", delete=False)
     try:
         tmp.write(content)
         tmp.close()
@@ -108,12 +109,13 @@ async def parse_dxf_file(file: UploadFile = File(...)):
                 e = ent.geometry.get("end", (0, 0))
                 length = ((s[0]-e[0])**2 + (s[1]-e[1])**2)**0.5
             elif ent.entity_type == "CIRCLE":
-                length = 2 * 3.14159265 * ent.geometry.get("radius", 0)
+                length = 2 * math.pi * ent.geometry.get("radius", 0)
             elif ent.entity_type == "ARC":
                 r = ent.geometry.get("radius", 0)
                 a1 = ent.geometry.get("start_angle", 0)
                 a2 = ent.geometry.get("end_angle", 360)
-                length = r * abs(a2 - a1) * 3.14159265 / 180
+                sweep_deg = (a2 - a1) % 360.0
+                length = r * math.radians(sweep_deg)
 
             entity_infos.append(DXFEntityInfo(
                 entity_type=ent.entity_type,
