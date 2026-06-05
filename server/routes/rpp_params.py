@@ -52,7 +52,7 @@ def _record(level: str, message: str) -> None:
 
 # ── Parameter Schema (server-side metadata) ───────────────────────────────────
 # This is the source of truth for type, group, description, and bounds.
-# All 34 parameters from rpp_controller_node.py are listed here, organised
+# Parameters from rpp_controller_node.py are listed here, organised
 # into functional groups matching the controller code's docstring sections.
 #
 # The frontend uses this schema to render the correct input controls (slider,
@@ -75,7 +75,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     # ── RPP Geometry ───────────────────────────────────────────────────────────
     "max_linear_vel": {
         "type": "float",
-        "default": 1.0,
+        "default": 0.8,
         "group": "RPP Geometry",
         "description": "Hardware ceiling for linear velocity (m/s)",
         "min": 0.0,
@@ -91,7 +91,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "min_lookahead_dist": {
         "type": "float",
-        "default": 0.5,
+        "default": 0.52,
         "group": "RPP Geometry",
         "description": "Minimum lookahead distance (m)",
         "min": 0.1,
@@ -99,7 +99,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "max_lookahead_dist": {
         "type": "float",
-        "default": 1.5,
+        "default": 1.0,
         "group": "RPP Geometry",
         "description": "Maximum lookahead distance (m)",
         "min": 0.1,
@@ -107,7 +107,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "lookahead_time": {
         "type": "float",
-        "default": 1.5,
+        "default": 1.6,
         "group": "RPP Geometry",
         "description": "Lookahead time (s); used for closed-loop velocity-scaled L_d",
         "min": 0.1,
@@ -180,22 +180,6 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
         "min": 0.05,
         "max": 5.0,
     },
-    "pose_converge_age_ms": {
-        "type": "float",
-        "default": 50.0,
-        "group": "Safety",
-        "description": "Pose age threshold for convergence gate (ms)",
-        "min": 0.0,
-        "max": 500.0,
-    },
-    "pose_converge_time_s": {
-        "type": "float",
-        "default": 1.0,
-        "group": "Safety",
-        "description": "Duration pose must stay fresh before tracking starts (s)",
-        "min": 0.0,
-        "max": 30.0,
-    },
     "path_frame_id": {
         "type": "string",
         "default": "local_ned",
@@ -228,25 +212,9 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     # ── Adaptive Lookahead (P1.2) ──────────────────────────────────────────────
     "xtrack_lookahead_gain": {
         "type": "float",
-        "default": 0.3,
+        "default": 0.05,
         "group": "Adaptive Lookahead",
         "description": "Cross-track error gain for adaptive L_d. L_d += k_e · |xtrack|. 0 disables the xtrack term",
-        "min": 0.0,
-        "max": 5.0,
-    },
-    "l_d_lpf_alpha": {
-        "type": "float",
-        "default": 0.0,
-        "group": "Adaptive Lookahead",
-        "description": "L_d low-pass filter coefficient. 0 disables. Recommended: 0.7 for arcs, 0.85-0.90 for very smooth marking. Never ≥ 1.0",
-        "min": 0.0,
-        "max": 0.999,
-    },
-    "curvature_ld_factor": {
-        "type": "float",
-        "default": 0.75,
-        "group": "Adaptive Lookahead",
-        "description": "Curvature-aware L_d minimum: l_d ≥ factor / κ_path on arcs. 0 matches Nav2 velocity-scaled behaviour. 0.45 recommended for R ≥ 1.5 m",
         "min": 0.0,
         "max": 5.0,
     },
@@ -274,14 +242,6 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
         "description": "Number of points per inscribed arc (only used when corner_smooth_radius_m > 0)",
         "min": 3,
         "max": 50,
-    },
-    "corner_smooth_min_bend_deg": {
-        "type": "float",
-        "default": 10.0,
-        "group": "Path Conditioning",
-        "description": "Minimum bend angle (deg) to apply corner smoothing. Prevents spurious high-κ arcs at shallow polygon bends. 0 smooths every non-collinear vertex",
-        "min": 0.0,
-        "max": 90.0,
     },
     # ── Latency Closure (P2.4) ────────────────────────────────────────────────
     "use_imu_extrapolation": {
@@ -315,7 +275,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "max_yaw_rate_body": {
         "type": "float",
-        "default": 1.0,
+        "default": 0.45,
         "group": "Feedforward Yaw Rate",
         "description": "Max body yaw rate clamp (rad/s). ≈57°/s at 1.0. 0 disables clamping",
         "min": 0.0,
@@ -324,7 +284,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     # ── Mission Control (P4.2) ──────────────────────────────────────────────────
     "max_linear_accel": {
         "type": "float",
-        "default": 0.5,
+        "default": 0.35,
         "group": "Mission Control",
         "description": "Acceleration ramp limit (m/s²). Caps speed increase per cycle. 0 disables",
         "min": 0.0,
@@ -332,7 +292,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "mission_speed": {
         "type": "float",
-        "default": 0.4,
+        "default": 0.35,
         "group": "Mission Control",
         "description": "Operator-facing mission speed (m/s). Single knob per job. 1.0 for roads, 0.3-0.5 for fields",
         "min": 0.0,

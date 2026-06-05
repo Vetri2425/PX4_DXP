@@ -125,7 +125,12 @@ class GlobalSample:
 # Parsing helpers (testable without rosbags)
 # ---------------------------------------------------------------------------
 def decode_debug_array(data: Sequence[float], t: float) -> DebugSample:
-    """Decode one /rpp/debug payload. Tolerates 8-element (old) and 10-element (new)."""
+    """Decode one /rpp/debug payload.
+
+    Tolerates legacy 8-field bags and current 39-field bags. This tool only
+    needs the first 10 fields; the controller's [11..38] param snapshot is
+    intentionally ignored here.
+    """
     n = len(data)
     if n < 8:
         raise ValueError(f"/rpp/debug payload has {n} elements (need >= 8)")
@@ -421,10 +426,16 @@ def self_test() -> int:
         ]
         debug.append(decode_debug_array(d_list, t))
 
-    # Test 8-element tolerance
+    # Test legacy 8-field tolerance
     short = decode_debug_array([0.01, 0.0, 0.4, 0.4, 0.5, 10.0, 5.0, 1], 0.0)
     assert math.isnan(short.l_d_raw_m), "l_d_raw_m must be NaN for 8-elem payload"
     assert math.isnan(short.kappa_speed), "kappa_speed must be NaN for 8-elem payload"
+
+    # Test current 39-field tolerance. The benchmark consumes [0..9] and
+    # ignores [10..38] because those are yaw-rate/param-snapshot fields.
+    full = decode_debug_array([0.01, 0.0, 0.4, 0.4, 0.5, 10.0, 5.0, 1, 0.45, 0.55] + [0.0] * 29, 0.0)
+    assert full.l_d_raw_m == 0.45
+    assert full.kappa_speed == 0.55
 
     poses = [PoseSample(t=i * 0.05, pos_n_m=i * 0.02, pos_e_m=0.0) for i in range(100)]
     globals_: List[GlobalSample] = []  # no GPS in self-test
@@ -437,7 +448,7 @@ def self_test() -> int:
     summary_with_gps = compute_summary(debug, poses, globals_, "square",
                                        mission_last_wp=(13.07208272, 80.26194903))
 
-    print("[self-test] 8-element payload tolerated: OK")
+    print("[self-test] 8-field and 39-field payloads tolerated: OK")
     print("[self-test] no-GPS summary:")
     print("    " + summary_no_gps)
     print("[self-test] with-GPS summary:")

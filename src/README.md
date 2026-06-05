@@ -8,6 +8,7 @@ accuracy with PX4 v1.16.2 + RoboClaw QPPS closed-loop wheel control + UM982 RTK.
 path_publisher  ─→ /path
                        ↓
          rpp_controller ─→ /rpp/velocity_ned
+                        └→ /rpp/yaw_rate_body
                        ↓                    ↘
        twist_to_setpoint                    xtrack_logger ─→ CSV
                        ↓
@@ -28,8 +29,8 @@ path_publisher  ─→ /path
 
 | File | Purpose | Topics |
 |---|---|---|
-| `rpp_controller_node.py` | Regulated Pure Pursuit math; outputs NED velocity vector | sub: `/path`, `/mavros/local_position/pose`<br>pub: `/rpp/velocity_ned`, `/rpp/debug` |
-| `twist_to_setpoint_node.py` | OFFBOARD heartbeat; bridges to MAVROS at 50 Hz | sub: `/rpp/velocity_ned`<br>pub: `/mavros/setpoint_raw/local` |
+| `rpp_controller_node.py` | Regulated Pure Pursuit math; outputs NED velocity vector, diagnostics, and optional yaw-rate feedforward | sub: `/path`, `/mavros/local_position/pose`, `/mavros/local_position/velocity_local`, `/mavros/gpsstatus/gps1/raw`<br>pub: `/rpp/velocity_ned`, `/rpp/yaw_rate_body`, `/rpp/debug` |
+| `twist_to_setpoint_node.py` | OFFBOARD heartbeat; bridges to MAVROS at 50 Hz with velocity + explicit yaw, and yaw-rate when fresh | sub: `/rpp/velocity_ned`, `/rpp/yaw_rate_body`<br>pub: `/mavros/setpoint_raw/local` |
 | `path_publisher_node.py` | Hardcoded test paths in NED | pub: `/path` (TRANSIENT_LOCAL) |
 | `xtrack_logger_node.py` | Time-aligned CSV of every tuning signal | sub: `/path`, `/mavros/local_position/pose`, `/rpp/debug`, `/rpp/velocity_ned`, `/mavros/setpoint_raw/local`<br>output: `/tmp/rpp_<path>_<ts>.csv` |
 | `mission_runner_node.py` | Drives OFFBOARD lifecycle (pre-stream → mode → arm → wait DONE → disarm) | sub: `/mavros/state`, `/rpp/debug`<br>srv: `/mavros/set_mode`, `/mavros/cmd/arming` |
@@ -104,20 +105,28 @@ waypoint for `done_settle_s` (default 1 s).
 
 ## Tuning entry points
 
-**Current recommended defaults for 1.5 m radius arc marking** (validated on `arc_half_1m5` + `circle_1m5`):
+**Current recommended defaults for Phase 2 corner/arc marking**:
 
-- `curvature_ld_factor=0.45`
-- `l_d_lpf_alpha=0.85`
-- `xtrack_lookahead_gain=0.0`
-
-These are now the node defaults (as of late May 2026).
+- `mission_speed=0.35`
+- `min_lookahead_dist=0.52`
+- `lookahead_time=1.6`
+- `a_lat_max=0.3`
+- `preview_curvature_n=4`
+- `xtrack_lookahead_gain=0.05`
+- `path_resample_spacing_m=0.08`
+- `corner_smooth_radius_m=0.5`
+- `corner_smooth_arc_pts=6`
+- `use_feedforward_yaw_rate=true`
+- `yaw_rate_feedback_gain=0.0`
+- `max_yaw_rate_body=0.45`
 
 Order matters — change one parameter at a time, capture a CSV, plot, repeat.
 
 | Symptom | Try |
 |---|---|
-| Wobbles on straight line | Increase `min_lookahead_dist` (0.30 → 0.40) or decrease `lookahead_time` (1.2 → 1.0) |
-| Cuts arcs significantly | Increase `curvature_ld_factor` (0.35 → 0.45–0.55) or lower `lookahead_time` |
+| Wobbles on straight line | Increase `min_lookahead_dist` or reduce `mission_speed` |
+| Cuts arcs/corners significantly | Lower `a_lat_max`, increase `corner_smooth_radius_m`, or increase `corner_smooth_arc_pts` |
+| Corner yaw overshoots | Lower `yaw_rate_feedback_gain`; current mainline default is pure feedforward (`0.0`) |
 | Overshoots goal | Decrease `approach_velocity_scaling_dist` (0.6 → 0.4) |
 | Stops short of goal | Decrease `xy_goal_tolerance` (0.02 → 0.01); also check P4 `p4_zero_vel_threshold` |
 | Velocity step ringing on hardware | Reduce PX4 `RO_SPEED_P` from 0.5 → 0.2-0.3 (post-QPPS plant is much stiffer) |
@@ -141,13 +150,19 @@ PX4-side params (`RO_*`, `RD_*`, `PP_*`) are flashed via QGC.
   swaps axes on read.
 - `/rpp/velocity_ned` is **NED** (`vector.x = vN`, `vector.y = vE`).
 - The MAVROS PositionTarget output uses `coordinate_frame = 1` (LOCAL_NED).
-- PX4 v1.16+ `DifferentialOffboardMode` **derives target yaw from
-  `atan2(vE, vN)`** of the velocity vector. Do not try to set yawspeed —
-  PX4 ignores it in this branch.
+- `twist_to_setpoint_node` converts the RPP velocity to MAVROS ENU fields:
+  `velocity.x = v_e`, `velocity.y = v_n`, `velocity.z = -v_d`.
+- `twist_to_setpoint_node` computes explicit ENU yaw from the velocity
+  direction and holds the previous yaw below 1 cm/s.
+- `/rpp/yaw_rate_body` is NED/body yaw-rate feedforward. When it is fresh and
+  nonzero, `twist_to_setpoint_node` sends type_mask `455`; otherwise it sends
+  velocity + yaw with yaw-rate ignored (`2503`).
 
 ## Diagnostics
 
-`/rpp/debug` (`std_msgs/Float32MultiArray`) emits 8 floats every 50 ms:
+`/rpp/debug` (`std_msgs/Float32MultiArray`) emits 39 floats every control
+cycle. Indices `[0..7]` are the stable legacy runtime fields, `[8..10]`
+add tuning diagnostics, and `[11..38]` snapshot the active controller params.
 
 | Idx | Field | Units |
 |---|---|---|
@@ -158,15 +173,22 @@ PX4-side params (`RO_*`, `RD_*`, `PP_*`) are flashed via QGC.
 | 4 | curvature κ | 1/m |
 | 5 | dist_to_goal | m |
 | 6 | pose_age | ms |
-| 7 | state_code | -1=stale, 0=idle, 1=tracking, 2=approach, 3=done |
+| 7 | state_code | -1=STALE, 0=IDLE, 1=TRACKING, 2=APPROACH, 3=DONE, 4=RTK_WAIT, 5=JUMP_SKIP |
+| 8 | l_d_raw | m |
+| 9 | kappa_speed | 1/m |
+| 10 | yaw_rate_cmd | rad/s |
+| 11..38 | param snapshot | see `rpp_controller_node.py` header |
 
-`xtrack_logger_node` writes a CSV with all 8 plus rover pose, closest path
-point, RPP velocity, and final MAVROS setpoint — drop into pandas for plots.
+`xtrack_logger_node` writes a CSV with the runtime diagnostics plus rover pose,
+closest path point, RPP velocity, yaw-rate command, and final MAVROS setpoint.
 
 ## Safety & failsafes
 
 - **Pose staleness:** RPP emits `(0, 0, 0)` if pose hasn't arrived in 200 ms.
   Rover will hold position; OFFBOARD stays alive.
+- **Pose extrapolation:** `use_imu_extrapolation=true` enables velocity-based
+  extrapolation from `/mavros/local_position/velocity_local`. The parameter
+  name is legacy; the current code does not integrate IMU acceleration.
 - **Input staleness:** twist_to_setpoint emits `(0, 0, 0)` if `/rpp/velocity_ned`
   hasn't arrived in 200 ms. Independent layer of protection.
 - **Mission timeout:** `mission_runner` aborts and disarms after 300 s
@@ -178,6 +200,9 @@ point, RPP velocity, and final MAVROS setpoint — drop into pandas for plots.
 - **PX4 OFFBOARD failsafe:** if streaming gaps exceed 500 ms (`COM_OF_LOSS_T`),
   PX4 drops OFFBOARD on its own — the streamer's zero-velocity heartbeat
   prevents this.
+- **Emergency stop path:** RPP intentionally ignores empty `Path` messages.
+  E-stop should publish a single-point path at the current position, then
+  switch MANUAL / disarm through the server safety path.
 
 ## What's NOT in this pipeline
 

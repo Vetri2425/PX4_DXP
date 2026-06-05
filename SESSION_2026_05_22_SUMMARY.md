@@ -1,189 +1,88 @@
 # RPP Upgrade Path — Session 2026-05-22 Summary
 
 ## Objective
-Complete the RPP_UPGRADE_PATH.md by implementing remaining steering-file changes (P0.5, P2.5, P2.4) to close the latency gap and unlock P3.1 (feedforward yaw rate).
 
-## Completed Items
+Capture the Phase C RPP runtime changes that closed pose latency and added yaw
+feedforward support. This note has been corrected to match current code, not
+the short-lived intermediate `/rpp/yaw_setpoint_ned` design.
 
-### P0.5 — Explicit Yaw Setpoint Output ✅
-**Purpose:** Give RPP authority over heading instead of relying on PX4's `atan2(vE, vN)` derivation. Enables smoother corners and decouples geometry from FSM.
+## Current Runtime Reality
 
-**Changes:**
-- **rpp_controller_node.py:**
-  - Added `Float32` import
-  - Added `_last_yaw_cmd` state variable (for yaw freeze when speed < 1 cm/s)
-  - Added `/rpp/yaw_setpoint_ned` publisher (Float32, NED radians)
-  - Modified `_publish_velocity()` to compute and publish yaw: `atan2(v_e, v_n)` in NED
-  - Yaw freezes at last commanded value when speed < 1 cm/s (matches PX4 P4 behavior)
+### Explicit Yaw
 
-- **twist_to_setpoint_node.py:**
-  - Added `Float32` import
-  - Added `use_explicit_yaw` parameter (default=false for backward compat)
-  - Added `yaw_slew_rate_rad_s` parameter (default=90 deg/s)
-  - Added `/rpp/yaw_setpoint_ned` subscription
-  - Added `_last_yaw_cmd` state for slew limiting
-  - Added `_slew_yaw()` static method (wraps error to [-π, π], clamps rate)
-  - Added `TYPE_MASK_VELOCITY_AND_YAW` constant (2503 = ignore PX/PY/PZ/AFX/AFY/AFZ/YAW_RATE)
-  - Modified `_stream_cb()` to include yaw in PositionTarget when enabled
+`/rpp/yaw_setpoint_ned` has been removed.
 
-**Testing:**
-- Created `test_p05_yaw_setpoint.py` with 5 comprehensive tests:
-  1. Yaw derivation from velocity vector (NED convention)
-  2. Yaw freeze below 1 cm/s threshold
-  3. Yaw slew limiting (wrap-around, clamping)
-  4. Type mask constants validation
-  5. Backward compatibility check
-- All 5 tests pass ✅
+`twist_to_setpoint_node.py` computes explicit yaw directly from fresh
+`/rpp/velocity_ned`:
 
-**Backward Compatibility:**
-- Default `use_explicit_yaw=false` maintains velocity-only behavior
-- Existing consumers of `/mavros/setpoint_raw/local` unaffected
-- Can be enabled per-deployment via parameter
-
----
-
-### P2.5 — Real-Time Scheduling ✅
-**Purpose:** Reduce timer jitter from ±20 ms to ±2 ms on Jetson Orin, enabling tighter control loops.
-
-**Changes:**
-- **rpp-pipeline.service:**
-  - Added `CPUSchedulingPolicy=fifo` (FIFO real-time scheduling)
-  - Added `CPUSchedulingPriority=80` (high but not system-critical; kernel threads run at 50-60)
-  - Added `CPUAffinity=4` (pin to core 4, a performance core on Jetson Orin)
-  - Added explanatory comments
-
-**Impact:**
-- Jitter reduction: ±20 ms → ±2 ms
-- Enables 250 Hz control loops (future P2.1/P2.2)
-- Zero risk: non-destructive, immediate latency win
-
----
-
-### P2.4 — IMU-Based Pose Extrapolation ✅
-**Status:** Already implemented in rpp_controller_node.py (verified).
-
-**How it works:**
-- Subscribes to `/mavros/imu/data` (sensor_msgs/Imu)
-- Rotates body-frame acceleration to NED using latest pose yaw
-- Dead-reckon pose forward by time since last IMU sample: `Δp = 0.5 * a * dt²`
-- Clamped to 50 ms (one control cycle) to avoid runaway
-- Gated by `use_imu_extrapolation` parameter (default=false)
-
-**Latency reduction:**
-- MAVROS pose: 10 Hz (100 ms period) → ~50 ms average latency
-- With IMU extrapolation: ~5 ms (half the MAVROS period)
-- Fallback if uXRCE-DDS blocked
-
-**Code location:**
-- `rpp_controller_node.py` lines ~975–1010 (pose_for_projection creation)
-- `_imu_cb()` method (lines ~450–475) handles IMU subscription and NED rotation
-
----
-
-## Files Modified
-
-| File | Changes | Lines |
-|------|---------|-------|
-| `src/rpp_controller_node.py` | P0.5 yaw publisher + state; P2.4 already present | +30 |
-| `src/twist_to_setpoint_node.py` | P0.5 yaw subscription + slew limiting | +50 |
-| `rpp-pipeline.service` | P2.5 RT scheduling | +5 |
-| `src/test_p05_yaw_setpoint.py` | NEW: comprehensive P0.5 tests | 160 |
-
----
-
-## Testing & Verification
-
-### Unit Tests (test_p05_yaw_setpoint.py)
-```
-test_backward_compatibility ............................ ok
-test_type_mask_constants .............................. ok
-test_yaw_freeze_below_threshold ........................ ok
-test_yaw_from_velocity_vector .......................... ok
-test_yaw_slew_limiting ................................. ok
-
-Ran 5 tests in 0.005s — OK ✅
+```text
+yaw_NED = atan2(v_east, v_north)
+yaw_ENU = pi/2 - yaw_NED = atan2(v_north, v_east)
 ```
 
-### Syntax Verification
-- `rpp_controller_node.py`: ✅ compiles
-- `twist_to_setpoint_node.py`: ✅ compiles
-- `test_p05_yaw_setpoint.py`: ✅ compiles
+When speed is below 1 cm/s, the node holds the last yaw to avoid `atan2(0,0)`.
+The PositionTarget mask is `2503` when yaw_rate is ignored.
 
----
+### Feedforward Yaw Rate
 
-## Remaining Work (Future Sessions)
+RPP publishes `/rpp/yaw_rate_body` as body yaw rate in NED convention, CW
+positive. `twist_to_setpoint_node.py` includes it only when the value is fresh
+and non-zero:
 
-### P2.3 — uXRCE-DDS Direct (blocked)
-- PX4 Forum 48430: rover offboard broken
-- Awaiting upstream fix before pursuing
+| Condition | PositionTarget mask | Meaning |
+|---|---:|---|
+| fresh non-zero `/rpp/yaw_rate_body` | `455` | velocity + yaw + yaw_rate |
+| stale/zero yaw rate | `2503` | velocity + yaw, yaw_rate ignored |
 
-### P2.1/P2.2 — C++ Port at 250 Hz
-- Effort: 3–5 days
-- Enables deterministic 250 Hz loop rate
-- Vectorize projection loop (SIMD on Jetson)
+### Pose Extrapolation
 
-### P3.1 — Feedforward Yaw Rate
-- Effort: 1 day
-- Requires P0.5 (explicit yaw_setpoint) ✅ now available
-- Sends `ω_ff = κ·v` via OFFBOARD body-rate mode
-- Bypasses spot-turn FSM, smoother corners
+The parameter is still named `use_imu_extrapolation`, but the implementation is
+velocity-based. RPP subscribes to `/mavros/local_position/velocity_local`,
+converts ENU velocity to NED, and extrapolates pose with `dp = v * dt` bounded
+by `imu_max_extrap_age_s`. Debug logs use `P2.4 v-extrapolation`.
 
-### P3.2 — Slip Calibration
-- Effort: half-day field + 2 h code
-- Identify `α = R_actual / R_commanded` on R=1 m arc
-- Apply to IK: `R_eff = α · R_kin`
+## Debug Array
 
-### P3.3 — Linear MPC Inner Loop
-- Effort: 2–3 weeks
-- Solver: acados (100–500 µs on Jetson Orin)
-- Only if Sprint 5 leaves > 1 cm on R < 1 m circles
+`/rpp/debug` is now a 39-field `Float32MultiArray`:
 
----
+- `[0..7]`: stable runtime fields used by legacy consumers
+- `[8]`: `l_d_raw_m`
+- `[9]`: `kappa_speed`
+- `[10]`: `yaw_rate_cmd_rad_s`
+- `[11..38]`: active RPP parameter snapshot for every bag sample
 
-## Key Metrics
+State code `[7]` values:
 
-| Metric | Before | After | Notes |
-|--------|--------|-------|-------|
-| Yaw authority | PX4 FSM | RPP (P0.5) | Decouples geometry from FSM |
-| Timer jitter | ±20 ms | ±2 ms | P2.5 RT scheduling |
-| Pose latency | ~50 ms | ~5 ms | P2.4 IMU extrapolation |
-| Backward compat | N/A | ✅ | P0.5 default=false |
+| Code | Name | Meaning |
+|---:|---|---|
+| -1 | STALE | pose/input stale |
+| 0 | IDLE | no active path |
+| 1 | TRACKING | following path |
+| 2 | APPROACH | final approach |
+| 3 | DONE | goal reached |
+| 4 | RTK_WAIT | GPS fix below RTK_FIXED |
+| 5 | JUMP_SKIP | one-cycle EKF/position-jump skip |
 
----
+## Safety Correction
 
-## Deployment Notes
+RPP ignores empty `Path` messages. E-stop and soft-stop paths must publish a
+single-point path at the rover's current NED position, then the server switches
+MANUAL and disarms for e-stop.
 
-### Enable P0.5 (Explicit Yaw)
+## Useful Verification
+
 ```bash
-ros2 param set /twist_to_setpoint use_explicit_yaw true
+ros2 topic echo /rpp/debug --once
+ros2 topic echo /rpp/yaw_rate_body
+ros2 topic echo /mavros/setpoint_raw/local --once
+ros2 param get /rpp_controller use_imu_extrapolation
 ```
 
-### Enable P2.4 (IMU Extrapolation)
-```bash
-ros2 param set /rpp_controller use_imu_extrapolation true
-```
+## Status
 
-### P2.5 (RT Scheduling)
-- Automatic via systemd service
-- Requires `systemd` user privileges (already configured)
-
----
-
-## Next Session Checklist
-
-- [ ] Flash latest firmware (617cce5a) if not already done
-- [ ] Deploy updated rpp_controller_node.py and twist_to_setpoint_node.py
-- [ ] Restart rpp-pipeline service (systemd will apply RT scheduling)
-- [ ] Verify P0.5 works: `ros2 topic echo /rpp/yaw_setpoint_ned`
-- [ ] Verify P2.5 works: `ps aux | grep rpp_controller` (check FIFO priority)
-- [ ] Verify P2.4 works: `ros2 param set /rpp_controller use_imu_extrapolation true` + log pose extrapolation debug messages
-- [ ] Run baseline test (10 m straight, R=1 m circle, 2 m square) with P0.5 enabled
-- [ ] Compare XTE vs baseline (expect smoother corners, no change on straights)
-
----
-
-## Document Version
-- **Created:** 2026-05-22
-- **Session:** RPP Upgrade Path — Steering Files (P0.5, P2.5, P2.4)
-- **Status:** ✅ COMPLETE
-- **Next:** P2.3 (uXRCE-DDS) or P2.1/P2.2 (C++ port)
+- Current validated RPP params include `max_yaw_rate_body=0.45`,
+  `a_lat_max=0.3`, and `corner_smooth_radius_m=0.5`.
+- P2.4 is velocity-based despite the legacy parameter name.
+- P3.1 yaw-rate feedforward is conditional at the MAVROS bridge.
+- Historical P0.5 unit-test/deployment notes referencing
+  `/rpp/yaw_setpoint_ned` are obsolete.

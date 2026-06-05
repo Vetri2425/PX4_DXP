@@ -367,8 +367,8 @@ class RPPControllerNode(Node):
         # acceleration) because at v=0.4 m/s the v·dt term is ~30× larger
         # than 0.5·a·dt² and is gravity-clean (PX4 EKF compensated).
         # `_latest_vel_ned` holds the latest NED velocity from
-        # /mavros/local_position/velocity_local (already in ENU/NED at the
-        # MAVROS boundary; we swap x↔y like for pose).
+        # /mavros/local_position/velocity_local. MAVROS publishes it in ENU;
+        # we swap x↔y like for pose in _vel_cb().
         self._latest_vel_ned: tuple[float, float] = (0.0, 0.0)
         self._latest_vel_time: RclTime | None = None
 
@@ -1172,20 +1172,22 @@ class RPPControllerNode(Node):
             if vel_age_s < extrap_horizon:
                 v_n, v_e = self._latest_vel_ned
                 dt = pose_age_s
-                dx = v_n * dt
-                dy = v_e * dt
+                d_n = v_n * dt
+                d_e = v_e * dt
 
                 pose_for_projection = PoseStamped()
                 pose_for_projection.header = self._pose.header
-                pose_for_projection.pose.position.x = self._pose.pose.position.x + dx
-                pose_for_projection.pose.position.y = self._pose.pose.position.y + dy
+                # self._pose is MAVROS ENU: x=East, y=North.
+                # _latest_vel_ned is NED: v_n=North, v_e=East.
+                pose_for_projection.pose.position.x = self._pose.pose.position.x + d_e
+                pose_for_projection.pose.position.y = self._pose.pose.position.y + d_n
                 pose_for_projection.pose.position.z = self._pose.pose.position.z
                 pose_for_projection.pose.orientation = self._pose.pose.orientation
 
                 self.get_logger().debug(
                     f"P2.4 v-extrapolation: pose_age={pose_age_s*1000:.1f}ms, "
                     f"v_ned=({v_n:+.2f},{v_e:+.2f}) m/s, "
-                    f"Δpos=({dx*100:+.2f},{dy*100:+.2f}) cm"
+                    f"Δned=({d_n*100:+.2f},{d_e*100:+.2f}) cm"
                 )
 
         # ---- P0.3: RTK FIX gate ----

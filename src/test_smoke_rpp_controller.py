@@ -11,36 +11,44 @@ Run:  python -X utf8 test_smoke_rpp_controller.py
 
 import sys
 import math
-import time
 
 # ---------------------------------------------------------------------------
 # Minimal rclpy bootstrap — no ROS master needed
 # ---------------------------------------------------------------------------
 import rclpy
-from rclpy.node import Node
 
 
-def _make_pose(x_ned, y_ned, yaw_ned=0.0):
-    """Build a minimal PoseStamped in NED with the fields RPP reads."""
+def _make_mavros_pose_from_ned(north, east, yaw_ned=0.0):
+    """Build a minimal MAVROS ENU PoseStamped for a desired NED pose."""
     from geometry_msgs.msg import PoseStamped
-    from builtin_interfaces.msg import Time as BTime
-    from std_msgs.msg import Header
 
     msg = PoseStamped()
-    msg.header.frame_id = "local_ned"
-    # RPP reads header.stamp for age; set to "now"
-    msg.header.stamp = BTime(sec=int(time.time()), nanosec=0)
-    # Position: x=North, y=East in NED
-    msg.pose.position.x = x_ned
-    msg.pose.position.y = y_ned
+    msg.header.frame_id = "map"
+    # MAVROS pose is ENU: x=East, y=North.
+    msg.pose.position.x = east
+    msg.pose.position.y = north
     msg.pose.position.z = 0.0
-    # Quaternion from yaw_ned (NED convention)
-    # NED yaw: 0=North, CW positive
-    half = yaw_ned / 2.0
+
+    # Convert NED yaw (0=North, CW+) to ENU yaw (0=East, CCW+).
+    yaw_enu = math.pi / 2.0 - yaw_ned
+    half = yaw_enu / 2.0
     msg.pose.orientation.w = math.cos(half)
     msg.pose.orientation.x = 0.0
     msg.pose.orientation.y = 0.0
     msg.pose.orientation.z = math.sin(half)
+    return msg
+
+
+def _make_path_pose(north, east):
+    """Build a LOCAL_NED path waypoint."""
+    from geometry_msgs.msg import PoseStamped
+
+    msg = PoseStamped()
+    msg.header.frame_id = "local_ned"
+    msg.pose.position.x = north
+    msg.pose.position.y = east
+    msg.pose.position.z = 0.0
+    msg.pose.orientation.w = 1.0
     return msg
 
 
@@ -55,24 +63,26 @@ def test_smoke():
 
         # Inject a 2-point straight path (5 m North from origin)
         from nav_msgs.msg import Path
-        from geometry_msgs.msg import PoseStamped as PS
 
         path_msg = Path()
         path_msg.header.frame_id = "local_ned"
         path_msg.header.stamp = node.get_clock().now().to_msg()
 
-        wp0 = _make_pose(0.0, 0.0, 0.0)
-        wp1 = _make_pose(5.0, 0.0, 0.0)
+        wp0 = _make_path_pose(0.0, 0.0)
+        wp1 = _make_path_pose(5.0, 0.0)
         path_msg.poses = [wp0, wp1]
 
         # Publish path via the subscriber callback directly
         node._path_cb(path_msg)
         assert len(node._path) == 2, f"Path should have 2 points, got {len(node._path)}"
 
-        # Inject pose at origin
-        pose_msg = _make_pose(0.0, 0.0, 0.0)
+        # Inject MAVROS pose at NED origin, facing North.
+        pose_msg = _make_mavros_pose_from_ned(0.0, 0.0, 0.0)
         node._pose_cb(pose_msg)
         assert node._pose is not None, "Pose should be set"
+        n, e, yaw = node._enu_pose_to_ned(pose_msg)
+        assert abs(n) < 1e-9 and abs(e) < 1e-9
+        assert abs(yaw) < 1e-9, f"Expected yaw_ned=0, got {yaw}"
 
         # Inject GPS fix type = 4 (DGPS, not RTK) to test RTK_WAIT path
         from mavros_msgs.msg import GPSRAW
@@ -115,14 +125,6 @@ def test_smoke():
             print("PASS: _publish_yaw_rate(0.0) executed without exception")
         except Exception as e:
             print(f"FAIL: _publish_yaw_rate raised {type(e).__name__}: {e}")
-            raise
-
-        # Test _publish_yaw (P0.5)
-        try:
-            node._publish_yaw(1.57)
-            print("PASS: _publish_yaw(1.57) executed without exception")
-        except Exception as e:
-            print(f"FAIL: _publish_yaw raised {type(e).__name__}: {e}")
             raise
 
         node.destroy_node()

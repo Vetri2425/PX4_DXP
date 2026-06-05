@@ -12,7 +12,7 @@
 - Laptop (this session): param file edits, analysis scripts, plan/launch edits, this document.
 - Jetson: service restarts, field runs, rosbag capture. SSH: `ssh flash@192.168.1.102`.
 
-**Baseline (log 59, 2026-05-23):** max xtrack 9.4cm corners, 1-3cm straights. P3.1 FF yaw rate was on at `yaw_rate_feedback_gain=1.2`.
+**Baseline (log 59, 2026-05-23):** max xtrack 9.4cm corners, 1-3cm straights. That older run used P3.1 yaw-rate feedforward with `yaw_rate_feedback_gain=1.2`. Current mainline defaults to pure feedforward (`yaw_rate_feedback_gain=0.0`) with `max_yaw_rate_body=0.45`.
 
 ---
 
@@ -22,7 +22,7 @@ The three mechanisms at play and their failure modes:
 
 | Mechanism | Param | Current value | What goes wrong at corners |
 |---|---|---|---|
-| **P3.1 FF yaw rate** (κ·v) | `yaw_rate_feedback_gain` | 1.2 (launch override) | If k_ψ·θ_e over-commands, the rover yaws past tangent → oscillates out the back of the corner |
+| **P3.1 FF yaw rate** (κ·v) | `yaw_rate_feedback_gain` | 0.0 current mainline; 1.2 in old log 59 baseline | If k_ψ·θ_e over-commands, the rover yaws past tangent → oscillates out the back of the corner |
 | **P1.1 Predictive κ** | `preview_curvature_n` | 4 | If speed doesn't drop early enough, lateral slip puts rover outside the arc |
 | **P1.3 Corner smoothing** | `corner_smooth_radius_m` | 0.5m | Smoothed arc may still demand curvature beyond what a_lat_max constrains the speed to |
 | **P4.1 Lateral accel** | `a_lat_max` | 0.3 m/s² | At R=0.5m (κ=2), speed floor 0.3m/s gives v²/R = 0.18 m/s² — under budget, but barely |
@@ -33,19 +33,20 @@ Corner xtrack is dominated by **yaw lag** (P3.1 k_ψ too high → overshoot) or 
 
 ## Sprint 1 — Tune existing RPP to ≤5cm corners (field-testable in hours)
 
-**Entry condition:** Current code on Jetson matches `arc_fix_18` baseline. Uncommitted diff on laptop (debug [11..38] param snapshot expansion) must be committed and deployed first.
+**Entry condition:** Current code on Jetson has the 39-field `/rpp/debug` layout, `/rpp/yaw_rate_body`, and current `twist_to_setpoint_node.py` yaw handling deployed.
 
-### Task 1: Commit & deploy the debug expansion
+### Task 1: Deploy and verify the current RPP runtime
 
 **Files:**
-- Modify (already done, uncommitted): `src/rpp_controller_node.py`
+- `src/rpp_controller_node.py`
+- `src/twist_to_setpoint_node.py`
+- `server/config.py` / server telemetry consumers
 
-- [ ] **Step 1.1 — Commit the debug expansion on laptop**
+- [ ] **Step 1.1 — Verify working tree / commit state on laptop**
 
 ```bash
 cd D:/Vetri/3WD_GCS/PX4_DXP
-git add src/rpp_controller_node.py
-git commit -m "feat(debug): expand /rpp/debug to 39-field param snapshot [11..38]"
+git status --short
 ```
 
 - [ ] **Step 1.2 — Push and deploy on Jetson**
@@ -68,6 +69,15 @@ ros2 topic echo /rpp/debug --once | grep -E "size|stride"
 
 Expected: `size: 39`, `stride: 39`.
 
+- [ ] **Step 1.4 — Verify yaw-rate path**
+
+```bash
+ros2 topic echo /rpp/yaw_rate_body --once
+ros2 topic echo /mavros/setpoint_raw/local --once | grep -E "type_mask|yaw|yaw_rate"
+```
+
+Expected: type_mask `2503` while stopped or zero yaw-rate; type_mask `455` while tracking a curve with fresh nonzero yaw-rate.
+
 ---
 
 ### Task 2: Baseline corner bag — capture before tuning
@@ -87,7 +97,7 @@ ros2 bag record /rpp/debug /mavros/local_position/pose /mavros/state \
 # Terminal 2 — launch (manual mission start):
 cd ~/PX4_DXP
 ros2 launch src/launch/rpp_pipeline.launch.py path_name:=square_2x2 \
-    use_feedforward_yaw_rate:=true yaw_rate_feedback_gain:=1.2 log_level:=debug
+    use_feedforward_yaw_rate:=true yaw_rate_feedback_gain:=0.0 log_level:=debug
 ```
 
 - [ ] **Step 2.2 — Extract corner xtrack from bag (laptop)**
@@ -111,28 +121,28 @@ Max |debug[0]| during state=TRACKING is your corner xtrack number.
 
 ### Task 3: Sweep yaw_rate_feedback_gain — find the square-corner optimum
 
-**Context from git history:** arc_fix_18 ran with k_ψ=1.2 (launch file override) and produced the 9.4cm corner baseline. The `687003f` commit synced the code *default* to 0.3 but did NOT change the launch override. So **the 9.4cm result was at k_ψ=1.2 — lower values are the primary hypothesis** for improvement. Sweep down first, keep 1.8 as a sanity check only.
+**Context from git history:** the 9.4cm log 59 baseline was at k_ψ=1.2. Current mainline default is k_ψ=0.0, so the first field run should establish a new square-corner baseline before adding feedback back in.
 
 Observation model: watch `debug[10]` (yaw_rate_cmd_rad_s) and `debug[0]` (xtrack_m) simultaneously. At corners, if the rover cuts inside the arc = gain too high (overshoot into interior). If it swings wide and corrects late = gain too low (insufficient correction).
 
-- [ ] **Step 3.1 — Test k_ψ = 1.8 (higher than current)**
+- [ ] **Step 3.1 — Test k_ψ = 0.0 (current mainline)**
 
 ```bash
 # Jetson — while RPP is running square_2x2:
-ros2 param set /rpp_controller yaw_rate_feedback_gain 1.8
+ros2 param set /rpp_controller yaw_rate_feedback_gain 0.0
 ```
 
-Record peak |debug[0]| at corner. Note: if rover oscillates or cuts inside → too high, stop here.
+Record peak |debug[0]| at corner. This is the new current-code baseline.
 
-- [ ] **Step 3.2 — Test k_ψ = 0.6 (lower than current)**
+- [ ] **Step 3.2 — Test k_ψ = 0.6 (moderate feedback)**
 
 ```bash
 ros2 param set /rpp_controller yaw_rate_feedback_gain 0.6
 ```
 
-Record peak |debug[0]|. Compare to 1.2 baseline and 1.8.
+Record peak |debug[0]|. Compare to 0.0 and the old 1.2 baseline.
 
-- [ ] **Step 3.3 — Test k_ψ = 0.3 (code default, was validated at arc_fix_18)**
+- [ ] **Step 3.3 — Test k_ψ = 0.3**
 
 ```bash
 ros2 param set /rpp_controller yaw_rate_feedback_gain 0.3
@@ -141,8 +151,8 @@ ros2 param set /rpp_controller yaw_rate_feedback_gain 0.3
 - [ ] **Step 3.4 — Record winning value, update launch file with the best**
 
 ```python
-# src/launch/rpp_pipeline.launch.py line 186:
-DeclareLaunchArgument("yaw_rate_feedback_gain", default_value="X.X"),  # replace 1.2 with winner
+# Use runtime param set for field tuning. If a nonzero value clearly wins,
+# update src/rpp_controller_node.py default or pass it through launch/systemd.
 ```
 
 Commit: `git commit -m "tune(rpp): yaw_rate_feedback_gain X.X — best corner xtrack on square_2x2"`

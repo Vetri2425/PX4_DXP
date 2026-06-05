@@ -1,7 +1,7 @@
 # 3WD Marking Rover — Jetson Companion
 
 Scope: runtime, ROS2, MAVROS2, on-device debugging on Jetson Orin `192.168.1.102`.
-Not your job: PX4 firmware, waypoint gen, log analysis — those belong to Laptop Claude at `D:\Vetri\3WD_GCS\`.
+Not your job: PX4 firmware, waypoint gen, log analysis — those belong to Laptop Codex at `D:\Vetri\3WD_GCS\`.
 
 ## Hardware
 

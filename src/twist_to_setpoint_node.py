@@ -18,7 +18,7 @@ Output contract
   Frame:  FRAME_LOCAL_NED (1)
   Mask:   455 (velocity + explicit yaw + yaw_rate feedforward; ignore positions, accelerations)
           Yaw is computed from velocity direction: yaw_ENU = atan2(v_n, v_e).
-          yaw_rate = -yaw_rate_body (NED CW+ → ENU CCW-) from /rpp/yaw_rate_body.
+          yaw_rate = yaw_rate_body (LOCAL_NED pass-through, NED CW+) from /rpp/yaw_rate_body.
           Feedforward κ·v eliminates arc outside-drift structural bias caused by
           yaw controller phase lag on continuous curves.
 

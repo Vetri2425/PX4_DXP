@@ -59,7 +59,7 @@ Server PUBLISHES:
   /path                    [nav_msgs/Path, RELIABLE+TRANSIENT_LOCAL]  — inject mission path
 
 Server SUBSCRIBES:
-  /rpp/debug               [std_msgs/Float32MultiArray]              — 8-element RPP diagnostics
+  /rpp/debug               [std_msgs/Float32MultiArray]              — 39-field RPP diagnostics; server consumes [0..9]
   /rpp/velocity_ned        [geometry_msgs/Vector3Stamped]            — NED velocity output
   /mavros/state             [mavros_msgs/State]                       — armed, mode, connected
   /mavros/local_position/pose  [geometry_msgs/PoseStamped]            — ENU pose (convert to NED)
@@ -84,8 +84,16 @@ Server CALLS SERVICES:
 [4] kappa             — path curvature (1/radius)
 [5] dist_to_goal_m    — distance to final waypoint in metres
 [6] pose_age_ms       — pose message staleness in milliseconds
-[7] state_code        — -1=STALE, 0=IDLE, 1=TRACKING, 2=APPROACH, 3=DONE
+[7] state_code        — -1=STALE, 0=IDLE, 1=TRACKING, 2=APPROACH, 3=DONE, 4=RTK_WAIT, 5=JUMP_SKIP
+[8] l_d_raw_m         — requested lookahead before clamp
+[9] kappa_speed       — predictive curvature used for speed scaling
+[10] yaw_rate_cmd     — body yaw-rate command from RPP
+[11..38]              — controller parameter snapshot for bag analysis
 ```
+
+The server keeps backward compatibility with legacy 8-field producers. Current
+runtime code publishes 39 values; `ros_node.py` stores `[8]` and `[9]` for
+telemetry and ignores the param snapshot.
 
 ### ENU to NED Conversion (CRITICAL)
 
@@ -99,7 +107,7 @@ pos_e = pose_enu_x   # ENU x → NED East
 
 ### OFFBOARD Pre-Stream Requirement (CRITICAL)
 
-PX4 REQUIRES setpoints streamed at ≥2 Hz BEFORE switching to OFFBOARD mode, or it rejects the mode switch. The `twist_to_setpoint_node` already handles this (streams zeros when no input). The server must verify streaming is active before attempting OFFBOARD switch by checking `/rpp/debug[7]` is not STALE (-1).
+PX4 REQUIRES setpoints streamed at ≥2 Hz BEFORE switching to OFFBOARD mode, or it rejects the mode switch. The `twist_to_setpoint_node` already handles this (streams zeros when no input). The server must verify streaming is active before attempting OFFBOARD switch by checking `/rpp/debug[7]` is not an unhealthy code (`STALE=-1`, `RTK_WAIT=4`, or `JUMP_SKIP=5`).
 
 ---
 
@@ -108,7 +116,7 @@ PX4 REQUIRES setpoints streamed at ≥2 Hz BEFORE switching to OFFBOARD mode, or
 1. **Pure rclpy** — Server runs on Jetson, same machine as ROS2. Single rclpy node in background thread. No roslibpy.
 2. **Server owns OFFBOARD lifecycle** — When frontend is connected, server manages arm/mode/path. The existing `mission_runner_node` is for headless operation only.
 3. **Path injection via /path topic** — Server publishes `nav_msgs/Path` to `/path`. Replaces `path_publisher_node` when UI is active.
-4. **Emergency stop = switch to MANUAL** — Safest method. PX4 exits OFFBOARD and stops motors. Also publishes empty Path to make RPP go IDLE.
+4. **Emergency stop = stop-path + MANUAL/disarm** — RPP ignores empty paths, so the server publishes a single-point path at the current position, then switches MANUAL and disarms through the safety path.
 5. **Socket.IO for telemetry (10Hz), REST for commands** — Same pattern as NRP_ROS frontend expects.
 
 ---
@@ -179,6 +187,9 @@ RPP_IDLE = 0
 RPP_TRACKING = 1
 RPP_APPROACH = 2
 RPP_DONE = 3
+RPP_RTK_WAIT = 4
+RPP_JUMP_SKIP = 5
+RPP_UNHEALTHY_CODES = {RPP_STALE, RPP_RTK_WAIT, RPP_JUMP_SKIP}
 
 # ── Server Defaults ──
 DEFAULT_HOST = "0.0.0.0"
@@ -401,6 +412,8 @@ class RosBridgeNode(Node):
                 self._state["dist_to_goal_m"] = msg.data[5]
                 self._state["pose_age_ms"] = msg.data[6]
                 self._state["rpp_state"] = int(msg.data[7])
+                self._state["l_d_raw_m"] = msg.data[8] if len(msg.data) >= 9 else float("nan")
+                self._state["kappa_speed"] = msg.data[9] if len(msg.data) >= 10 else float("nan")
 
     def _cb_rpp_velocity(self, msg: Vector3Stamped):
         with self._lock:
@@ -585,14 +598,14 @@ class OffboardController:
 
     def stop(self):
         """Stop path following, stay armed."""
-        # Publish empty path → RPP goes IDLE → zero velocity
-        self._node.publish_path([], frame_id="local_ned")
+        # Publish a current-position single-point path → RPP zero velocity
+        self._node.publish_stop_path_at_current_position()
         self._state = OffboardState.IDLE
         self._log.append({"level": "info", "message": "Mission stopped"})
 
     def abort(self):
-        """Emergency abort: empty path + MANUAL + disarm."""
-        self._node.publish_path([], frame_id="local_ned")
+        """Emergency abort: stop path + MANUAL + disarm."""
+        self._node.publish_stop_path_at_current_position()
         self._node.set_mode("MANUAL")
         self._node.arm(False)
         self._state = OffboardState.ABORTED
@@ -773,7 +786,15 @@ class PathManager:
 import time
 from dataclasses import dataclass
 
-RPP_STATE_NAMES = {-1: "STALE", 0: "IDLE", 1: "TRACKING", 2: "APPROACH", 3: "DONE"}
+RPP_STATE_NAMES = {
+    -1: "STALE",
+    0: "IDLE",
+    1: "TRACKING",
+    2: "APPROACH",
+    3: "DONE",
+    4: "RTK_WAIT",
+    5: "JUMP_SKIP",
+}
 
 @dataclass
 class RppState:
@@ -832,9 +853,10 @@ class EmergencyHandler:
         self._log = activity_log
 
     def estop(self):
-        """Emergency stop: empty path + MANUAL mode + disarm."""
-        # 1. Publish empty path → RPP goes IDLE → zero velocity
-        self._node.publish_path([], frame_id="local_ned")
+        """Emergency stop: current-position stop path + MANUAL mode + disarm."""
+        # 1. Publish a single-point path at current position.
+        # Empty Path is ignored by RPP and is not a reliable stop command.
+        self._node.publish_stop_path_at_current_position()
         # 2. Switch to MANUAL → PX4 exits OFFBOARD, stops motors
         self._node.set_mode("MANUAL")
         # 3. Disarm
@@ -912,14 +934,14 @@ class RoverBeacon:
 |---|---|---|
 | POST | `/api/arm` | Arm/disarm: `{arm: true/false}` |
 | POST | `/api/set_mode` | Set mode: `{mode: "OFFBOARD"/"MANUAL"}` |
-| POST | `/api/estop` | Emergency stop (empty path + MANUAL + disarm) |
+| POST | `/api/estop` | Emergency stop (stop path + MANUAL + disarm) |
 
 ### Mission (`routes/mission.py`)
 | Method | Path | Handler |
 |---|---|---|
 | POST | `/api/mission/load` | Load path by name or file |
 | POST | `/api/mission/start` | Execute: arm → OFFBOARD → publish path |
-| POST | `/api/mission/stop` | Publish empty path, stay armed |
+| POST | `/api/mission/stop` | Publish current-position stop path, stay armed |
 | POST | `/api/mission/abort` | Emergency abort |
 | GET | `/api/mission/status` | Current state + RPP status |
 
@@ -976,14 +998,14 @@ class RoverBeacon:
 2. Frontend: POST /api/mission/load {path_name: "square_2x2"} → server loads path
 3. Frontend: POST /api/mission/start → OffboardController:
    a. Check FCU connected (mavros/state)
-   b. Check twist_to_setpoint streaming (rpp_state != STALE)
+   b. Check twist_to_setpoint streaming (rpp_state not in RPP_UNHEALTHY_CODES)
    c. Arm vehicle (mavros/cmd/arming)
    d. Switch to OFFBOARD (mavros/set_mode)
    e. Publish path to /path topic
 4. Server: emit "telemetry" at 10Hz
 5. RPP controller: tracks path, outputs velocity
 6. twist_to_setpoint: streams PositionTarget at 50Hz
-7. Frontend: POST /api/mission/stop → server publishes empty path → RPP → IDLE
+7. Frontend: POST /api/mission/stop → server publishes current-position stop path
 8. Frontend: POST /api/arm {arm: false} → disarm
 ```
 
@@ -993,7 +1015,7 @@ class RoverBeacon:
 
 ```
 POST /api/estop → EmergencyHandler:
-1. Publish empty Path to /path → RPP → IDLE → zero velocity
+1. Publish current-position single-point Path to /path → RPP zero velocity
 2. Call /mavros/set_mode MANUAL → PX4 exits OFFBOARD
 3. Call /mavros/cmd/arming {value: false} → disarm
 4. Set state = ABORTED
