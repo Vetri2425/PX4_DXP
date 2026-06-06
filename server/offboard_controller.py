@@ -19,6 +19,7 @@ from typing import Any, Optional
 
 from config import RPP_STALE, RPP_UNHEALTHY_CODES, SETPOINT_STREAM_GRACE_S
 from logging_setup import get_logger
+from mission_loading import pose_origin_or_error
 from models import MissionState
 
 log = get_logger("server.offboard")
@@ -73,6 +74,21 @@ class OffboardController:
 
     # ── Lifecycle (async) ─────────────────────────────────────────────────────
 
+    def _rpp_unhealthy_start_message(self, rpp_code: int) -> str:
+        if rpp_code == RPP_STALE:
+            return "start: RPP STALE — is twist_to_setpoint_node running?"
+        if rpp_code == 4:  # RPP_RTK_WAIT
+            return (
+                "start: RPP RTK_WAIT — GPS fix < RTK_FIXED. "
+                "Wait for fix or set require_rtk_fix:=false on the controller."
+            )
+        if rpp_code == 5:  # RPP_JUMP_SKIP
+            return (
+                "start: RPP JUMP_SKIP — EKF position jump in progress; "
+                "retry in ~1 s once the estimator settles."
+            )
+        return f"start: RPP unhealthy (code={rpp_code})"
+
     async def start_async(self, auto_origin: bool = False) -> tuple[bool, str]:
         async with self._lock:
             if self._node is None:
@@ -82,6 +98,17 @@ class OffboardController:
             # OFFBOARD, which is wrong. Operator must stop first.
             if self._state == MissionState.RUNNING:
                 msg = "start: mission already running — call stop first"
+                self._log_entry("warning", msg)
+                return False, msg
+
+            if self._state in (
+                MissionState.LOADING,
+                MissionState.ARMING,
+                MissionState.SWITCHING_OFFBOARD,
+                MissionState.STOPPING,
+                MissionState.DISARMING,
+            ):
+                msg = f"start: controller state is {self._state.value} — wait until idle"
                 self._log_entry("warning", msg)
                 return False, msg
 
@@ -106,57 +133,71 @@ class OffboardController:
             rpp_code = fcu.get("rpp_state", RPP_STALE)
             if rpp_code in RPP_UNHEALTHY_CODES:
                 self._state = MissionState.ERROR
-                if rpp_code == RPP_STALE:
-                    msg = "start: RPP STALE — is twist_to_setpoint_node running?"
-                elif rpp_code == 4:  # RPP_RTK_WAIT
-                    msg = ("start: RPP RTK_WAIT — GPS fix < RTK_FIXED. "
-                           "Wait for fix or set require_rtk_fix:=false on the controller.")
-                elif rpp_code == 5:  # RPP_JUMP_SKIP
-                    msg = ("start: RPP JUMP_SKIP — EKF position jump in progress; "
-                           "retry in ~1 s once the estimator settles.")
-                else:
-                    msg = f"start: RPP unhealthy (code={rpp_code})"
+                msg = self._rpp_unhealthy_start_message(rpp_code)
                 self._log_entry("error", msg)
                 return False, msg
 
-            # ── Arm ───────────────────────────────────────────────────────────
-            self._state = MissionState.ARMING
-            self._log_entry("info", "arming…")
-            ok, why = await self._node.arm_async(True)
-            if not ok:
-                self._state = MissionState.ERROR
-                self._log_entry("error", f"arming failed: {why}")
-                return False, f"arm failed: {why}"
-
-            # ── Switch to OFFBOARD ────────────────────────────────────────────
-            self._state = MissionState.SWITCHING_OFFBOARD
-            self._log_entry("info", "switching to OFFBOARD…")
-            await asyncio.sleep(SETPOINT_STREAM_GRACE_S)
-            ok, why = await self._node.set_mode_async("OFFBOARD")
-            if not ok:
-                self._state = MissionState.ERROR
-                self._log_entry("error", f"OFFBOARD switch failed: {why}")
-                # Best-effort disarm; ignore result
-                await self._node.arm_async(False)
-                return False, f"OFFBOARD failed: {why}"
-
-            # ── Publish path ──────────────────────────────────────────────────
-            pts_to_publish = self._loaded_pts
-            if auto_origin:
-                s = self._node.get_state()
-                if not s.get("pose_received", False):
+            armed_here = False
+            try:
+                # ── Arm ───────────────────────────────────────────────────────
+                self._state = MissionState.ARMING
+                self._log_entry("info", "arming…")
+                ok, why = await self._node.arm_async(True)
+                if not ok:
                     self._state = MissionState.ERROR
-                    msg = "start: auto_origin requested but no local pose received yet"
+                    self._log_entry("error", f"arming failed: {why}")
+                    return False, f"arm failed: {why}"
+                armed_here = True
+
+                # ── Switch to OFFBOARD ────────────────────────────────────────
+                self._state = MissionState.SWITCHING_OFFBOARD
+                self._log_entry("info", "switching to OFFBOARD…")
+                await asyncio.sleep(SETPOINT_STREAM_GRACE_S)
+                fcu = self._node.get_state()
+                rpp_code = fcu.get("rpp_state", RPP_STALE)
+                if rpp_code in RPP_UNHEALTHY_CODES:
+                    self._state = MissionState.ERROR
+                    msg = self._rpp_unhealthy_start_message(rpp_code)
                     self._log_entry("error", msg)
+                    await self._node.arm_async(False)
                     return False, msg
-                off_n = float(s.get("pos_n", 0.0))
-                off_e = float(s.get("pos_e", 0.0))
-                pts_to_publish = [(n + off_n, e + off_e) for n, e in self._loaded_pts]
-                self._log_entry("info", f"auto_origin offset: +{off_n:.3f}N +{off_e:.3f}E")
-            self._node.publish_path(pts_to_publish)
-            self._state = MissionState.RUNNING
-            self._log_entry("info", f"mission running: {self._path_name}")
-            return True, "running"
+                ok, why = await self._node.set_mode_async("OFFBOARD")
+                if not ok:
+                    self._state = MissionState.ERROR
+                    self._log_entry("error", f"OFFBOARD switch failed: {why}")
+                    # Best-effort disarm; ignore result
+                    await self._node.arm_async(False)
+                    return False, f"OFFBOARD failed: {why}"
+
+                # ── Publish path ──────────────────────────────────────────────
+                pts_to_publish = self._loaded_pts
+                if auto_origin:
+                    pose_origin = pose_origin_or_error(self._node.get_state())
+                    if isinstance(pose_origin, str):
+                        self._state = MissionState.ERROR
+                        msg = f"start: {pose_origin}"
+                        self._log_entry("error", msg)
+                        return False, msg
+                    off_n, off_e = pose_origin
+                    pts_to_publish = [
+                        (n + off_n, e + off_e) for n, e in self._loaded_pts
+                    ]
+                    self._log_entry(
+                        "info", f"auto_origin offset: +{off_n:.3f}N +{off_e:.3f}E"
+                    )
+                self._node.publish_path(pts_to_publish)
+                self._state = MissionState.RUNNING
+                self._log_entry("info", f"mission running: {self._path_name}")
+                return True, "running"
+            except Exception as exc:
+                self._state = MissionState.ERROR
+                self._log_entry("error", f"unexpected start failure: {exc}")
+                if armed_here:
+                    try:
+                        await self._node.arm_async(False)
+                    except Exception:
+                        pass
+                return False, f"unexpected start failure: {exc}"
 
     async def stop_async(self) -> None:
         """Soft stop: publish a single-point stop-path → RPP zeroes velocity.

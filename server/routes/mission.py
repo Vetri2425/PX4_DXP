@@ -12,6 +12,11 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from auth import require_token
 from config import RPP_STATE_NAMES
+from mission_loading import (
+    MissionLoadConflict,
+    load_path_for_controller,
+    pose_origin_or_error,
+)
 from models import MissionLoadRequest, MissionStartRequest, MissionStatus
 
 router = APIRouter(prefix="/mission", tags=["mission"],
@@ -52,9 +57,10 @@ async def start_mission(req: MissionStartRequest | None = None):
         if ros_node is None:
             raise HTTPException(503, "ROS node not ready")
         s = ros_node.get_state()
-        if not s.get("pose_received", False):
-            raise HTTPException(409, "auto_origin requested but no local pose received yet")
-        origin = (float(s.get("pos_n", 0.0)), float(s.get("pos_e", 0.0)))
+        pose_origin = pose_origin_or_error(s)
+        if isinstance(pose_origin, str):
+            raise HTTPException(409, pose_origin)
+        origin = pose_origin
         start_position = origin
         if not name:
             loaded = offboard_ctrl.loaded_path_name
@@ -63,16 +69,19 @@ async def start_mission(req: MissionStartRequest | None = None):
 
     if name:
         try:
-            pts = path_mgr.load_path(
+            pts = await load_path_for_controller(
+                offboard_ctrl,
+                path_mgr,
                 name,
                 origin=origin,
                 start_position=start_position,
             )
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc))
+        except MissionLoadConflict as exc:
+            raise HTTPException(409, str(exc))
         except Exception as exc:
             raise HTTPException(400, f"Path load failed: {exc}")
-        offboard_ctrl.load_path(pts, name=name)
         origin_pre_applied = auto_origin
 
     ok, msg = await offboard_ctrl.start_async(
