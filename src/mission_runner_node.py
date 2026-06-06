@@ -224,7 +224,7 @@ class MissionRunnerNode(Node):
     # ==================================================================
     def _call_set_mode(self, mode: str) -> bool:
         """Initiate set_mode call. Returns True if call was sent, False if service unavailable."""
-        if not self._set_mode_cli.wait_for_service(timeout_sec=1.0):
+        if not self._set_mode_cli.service_is_ready():
             self.get_logger().error("/mavros/set_mode unavailable")
             return False
         req = SetMode.Request()
@@ -235,7 +235,7 @@ class MissionRunnerNode(Node):
 
     def _call_arm(self, value: bool) -> bool:
         """Initiate arm/disarm call. Returns True if call was sent, False if service unavailable."""
-        if not self._arm_cli.wait_for_service(timeout_sec=1.0):
+        if not self._arm_cli.service_is_ready():
             self.get_logger().error("/mavros/cmd/arming unavailable")
             return False
         req = CommandBool.Request()

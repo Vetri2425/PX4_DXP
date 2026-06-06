@@ -66,7 +66,7 @@ MISSION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "missions
 POSE_STALE_MS = 500.0  # consider pose stale above this
 SAFETY_STALE_GRACE_S = 1.0  # auto-abort after this long in STALE
 DONE_SETTLE_S = 1.0  # require this much DONE before auto-completing
-SETPOINT_STREAM_GRACE_S = 0.5  # delay between OFFBOARD switch and path publish
+SETPOINT_STREAM_GRACE_S = 0.5  # path/setpoint settle time before OFFBOARD request
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 TOKEN_FILE_DEFAULT = os.path.expanduser("~/.rover_token")

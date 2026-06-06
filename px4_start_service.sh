@@ -26,6 +26,7 @@ MAVROS_FAIL_DELAY=5
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 NTRIP_SCRIPT="${SCRIPT_DIR}/ntrip_rtcm_node.py"
+MAVROS_HEALTH_SCRIPT="${SCRIPT_DIR}/tools/ros2_mavros_health.py"
 MAVROS_READY_FLAG="/tmp/px4_mavros_ready"
 
 declare -a CHILD_PIDS=()
@@ -53,9 +54,9 @@ handle_exit() {
 }
 
 check_ros_node() {
-    # timeout 5: prevents an indefinitely-hung ROS2 daemon from blocking
-    # the watchdog restart loop for up to MAVROS_READY_WAIT × ∞ seconds.
-    timeout 5 ros2 node list 2>/dev/null | grep -q "$1"
+    # Use direct rclpy discovery instead of `ros2 node list`, which goes
+    # through the ROS2 CLI daemon and can be slow/stale during MAVROS restarts.
+    timeout 6 python3 "$MAVROS_HEALTH_SCRIPT" --timeout 5 node "$1" 2>/dev/null
 }
 
 free_port() {
@@ -82,9 +83,6 @@ mavros_watchdog() {
 
     while true; do
         log "Watchdog: starting MAVROS (PX4)..."
-        # Flush stale ROS2 daemon entries so check_ros_node doesn't
-        # return true from a dead /mavros node left over from the crash.
-        timeout 5 ros2 daemon stop >/dev/null 2>&1 || true
         free_port 14550
         sleep 1
 
@@ -169,11 +167,10 @@ if [[ ! -f "$ROS_SETUP" ]]; then
 fi
 set +u; source "$ROS_SETUP"; set -u
 
-# Stop daemon and kill stale processes — all best-effort, explicitly bracketed.
+# Kill stale processes — all best-effort, explicitly bracketed.
 # `set -e` would abort the script if any of these fail, which is wrong here
 # (they're cleanup ops; non-zero exit is expected when nothing is running).
 set +e
-timeout 5 ros2 daemon stop >/dev/null 2>&1
 pkill -f "mavros.*node.launch" 2>/dev/null
 pkill -f "ntrip_rtcm_node" 2>/dev/null
 set -e
@@ -216,10 +213,9 @@ fi
 
 log "MAVROS is READY"
 
-# Validate FCU connection
-# `timeout 10` is the outer guard; --timeout is NOT a valid ros2 topic echo
-# flag in Humble — the outer timeout provides the same protection cleanly.
-if timeout 10 ros2 topic echo /mavros/state --once 2>/dev/null | grep -q "connected: true"; then
+# Validate FCU connection with direct rclpy subscription instead of
+# `ros2 topic echo`, avoiding ROS2 CLI daemon latency/stale process state.
+if timeout 11 python3 "$MAVROS_HEALTH_SCRIPT" --timeout 10 state --require-connected 2>/dev/null; then
     log "FCU connected via MAVROS"
 else
     log "WARNING: MAVROS node exists but FCU may not be connected — check serial link"
@@ -240,7 +236,8 @@ if ! kill -0 "$NTRIP_WATCHDOG_PID" 2>/dev/null; then
 fi
 
 log "Active ROS nodes:"
-timeout 10 ros2 node list 2>/dev/null || true
+timeout 10 python3 "$MAVROS_HEALTH_SCRIPT" --timeout 5 node "/mavros" >/dev/null 2>&1 \
+    && log "  /mavros" || log "  /mavros not discovered"
 log "=== Bridge running. QGC → UDP → ${JETSON_IP}:${GCS_UDP_PORT} ==="
 
 wait "$MAVROS_WATCHDOG_PID" "$NTRIP_WATCHDOG_PID"

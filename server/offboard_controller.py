@@ -17,7 +17,12 @@ import datetime
 from collections import deque
 from typing import Any, Optional
 
-from config import RPP_STALE, RPP_UNHEALTHY_CODES, SETPOINT_STREAM_GRACE_S
+from config import (
+    RPP_IDLE,
+    RPP_STALE,
+    RPP_UNHEALTHY_CODES,
+    SETPOINT_STREAM_GRACE_S,
+)
 from logging_setup import get_logger
 from mission_loading import pose_origin_or_error
 from models import MissionState
@@ -149,8 +154,29 @@ class OffboardController:
                 self._log_entry("error", msg)
                 return False, msg
 
+            pts_to_publish = self._loaded_pts
+            if auto_origin:
+                pose_origin = pose_origin_or_error(self._node.get_state())
+                if isinstance(pose_origin, str):
+                    self._state = MissionState.ERROR
+                    msg = f"start: {pose_origin}"
+                    self._log_entry("error", msg)
+                    return False, msg
+                off_n, off_e = pose_origin
+                pts_to_publish = [
+                    (n + off_n, e + off_e) for n, e in self._loaded_pts
+                ]
+                self._log_entry(
+                    "info", f"auto_origin offset: +{off_n:.3f}N +{off_e:.3f}E"
+                )
+
             armed_here = False
             try:
+                # Publish the mission path before the OFFBOARD request so the
+                # 50 Hz setpoint stream carries mission setpoints, not just the
+                # streamer's zero-velocity bootstrap, when PX4 evaluates entry.
+                self._node.publish_path(pts_to_publish)
+
                 # ── Arm ───────────────────────────────────────────────────────
                 self._state = MissionState.ARMING
                 self._log_entry("info", "arming…")
@@ -173,6 +199,15 @@ class OffboardController:
                     self._log_entry("error", msg)
                     await self._node.arm_async(False)
                     return False, msg
+                if rpp_code == RPP_IDLE:
+                    self._state = MissionState.ERROR
+                    msg = (
+                        "start: RPP IDLE after path publish — "
+                        "setpoint chain not ready"
+                    )
+                    self._log_entry("error", msg)
+                    await self._node.arm_async(False)
+                    return False, msg
                 ok, why = await self._node.set_mode_async("OFFBOARD")
                 if not ok:
                     self._state = MissionState.ERROR
@@ -181,23 +216,6 @@ class OffboardController:
                     await self._node.arm_async(False)
                     return False, f"OFFBOARD failed: {why}"
 
-                # ── Publish path ──────────────────────────────────────────────
-                pts_to_publish = self._loaded_pts
-                if auto_origin:
-                    pose_origin = pose_origin_or_error(self._node.get_state())
-                    if isinstance(pose_origin, str):
-                        self._state = MissionState.ERROR
-                        msg = f"start: {pose_origin}"
-                        self._log_entry("error", msg)
-                        return False, msg
-                    off_n, off_e = pose_origin
-                    pts_to_publish = [
-                        (n + off_n, e + off_e) for n, e in self._loaded_pts
-                    ]
-                    self._log_entry(
-                        "info", f"auto_origin offset: +{off_n:.3f}N +{off_e:.3f}E"
-                    )
-                self._node.publish_path(pts_to_publish)
                 self._state = MissionState.RUNNING
                 self._log_entry("info", f"mission running: {self._path_name}")
                 return True, "running"

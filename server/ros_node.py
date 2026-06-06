@@ -276,8 +276,7 @@ class RosBridgeNode(Node):
         # ── RPP controller param service clients ──────────────────────────────
         # These talk to the running rpp_controller node via standard ROS2
         # rcl_interfaces services. The controller starts independently and may
-        # not be up when the bridge starts; wait_for_service is deferred to
-        # each call site.
+        # not be up when the bridge starts; readiness is checked on demand.
         self._rpp_param_get_cli: GetParameters.Request | None = None
         self._rpp_param_set_cli: SetParameters.Request | None = None
         self._rpp_param_list_cli: ListParameters.Request | None = None
@@ -298,20 +297,10 @@ class RosBridgeNode(Node):
                 callback_group=self._svc_group,
             )
 
-        # Non-blocking startup wait — services may come up after us
-        for cli, name in (
-            (self._arming_cli, "/mavros/cmd/arming"),
-            (self._set_mode_cli, "/mavros/set_mode"),
-            (self._param_get_cli, "/mavros/param/get_parameters"),
-            (self._param_set_cli, "/mavros/param/set_parameters"),
-            (self._rpp_param_get_cli, SRV_RPP_GET_PARAMS),
-            (self._rpp_param_set_cli, SRV_RPP_SET_PARAMS),
-            (self._rpp_param_list_cli, SRV_RPP_LIST_PARAMS),
-        ):
-            if cli is not None and not cli.wait_for_service(timeout_sec=2.0):
-                log.warning("service %s not yet available — will retry on demand", name)
-
-        log.info("RosBridgeNode initialised")
+        # Do not wait for services here: RosBridgeNode is constructed
+        # inside FastAPI lifespan, so startup service discovery must not block
+        # the asyncio loop. Request paths perform a fail-fast readiness check.
+        log.info("RosBridgeNode initialised; service readiness checked fail-fast")
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
@@ -421,27 +410,13 @@ class RosBridgeNode(Node):
         """
         if cli is None:
             return False, "service client not available"
-        if not cli.service_is_ready():
-            # Try a brief re-check (services can come up late)
-            if not cli.wait_for_service(timeout_sec=0.5):
-                return False, f"service {cli.srv_name} not ready"
+        if not await self._service_ready_async(cli, timeout_sec=0.5):
+            return False, f"service {cli.srv_name} not ready"
 
         future = cli.call_async(request)
-        loop = asyncio.get_running_loop()
-        af: asyncio.Future = loop.create_future()
-
-        def _done_cb(f) -> None:
-            try:
-                result = f.result()
-            except Exception as exc:
-                loop.call_soon_threadsafe(af.set_exception, exc)
-                return
-            loop.call_soon_threadsafe(af.set_result, result)
-
-        future.add_done_callback(_done_cb)
 
         try:
-            result = await asyncio.wait_for(af, timeout=timeout)
+            result = await self._await_ros_future(future, timeout=timeout)
         except asyncio.TimeoutError:
             return False, f"service {cli.srv_name} timed out after {timeout}s"
         except Exception as exc:
@@ -454,6 +429,45 @@ class RosBridgeNode(Node):
             # No success attr — treat presence of result as success
             return True, ""
         return bool(flag), "" if flag else f"service rejected (success={flag})"
+
+    async def _service_ready_async(self, cli, timeout_sec: float = 0.5) -> bool:
+        """Fail-fast service readiness check for command/control paths."""
+        if cli is None:
+            return False
+        return bool(cli.service_is_ready())
+
+    async def _await_ros_future(self, future, timeout: float):
+        """Await an rclpy Future from asyncio without late-result races.
+
+        `asyncio.wait_for()` cancels the asyncio-side future on timeout. ROS
+        service responses can still arrive later, so the callback must not call
+        set_result/set_exception on an already-done Future.
+        """
+        loop = asyncio.get_running_loop()
+        af: asyncio.Future = loop.create_future()
+
+        def _done_cb(f) -> None:
+            def _complete_result(result) -> None:
+                if not af.done():
+                    af.set_result(result)
+
+            def _complete_exception(exc: BaseException) -> None:
+                if not af.done():
+                    af.set_exception(exc)
+
+            try:
+                result = f.result()
+            except Exception as exc:
+                loop.call_soon_threadsafe(_complete_exception, exc)
+                return
+            loop.call_soon_threadsafe(_complete_result, result)
+
+        future.add_done_callback(_done_cb)
+        try:
+            return await asyncio.wait_for(af, timeout=timeout)
+        except asyncio.TimeoutError:
+            af.cancel()
+            raise
 
     async def arm_async(self, arm: bool, timeout: float = 5.0) -> tuple[bool, str]:
         if self._arming_cli is None:
@@ -477,27 +491,17 @@ class RosBridgeNode(Node):
             return False, None, "param service not available"
         req = GetParameters.Request()
         req.names = [name]
-        if not self._param_get_cli.service_is_ready():
-            if not self._param_get_cli.wait_for_service(timeout_sec=0.5):
-                return False, None, "param get service not ready"
+        if not await self._service_ready_async(self._param_get_cli, timeout_sec=0.5):
+            return False, None, "param get service not ready"
 
-        future = self._param_get_cli.call_async(req)
-        loop = asyncio.get_running_loop()
-        af: asyncio.Future = loop.create_future()
-
-        def _done_cb(f) -> None:
-            try:
-                result = f.result()
-            except Exception as exc:
-                loop.call_soon_threadsafe(af.set_exception, exc)
-                return
-            loop.call_soon_threadsafe(af.set_result, result)
-
-        future.add_done_callback(_done_cb)
         try:
-            result = await asyncio.wait_for(af, timeout=timeout)
+            result = await self._await_ros_future(
+                self._param_get_cli.call_async(req), timeout=timeout
+            )
         except asyncio.TimeoutError:
             return False, None, "param get timed out"
+        except Exception as exc:
+            return False, None, f"param get failed: {exc}"
         if result is None or not result.values:
             return False, None, "param not found"
         return True, _param_value_to_python(result.values[0]), ""
@@ -517,26 +521,16 @@ class RosBridgeNode(Node):
         return ok, msg
 
     async def _call_set_param(self, req, timeout: float) -> tuple[bool, list, str]:
-        if not self._param_set_cli.service_is_ready():
-            if not self._param_set_cli.wait_for_service(timeout_sec=0.5):
-                return False, [], "param set service not ready"
-        future = self._param_set_cli.call_async(req)
-        loop = asyncio.get_running_loop()
-        af: asyncio.Future = loop.create_future()
-
-        def _done_cb(f) -> None:
-            try:
-                result = f.result()
-            except Exception as exc:
-                loop.call_soon_threadsafe(af.set_exception, exc)
-                return
-            loop.call_soon_threadsafe(af.set_result, result)
-
-        future.add_done_callback(_done_cb)
+        if not await self._service_ready_async(self._param_set_cli, timeout_sec=0.5):
+            return False, [], "param set service not ready"
         try:
-            result = await asyncio.wait_for(af, timeout=timeout)
+            result = await self._await_ros_future(
+                self._param_set_cli.call_async(req), timeout=timeout
+            )
         except asyncio.TimeoutError:
             return False, [], "param set timed out"
+        except Exception as exc:
+            return False, [], f"param set failed: {exc}"
         if result is None:
             return False, [], "param set returned None"
         results = list(result.results)
@@ -554,22 +548,14 @@ class RosBridgeNode(Node):
             return False, None, "RPP param service not available"
         req = GetParameters.Request()
         req.names = [name]
-        if not self._rpp_param_get_cli.service_is_ready():
-            if not self._rpp_param_get_cli.wait_for_service(timeout_sec=0.5):
-                return False, None, "RPP controller not running"
-        future = self._rpp_param_get_cli.call_async(req)
-        loop = asyncio.get_running_loop()
-        af: asyncio.Future = loop.create_future()
-
-        def _done_cb(f) -> None:
-            try:
-                loop.call_soon_threadsafe(af.set_result, f.result())
-            except Exception as exc:
-                loop.call_soon_threadsafe(af.set_exception, exc)
-
-        future.add_done_callback(_done_cb)
+        if not await self._service_ready_async(
+            self._rpp_param_get_cli, timeout_sec=0.5
+        ):
+            return False, None, "RPP controller not running"
         try:
-            result = await asyncio.wait_for(af, timeout=timeout)
+            result = await self._await_ros_future(
+                self._rpp_param_get_cli.call_async(req), timeout=timeout
+            )
         except asyncio.TimeoutError:
             return False, None, "RPP param get timed out"
         except Exception as exc:
@@ -586,22 +572,14 @@ class RosBridgeNode(Node):
             return False, {}, "RPP param service not available"
         req = GetParameters.Request()
         req.names = names
-        if not self._rpp_param_get_cli.service_is_ready():
-            if not self._rpp_param_get_cli.wait_for_service(timeout_sec=0.5):
-                return False, {}, "RPP controller not running"
-        future = self._rpp_param_get_cli.call_async(req)
-        loop = asyncio.get_running_loop()
-        af: asyncio.Future = loop.create_future()
-
-        def _done_cb(f) -> None:
-            try:
-                loop.call_soon_threadsafe(af.set_result, f.result())
-            except Exception as exc:
-                loop.call_soon_threadsafe(af.set_exception, exc)
-
-        future.add_done_callback(_done_cb)
+        if not await self._service_ready_async(
+            self._rpp_param_get_cli, timeout_sec=0.5
+        ):
+            return False, {}, "RPP controller not running"
         try:
-            result = await asyncio.wait_for(af, timeout=timeout)
+            result = await self._await_ros_future(
+                self._rpp_param_get_cli.call_async(req), timeout=timeout
+            )
         except asyncio.TimeoutError:
             return False, {}, "RPP param get timed out"
         except Exception as exc:
@@ -655,22 +633,14 @@ class RosBridgeNode(Node):
 
     async def _call_rpp_set_param(self, req, timeout: float) -> tuple[bool, list, str]:
         """Shared rcl SetParameters call wrapper for RPP controller."""
-        if not self._rpp_param_set_cli.service_is_ready():
-            if not self._rpp_param_set_cli.wait_for_service(timeout_sec=0.5):
-                return False, [], "RPP controller not running"
-        future = self._rpp_param_set_cli.call_async(req)
-        loop = asyncio.get_running_loop()
-        af: asyncio.Future = loop.create_future()
-
-        def _done_cb(f) -> None:
-            try:
-                loop.call_soon_threadsafe(af.set_result, f.result())
-            except Exception as exc:
-                loop.call_soon_threadsafe(af.set_exception, exc)
-
-        future.add_done_callback(_done_cb)
+        if not await self._service_ready_async(
+            self._rpp_param_set_cli, timeout_sec=0.5
+        ):
+            return False, [], "RPP controller not running"
         try:
-            result = await asyncio.wait_for(af, timeout=timeout)
+            result = await self._await_ros_future(
+                self._rpp_param_set_cli.call_async(req), timeout=timeout
+            )
         except asyncio.TimeoutError:
             return False, [], "RPP param set timed out"
         except Exception as exc:
@@ -690,22 +660,14 @@ class RosBridgeNode(Node):
             return False, [], "RPP param service not available"
         req = ListParameters.Request()
         req.depth = 0  # 0 = unlimited recursion (flat list)
-        if not self._rpp_param_list_cli.service_is_ready():
-            if not self._rpp_param_list_cli.wait_for_service(timeout_sec=0.5):
-                return False, [], "RPP controller not running"
-        future = self._rpp_param_list_cli.call_async(req)
-        loop = asyncio.get_running_loop()
-        af: asyncio.Future = loop.create_future()
-
-        def _done_cb(f) -> None:
-            try:
-                loop.call_soon_threadsafe(af.set_result, f.result())
-            except Exception as exc:
-                loop.call_soon_threadsafe(af.set_exception, exc)
-
-        future.add_done_callback(_done_cb)
+        if not await self._service_ready_async(
+            self._rpp_param_list_cli, timeout_sec=0.5
+        ):
+            return False, [], "RPP controller not running"
         try:
-            result = await asyncio.wait_for(af, timeout=timeout)
+            result = await self._await_ros_future(
+                self._rpp_param_list_cli.call_async(req), timeout=timeout
+            )
         except asyncio.TimeoutError:
             return False, [], "RPP list params timed out"
         except Exception as exc:
@@ -747,17 +709,15 @@ class RosBridgeNode(Node):
         rover is already within `xy_goal_tolerance` of itself), so RPP zeroes
         its velocity output. This is the safe `mission_stop` semantic.
 
-        Guard: if the server has never received a pose (pos_n=0.0, pos_e=0.0
-        and connected=False), publishing at origin (0,0) could issue an
-        unintended movement command if the rover is not actually at the EKF
-        origin. In that case we publish nothing, log a warning, and return
-        None. `set_mode_async("MANUAL")` in the
-        abort chain still fires, which is the actual safety net.
+        Guard: if the server has never received a pose, publishing at origin
+        (0,0) could issue an unintended movement command if the rover is not
+        actually at the EKF origin. In that case we publish nothing, log a
+        warning, and return None. `set_mode_async("MANUAL")` in the abort
+        chain still fires, which is the actual safety net.
         """
         s = self.get_state()
         n, e = float(s.get("pos_n", 0.0)), float(s.get("pos_e", 0.0))
-        pose_received = not (n == 0.0 and e == 0.0 and not s.get("connected", False))
-        if not pose_received:
+        if not s.get("pose_received", False):
             log.warning(
                 "publish_stop_path: no pose received yet — "
                 "no stop-path published"
