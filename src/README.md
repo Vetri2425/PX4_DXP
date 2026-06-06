@@ -1,8 +1,9 @@
 # RPP Controller Pipeline — Operator Guide
 
-This directory contains the Phase 2 OFFBOARD path-following pipeline for the
-3WD marking rover. Five nodes + one launch file. Designed for ±1-2 cm marking
-accuracy with PX4 v1.16.2 + RoboClaw QPPS closed-loop wheel control + UM982 RTK.
+**Version:** 2.0 (FastAPI Server Integrated & Sprint 2 Geometry Upgrades)  
+**Last Updated:** 2026-06-06
+
+This directory contains the Phase 2 OFFBOARD path-following pipeline for the 3WD marking rover. It consists of five core runtime nodes, three validation test suites, and one central launch file. The system is designed for ±1–2 cm marking accuracy with PX4 v1.16.2, RoboClaw QPPS closed-loop wheel control, and Holybro UM982 RTK GPS.
 
 ```
 path_publisher  ─→ /path
@@ -25,207 +26,145 @@ path_publisher  ─→ /path
          /mavros/set_mode, /mavros/cmd/arming
 ```
 
-## Files
+---
 
-| File | Purpose | Topics |
-|---|---|---|
-| `rpp_controller_node.py` | Regulated Pure Pursuit math; outputs NED velocity vector, diagnostics, and optional yaw-rate feedforward | sub: `/path`, `/mavros/local_position/pose`, `/mavros/local_position/velocity_local`, `/mavros/gpsstatus/gps1/raw`<br>pub: `/rpp/velocity_ned`, `/rpp/yaw_rate_body`, `/rpp/debug` |
-| `twist_to_setpoint_node.py` | OFFBOARD heartbeat; bridges to MAVROS at 50 Hz with velocity + explicit yaw, and yaw-rate when fresh | sub: `/rpp/velocity_ned`, `/rpp/yaw_rate_body`<br>pub: `/mavros/setpoint_raw/local` |
-| `path_publisher_node.py` | Hardcoded test paths in NED | pub: `/path` (TRANSIENT_LOCAL) |
-| `xtrack_logger_node.py` | Time-aligned CSV of every tuning signal | sub: `/path`, `/mavros/local_position/pose`, `/rpp/debug`, `/rpp/velocity_ned`, `/mavros/setpoint_raw/local`<br>output: `/tmp/rpp_<path>_<ts>.csv` |
-| `mission_runner_node.py` | Drives OFFBOARD lifecycle (pre-stream → mode → arm → wait DONE → disarm) | sub: `/mavros/state`, `/rpp/debug`<br>srv: `/mavros/set_mode`, `/mavros/cmd/arming` |
-| `launch/rpp_pipeline.launch.py` | Brings up everything in the right order | — |
-| `offboard_test.py` | Pre-Phase-2 standalone OFFBOARD test (kept for regression) | — |
+## 📁 Files
 
-## Running it
+### Core ROS2 Nodes
 
-### SITL bring-up (recommended first)
+| File | Purpose | Key Topics / Services |
+| :--- | :--- | :--- |
+| [`rpp_controller_node.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/src/rpp_controller_node.py) | **Regulated Pure Pursuit Controller**:<br>• Tracks path waypoints and translates ENU poses to NED.<br>• Computes lookahead targets, worst-case preview curvatures, and lateral acceleration speed limits.<br>• Publishes relative NED velocity vectors and body yaw-rate feedforward signals. | **Subscribes to**:<br>• `/path` (`nav_msgs/Path`) - target waypoints<br>• `/mavros/local_position/pose` (`geometry_msgs/PoseStamped`) - ENU pose<br>• `/mavros/local_position/velocity_local` (`geometry_msgs/TwistStamped`) - ENU velocity<br>• `/mavros/gpsstatus/gps1/raw` (`mavros_msgs/GPSRAW`) - RTK fix gate<br><br>**Publishes to**:<br>• `/rpp/velocity_ned` (`geometry_msgs/Vector3Stamped`) - velocity setpoint<br>• `/rpp/yaw_rate_body` (`std_msgs/Float32`) - body yaw rate<br>• `/rpp/debug` (`std_msgs/Float32MultiArray`) - 39 performance metrics |
+| [`twist_to_setpoint_node.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/src/twist_to_setpoint_node.py) | **MAVROS Heartbeat Translator**:<br>• Subscribes to RPP velocity and body yaw-rate inputs at 50 Hz.<br>• Translates signals to MAVROS ENU coordinates and publishes them as raw setpoints.<br>• Computes explicit ENU yaw from velocity direction and freezes heading below 1 cm/s (P4/P0.5). | **Subscribes to**:<br>• `/rpp/velocity_ned`<br>• `/rpp/yaw_rate_body`<br><br>**Publishes to**:<br>• `/mavros/setpoint_raw/local` (`mavros_msgs/PositionTarget`) |
+| [`path_publisher_node.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/src/path_publisher_node.py) | **Test Path Publisher**:<br>• Publishes hardcoded test trajectories (`straight_5m`, `arc_quarter_1m5`, `lshape_2x2`, `square_2x2`, etc.) in the `local_ned` frame. | **Publishes to**:<br>• `/path` (TRANSIENT_LOCAL) |
+| [`xtrack_logger_node.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/src/xtrack_logger_node.py) | **Tuning CSV Logger**:<br>• Aggregates time-aligned telemetry (pose, speed, cross-track error, yaw-rates) from various topics at 20 Hz.<br>• Logs values to a CSV file (`/tmp/rpp_<path>_<ts>.csv`) for spreadsheet/pandas analysis. | **Subscribes to**:<br>• `/path`, `/mavros/local_position/pose`, `/rpp/debug`, `/rpp/velocity_ned`, `/mavros/setpoint_raw/local` |
+| [`mission_runner_node.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/src/mission_runner_node.py) | **Autonomous Offboard Manager**:<br>• Orchestrates the full automatic mission sequence: pre-streaming -> arming -> switching to OFFBOARD -> waiting for DONE status -> disarming. | **Subscribes to**:<br>• `/mavros/state`, `/rpp/debug`<br><br>**Calls Services**:<br>• `/mavros/cmd/arming`, `/mavros/set_mode` |
+
+### Pipeline Launch
+
+| File | Purpose |
+| :--- | :--- |
+| [`launch/rpp_pipeline.launch.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/src/launch/rpp_pipeline.launch.py) | **Central Launch Orchestrator**:<br>• Initializes and configures the ROS2 nodes in the correct startup order.<br>• Accepts tuning overrides (`min_lookahead_dist`, `max_linear_vel`, `mission_speed`, etc.) to tweak properties at runtime. |
+
+### Diagnostic & Verification Tests
+
+| File | Purpose |
+| :--- | :--- |
+| [`test_smoke_rpp_controller.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/src/test_smoke_rpp_controller.py) | **Node Runtime Smoke Test**:<br>• Instantiates the controller, mocks subscriber data, and executes `_control_loop` to ensure execution completes without crashes. |
+| [`test_sprint2_geometry.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/src/test_sprint2_geometry.py) | **Geometry Solver Offline Tests**:<br>• Solves linear resampling, corner smoothing arcs, lookahead projections, and Menger curvature math offline without requiring a running ROS2 framework. |
+| [`test_p05_yaw_setpoint.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/src/test_p05_yaw_setpoint.py) | **Explicit Yaw Tests**:<br>• Verifies explicit yaw calculation formulas, swaps, and 1 cm/s heading lock freeze thresholds. |
+| [`offboard_test.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/src/offboard_test.py) | **Legacy Standalone Test Node**:<br>• A basic pre-Phase-2 offboard publisher kept to verify baseline low-level compatibility. |
+
+---
+
+## 🏃 Running the Pipeline
+
+### SITL Simulation (Gazebo Harmonic)
+
+1. **Terminal 1: Launch PX4 SITL Rover**
+   ```bash
+   cd ~/PX4-Autopilot
+   make px4_sitl gz_r1_rover
+   ```
+
+2. **Terminal 2: Launch MAVROS SITL Bridge**
+   ```bash
+   ros2 launch mavros px4.launch fcu_url:=udp://:14540@localhost:14580
+   ```
+
+3. **Terminal 3: Launch RPP Node Pipeline**
+   ```bash
+   cd ~/PX4_DXP
+   ros2 launch src/launch/rpp_pipeline.launch.py path_name:=straight_5m
+   ```
+
+4. **Terminal 4: Start the Automated Mission Runner**
+   ```bash
+   ros2 run --prefix "python3" src/mission_runner_node.py
+   ```
+
+### Hardware Deployment
+
+Ensure the MAVROS companion services are active on the Jetson Orin before launching the pipeline:
 
 ```bash
-# Terminal 1: PX4 SITL with differential rover (Gazebo Harmonic)
-cd ~/PX4-Autopilot
-make px4_sitl gz_r1_rover
+# Verify companion bridge state
+systemctl status px4-dxp.service
 
-# Terminal 2: MAVROS bridge for SITL (or rely on px4-dxp.service if testing on-rover)
-ros2 launch mavros px4.launch fcu_url:=udp://:14540@localhost:14580
-
-# Terminal 3: bring up the pipeline (manual mission start)
-cd ~/PX4_DXP
-ros2 launch src/launch/rpp_pipeline.launch.py path_name:=straight_5m
-
-# Terminal 4: monitor RPP debug
-ros2 topic echo /rpp/debug
-
-# Once you see RPP outputting non-zero velocity, run the mission separately:
-ros2 run --prefix "python3" src/mission_runner_node.py
+# Launch the pipeline on hardware with auto-run enabled
+ros2 launch src/launch/rpp_pipeline.launch.py path_name:=straight_5m auto_run:=true
 ```
 
-### Hardware bring-up (after SITL passes)
+> [!WARNING]
+> Only enable `auto_run:=true` on hardware if the rover is positioned in a cleared test area and an operator is holding a physical RC E-stop switch.
 
-The Jetson already runs `px4-dxp.service` (MAVROS + NTRIP). Just launch the
-pipeline:
+### Dry-Run Telemetry Capturing (No Arming)
+
+For safety validation, run a dry-run mission:
 
 ```bash
-# On Jetson
-cd ~/PX4_DXP
-ros2 launch src/launch/rpp_pipeline.launch.py \
-    path_name:=straight_5m \
-    auto_run:=true
-
-# In another shell, watch live xtrack:
-ros2 topic echo /rpp/debug
+ros2 launch src/launch/rpp_pipeline.launch.py path_name:=arc_quarter_1m5 auto_run:=true dry_run:=true
 ```
 
-`auto_run:=true` is **only** safe on hardware with the rover positioned in a
-clear test area and an RC E-stop ready.
+This runs the RPP and translator pipelines without publishing arming commands, allowing log captures of simulated target paths.
 
-### Dry-run telemetry capture (no arming)
+---
 
-```bash
-ros2 launch src/launch/rpp_pipeline.launch.py \
-    path_name:=arc_quarter_1m5 \
-    auto_run:=true \
-    dry_run:=true
-```
+## 📐 Frame Conventions
 
-In dry-run, mission_runner walks through every phase but skips `set_mode` and
-`arming` calls. Useful for capturing the RPP→twist→MAVROS pipeline without
-moving the rover.
+* **Local Path**: Described in **LOCAL_NED** (`pose.position.x = North`, `pose.position.y = East`). The frame header must match `"local_ned"`.
+* **MAVROS Pose**: Published in **ENU** (`x = East`, `y = North`) per REP-103. The controller swaps these coordinates on read.
+* **RPP Velocity Output**: Published to `/rpp/velocity_ned` in **NED** (`x = vN`, `y = vE`).
+* **Heartbeat Translator Output**: Published in MAVROS ENU coordinates (`velocity.x = vE`, `velocity.y = vN`, `velocity.z = -vD`).
+* **Feedforward Yaw Rate**: Published on `/rpp/yaw_rate_body` in body frame (rad/s). If active, the type mask changes to `455` (ignores yaw, sends yaw rate). Otherwise, it sends velocity + explicit yaw under mask `2503`.
 
-## Test paths
+---
 
-| Name | Description | Tests |
-|---|---|---|
-| `straight_5m` | 5 m straight north, 50 cm point spacing | Cross-track stability on straight |
-| `arc_quarter_1m5` | Quarter circle, R=1.5 m, NE turn | Arc tracking, curvature regulation |
-| `lshape_2x2` | 2 m N then 2 m E (90° corner) | PX4 spot-turn FSM, corner behaviour |
+## 📈 Parameter Tuning & Diagnostics
 
-Goal acceptance: rover within `xy_goal_tolerance` (default 2 cm) of the final
-waypoint for `done_settle_s` (default 1 s).
+### Telemetry Debug Format (`/rpp/debug`)
 
-## Tuning entry points
+The node publishes a 39-field diagnostic payload. Below is the structured register:
 
-**Current recommended defaults for Phase 2 corner/arc marking**:
+| Index | Field | Description / Units |
+| :--- | :--- | :--- |
+| `0` | `cross_track_error_signed` | Cross-track deviation in metres (+ = right of path) |
+| `1` | `heading_error` | Angle offset between current heading and lookahead (rad) |
+| `2` | `lookahead_dist` | Current lookahead horizon distance in metres |
+| `3` | `speed_cmd` | Output target speed command in m/s |
+| `4` | `curvature_kappa` | Instantaneous steering curvature $\kappa$ ($1/m$) |
+| `5` | `dist_to_goal` | Metres remaining to final path waypoint |
+| `6` | `pose_age` | Latency age of the pose message (ms) |
+| `7` | `state_code` | Status code: `-1` (stale), `0` (idle), `1` (tracking), `2` (approach), `3` (done), `4` (RTK wait), `5` (jump skip) |
+| `8` | `l_d_raw` | Target lookahead distance calculated before bounding clamp (m) |
+| `9` | `kappa_speed` | Curvature value used to scale velocity limits ($1/m$) |
+| `10` | `yaw_rate_cmd` | Computed body-rate yaw command (rad/s) |
+| `11..38` | `params` | Snapshot of active controller parameters (for post-run parsing) |
 
-- `mission_speed=0.35`
-- `min_lookahead_dist=0.52`
-- `lookahead_time=1.6`
-- `a_lat_max=0.3`
-- `preview_curvature_n=4`
-- `xtrack_lookahead_gain=0.05`
-- `path_resample_spacing_m=0.08`
-- `corner_smooth_radius_m=0.5`
-- `corner_smooth_arc_pts=6`
-- `use_feedforward_yaw_rate=true`
-- `yaw_rate_feedback_gain=0.0`
-- `max_yaw_rate_body=0.45`
+### Real-Time Parameter Adjustment
 
-Order matters — change one parameter at a time, capture a CSV, plot, repeat.
-
-| Symptom | Try |
-|---|---|
-| Wobbles on straight line | Increase `min_lookahead_dist` or reduce `mission_speed` |
-| Cuts arcs/corners significantly | Lower `a_lat_max`, increase `corner_smooth_radius_m`, or increase `corner_smooth_arc_pts` |
-| Corner yaw overshoots | Lower `yaw_rate_feedback_gain`; current mainline default is pure feedforward (`0.0`) |
-| Overshoots goal | Decrease `approach_velocity_scaling_dist` (0.6 → 0.4) |
-| Stops short of goal | Decrease `xy_goal_tolerance` (0.02 → 0.01); also check P4 `p4_zero_vel_threshold` |
-| Velocity step ringing on hardware | Reduce PX4 `RO_SPEED_P` from 0.5 → 0.2-0.3 (post-QPPS plant is much stiffer) |
-| Spot-turn doesn't trigger on L-shape | Reduce PX4 `RD_TRANS_DRV_TRN` toward 25° |
-| Spot-turn lingers | Reduce PX4 `RD_TRANS_TRN_DRV` toward 3° |
-
-All RPP-side tunables are ROS2 params on `rpp_controller_node` and adjustable
-at runtime:
+ROS2 parameters can be set dynamically during execution:
 
 ```bash
+# Example: Lower the lookahead floor to 40 cm for tight tracks
 ros2 param set /rpp_controller min_lookahead_dist 0.40
 ```
 
-PX4-side params (`RO_*`, `RD_*`, `PP_*`) are flashed via QGC.
+Tuning guidance is summarized in the table below:
 
-## Frame conventions (avoid the most common bugs)
+| Symptom | Adjustment |
+| :--- | :--- |
+| **Straight-line oscillation** | Increase `min_lookahead_dist` or reduce `mission_speed`. |
+| **Corner-cutting** | Reduce `a_lat_max`, increase `corner_smooth_radius_m` or `corner_smooth_arc_pts`. |
+| **Yaw overshoot at corners** | Decrease `yaw_rate_feedback_gain` (rely on feedforward). |
+| **Over-shooting goal endpoint** | Reduce `approach_velocity_scaling_dist` (e.g. from `0.6` to `0.4`). |
+| **Stopping short of goal** | Decrease `xy_goal_tolerance` (e.g. from `0.02` to `0.01`). |
 
-- All paths are in **LOCAL_NED**: `pose.position.x = North`, `pose.position.y = East`.
-- `path.header.frame_id = "local_ned"` is enforced by `rpp_controller_node`.
-- MAVROS `/mavros/local_position/pose` is **ENU** per REP-103. The RPP node
-  swaps axes on read.
-- `/rpp/velocity_ned` is **NED** (`vector.x = vN`, `vector.y = vE`).
-- The MAVROS PositionTarget output uses `coordinate_frame = 1` (LOCAL_NED).
-- `twist_to_setpoint_node` converts the RPP velocity to MAVROS ENU fields:
-  `velocity.x = v_e`, `velocity.y = v_n`, `velocity.z = -v_d`.
-- `twist_to_setpoint_node` computes explicit ENU yaw from the velocity
-  direction and holds the previous yaw below 1 cm/s.
-- `/rpp/yaw_rate_body` is NED/body yaw-rate feedforward. When it is fresh and
-  nonzero, `twist_to_setpoint_node` sends type_mask `455`; otherwise it sends
-  velocity + yaw with yaw-rate ignored (`2503`).
+---
 
-## Diagnostics
+## 🛡 Safety & Failsafe Guards
 
-`/rpp/debug` (`std_msgs/Float32MultiArray`) emits 39 floats every control
-cycle. Indices `[0..7]` are the stable legacy runtime fields, `[8..10]`
-add tuning diagnostics, and `[11..38]` snapshot the active controller params.
-
-| Idx | Field | Units |
-|---|---|---|
-| 0 | cross_track_error_signed | m (`+` = right of path) |
-| 1 | heading_error | rad |
-| 2 | lookahead_dist | m |
-| 3 | speed_cmd | m/s |
-| 4 | curvature κ | 1/m |
-| 5 | dist_to_goal | m |
-| 6 | pose_age | ms |
-| 7 | state_code | -1=STALE, 0=IDLE, 1=TRACKING, 2=APPROACH, 3=DONE, 4=RTK_WAIT, 5=JUMP_SKIP |
-| 8 | l_d_raw | m |
-| 9 | kappa_speed | 1/m |
-| 10 | yaw_rate_cmd | rad/s |
-| 11..38 | param snapshot | see `rpp_controller_node.py` header |
-
-`xtrack_logger_node` writes a CSV with the runtime diagnostics plus rover pose,
-closest path point, RPP velocity, yaw-rate command, and final MAVROS setpoint.
-
-## Safety & failsafes
-
-- **Pose staleness:** RPP emits `(0, 0, 0)` if pose hasn't arrived in 200 ms.
-  Rover will hold position; OFFBOARD stays alive.
-- **Pose extrapolation:** `use_imu_extrapolation=true` enables velocity-based
-  extrapolation from `/mavros/local_position/velocity_local`. The parameter
-  name is legacy; the current code does not integrate IMU acceleration.
-- **Input staleness:** twist_to_setpoint emits `(0, 0, 0)` if `/rpp/velocity_ned`
-  hasn't arrived in 200 ms. Independent layer of protection.
-- **Mission timeout:** `mission_runner` aborts and disarms after 300 s
-  (configurable via `mission_timeout_s`).
-- **External OFFBOARD exit:** if RC override or failsafe drops OFFBOARD,
-  `mission_runner` detects the mode change and exits without disarming
-  (operator now has control).
-- **Ctrl+C on mission_runner:** disarms and reverts to MANUAL on shutdown.
-- **PX4 OFFBOARD failsafe:** if streaming gaps exceed 500 ms (`COM_OF_LOSS_T`),
-  PX4 drops OFFBOARD on its own — the streamer's zero-velocity heartbeat
-  prevents this.
-- **Emergency stop path:** RPP intentionally ignores empty `Path` messages.
-  E-stop should publish a single-point path at the current position, then
-  switch MANUAL / disarm through the server safety path.
-
-## What's NOT in this pipeline
-
-By design, these are deferred to later phases or out of scope:
-
-- **No Nav2 stack** — single-purpose controller, no costmaps or behavior trees
-- **No global planner** — paths come pre-computed (Phase 3: DXF parser)
-- **No obstacle avoidance** — marking has no obstacles
-- **No Stanley / MPC fallback** — only RPP. Add only if RPP misses ±2 cm after
-  RTK validation.
-- **No spline smoothing** — RPP handles polylines fine. Phase 3 adds DXF→spline.
-- **No reverse path support** — RPP outputs forward velocity only. PX4's P3
-  patch handles momentary reverse during spot-turns; not exposed at path level.
-
-## Verification checklist before declaring Phase 2 done
-
-- [ ] All 6 files compile clean (already passing)
-- [ ] SITL: straight_5m completes with CSV cross-track < 5 cm RMS
-- [ ] SITL: arc_quarter_1m5 completes with CSV cross-track < 5 cm RMS
-- [ ] SITL: lshape_2x2 completes; spot-turn visible in `rover_velocity_status`
-- [ ] Hardware: RTK fix > 95% of run time (orthogonal to controller — but gates accuracy)
-- [ ] Hardware: straight_5m at 0.4 m/s with cross-track < 3 cm RMS on RTK
-- [ ] Hardware: arc_quarter_1m5 with cross-track < 3 cm RMS
-- [ ] Hardware: `RO_SPEED_P` re-tuned for QPPS plant (no ringing on velocity steps)
-- [ ] P3 (reverse) validation: command brief reverse, observe no 180° spin
-- [ ] P4 (heading hold) validation: command zero velocity on slope, drift < 1 cm/s
+* **Pose Loss (Staleness)**: Commands an emergency-stop `(0,0,0)` if no MAVROS pose is received for `200 ms` to keep the OFFBOARD stream active without tripping failsafes.
+* **Pose Extrapolation (Latency Closure)**: If `use_imu_extrapolation=true` is enabled, predicts pose forward by `v_ned * pose_age` to handle message latency.
+* **Input Staleness**: `twist_to_setpoint_node` immediately commands zero velocity if RPP stops publishing for `200 ms`.
+* **External Interrupts**: The `mission_runner` immediately releases controller lock and yields to MANUAL mode control if the operator triggers an RC override.

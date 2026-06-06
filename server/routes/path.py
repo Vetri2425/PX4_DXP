@@ -153,6 +153,21 @@ async def plan_path(req: PathPlanRequest):
     import asyncio
     from main import path_mgr
 
+    unsupported = []
+    if req.selected_entities is not None:
+        unsupported.append("selected_entities")
+    if req.overrides is not None:
+        unsupported.append("overrides")
+    if req.order is not None:
+        unsupported.append("order")
+    if req.ref_points is not None:
+        unsupported.append("ref_points")
+    if unsupported:
+        raise HTTPException(
+            422,
+            "Preview fields not implemented yet: " + ", ".join(unsupported),
+        )
+
     origin = tuple(req.origin) if req.origin else (0.0, 0.0)
     start_position = tuple(req.start_position) if req.start_position else None
     summary_only = not (req.include_waypoints)
@@ -167,6 +182,9 @@ async def plan_path(req: PathPlanRequest):
                 transit_spacing=req.transit_spacing,
                 marking_speed=req.marking_speed,
                 transit_speed=req.transit_speed,
+                layer_mapping=req.layer_mapping,
+                optimize=req.optimize,
+                compensate_spray=req.compensate_spray,
                 origin=origin,
                 start_position=start_position,
             ),

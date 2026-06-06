@@ -46,6 +46,7 @@ class PathPublishRequest(BaseModel):
 class MissionStartRequest(BaseModel):
     path_name: Optional[str] = None
     mission_file: Optional[str] = None
+    auto_origin: bool = False
 
 
 class MissionLoadRequest(BaseModel):

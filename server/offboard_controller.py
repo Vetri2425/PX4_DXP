@@ -73,7 +73,7 @@ class OffboardController:
 
     # ── Lifecycle (async) ─────────────────────────────────────────────────────
 
-    async def start_async(self) -> tuple[bool, str]:
+    async def start_async(self, auto_origin: bool = False) -> tuple[bool, str]:
         async with self._lock:
             if self._node is None:
                 return False, "ROS node not available"
@@ -141,7 +141,14 @@ class OffboardController:
                 return False, f"OFFBOARD failed: {why}"
 
             # ── Publish path ──────────────────────────────────────────────────
-            self._node.publish_path(self._loaded_pts)
+            pts_to_publish = self._loaded_pts
+            if auto_origin:
+                s = self._node.get_state()
+                off_n = float(s.get("pos_n", 0.0))
+                off_e = float(s.get("pos_e", 0.0))
+                pts_to_publish = [(n + off_n, e + off_e) for n, e in self._loaded_pts]
+                self._log_entry("info", f"auto_origin offset: +{off_n:.3f}N +{off_e:.3f}E")
+            self._node.publish_path(pts_to_publish)
             self._state = MissionState.RUNNING
             self._log_entry("info", f"mission running: {self._path_name}")
             return True, "running"

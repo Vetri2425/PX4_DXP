@@ -50,7 +50,8 @@ async def start_mission(req: MissionStartRequest | None = None):
         except Exception as exc:
             raise HTTPException(400, f"Path load failed: {exc}")
         offboard_ctrl.load_path(pts, name=name)
-    ok, msg = await offboard_ctrl.start_async()
+    auto_origin = req.auto_origin if req else False
+    ok, msg = await offboard_ctrl.start_async(auto_origin=auto_origin)
     if not ok:
         raise HTTPException(409, f"Mission start failed: {msg}")
     return {"state": offboard_ctrl.state.value, "message": msg}

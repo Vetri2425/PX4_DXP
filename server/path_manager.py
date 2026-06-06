@@ -21,12 +21,12 @@ log = get_logger("server.path")
 
 # ── Hardcoded path generators (mirror path_publisher_node.py) ─────────────────
 
-def gen_straight_5m(spacing: float = 0.5) -> list[tuple[float, float]]:
+def gen_straight_5m(spacing: float = 0.1) -> list[tuple[float, float]]:
     return [(i * spacing, 0.0) for i in range(int(5.0 / spacing) + 1)]
 
 
 def gen_arc_quarter_1m5(
-    radius: float = 1.5, arc_spacing: float = 0.1
+    radius: float = 1.5, arc_spacing: float = 0.05
 ) -> list[tuple[float, float]]:
     arc_len = radius * (math.pi / 2.0)
     n = max(2, int(arc_len / arc_spacing) + 1)
@@ -37,13 +37,25 @@ def gen_arc_quarter_1m5(
     ]
 
 
-def gen_lshape_2x2(spacing: float = 0.25) -> list[tuple[float, float]]:
+def gen_arc_half_1m5(
+    radius: float = 1.5, arc_spacing: float = 0.05
+) -> list[tuple[float, float]]:
+    arc_len = radius * math.pi
+    n = max(2, int(arc_len / arc_spacing) + 1)
+    return [
+        (radius * math.sin(math.pi * i / (n - 1)),
+         radius * (1.0 - math.cos(math.pi * i / (n - 1))))
+        for i in range(n)
+    ]
+
+
+def gen_lshape_2x2(spacing: float = 0.15) -> list[tuple[float, float]]:
     pts = [(i * spacing, 0.0) for i in range(int(2.0 / spacing) + 1)]
     pts += [(2.0, i * spacing) for i in range(1, int(2.0 / spacing) + 1)]
     return pts
 
 
-def gen_square_2x2(spacing: float = 0.25) -> list[tuple[float, float]]:
+def gen_square_2x2(spacing: float = 0.15) -> list[tuple[float, float]]:
     side = 2.0
     steps = int(side / spacing)
     pts = [(i * spacing, 0.0) for i in range(steps + 1)]
@@ -53,7 +65,7 @@ def gen_square_2x2(spacing: float = 0.25) -> list[tuple[float, float]]:
     return pts
 
 
-def gen_rectangle_3x2(spacing: float = 0.25) -> list[tuple[float, float]]:
+def gen_rectangle_3x2(spacing: float = 0.15) -> list[tuple[float, float]]:
     ln, le = 3.0, 2.0
     pts  = [(i * spacing, 0.0) for i in range(int(ln / spacing) + 1)]
     pts += [(ln, i * spacing)       for i in range(1, int(le / spacing) + 1)]
@@ -63,7 +75,7 @@ def gen_rectangle_3x2(spacing: float = 0.25) -> list[tuple[float, float]]:
 
 
 def gen_circle_1m5(
-    radius: float = 1.5, arc_spacing: float = 0.1
+    radius: float = 1.5, arc_spacing: float = 0.05
 ) -> list[tuple[float, float]]:
     n = max(4, int(radius * 2 * math.pi / arc_spacing) + 1)
     pts = [
@@ -76,12 +88,13 @@ def gen_circle_1m5(
 
 
 BUILTIN_PATHS: dict[str, dict] = {
-    "straight_5m":     {"gen": gen_straight_5m,      "desc": "5 m straight north, 50 cm spacing"},
-    "arc_quarter_1m5": {"gen": gen_arc_quarter_1m5,  "desc": "Quarter circle, R=1.5 m, north then east"},
-    "lshape_2x2":      {"gen": gen_lshape_2x2,       "desc": "2 m north then 2 m east, 25 cm spacing"},
-    "square_2x2":      {"gen": gen_square_2x2,       "desc": "2 m × 2 m closed square, 25 cm spacing"},
-    "rectangle_3x2":   {"gen": gen_rectangle_3x2,    "desc": "3 m north × 2 m east rectangle"},
-    "circle_1m5":      {"gen": gen_circle_1m5,       "desc": "Full circle, R=1.5 m, closed loop"},
+    "straight_5m":     {"gen": gen_straight_5m,      "desc": "5 m straight north, 10 cm spacing"},
+    "arc_quarter_1m5": {"gen": gen_arc_quarter_1m5,  "desc": "Quarter circle, R=1.5 m, 5 cm arc spacing, north then east"},
+    "arc_half_1m5":    {"gen": gen_arc_half_1m5,     "desc": "Half circle, R=1.5 m, 5 cm arc spacing, north then east"},
+    "lshape_2x2":      {"gen": gen_lshape_2x2,       "desc": "2 m north then 2 m east, 15 cm spacing"},
+    "square_2x2":      {"gen": gen_square_2x2,       "desc": "2 m × 2 m closed square, 15 cm spacing"},
+    "rectangle_3x2":   {"gen": gen_rectangle_3x2,    "desc": "3 m north × 2 m east rectangle, 15 cm spacing"},
+    "circle_1m5":      {"gen": gen_circle_1m5,       "desc": "Full circle, R=1.5 m, 5 cm arc spacing, closed loop"},
 }
 
 
@@ -89,6 +102,13 @@ BUILTIN_PATHS: dict[str, dict] = {
 def _cached_builtin(name: str) -> tuple[tuple[float, float], ...]:
     """Cache builtin generation across calls to list_paths()."""
     return tuple(BUILTIN_PATHS[name]["gen"]())
+
+
+def _path_length(points: list[tuple[float, float]]) -> float:
+    return sum(
+        math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1])
+        for i in range(1, len(points))
+    )
 
 
 # ── File readers ──────────────────────────────────────────────────────────────
@@ -265,42 +285,77 @@ class PathManager:
         """Run the full planning pipeline on a file and return PlannedPath info.
 
         Args:
-            name: Filename in missions dir or builtin path name.
+            name: Filename in missions dir or builtin path name. Builtins may
+                  optionally be prefixed with "builtin:".
             summary_only: If True, return only counts/lengths (no waypoints).
             **kwargs: Passed to PathEngine.plan_file().
 
         Returns:
             Dict with waypoints, segments, and metadata.
         """
+        source_name = name
+        if name.startswith("builtin:"):
+            name = name.removeprefix("builtin:")
+
+        origin = kwargs.pop("origin", (0.0, 0.0))
+        start_position = kwargs.pop("start_position", None)
+        layer_mapping = kwargs.pop("layer_mapping", None)
+        optimize = kwargs.pop("optimize", True)
+        compensate_spray = kwargs.pop("compensate_spray", True)
+        line_spacing = kwargs.pop("line_spacing", 0.05)
+        transit_spacing = kwargs.pop("transit_spacing", 0.15)
+        marking_speed = kwargs.pop("marking_speed", 0.35)
+        transit_speed = kwargs.pop("transit_speed", 0.50)
+
+        if name in BUILTIN_PATHS:
+            # Builtin preview must match the path that mission/load publishes:
+            # these generators are already densified to their tuned spacing.
+            pts = list(_cached_builtin(name))
+            shifted = [(n + origin[0], e + origin[1]) for n, e in pts]
+            mark_length = _path_length(pts)
+            result = {
+                "source": source_name,
+                "num_waypoints": len(shifted),
+                "num_segments": 1 if shifted else 0,
+                "mark_length_m": round(mark_length, 3),
+                "transit_length_m": 0.0,
+                "total_length_m": round(mark_length, 3),
+                "segments": [{
+                    "type": "MARK",
+                    "speed": marking_speed,
+                    "source": f"builtin:{name}",
+                    "length_m": round(mark_length, 3),
+                }] if shifted else [],
+            }
+            if not summary_only:
+                result["merged_waypoints"] = shifted
+                result["spray_flags"] = [True] * len(shifted)
+            return result
+
         from path_engine.engine import PathEngine
         engine = PathEngine(
-            mark_spacing=kwargs.pop("line_spacing", 0.05),
-            transit_spacing=kwargs.pop("transit_spacing", 0.15),
-            marking_speed=kwargs.pop("marking_speed", 0.35),
-            transit_speed=kwargs.pop("transit_speed", 0.50),
+            mark_spacing=line_spacing,
+            transit_spacing=transit_spacing,
+            marking_speed=marking_speed,
+            transit_speed=transit_speed,
+            optimize_order=optimize,
+            compensate_spray=compensate_spray,
         )
 
         # Resolve file path
         fpath = os.path.join(self._dir, os.path.basename(name))
         if os.path.isfile(fpath):
-            plan = engine.plan_file(fpath, **kwargs)
-        elif name in BUILTIN_PATHS:
-            # For builtins, use the simple flat waypoint list
-            pts = list(_cached_builtin(name))
-            from path_engine.core import PathSegment, SegmentType
-            segments = [PathSegment(
-                segment_type=SegmentType.MARK,
-                points=pts,
-                speed=0.35,
-                source_entity=f"builtin:{name}",
-            )]
-            plan = engine.plan_segments(segments, origin=kwargs.get("origin", (0.0, 0.0)),
-                                         start_position=kwargs.get("start_position"))
+            plan = engine.plan_file(
+                fpath,
+                layer_mapping=layer_mapping,
+                origin=origin,
+                start_position=start_position,
+            )
         else:
             raise FileNotFoundError(f"Path not found: {name!r}")
 
         result = {
-            "source": name,
+            "source": source_name,
             "num_waypoints": plan.num_waypoints,
             "num_segments": len(plan.segments),
             "mark_length_m": round(plan.total_mark_length, 3),
