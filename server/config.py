@@ -86,4 +86,13 @@ if os.environ.get("ROVER_DISABLE_AUTH"):
 else:
     CORS_ALLOW_ORIGINS = ["*"]
     DEFAULT_HOST = "0.0.0.0"
+
+# Explicit override (deployment-specific, set via systemd drop-in). Comma-
+# separated list of allowed origins, or "*" for any. Lets a trusted/isolated
+# LAN serve the browser/mobile frontend (whose origin is an arbitrary LAN IP)
+# even with auth disabled, without baking an open policy into the repo.
+_cors_env = os.environ.get("ROVER_CORS_ORIGINS")
+if _cors_env:
+    CORS_ALLOW_ORIGINS = [o.strip() for o in _cors_env.split(",") if o.strip()]
+
 CORS_ALLOW_CREDENTIALS = False
