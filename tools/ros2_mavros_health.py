@@ -36,9 +36,15 @@ def check_node(node_name: str, timeout: float) -> int:
     rclpy.init()
     node = Node("px4_dxp_node_probe")
     deadline = time.monotonic() + timeout
+    # Prefix-aware match: MAVROS registers many sub-namespaced nodes
+    # (/mavros/mavros_node, /mavros/sys, ...) and NONE named exactly
+    # "/mavros". Match the target itself or any node under it, mirroring the
+    # old `ros2 node list | grep "/mavros"` substring behavior.
+    target = node_name.rstrip("/")
     try:
         while rclpy.ok() and time.monotonic() < deadline:
-            if node_name in _full_node_names(node):
+            names = _full_node_names(node)
+            if any(n == target or n.startswith(target + "/") for n in names):
                 return 0
             rclpy.spin_once(node, timeout_sec=0.1)
         return 1
