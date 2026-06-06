@@ -8,6 +8,7 @@ Type=exec
 User=flash
 Group=flash
 WorkingDirectory=/home/flash/PX4_DXP
+ExecStartPre=/bin/sh -c 'rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_* 2>/dev/null || true'
 ExecStart=/home/flash/PX4_DXP/px4_start_service.sh
 ExecStop=/bin/kill -TERM $MAINPID
 Restart=always
@@ -51,6 +52,7 @@ ProtectClock=no
 # Environment
 Environment=ROS_DOMAIN_ID=0
 Environment=ROS_LOCALHOST_ONLY=0
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/home/flash/PX4_DXP/config/fastdds_no_shm.xml
 UnsetEnvironment=AMENT_TRACE_SETUP_FILES
 Environment=HOME=/home/flash
 

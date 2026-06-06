@@ -36,6 +36,7 @@ CPUQuota=200%
 # Environment
 Environment=ROS_DOMAIN_ID=0
 Environment=ROS_LOCALHOST_ONLY=0
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/home/flash/PX4_DXP/config/fastdds_no_shm.xml
 Environment=HOME=/home/flash
 Environment=FASTAPI_PORT=5001
 # Disable auth for initial bring-up; remove this line for production
