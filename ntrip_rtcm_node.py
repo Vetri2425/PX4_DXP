@@ -265,8 +265,8 @@ class NtripNode(Node):
                 header, leftover = resp.split(b"\r\n\r\n", 1)
                 header = header.decode(errors="ignore")
                 break
-            # ICY casters: "ICY 200 OK\r\n" then binary immediately
-            if b"ICY 200 OK" in resp and len(resp) > 20:
+            # ICY casters: "ICY 200 OK\r\n" then binary, possibly in a later packet.
+            if resp.startswith(b"ICY 200 OK") and b"\r\n" in resp:
                 lines = resp.split(b"\r\n", 1)
                 header = lines[0].decode(errors="ignore")
                 leftover = lines[1] if len(lines) > 1 else b""
