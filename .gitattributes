@@ -1,0 +1,16 @@
+# Pin line endings to LF so the Jetson working tree never reintroduces CRLF
+# (CRLF churn previously produced phantom diffs that blocked git pull on deploy).
+*.sh   text eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.json text eol=lf
+*.txt  text eol=lf
+*.csv  text eol=lf
+
+# Binary assets — never touch line endings.
+*.dxf  binary
+*.png  binary
+*.jpg  binary
+*.bag  binary
