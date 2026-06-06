@@ -49,10 +49,12 @@ class RppStatusMonitor:
         self._done_settle_s = done_settle_s
         self._done_since: float | None = None
         self._snapshot = RppSnapshot()
+        self._has_snapshot = False
 
     def update(self, data: list[float]) -> None:
         if len(data) >= 8:
             self._snapshot = RppSnapshot.from_debug_array(data)
+            self._has_snapshot = True
             if self._snapshot.state_code == RPP_DONE:
                 if self._done_since is None:
                     self._done_since = time.time()
@@ -67,6 +69,9 @@ class RppStatusMonitor:
 
     def get_snapshot(self) -> RppSnapshot:
         return self._snapshot
+
+    def has_snapshot(self) -> bool:
+        return self._has_snapshot
 
     def is_done(self) -> bool:
         """True only after DONE state has been held for `done_settle_s`."""

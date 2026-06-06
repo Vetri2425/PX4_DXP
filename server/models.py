@@ -106,6 +106,9 @@ class MissionStatus(BaseModel):
     dist_to_goal: Optional[float] = None
     speed: Optional[float] = None
     xtrack: Optional[float] = None
+    pose_age_ms: Optional[float] = None
+    fcu_connected: Optional[bool] = None
+    last_path_loaded: Optional[str] = None
 
 
 class ActivityEntry(BaseModel):

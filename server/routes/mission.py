@@ -127,12 +127,14 @@ async def mission_status():
     pose_age_ms = s.get("pose_age_ms")
     if ros_node is not None:
         try:
-            rpp = ros_node.get_rpp_monitor().get_snapshot()
-            code = rpp.state_code
-            dist_to_goal = rpp.dist_to_goal_m
-            speed = rpp.speed_m_s
-            xtrack = rpp.xtrack_m
-            pose_age_ms = rpp.pose_age_ms
+            monitor = ros_node.get_rpp_monitor()
+            if monitor.has_snapshot():
+                rpp = monitor.get_snapshot()
+                code = rpp.state_code
+                dist_to_goal = rpp.dist_to_goal_m
+                speed = rpp.speed_m_s
+                xtrack = rpp.xtrack_m
+                pose_age_ms = rpp.pose_age_ms
         except Exception:
             code = s.get("rpp_state", RPP_STALE)
             dist_to_goal = s.get("dist_to_goal_m")
