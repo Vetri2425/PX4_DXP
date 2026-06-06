@@ -10,6 +10,10 @@ Type=simple
 User=flash
 Group=flash
 WorkingDirectory=/home/flash/PX4_DXP/server
+# NOTE: rover-server is intentionally NOT gated on /mavros discovery. It is the
+# operator's UI/telemetry surface and must come up even when MAVROS is down so
+# /api/mission/status can report fcu_connected:False (graceful degradation).
+# Upholds= (from px4-dxp) + Restart= reconnect once MAVROS returns.
 ExecStart=/home/flash/PX4_DXP/server/run.sh
 Restart=on-failure
 RestartSec=5

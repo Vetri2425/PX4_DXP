@@ -23,6 +23,7 @@ NTRIP_READY_WAIT=2
 MAVROS_RESTART_DELAY=3
 NTRIP_RESTART_DELAY=3
 MAVROS_FAIL_DELAY=5
+SHUTDOWN_GRACE_TICKS=25
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 NTRIP_SCRIPT="${SCRIPT_DIR}/ntrip_rtcm_node.py"
@@ -35,14 +36,32 @@ NTRIP_WATCHDOG_PID=""
 
 log() { echo "[px4_service] $(date '+%H:%M:%S') $*"; }
 
+terminate_pid() {
+    local pid="${1:-}"
+    local label="${2:-process}"
+    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+
+    kill -TERM "$pid" 2>/dev/null || true
+    for _ in $(seq 1 "$SHUTDOWN_GRACE_TICKS"); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null || true
+            return 0
+        fi
+        sleep 0.2
+    done
+
+    log "WARNING: $label did not exit after TERM — sending KILL"
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
 cleanup() {
     log "Cleaning up child processes..."
     rm -f "$MAVROS_READY_FLAG"
     for pid in "${CHILD_PIDS[@]:-}"; do
-        if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
-        fi
+        terminate_pid "$pid" "watchdog PID $pid"
     done
 }
 
@@ -76,7 +95,7 @@ mavros_watchdog() {
     local mavros_pid=""
 
     _wd_cleanup() {
-        [[ -n "$mavros_pid" ]] && kill "$mavros_pid" 2>/dev/null || true
+        terminate_pid "$mavros_pid" "MAVROS"
         exit 0
     }
     trap '_wd_cleanup' TERM INT
@@ -121,8 +140,7 @@ mavros_watchdog() {
             sleep "$MAVROS_RESTART_DELAY"
         else
             log "Watchdog: MAVROS failed to start — retrying in ${MAVROS_FAIL_DELAY}s..."
-            kill "$mavros_pid" 2>/dev/null || true
-            wait "$mavros_pid" 2>/dev/null || true
+            terminate_pid "$mavros_pid" "MAVROS failed start"
             mavros_pid=""
             sleep "$MAVROS_FAIL_DELAY"
         fi
@@ -133,7 +151,7 @@ ntrip_watchdog() {
     local ntrip_pid=""
 
     _ntrip_cleanup() {
-        [[ -n "$ntrip_pid" ]] && kill "$ntrip_pid" 2>/dev/null || true
+        terminate_pid "$ntrip_pid" "NTRIP"
         exit 0
     }
     trap '_ntrip_cleanup' TERM INT

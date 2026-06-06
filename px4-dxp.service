@@ -2,6 +2,9 @@
 Description=PX4 DXP Bridge - MAVROS2 + NTRIP RTK (CubeOrangePlus)
 After=network.target network-online.target dev-ttyACM0.device
 Wants=network-online.target
+# Keep the dependent ROS services active whenever the bridge service is active.
+# This closes the PartOf= start gap after a px4-dxp restart.
+Upholds=rpp-pipeline.service rover-server.service
 
 [Service]
 Type=exec

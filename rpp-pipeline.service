@@ -11,6 +11,7 @@ Type=exec
 User=flash
 Group=flash
 WorkingDirectory=/home/flash/PX4_DXP
+ExecStartPre=/bin/bash -lc 'source /opt/ros/humble/setup.bash && timeout 35 python3 /home/flash/PX4_DXP/tools/ros2_mavros_health.py --timeout 30 node /mavros'
 ExecStart=/home/flash/PX4_DXP/rpp_start.sh
 Restart=on-failure
 RestartSec=5
@@ -55,7 +56,7 @@ SyslogIdentifier=rpp-pipeline
 # Shutdown
 KillMode=mixed
 KillSignal=SIGTERM
-TimeoutStartSec=30
+TimeoutStartSec=45
 TimeoutStopSec=15
 
 [Install]

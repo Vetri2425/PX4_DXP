@@ -140,11 +140,35 @@ elif grep -q "^# EnvironmentFile=" "$SERVICE_SRC" 2>/dev/null; then
     log "  Edit ${SERVICE_SRC} and uncomment the EnvironmentFile line."
 fi
 
-# ── 5. Reload systemd ──────────────────────────────────────────────
+# ── 5. Keep manual ROS shells on the same Fast DDS profile ─────────
+DDS_PROFILE_EXPORT="export FASTRTPS_DEFAULT_PROFILES_FILE=${SCRIPT_DIR}/config/fastdds_no_shm.xml"
+
+_ensure_shell_export() {
+    local shell_file="$1"
+    touch "$shell_file"
+    if grep -qxF "$DDS_PROFILE_EXPORT" "$shell_file"; then
+        log "shell: FASTRTPS_DEFAULT_PROFILES_FILE already configured in ${shell_file}"
+    elif grep -q "^export FASTRTPS_DEFAULT_PROFILES_FILE=" "$shell_file"; then
+        sed -i.bak "s#^export FASTRTPS_DEFAULT_PROFILES_FILE=.*#${DDS_PROFILE_EXPORT}#" "$shell_file"
+        log "shell: updated FASTRTPS_DEFAULT_PROFILES_FILE in ${shell_file}"
+    else
+        {
+            echo ""
+            echo "# PX4_DXP: disable Fast DDS shared memory for rover ROS diagnostics."
+            echo "$DDS_PROFILE_EXPORT"
+        } >> "$shell_file"
+        log "shell: added FASTRTPS_DEFAULT_PROFILES_FILE to ${shell_file}"
+    fi
+}
+
+_ensure_shell_export "${HOME}/.bashrc"
+_ensure_shell_export "${HOME}/.profile"
+
+# ── 6. Reload systemd ──────────────────────────────────────────────
 sudo systemctl daemon-reload
 log "systemd: daemon reloaded"
 
-# ── 6. Enable service (if not already) ─────────────────────────────
+# ── 7. Enable service (if not already) ─────────────────────────────
 if systemctl is-enabled px4-dxp.service >/dev/null 2>&1; then
     log "systemd: px4-dxp already enabled"
 else
@@ -166,7 +190,7 @@ else
     log "systemd: rover-server enabled"
 fi
 
-# ── 7. Restart (optional) ──────────────────────────────────────────
+# ── 8. Restart (optional) ──────────────────────────────────────────
 if $RESTART; then
     log "Restarting all services..."
     sudo systemctl restart px4-dxp.service
