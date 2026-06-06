@@ -11,14 +11,13 @@ FCU_DEVICE="/dev/serial/by-id/usb-CubePilot_CubeOrange+_0-if00"
 FCU_BAUD="921600"
 GCS_UDP_PORT="14550"
 JETSON_IP="192.168.1.102"
-# GCS link mode. Default = LAN broadcast on the GCS port: MAVROS blasts MAVLink
-# to the subnet so any QGC/mobile GCS with default UDP AutoConnect picks it up
-# with zero client config. (mavros2's router only forwards to a unicast GCS
-# AFTER that GCS sends first, so a fixed remote does not proactively push —
-# broadcast does.) Override with env GCS_URL to use unicast/server mode, e.g.
-#   GCS_URL="udp://:14550@"                 (server: GCS must dial the Jetson)
-#   GCS_URL="udp://:14550@192.168.1.7:14550" (unicast to one GCS)
-GCS_URL="${GCS_URL:-udp-b://@:${GCS_UDP_PORT}}"
+# GCS link. Default = server mode: MAVROS binds :14550 and the GCS dials in.
+# mavros2's router only forwards FCU telemetry to a GCS AFTER that GCS has sent
+# a packet first, so proactive push (unicast remote OR broadcast) does NOT work
+# — the GCS must initiate. In QGC: add a UDP link with Server Address
+# <jetson-ip>:14550 (NOT the listen-only AutoConnect default). Override via env:
+#   GCS_URL="udp://:14550@192.168.1.7:14550" (if a specific GCS sends first)
+GCS_URL="${GCS_URL:-udp://:${GCS_UDP_PORT}@}"
 ROS_SETUP="/opt/ros/humble/setup.bash"
 
 # Timing constants
