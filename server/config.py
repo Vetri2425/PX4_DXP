@@ -68,6 +68,17 @@ SAFETY_STALE_GRACE_S = 1.0  # auto-abort after this long in STALE
 DONE_SETTLE_S = 1.0  # require this much DONE before auto-completing
 SETPOINT_STREAM_GRACE_S = 0.5  # path/setpoint settle time before OFFBOARD request
 
+# ── Bridge health watchdog (Phase 3) ──────────────────────────────────────────
+BRIDGE_HEALTH_POLL_S = 1.0          # how often BridgeHealthManager checks
+BRIDGE_STATE_STALE_MS = 2500.0      # /mavros/state older than this => link frozen
+BRIDGE_FROZEN_GRACE_S = 6.0         # sustained-frozen duration before recovery
+BRIDGE_RECOVERY_MAX = 3             # max auto-recoveries within the window
+BRIDGE_RECOVERY_WINDOW_S = 300.0    # backoff window (5 min)
+BRIDGE_RECOVERY_COOLDOWN_S = 30.0   # suppress detection after a recovery (MAVROS comes back)
+# Phase 3A = observe-only by default. Flip to "1" (env) to enable auto-restart
+# of px4-dxp (Phase 3B) only after detection is validated in the field.
+BRIDGE_AUTO_RECOVER = os.environ.get("ROVER_BRIDGE_AUTO_RECOVER", "0") == "1"
+
 # ── Auth ──────────────────────────────────────────────────────────────────────
 TOKEN_FILE_DEFAULT = os.path.expanduser("~/.rover_token")
 TOKEN_HEADER_NAME = "X-Rover-Token"

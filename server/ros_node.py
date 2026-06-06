@@ -183,6 +183,7 @@ class RosBridgeNode(Node):
         # messages; connected stays "True" forever from cached value.
         # We expose this timestamp so callers can detect true process death.
         self._state_recv_time: float | None = None
+        self._pose_recv_time: float | None = None  # last /mavros/local_position/pose
         self._MAVROS_STATE_TIMEOUT_S = 2.0  # MAVROS publishes /state ~10 Hz
 
         # Callback groups: subs mutually exclusive, services reentrant
@@ -313,6 +314,7 @@ class RosBridgeNode(Node):
 
     def _cb_pose(self, msg) -> None:
         """ENU (MAVROS REP-103) → NED conversion."""
+        self._pose_recv_time = time.monotonic()
         q = msg.pose.orientation
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
@@ -389,6 +391,48 @@ class RosBridgeNode(Node):
             if age > self._MAVROS_STATE_TIMEOUT_S:
                 state["connected"] = False
         return state
+
+    def get_bridge_snapshot(self) -> dict[str, Any]:
+        """Cheap, cached-only health view of the MAVROS bridge link.
+
+        `state_age_ms` (freshness of /mavros/state) is the authoritative
+        liveness signal — it goes stale when MAVROS dies or the FCU link
+        drops, even while the TRANSIENT_LOCAL cached State still reads
+        connected=True. `pose_age_ms` is INFORMATIONAL only: pose can be
+        legitimately absent (EKF without a GPS/RTK solution) and must NOT
+        be used to declare the bridge frozen.
+        """
+        with self._lock:
+            armed = self._state.get("armed")
+            mode = self._state.get("mode")
+            connected_cached = self._state.get("connected", False)
+        now = time.monotonic()
+        state_age_ms = (
+            (now - self._state_recv_time) * 1000.0
+            if self._state_recv_time is not None
+            else None
+        )
+        pose_age_ms = (
+            (now - self._pose_recv_time) * 1000.0
+            if self._pose_recv_time is not None
+            else None
+        )
+        # True process-death-aware connected flag (mirror get_state override).
+        fcu_connected = bool(connected_cached)
+        if state_age_ms is not None and state_age_ms > self._MAVROS_STATE_TIMEOUT_S * 1000.0:
+            fcu_connected = False
+        try:
+            mavros_state_publishers = self.count_publishers("/mavros/state")
+        except Exception:
+            mavros_state_publishers = -1  # unknown (graph query failed)
+        return {
+            "fcu_connected": fcu_connected,
+            "state_age_ms": state_age_ms,
+            "pose_age_ms": pose_age_ms,
+            "mavros_state_publishers": mavros_state_publishers,
+            "armed": armed,
+            "mode": mode,
+        }
 
     def get_rpp_monitor(self) -> RppStatusMonitor:
         return self._rpp_monitor

@@ -35,6 +35,30 @@ async def healthz():
     }
 
 
+@router.get("/health/bridge")
+async def health_bridge():
+    """MAVROS bridge liveness + recovery state (Phase 3).
+
+    Reports the BridgeHealthManager's view: health (healthy/degraded/
+    recovering/failed), the cached bridge snapshot (fcu_connected,
+    state_age_ms, pose_age_ms, mavros_state_publishers, armed, mode), and
+    recovery metadata. Read-only; never commands the FCU.
+    """
+    from main import bridge_health, ros_node
+    if bridge_health is not None:
+        return bridge_health.get_status()
+    # Fallback if the watchdog never started.
+    snap = ros_node.get_bridge_snapshot() if ros_node is not None else {}
+    return {
+        "health": "unknown",
+        "auto_recover": False,
+        "recovery_count": 0,
+        "last_recovery_ts": None,
+        "last_recovery_reason": None,
+        **snap,
+    }
+
+
 @router.get("/activity")
 async def activity():
     from main import activity_log

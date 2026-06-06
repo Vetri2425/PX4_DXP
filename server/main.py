@@ -68,6 +68,7 @@ _executor: Optional["object"] = None
 _beacon: Optional["object"] = None
 _listener: Optional["object"] = None
 _telemetry_task: Optional[asyncio.Task] = None
+bridge_health: Optional["object"] = None
 
 # Bounded, thread-safe ring buffer (deque maxlen). All log appends are atomic
 # under the GIL; bounded eviction is built in. Replaces the racy list+trim.
@@ -92,7 +93,7 @@ socket_app = socketio.ASGIApp(sio)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global ros_node, offboard_ctrl, path_mgr, emergency_handler
-    global _executor, _beacon, _listener, _telemetry_task
+    global _executor, _beacon, _listener, _telemetry_task, bridge_health
 
     configure_logging()
     init_auth()
@@ -131,6 +132,18 @@ async def lifespan(app: FastAPI):
     # ── Start telemetry + watchdog loop ───────────────────────────────────────
     _telemetry_task = asyncio.create_task(_telemetry_loop(), name="telemetry-loop")
 
+    # ── Start bridge-health watchdog (Phase 3A: observe-only by default) ───────
+    try:
+        from bridge_health import BridgeHealthManager
+
+        bridge_health = BridgeHealthManager(
+            ros_node, offboard_ctrl, _record, sio.emit
+        )
+        bridge_health.start()
+    except Exception as exc:
+        log.exception("BridgeHealthManager failed to start")
+        _record("warning", f"bridge-health watchdog unavailable: {exc}")
+
     # ── Start UDP discovery beacon ────────────────────────────────────────────
     _beacon = RoverBeacon(
         port=BEACON_PORT,
@@ -153,6 +166,12 @@ async def lifespan(app: FastAPI):
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
     log.info("shutting down…")
+
+    if bridge_health is not None:
+        try:
+            await bridge_health.stop()
+        except Exception:
+            log.exception("bridge-health stop raised")
 
     if _telemetry_task:
         _telemetry_task.cancel()
