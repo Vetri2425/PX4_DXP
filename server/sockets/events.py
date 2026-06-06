@@ -125,18 +125,16 @@ def register_handlers(sio) -> None:
         from main import offboard_ctrl
         if not _auth_ok(data):
             return await _emit_unauth(sio, sid)
-        await offboard_ctrl.stop_async()
-        await sio.emit("mission_status_update",
-                       {"state": offboard_ctrl.state.value}, to=sid)
+        result = await offboard_ctrl.stop_async()
+        await sio.emit("mission_status_update", result, to=sid)
 
     @sio.on("mission_abort")
     async def on_mission_abort(sid, data=None):
         from main import offboard_ctrl
         if not _auth_ok(data):
             return await _emit_unauth(sio, sid)
-        await offboard_ctrl.abort_async()
-        await sio.emit("mission_status_update",
-                       {"state": offboard_ctrl.state.value}, to=sid)
+        result = await offboard_ctrl.abort_async()
+        await sio.emit("mission_status_update", result, to=sid)
 
     @sio.on("request_params")
     async def on_request_params(sid, data):

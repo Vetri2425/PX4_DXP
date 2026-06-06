@@ -737,7 +737,9 @@ class RosBridgeNode(Node):
         self._path_pub.publish(path)
         log.info("published path: %d points → %s", len(points), frame_id)
 
-    def publish_stop_path(self, frame_id: str = "local_ned") -> None:
+    def publish_stop_path(
+        self, frame_id: str = "local_ned"
+    ) -> tuple[float, float] | None:
         """Publish a single-point path at the rover's current NED position.
 
         Workaround for the upstream RPP node that ignores empty-path messages.
@@ -748,10 +750,9 @@ class RosBridgeNode(Node):
         Guard: if the server has never received a pose (pos_n=0.0, pos_e=0.0
         and connected=False), publishing at origin (0,0) could issue an
         unintended movement command if the rover is not actually at the EKF
-        origin. In that case we fall back to publishing an empty path and
-        log a warning. RPP ignores the empty path (early-return), but
-        `set_mode_async("MANUAL")` in the abort chain still fires, which is
-        the actual safety net.
+        origin. In that case we publish nothing, log a warning, and return
+        None. `set_mode_async("MANUAL")` in the
+        abort chain still fires, which is the actual safety net.
         """
         s = self.get_state()
         n, e = float(s.get("pos_n", 0.0)), float(s.get("pos_e", 0.0))
@@ -759,12 +760,12 @@ class RosBridgeNode(Node):
         if not pose_received:
             log.warning(
                 "publish_stop_path: no pose received yet — "
-                "publishing empty path (RPP ignores it; MANUAL switch is the fallback)"
+                "no stop-path published"
             )
-            self.publish_path([], frame_id=frame_id)
-            return
+            return None
         self.publish_path([(n, e)], frame_id=frame_id)
         log.info("published stop-path at (N=%.2f, E=%.2f)", n, e)
+        return (n, e)
 
 
 # ── Param value <-> Python helpers ────────────────────────────────────────────

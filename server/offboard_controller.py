@@ -24,6 +24,18 @@ from models import MissionState
 
 log = get_logger("server.offboard")
 
+STOP_ALLOWED_STATES = {
+    MissionState.RUNNING,
+    MissionState.ARMING,
+    MissionState.SWITCHING_OFFBOARD,
+}
+ABORT_NOOP_STATES = {
+    MissionState.IDLE,
+    MissionState.COMPLETED,
+    MissionState.ABORTED,
+}
+STOP_SETTLE_S = 0.1
+
 
 class OffboardController:
     def __init__(self, ros_node, activity_log: deque) -> None:
@@ -199,7 +211,7 @@ class OffboardController:
                         pass
                 return False, f"unexpected start failure: {exc}"
 
-    async def stop_async(self) -> None:
+    async def stop_async(self) -> dict[str, Any]:
         """Soft stop: publish a single-point stop-path → RPP zeroes velocity.
 
         Empty Path is **ignored** by upstream RPP (early-return), so we
@@ -208,29 +220,172 @@ class OffboardController:
         """
         async with self._lock:
             if self._node is None:
-                self._log_entry("warning", "stop: ROS node not available")
-                return
+                msg = "stop: ROS node not available"
+                self._log_entry("warning", msg)
+                return {
+                    "success": False,
+                    "state": self._state.value,
+                    "action": "no_node",
+                    "armed": None,
+                    "message": msg,
+                }
 
-            self._state = MissionState.STOPPING
-            self._node.publish_stop_path()
-            self._state = MissionState.IDLE
-            self._log_entry("info", "mission stopped (stop-path published)")
+            if self._state not in STOP_ALLOWED_STATES:
+                msg = f"stop called from {self._state.value} — no active mission to stop"
+                self._log_entry("info", msg)
+                s = self._node.get_state()
+                return {
+                    "success": False,
+                    "state": self._state.value,
+                    "action": "no_op",
+                    "armed": s.get("armed"),
+                    "message": msg,
+                }
 
-    async def abort_async(self) -> None:
+            try:
+                self._state = MissionState.STOPPING
+                stop_position = self._node.publish_stop_path()
+                if stop_position is None:
+                    self._state = MissionState.ERROR
+                    s = self._node.get_state()
+                    msg = "stop: no local pose available; stop-path not published"
+                    self._log_entry("error", msg)
+                    return {
+                        "success": False,
+                        "state": self._state.value,
+                        "action": "no_pose",
+                        "armed": s.get("armed"),
+                        "message": msg,
+                    }
+
+                await asyncio.sleep(STOP_SETTLE_S)
+                self._state = MissionState.IDLE
+                s = self._node.get_state()
+                n, e = stop_position
+                msg = f"mission stopped at N={n:.3f}, E={e:.3f}"
+                self._log_entry("info", msg)
+                return {
+                    "success": True,
+                    "state": self._state.value,
+                    "action": "hold_position",
+                    "armed": s.get("armed"),
+                    "message": msg,
+                    "stop_position": {"n": n, "e": e},
+                }
+            except Exception as exc:
+                self._state = MissionState.ERROR
+                msg = f"stop failed: {exc}"
+                self._log_entry("error", msg)
+                try:
+                    s = self._node.get_state()
+                    armed = s.get("armed")
+                except Exception:
+                    armed = None
+                return {
+                    "success": False,
+                    "state": self._state.value,
+                    "action": "error",
+                    "armed": armed,
+                    "message": msg,
+                }
+
+    async def abort_async(self) -> dict[str, Any]:
         """Hard abort: stop-path + MANUAL + disarm."""
         async with self._lock:
             if self._node is None:
-                self._log_entry("warning", "abort: ROS node not available")
-                return
+                msg = "abort: ROS node not available"
+                self._log_entry("warning", msg)
+                return {
+                    "success": False,
+                    "state": self._state.value,
+                    "action": "no_node",
+                    "message": msg,
+                    "errors": [msg],
+                    "stop_path_sent": False,
+                    "manual_mode": False,
+                    "disarmed": False,
+                    "armed": None,
+                }
 
-            if self._state == MissionState.IDLE:
-                self._log_entry("warning", "abort called from IDLE — no mission to abort")
-                return
-            self._node.publish_stop_path()
-            await self._node.set_mode_async("MANUAL")
-            await self._node.arm_async(False)
+            if self._state in ABORT_NOOP_STATES:
+                msg = f"abort called from {self._state.value} — no active mission to abort"
+                self._log_entry("info", msg)
+                s = self._node.get_state()
+                return {
+                    "success": True,
+                    "state": self._state.value,
+                    "action": "no_op",
+                    "message": msg,
+                    "errors": [],
+                    "stop_path_sent": False,
+                    "manual_mode": s.get("mode") == "MANUAL",
+                    "disarmed": not bool(s.get("armed")),
+                    "armed": s.get("armed"),
+                }
+
+            errors: list[str] = []
+            stop_position: tuple[float, float] | None = None
+            manual_mode = False
+            disarmed = False
+
+            try:
+                stop_position = self._node.publish_stop_path()
+                if stop_position is None:
+                    errors.append("publish_stop_path: no local pose available")
+            except Exception as exc:
+                errors.append(f"publish_stop_path raised: {exc}")
+                log.exception("abort publish_stop_path raised")
+
+            try:
+                ok, why = await self._node.set_mode_async("MANUAL")
+                manual_mode = bool(ok)
+                if not ok:
+                    errors.append(f"set_mode(MANUAL): {why}")
+            except Exception as exc:
+                errors.append(f"set_mode(MANUAL) raised: {exc}")
+                log.exception("abort set_mode(MANUAL) raised")
+
+            self._state = MissionState.DISARMING
+            try:
+                ok, why = await self._node.arm_async(False)
+                disarmed = bool(ok)
+                if not ok:
+                    errors.append(f"disarm: {why}")
+            except Exception as exc:
+                errors.append(f"disarm raised: {exc}")
+                log.exception("abort disarm raised")
+
             self._state = MissionState.ABORTED
-            self._log_entry("error", "mission ABORTED — MANUAL + disarm")
+            try:
+                s = self._node.get_state()
+                armed = s.get("armed")
+                if s.get("mode") == "MANUAL":
+                    manual_mode = True
+                if armed is False:
+                    disarmed = True
+            except Exception:
+                armed = None
+
+            msg = "mission ABORTED — MANUAL + disarm"
+            if errors:
+                msg += " (with errors: " + "; ".join(errors) + ")"
+            self._log_entry("warning" if errors else "error", msg)
+
+            result: dict[str, Any] = {
+                "success": not errors,
+                "state": self._state.value,
+                "action": "abort",
+                "message": msg,
+                "errors": errors,
+                "stop_path_sent": stop_position is not None,
+                "manual_mode": manual_mode,
+                "disarmed": disarmed,
+                "armed": armed,
+            }
+            if stop_position is not None:
+                n, e = stop_position
+                result["stop_position"] = {"n": n, "e": e}
+            return result
 
     async def disarm_async(self) -> bool:
         async with self._lock:

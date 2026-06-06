@@ -11,7 +11,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 
 from auth import require_token
-from config import RPP_STATE_NAMES
+from config import RPP_STALE, RPP_STATE_NAMES
 from mission_loading import (
     MissionLoadConflict,
     load_path_for_controller,
@@ -97,8 +97,7 @@ async def stop_mission():
     from main import offboard_ctrl
     if offboard_ctrl is None:
         raise HTTPException(503, "Controller not ready")
-    await offboard_ctrl.stop_async()
-    return {"state": offboard_ctrl.state.value}
+    return await offboard_ctrl.stop_async()
 
 
 @router.post("/abort")
@@ -106,22 +105,48 @@ async def abort_mission():
     from main import offboard_ctrl
     if offboard_ctrl is None:
         raise HTTPException(503, "Controller not ready")
-    await offboard_ctrl.abort_async()
-    return {"state": offboard_ctrl.state.value}
+    return await offboard_ctrl.abort_async()
 
 
 @router.get("/status", response_model=MissionStatus)
 async def mission_status():
     from main import offboard_ctrl, ros_node
-    if offboard_ctrl is None:
-        raise HTTPException(503, "Controller not ready")
-    s = ros_node.get_state() if ros_node else {}
-    code = s.get("rpp_state", 0)
+    state = offboard_ctrl.state if offboard_ctrl else "idle"
+    last_path_loaded = offboard_ctrl.loaded_path_name if offboard_ctrl else None
+    s = {}
+    if ros_node is not None:
+        try:
+            s = ros_node.get_state()
+        except Exception:
+            s = {}
+
+    code = RPP_STALE
+    dist_to_goal = None
+    speed = None
+    xtrack = None
+    pose_age_ms = s.get("pose_age_ms")
+    if ros_node is not None:
+        try:
+            rpp = ros_node.get_rpp_monitor().get_snapshot()
+            code = rpp.state_code
+            dist_to_goal = rpp.dist_to_goal_m
+            speed = rpp.speed_m_s
+            xtrack = rpp.xtrack_m
+            pose_age_ms = rpp.pose_age_ms
+        except Exception:
+            code = s.get("rpp_state", RPP_STALE)
+            dist_to_goal = s.get("dist_to_goal_m")
+            speed = s.get("speed_m_s")
+            xtrack = s.get("xtrack_m")
+
     return MissionStatus(
-        state          = offboard_ctrl.state,
+        state          = state,
         rpp_state      = code,
         rpp_state_name = RPP_STATE_NAMES.get(code, "UNKNOWN"),
-        dist_to_goal   = s.get("dist_to_goal_m"),
-        speed          = s.get("speed_m_s"),
-        xtrack         = s.get("xtrack_m"),
+        dist_to_goal   = dist_to_goal,
+        speed          = speed,
+        xtrack         = xtrack,
+        pose_age_ms    = pose_age_ms,
+        fcu_connected  = s.get("connected"),
+        last_path_loaded = last_path_loaded,
     )
