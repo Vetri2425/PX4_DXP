@@ -77,6 +77,7 @@ def densify_segment(
             speed=segment.speed,
             segment_id=segment.segment_id,
             source_entity=segment.source_entity,
+            metadata=dict(segment.metadata),
         )
 
     spacing = mark_spacing if segment.segment_type == SegmentType.MARK else transit_spacing
@@ -96,4 +97,5 @@ def densify_segment(
         speed=segment.speed,
         segment_id=segment.segment_id,
         source_entity=segment.source_entity,
+        metadata=dict(segment.metadata),
     )

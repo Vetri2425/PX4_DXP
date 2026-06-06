@@ -18,6 +18,7 @@ from .parsers import load_mission_file, load_mission_segments, parse_dxf, entiti
 from .parsers.csv_parser import read_ned_csv_enhanced
 from .parsers.waypoints_parser import read_qgc_waypoints_as_segment
 from .planners.straight_line import densify_line, densify_segment
+from .planners.extensions import split_mark_segment_with_extensions
 from .optimizers.segment_order import optimize_segment_order
 from .spray import apply_spray_latency_compensation
 
@@ -42,6 +43,9 @@ class PathEngine:
         spray_off_latency: float = 0.01,
         optimize_order: bool = True,
         compensate_spray: bool = True,
+        enable_path_extensions: bool = False,
+        pre_extension_m: float = 0.5,
+        aft_extension_m: float = 0.5,
     ):
         if mark_spacing <= 0:
             raise ValueError(f"mark_spacing must be > 0, got {mark_spacing}")
@@ -51,6 +55,10 @@ class PathEngine:
             raise ValueError(f"marking_speed must be > 0, got {marking_speed}")
         if transit_speed <= 0:
             raise ValueError(f"transit_speed must be > 0, got {transit_speed}")
+        if pre_extension_m < 0.0:
+            raise ValueError(f"pre_extension_m must be >= 0.0, got {pre_extension_m}")
+        if aft_extension_m < 0.0:
+            raise ValueError(f"aft_extension_m must be >= 0.0, got {aft_extension_m}")
         self.mark_spacing = mark_spacing
         self.transit_spacing = transit_spacing
         self.marking_speed = marking_speed
@@ -59,6 +67,9 @@ class PathEngine:
         self.spray_off_latency = spray_off_latency
         self.optimize_order = optimize_order
         self.compensate_spray = compensate_spray
+        self.enable_path_extensions = enable_path_extensions
+        self.pre_extension_m = pre_extension_m
+        self.aft_extension_m = aft_extension_m
 
     def plan_file(
         self,
@@ -179,8 +190,9 @@ class PathEngine:
           1. Densify (straight lines at appropriate spacing)
           2. Optimize segment order (nearest-neighbor TSP with endpoint reversal)
           3. Insert TRANSIT segments between disconnected MARK segments
-          4. Apply spray latency compensation
-          5. Merge into single polyline with spray flags
+          4. Apply drive extensions (PRE/AFT TRANSIT) to line-like MARK segments
+          5. Apply spray latency compensation to MARK segments only
+          6. Merge into single polyline with spray flags
 
         Args:
             segments: Input segments (may be sparse).
@@ -211,7 +223,23 @@ class PathEngine:
         else:
             ordered = densified
 
-        # Step 3: Apply spray latency compensation to MARK segments
+        # Step 3: Apply drive extensions to line-like MARK segments.
+        # Extensions are inserted AFTER the optimizer so TSP decisions are
+        # based on real CAD endpoints, not padded extension endpoints.
+        # ARC/CIRCLE are skipped in Stage 3 (source_entity prefix guard
+        # inside split_mark_segment_with_extensions).
+        if self.enable_path_extensions:
+            extended: list[PathSegment] = []
+            for seg in ordered:
+                extended.extend(split_mark_segment_with_extensions(
+                    seg,
+                    pre_extension_m=self.pre_extension_m,
+                    aft_extension_m=self.aft_extension_m,
+                    transit_speed=self.transit_speed,
+                ))
+            ordered = extended
+
+        # Step 4: Apply spray latency compensation to MARK segments
         if self.compensate_spray:
             compensated: list[PathSegment] = []
             for seg in ordered:
@@ -222,7 +250,7 @@ class PathEngine:
                 ))
             ordered = compensated
 
-        # Step 4: Merge into single polyline with spray flags
+        # Step 5: Merge into single polyline with spray flags
         merged_waypoints: list[tuple[float, float]] = []
         spray_flags: list[bool] = []
         total_mark = 0.0

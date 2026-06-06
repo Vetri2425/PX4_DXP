@@ -23,12 +23,21 @@ class PathSegment:
         speed: Target speed in m/s for this segment.
         segment_id: Integer ID matching DXF entity or CSV row group.
         source_entity: Human-readable label (e.g. "LINE_E042", "ARC_circle_1").
+        metadata: Optional geometry metadata dict.  Keys injected by parsers:
+            "geometry_type"  : "ARC" | "CIRCLE" (set by dxf_parser)
+            "start_tangent"  : (north, east) unit vector at segment start
+            "end_tangent"    : (north, east) unit vector at segment end
+            "direction"      : "CCW" | "CW" (arc traversal direction)
+            "reversed"       : True if optimizer reversed the point order
+            "extension_role" : "pre" | "aft" (set on extension TRANSIT segments)
+            "parent_source_entity": source of the parent MARK segment
     """
     segment_type: SegmentType = SegmentType.MARK
     points: list[tuple[float, float]] = field(default_factory=list)
     speed: float = 0.35
     segment_id: int = 0
     source_entity: str = ""
+    metadata: dict = field(default_factory=dict)
 
     @property
     def length(self) -> float:

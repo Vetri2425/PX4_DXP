@@ -48,9 +48,35 @@ def optimize_segment_order(
         return segments  # No MARK segments — nothing to reorder
 
     if len(mark_segments) == 1:
-        # Single segment — just add transit from start if needed
+        # Single segment: check whether entering from the end is closer.
+        # Mirrors the multi-segment nearest-neighbour reversal logic so that
+        # a lone ARC/CIRCLE can also be entered backward when appropriate.
         result: list[PathSegment] = []
         seg = mark_segments[0]
+        should_reverse = False
+        if start_position and seg.points and len(seg.points) > 1:
+            d_start = _distance(start_position, seg.points[0])
+            d_end   = _distance(start_position, seg.points[-1])
+            should_reverse = d_end < d_start
+
+        if should_reverse:
+            orig_meta = seg.metadata
+            new_meta = dict(orig_meta)
+            if "start_tangent" in orig_meta and "end_tangent" in orig_meta:
+                st = orig_meta["start_tangent"]
+                et = orig_meta["end_tangent"]
+                new_meta["start_tangent"] = (-et[0], -et[1])
+                new_meta["end_tangent"]   = (-st[0], -st[1])
+                new_meta["reversed"] = True
+            seg = PathSegment(
+                segment_type=seg.segment_type,
+                points=list(reversed(seg.points)),
+                speed=seg.speed,
+                segment_id=seg.segment_id,
+                source_entity=seg.source_entity,
+                metadata=new_meta,
+            )
+
         if start_position and seg.points:
             d = _distance(start_position, seg.points[0])
             if d > 0.01:
@@ -103,12 +129,24 @@ def optimize_segment_order(
 
         # Reverse point order if entering from the end
         if best_reverse and len(seg.points) > 1:
+            # Transform tangent metadata for reversed traversal direction.
+            # Reversing an arc/circle: rover now travels the opposite direction,
+            # so old end tangent becomes new start (negated) and vice versa.
+            orig_meta = seg.metadata
+            new_meta = dict(orig_meta)
+            if "start_tangent" in orig_meta and "end_tangent" in orig_meta:
+                st = orig_meta["start_tangent"]
+                et = orig_meta["end_tangent"]
+                new_meta["start_tangent"] = (-et[0], -et[1])
+                new_meta["end_tangent"]   = (-st[0], -st[1])
+                new_meta["reversed"] = True
             seg = PathSegment(
                 segment_type=seg.segment_type,
                 points=list(reversed(seg.points)),
                 speed=seg.speed,
                 segment_id=seg.segment_id,
                 source_entity=seg.source_entity,
+                metadata=new_meta,
             )
 
         # Insert TRANSIT segment from current position to segment start

@@ -431,12 +431,22 @@ def entities_to_segments(
                 min_spacing=min_spacing,
                 max_spacing=max_spacing,
             )
+            # densify_circle always starts at 0° (East point) and travels CCW.
+            # CCW tangent at 0°: (cos 0°, -sin 0°) = (1.0, 0.0) → heading North.
+            # Full circle returns to start, so end_tangent equals start_tangent.
+            circle_metadata = {
+                "geometry_type": "CIRCLE",
+                "start_tangent": (1.0, 0.0),
+                "end_tangent":   (1.0, 0.0),
+                "direction": "CCW",
+            }
             segments.append(PathSegment(
                 segment_type=seg_type,
                 points=pts,
                 speed=speed,
                 segment_id=seg_id,
                 source_entity=f"CIRCLE_{ent.entity_id}",
+                metadata=circle_metadata,
             ))
             seg_id += 1
             total_waypoints += len(pts)
@@ -453,12 +463,25 @@ def entities_to_segments(
                 min_spacing=min_spacing,
                 max_spacing=max_spacing,
             )
+            # CCW tangent at DXF angle θ (verified formula): (cos θ, -sin θ)
+            # This matches actual arc_waypoints() point-ordering direction.
+            # The 2π wrap for end_angle does not affect the tangent value because
+            # cos and sin are 2π-periodic, so no special case needed here.
+            a_start = math.radians(start_angle)
+            a_end   = math.radians(end_angle)
+            arc_metadata = {
+                "geometry_type": "ARC",
+                "start_tangent": (math.cos(a_start), -math.sin(a_start)),
+                "end_tangent":   (math.cos(a_end),    -math.sin(a_end)),
+                "direction": "CCW",
+            }
             segments.append(PathSegment(
                 segment_type=seg_type,
                 points=pts,
                 speed=speed,
                 segment_id=seg_id,
                 source_entity=f"ARC_{ent.entity_id}",
+                metadata=arc_metadata,
             ))
             seg_id += 1
             total_waypoints += len(pts)
