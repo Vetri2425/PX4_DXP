@@ -230,11 +230,36 @@ class PathManager:
                 continue
         return result
 
-    def load_path(self, name: str) -> list[tuple[float, float]]:
+    def load_path(
+        self,
+        name: str,
+        origin: tuple[float, float] = (0.0, 0.0),
+        start_position: tuple[float, float] | None = None,
+    ) -> list[tuple[float, float]]:
+        if name.startswith("builtin:"):
+            name = name.removeprefix("builtin:")
         if name in BUILTIN_PATHS:
-            return list(_cached_builtin(name))
+            pts = list(_cached_builtin(name))
+            if origin != (0.0, 0.0):
+                return [(n + origin[0], e + origin[1]) for n, e in pts]
+            return pts
         fpath = os.path.join(self._dir, os.path.basename(name))
         if os.path.isfile(fpath):
+            ext = os.path.splitext(fpath)[1].lower()
+            if ext in (".dxf", ".csv") and (
+                origin != (0.0, 0.0) or start_position is not None
+            ):
+                from path_engine import PathEngine
+                engine = PathEngine()
+                plan = engine.plan_file(
+                    fpath,
+                    origin=origin,
+                    start_position=start_position,
+                )
+                return plan.merged_waypoints
+            if origin != (0.0, 0.0):
+                pts = self._load_file(fpath)
+                return [(n + origin[0], e + origin[1]) for n, e in pts]
             return self._load_file(fpath)
         raise FileNotFoundError(f"Path not found: {name!r}")
 

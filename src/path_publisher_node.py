@@ -398,7 +398,7 @@ class PathPublisherNode(Node):
         pn = msg.pose.position.y
         pe = msg.pose.position.x
 
-        if self._origin_ned is None:
+        if self._auto_origin and self._origin_ned is None:
             ned = (pn, pe)
             self._origin_ned = ned
             self._start_position = ned
@@ -427,9 +427,10 @@ class PathPublisherNode(Node):
         mission_file = self.get_parameter("mission_file").value
         path_name = self.get_parameter("path_name").value
 
-        # Load path points — pass start_position for TSP if using path_engine
+        # Load path points — pass origin/start_position for TSP if using path_engine
         spray_flags: list[bool] | None = None
         pts: list[tuple[float, float]] = []
+        origin_applied_by_engine = False
 
         if mission_file:
             try:
@@ -442,11 +443,19 @@ class PathPublisherNode(Node):
                         )
                         return
                     engine = _PathEngine()
+                    origin = (
+                        self._origin_ned
+                        if self._auto_origin and self._origin_ned
+                        else (0.0, 0.0)
+                    )
                     plan = engine.plan_file(
-                        mission_file, start_position=self._start_position,
+                        mission_file,
+                        origin=origin,
+                        start_position=self._start_position,
                     )
                     pts = plan.merged_waypoints
                     spray_flags = plan.spray_flags
+                    origin_applied_by_engine = origin != (0.0, 0.0)
                     source = mission_file
                 else:
                     pts = load_mission_file(mission_file, start_position=self._start_position)
@@ -469,7 +478,7 @@ class PathPublisherNode(Node):
             return
 
         # Apply auto-origin offset if enabled
-        if self._origin_ned is not None:
+        if self._auto_origin and self._origin_ned is not None and not origin_applied_by_engine:
             offset_n, offset_e = self._origin_ned
             pts = [(n + offset_n, e + offset_e) for (n, e) in pts]
             self.get_logger().info(

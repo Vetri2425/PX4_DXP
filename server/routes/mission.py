@@ -38,20 +38,46 @@ async def load_mission(req: MissionLoadRequest):
 
 @router.post("/start")
 async def start_mission(req: MissionStartRequest | None = None):
-    from main import offboard_ctrl, path_mgr
+    from main import offboard_ctrl, path_mgr, ros_node
     if offboard_ctrl is None:
         raise HTTPException(503, "Controller not ready")
-    if req and (req.path_name or req.mission_file):
-        name = req.path_name or req.mission_file
+
+    auto_origin = req.auto_origin if req else False
+    name = (req.path_name or req.mission_file) if req else None
+    origin = (0.0, 0.0)
+    start_position = None
+    origin_pre_applied = False
+
+    if auto_origin:
+        if ros_node is None:
+            raise HTTPException(503, "ROS node not ready")
+        s = ros_node.get_state()
+        if not s.get("pose_received", False):
+            raise HTTPException(409, "auto_origin requested but no local pose received yet")
+        origin = (float(s.get("pos_n", 0.0)), float(s.get("pos_e", 0.0)))
+        start_position = origin
+        if not name:
+            loaded = offboard_ctrl.loaded_path_name
+            if loaded and loaded != "unknown":
+                name = loaded
+
+    if name:
         try:
-            pts = path_mgr.load_path(name)
+            pts = path_mgr.load_path(
+                name,
+                origin=origin,
+                start_position=start_position,
+            )
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc))
         except Exception as exc:
             raise HTTPException(400, f"Path load failed: {exc}")
         offboard_ctrl.load_path(pts, name=name)
-    auto_origin = req.auto_origin if req else False
-    ok, msg = await offboard_ctrl.start_async(auto_origin=auto_origin)
+        origin_pre_applied = auto_origin
+
+    ok, msg = await offboard_ctrl.start_async(
+        auto_origin=auto_origin and not origin_pre_applied
+    )
     if not ok:
         raise HTTPException(409, f"Mission start failed: {msg}")
     return {"state": offboard_ctrl.state.value, "message": msg}

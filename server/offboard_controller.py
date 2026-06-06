@@ -144,6 +144,11 @@ class OffboardController:
             pts_to_publish = self._loaded_pts
             if auto_origin:
                 s = self._node.get_state()
+                if not s.get("pose_received", False):
+                    self._state = MissionState.ERROR
+                    msg = "start: auto_origin requested but no local pose received yet"
+                    self._log_entry("error", msg)
+                    return False, msg
                 off_n = float(s.get("pos_n", 0.0))
                 off_e = float(s.get("pos_e", 0.0))
                 pts_to_publish = [(n + off_n, e + off_e) for n, e in self._loaded_pts]

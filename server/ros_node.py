@@ -149,6 +149,7 @@ class RosBridgeNode(Node):
         "connected": False,
         "pos_n": 0.0,
         "pos_e": 0.0,
+        "pose_received": False,
         "heading_ned_deg": 0.0,
         "battery_v": 0.0,
         "battery_pct": 0.0,
@@ -332,6 +333,7 @@ class RosBridgeNode(Node):
         with self._lock:
             self._state["pos_n"] = msg.pose.position.y  # ENU y = North → pos_n
             self._state["pos_e"] = msg.pose.position.x  # ENU x = East  → pos_e
+            self._state["pose_received"] = True
             self._state["heading_ned_deg"] = math.degrees(yaw_ned)
 
     def _cb_battery(self, msg) -> None:
