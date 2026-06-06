@@ -11,6 +11,12 @@ FCU_DEVICE="/dev/serial/by-id/usb-CubePilot_CubeOrange+_0-if00"
 FCU_BAUD="921600"
 GCS_UDP_PORT="14550"
 JETSON_IP="192.168.1.102"
+# GCS to actively push MAVLink to, so QGC's default UDP AutoConnect works with
+# zero client config. Override with env GCS_IP=<addr> (e.g. a different laptop).
+# Empty => server mode (clients must connect to the Jetson). Set to the laptop
+# running QGC. NOTE: hardcoding one IP means other devices (mobile) won't get
+# the push — they would need the QGC-client setup, or switch this to broadcast.
+GCS_IP="${GCS_IP:-192.168.1.7}"
 ROS_SETUP="/opt/ros/humble/setup.bash"
 
 # Timing constants
@@ -107,7 +113,7 @@ mavros_watchdog() {
 
         ros2 launch mavros node.launch \
             fcu_url:=${FCU_DEVICE}:${FCU_BAUD} \
-            gcs_url:=udp://:${GCS_UDP_PORT}@ \
+            gcs_url:=udp://:${GCS_UDP_PORT}@${GCS_IP}:${GCS_UDP_PORT} \
             pluginlists_yaml:=${SCRIPT_DIR}/px4_pluginlists_rover.yaml \
             config_yaml:=/opt/ros/humble/share/mavros/launch/px4_config.yaml \
             fcu_protocol:=v2.0 \
