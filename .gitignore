@@ -59,3 +59,20 @@ nul
 
 # Mac dev-flow virtualenv (no-hardware testing — see docs/SESSION_STARTUP_MAC_NO_HARDWARE.md)
 .venv-dev/
+
+# Built frontend bundle — 21MB artifact, not version-controlled (deploy separately)
+front-end.zip
+
+# Uploaded mission files (runtime user data). Committed templates are negated below.
+server/missions/*.dxf
+server/missions/*.csv
+!server/missions/soccer_field_penalty_area.dxf
+
+# Local scratch notes / planning (not for tracking)
+Todos/
+Role_of_Path_engine.md
+Server-rpp.md
+
+# API testing local config
+.postman.json
+.kiro/
