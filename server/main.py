@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import math
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -70,6 +71,7 @@ _beacon: Optional["object"] = None
 _listener: Optional["object"] = None
 _telemetry_task: Optional[asyncio.Task] = None
 bridge_health: Optional["object"] = None
+rtk_manager: Optional["object"] = None
 
 # Bounded, thread-safe ring buffer (deque maxlen). All log appends are atomic
 # under the GIL; bounded eviction is built in. Replaces the racy list+trim.
@@ -94,7 +96,7 @@ socket_app = socketio.ASGIApp(sio)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global ros_node, offboard_ctrl, path_mgr, emergency_handler
-    global _executor, _beacon, _listener, _telemetry_task, bridge_health
+    global _executor, _beacon, _listener, _telemetry_task, bridge_health, rtk_manager
 
     configure_logging()
     init_auth()
@@ -120,10 +122,12 @@ async def lifespan(app: FastAPI):
     from emergency import EmergencyHandler
     from offboard_controller import OffboardController
     from path_manager import PathManager
+    from rtk_manager import AsyncRTKManager
 
     path_mgr = PathManager(MISSION_DIR)
     offboard_ctrl = OffboardController(ros_node, activity_log)
     emergency_handler = EmergencyHandler(ros_node, offboard_ctrl, activity_log)
+    rtk_manager = AsyncRTKManager()
 
     # ── Register Socket.IO handlers ───────────────────────────────────────────
     from sockets.events import register_handlers
@@ -167,6 +171,12 @@ async def lifespan(app: FastAPI):
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
     log.info("shutting down…")
+
+    if rtk_manager is not None:
+        try:
+            await rtk_manager.stop_all()
+        except Exception:
+            log.exception("RTK manager stop raised")
 
     if bridge_health is not None:
         try:
@@ -230,6 +240,7 @@ def create_app() -> FastAPI:
     from routes.params import router as par_router
     from routes.rpp_params import router as rpp_par_router
     from routes.telemetry import router as tel_router
+    from routes.rtk import router as rtk_router
 
     app.include_router(sys_router, prefix="/api")
     app.include_router(veh_router, prefix="/api")
@@ -239,6 +250,7 @@ def create_app() -> FastAPI:
     app.include_router(par_router, prefix="/api")
     app.include_router(rpp_par_router, prefix="/api")
     app.include_router(tel_router, prefix="/api")
+    app.include_router(rtk_router, prefix="/api")
 
     # Socket.IO
     app.mount("/socket.io", socket_app)
@@ -249,6 +261,18 @@ app = create_app()
 
 
 # ── Telemetry loop with watchdog and auto-completion ──────────────────────────
+
+
+def _sanitize(d: dict) -> dict:
+    """Replace float NaN/Inf with None so Socket.IO emits valid JSON.
+
+    Python's json encoder writes the bare token NaN for float('nan'), which is
+    illegal JSON and causes JS JSON.parse() to throw, disconnecting the client.
+    """
+    return {
+        k: (None if isinstance(v, float) and not math.isfinite(v) else v)
+        for k, v in d.items()
+    }
 
 
 async def _telemetry_loop() -> None:
@@ -299,7 +323,7 @@ async def _telemetry_loop() -> None:
                     "lon": s.get("lon"),
                     "alt": s.get("alt"),
                 }
-                await sio.emit("telemetry", telem)
+                await sio.emit("telemetry", _sanitize(telem))
 
                 mission_status = {
                     "state": (offboard_ctrl.state.value if offboard_ctrl else "idle"),
@@ -309,7 +333,7 @@ async def _telemetry_loop() -> None:
                     "speed": s.get("speed_m_s"),
                     "xtrack": s.get("xtrack_m"),
                 }
-                await sio.emit("mission_status", mission_status)
+                await sio.emit("mission_status", _sanitize(mission_status))
 
                 # ── 2. Auto-completion: RUNNING + DONE settled → COMPLETED ─────
                 if (
