@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from config import RPP_STATE_NAMES
+from config import GPS_FIX_NAMES, RPP_STATE_NAMES
 from models import TelemetryData
 
 router = APIRouter(prefix="/telemetry", tags=["telemetry"])
@@ -38,6 +38,7 @@ async def telemetry_latest():
         battery_v       = s.get("battery_v"),
         battery_pct     = s.get("battery_pct"),
         gps_fix         = s.get("gps_fix"),
+        gps_fix_name    = GPS_FIX_NAMES.get(s.get("gps_fix", 0), "UNKNOWN"),
         gps_sat         = s.get("gps_sat"),
         hrms            = s.get("hrms"),
         vrms            = s.get("vrms"),

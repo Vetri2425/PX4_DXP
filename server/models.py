@@ -86,6 +86,7 @@ class TelemetryData(BaseModel):
     battery_pct: Optional[float] = None
     # GPS
     gps_fix: Optional[int] = None
+    gps_fix_name: Optional[str] = None
     gps_sat: Optional[int] = None
     hrms: Optional[float] = None
     vrms: Optional[float] = None

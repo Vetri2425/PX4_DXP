@@ -46,6 +46,16 @@ RPP_STATE_NAMES = {
     RPP_JUMP_SKIP: "JUMP_SKIP",
 }
 
+# GPS Fix Type Names (from MAVROS sensor_msgs/NavSatStatus.msg fix_type)
+GPS_FIX_NAMES = {
+    0: "NO_FIX",
+    1: "GPS",
+    2: "DGPS",
+    4: "DGPS",  # duplicate for compatibility
+    5: "RTK_FLOAT",
+    6: "RTK_FIXED",
+}
+
 # B2: codes that mean "controller is not driving safely". Treat the same as
 # STALE for safety-abort and OFFBOARD-start guard purposes. Centralised here
 # so server/main.py and server/offboard_controller.py stay in sync.
