@@ -76,3 +76,14 @@ Server-rpp.md
 # API testing local config
 .postman.json
 .kiro/
+
+# GCS-imported params (dated subdirs — local reference only, not tracked)
+params/*/
+params/TANK_PARM/
+params/old/
+
+# GCS-imported firmware builds (local reference only, not tracked)
+firmware/
+
+# GCS analysis scripts (local reference only, not tracked)
+tools/analysis/

@@ -1,7 +1,10 @@
 # 3WD Marking Rover — Jetson Companion
 
 Scope: runtime, ROS2, MAVROS2, on-device debugging on Jetson Orin `192.168.1.102`.
-Not your job: PX4 firmware, waypoint gen, log analysis — those belong to Laptop Claude at `D:\Vetri\3WD_GCS\`.
+Not your job: PX4 firmware, waypoint gen, log analysis — those live on Mac GCS at `/Users/dyx_a1/Vetri/3WD_GCS_transfer/3WD_GCS/`.
+
+> **Cross-project memory:** `/Users/dyx_a1/Vetri/PX4-Autopilot/.claude/memory/integration.md`
+> Load this when working on firmware↔companion integration, OFFBOARD interface, coordinate conventions, or open issues spanning both projects.
 
 ## Hardware
 
@@ -39,7 +42,16 @@ Not your job: PX4 firmware, waypoint gen, log analysis — those belong to Lapto
 4. Velocity: `/mavros/setpoint_velocity/cmd_vel` (TwistStamped)
 5. Path/arc: `/mavros/setpoint_raw/local` (PositionTarget)
 
-## Current status (2026-06-04)
+## GCS Machine (Mac)
+
+| Item | Value |
+|---|---|
+| Host | MacBook Air, user `dyx_a1` |
+| GCS path | `/Users/dyx_a1/Vetri/3WD_GCS_transfer/3WD_GCS/` |
+| SSH to Jetson | `ssh flash@192.168.1.102` |
+| QGC | QGroundControl on macOS |
+
+## Current status (2026-06-06)
 
 - Phase 2 OFFBOARD stack running; FastAPI + mobile frontend built
 - Arc tuning at arc_fix_28; arc_fix_16 validated 1.5m arc at **2.57cm median xtrack**
@@ -52,7 +64,7 @@ Not your job: PX4 firmware, waypoint gen, log analysis — those belong to Lapto
 - Do not edit PX4 firmware on Jetson
 - Do not stop `px4-dxp.service` without warning — carries QGC bridge
 - Do not disable RTK (`ntrip_rtcm_node.py`)
-- Do not push FCU params from Jetson — QGC on laptop is source of truth
+- Do not push FCU params from Jetson — QGC on Mac is source of truth
 - ArduRover is abandoned — do not propose ArduRover solutions
 
 ## Quick reference

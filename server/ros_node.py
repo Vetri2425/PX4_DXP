@@ -158,6 +158,8 @@ class RosBridgeNode(Node):
         "alt": 0.0,
         "gps_fix": 0,
         "gps_sat": 0,
+        "hrms": 0.0,
+        "vrms": 0.0,
         "xtrack_m": 0.0,
         "heading_err_deg": 0.0,
         "lookahead_m": 0.0,
@@ -336,10 +338,21 @@ class RosBridgeNode(Node):
             self._state["battery_pct"] = pct if pct is not None else 0.0
 
     def _cb_global_pos(self, msg) -> None:
+        hrms = 0.0
+        vrms = 0.0
+        try:
+            cov = msg.position_covariance
+            hrms = round(math.sqrt(abs(cov[0]) + abs(cov[4])), 3)
+            vrms = round(math.sqrt(abs(cov[8])), 3)
+        except (ValueError, IndexError, TypeError):
+            pass
+
         with self._lock:
             self._state["lat"] = msg.latitude
             self._state["lon"] = msg.longitude
             self._state["alt"] = msg.altitude
+            self._state["hrms"] = hrms
+            self._state["vrms"] = vrms
 
     def _cb_gps_raw(self, msg) -> None:
         with self._lock:
