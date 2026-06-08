@@ -5,10 +5,8 @@
 #
 # What it does:
 #   1. Symlinks systemd service → /etc/systemd/system/
-#   2. Symlinks logrotate config → /etc/logrotate.d/
-#   3. Creates NTRIP env file if missing (prompts for credentials)
-#   4. Reloads systemd daemon
-#   5. With --restart: restarts px4-dxp.service
+#   2. Reloads systemd daemon
+#   3. With --restart: restarts px4-dxp.service
 #
 # Symlinks mean future `git pull` updates are live immediately —
 # no re-deploy needed for file content changes. Only re-run this
@@ -77,70 +75,7 @@ _deploy_service "${SCRIPT_DIR}/rover-server.service" \
 chmod +x "${SCRIPT_DIR}/rpp_start.sh" 2>/dev/null || true
 chmod +x "${SCRIPT_DIR}/server/run.sh" 2>/dev/null || true
 
-# ── 2. Logrotate config ────────────────────────────────────────────
-LOGROTATE_SRC="${SCRIPT_DIR}/ntrip.logrotate"
-LOGROTATE_DST="/etc/logrotate.d/ntrip"
-
-if [[ -L "$LOGROTATE_DST" ]]; then
-    CURRENT_TARGET=$(readlink -f "$LOGROTATE_DST")
-    if [[ "$CURRENT_TARGET" == "$LOGROTATE_SRC" ]]; then
-        log "logrotate: symlink already correct → ${LOGROTATE_SRC}"
-    else
-        log "logrotate: updating symlink ${LOGROTATE_DST} → ${LOGROTATE_SRC}"
-        sudo ln -sf "$LOGROTATE_SRC" "$LOGROTATE_DST"
-    fi
-elif [[ -f "$LOGROTATE_DST" ]]; then
-    log "logrotate: replacing file with symlink ${LOGROTATE_DST} → ${LOGROTATE_SRC}"
-    sudo mv "$LOGROTATE_DST" "${LOGROTATE_DST}.bak"
-    sudo ln -s "$LOGROTATE_SRC" "$LOGROTATE_DST"
-else
-    log "logrotate: creating symlink ${LOGROTATE_DST} → ${LOGROTATE_SRC}"
-    sudo ln -s "$LOGROTATE_SRC" "$LOGROTATE_DST"
-fi
-
-# ── 3. NTRIP credentials ───────────────────────────────────────────
-NTRIP_ENV="${SCRIPT_DIR}/config/ntrip.env"
-
-if [[ -f "$NTRIP_ENV" ]]; then
-    log "ntrip: env file exists at ${NTRIP_ENV}"
-    # Patch existing file if NTRIP_MOUNTPT is missing
-    if ! grep -q "^NTRIP_MOUNTPT=" "$NTRIP_ENV"; then
-        echo ""
-        echo "  NTRIP_MOUNTPT not found in ${NTRIP_ENV} — adding it now."
-        read -rp "  NTRIP_MOUNTPT (e.g. MP23960a): " ntrip_mountpt
-        echo "NTRIP_MOUNTPT=${ntrip_mountpt}" >> "$NTRIP_ENV"
-        log "ntrip: NTRIP_MOUNTPT added to ${NTRIP_ENV}"
-    fi
-else
-    log "ntrip: env file NOT found — creating it now"
-    mkdir -p "$(dirname "$NTRIP_ENV")"
-
-    echo ""
-    echo "  NTRIP credentials required for RTK injection."
-    echo "  Stored at ${NTRIP_ENV} (gitignored, flash-owned, mode 600)."
-    echo ""
-    read -rp "  NTRIP_USER: " ntrip_user
-    read -rp "  NTRIP_PASS: " ntrip_pass
-    read -rp "  NTRIP_MOUNTPT (e.g. MP23960a): " ntrip_mountpt
-
-    printf "NTRIP_USER=%s\nNTRIP_PASS=%s\nNTRIP_MOUNTPT=%s\n" \
-        "$ntrip_user" "$ntrip_pass" "$ntrip_mountpt" > "$NTRIP_ENV"
-    chmod 600 "$NTRIP_ENV"
-    log "ntrip: env file created at ${NTRIP_ENV} (mode 600, owner flash)"
-fi
-
-# ── 4. Ensure service references env file ──────────────────────────
-# The service file has EnvironmentFile commented out by default.
-# Check if it's uncommented; if not, warn the user.
-if grep -q "^EnvironmentFile=" "$SERVICE_SRC" 2>/dev/null; then
-    log "systemd: EnvironmentFile is active in service"
-elif grep -q "^# EnvironmentFile=" "$SERVICE_SRC" 2>/dev/null; then
-    log "WARNING: EnvironmentFile is commented out in service file"
-    log "  NTRIP credentials won't be loaded until you uncomment it."
-    log "  Edit ${SERVICE_SRC} and uncomment the EnvironmentFile line."
-fi
-
-# ── 5. Keep manual ROS shells on the same Fast DDS profile ─────────
+# ── 2. Keep manual ROS shells on the same Fast DDS profile ─────────
 DDS_PROFILE_EXPORT="export FASTRTPS_DEFAULT_PROFILES_FILE=${SCRIPT_DIR}/config/fastdds_no_shm.xml"
 
 _ensure_shell_export() {
@@ -164,11 +99,11 @@ _ensure_shell_export() {
 _ensure_shell_export "${HOME}/.bashrc"
 _ensure_shell_export "${HOME}/.profile"
 
-# ── 6. Reload systemd ──────────────────────────────────────────────
+# ── 3. Reload systemd ──────────────────────────────────────────────
 sudo systemctl daemon-reload
 log "systemd: daemon reloaded"
 
-# ── 7. Enable service (if not already) ─────────────────────────────
+# ── 4. Enable service (if not already) ─────────────────────────────
 if systemctl is-enabled px4-dxp.service >/dev/null 2>&1; then
     log "systemd: px4-dxp already enabled"
 else

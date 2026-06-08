@@ -90,7 +90,10 @@ BRIDGE_RECOVERY_COOLDOWN_S = 30.0   # suppress detection after a recovery (MAVRO
 BRIDGE_AUTO_RECOVER = os.environ.get("ROVER_BRIDGE_AUTO_RECOVER", "0") == "1"
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
-TOKEN_FILE_DEFAULT = os.path.expanduser("~/.rover_token")
+TOKEN_FILE_DEFAULT = os.environ.get(
+    "ROVER_TOKEN_FILE",
+    os.path.expanduser("~/.rover_token"),
+)
 TOKEN_HEADER_NAME = "X-Rover-Token"
 
 # ── File upload limits ────────────────────────────────────────────────────────

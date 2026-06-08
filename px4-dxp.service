@@ -1,5 +1,5 @@
 [Unit]
-Description=PX4 DXP Bridge - MAVROS2 + NTRIP RTK (CubeOrangePlus)
+Description=PX4 DXP Bridge - MAVROS2 (CubeOrangePlus)
 After=network.target network-online.target dev-ttyACM0.device
 Wants=network-online.target
 # Keep the dependent ROS services active whenever the bridge service is active.
@@ -58,12 +58,6 @@ Environment=ROS_LOCALHOST_ONLY=0
 Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/home/flash/PX4_DXP/config/fastdds_no_shm.xml
 UnsetEnvironment=AMENT_TRACE_SETUP_FILES
 Environment=HOME=/home/flash
-
-# NTRIP credentials — REQUIRED for ntrip_rtcm_node.py
-# ntrip_rtcm_node.py requires NTRIP_USER and NTRIP_PASS env vars (no defaults).
-# Run deploy.sh to create the env file (prompts once, skips if exists):
-#   cd ~/PX4_DXP && ./deploy.sh
-EnvironmentFile=/home/flash/PX4_DXP/config/ntrip.env
 
 # Output
 StandardOutput=journal

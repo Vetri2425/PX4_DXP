@@ -26,20 +26,16 @@ ROS_SETUP="/opt/ros/humble/setup.bash"
 # so the main body always gives the watchdog at least one full attempt.
 MAVROS_READY_TIMEOUT=35
 MAVROS_READY_WAIT=30
-NTRIP_READY_WAIT=2
 MAVROS_RESTART_DELAY=3
-NTRIP_RESTART_DELAY=3
 MAVROS_FAIL_DELAY=5
 SHUTDOWN_GRACE_TICKS=25
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-NTRIP_SCRIPT="${SCRIPT_DIR}/ntrip_rtcm_node.py"
 MAVROS_HEALTH_SCRIPT="${SCRIPT_DIR}/tools/ros2_mavros_health.py"
 MAVROS_READY_FLAG="/tmp/px4_mavros_ready"
 
 declare -a CHILD_PIDS=()
 MAVROS_WATCHDOG_PID=""
-NTRIP_WATCHDOG_PID=""
 
 log() { echo "[px4_service] $(date '+%H:%M:%S') $*"; }
 
@@ -154,26 +150,6 @@ mavros_watchdog() {
     done
 }
 
-ntrip_watchdog() {
-    local ntrip_pid=""
-
-    _ntrip_cleanup() {
-        terminate_pid "$ntrip_pid" "NTRIP"
-        exit 0
-    }
-    trap '_ntrip_cleanup' TERM INT
-
-    while true; do
-        log "Watchdog: starting NTRIP RTK client..."
-        python3 "$NTRIP_SCRIPT" &
-        ntrip_pid=$!
-        wait "$ntrip_pid" 2>/dev/null || true
-        log "Watchdog: NTRIP exited — restarting in ${NTRIP_RESTART_DELAY}s..."
-        ntrip_pid=""
-        sleep "$NTRIP_RESTART_DELAY"
-    done
-}
-
 trap 'handle_exit $?' EXIT
 trap 'handle_exit 130' INT
 trap 'handle_exit 143' TERM
@@ -197,7 +173,6 @@ set +u; source "$ROS_SETUP"; set -u
 # (they're cleanup ops; non-zero exit is expected when nothing is running).
 set +e
 pkill -f "mavros.*node.launch" 2>/dev/null
-pkill -f "ntrip_rtcm_node" 2>/dev/null
 set -e
 sleep 1
 
@@ -246,23 +221,9 @@ else
     log "WARNING: MAVROS node exists but FCU may not be connected — check serial link"
 fi
 
-log "Starting NTRIP RTK client..."
-if [[ -z "${NTRIP_USER:-}" ]] || [[ -z "${NTRIP_PASS:-}" ]] || [[ -z "${NTRIP_MOUNTPT:-}" ]]; then
-    log "WARNING: NTRIP_USER, NTRIP_PASS, or NTRIP_MOUNTPT env vars not set — NTRIP will crash-loop"
-    log "Run deploy.sh to create config/ntrip.env"
-fi
-ntrip_watchdog &
-NTRIP_WATCHDOG_PID=$!
-CHILD_PIDS+=("$NTRIP_WATCHDOG_PID")
-
-sleep "$NTRIP_READY_WAIT"
-if ! kill -0 "$NTRIP_WATCHDOG_PID" 2>/dev/null; then
-    log "WARNING: NTRIP watchdog exited immediately — check: journalctl -u px4-dxp.service -n 50"
-fi
-
 log "Active ROS nodes:"
 timeout 10 python3 "$MAVROS_HEALTH_SCRIPT" --timeout 5 node "/mavros" >/dev/null 2>&1 \
     && log "  /mavros" || log "  /mavros not discovered"
 log "=== Bridge running. QGC → UDP → ${JETSON_IP}:${GCS_UDP_PORT} ==="
 
-wait "$MAVROS_WATCHDOG_PID" "$NTRIP_WATCHDOG_PID"
+wait "$MAVROS_WATCHDOG_PID"

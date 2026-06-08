@@ -6,11 +6,15 @@ and publishes them to /mavros/gps_rtk/send_rtcm for PX4 RTK injection.
 Sends GGA back-feed every 10 seconds as required by NTRIP v1 casters.
 """
 
+import argparse
+import base64
+import json
 import os
 import socket
-import base64
+import sys
 import threading
 import time
+from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
@@ -19,25 +23,45 @@ from mavros_msgs.msg import RTCM
 from sensor_msgs.msg import NavSatFix, NavSatStatus
 
 # ---------------------------------------------------------------------------
-# Configuration via environment variables
+# Configuration via CLI arguments
 # ---------------------------------------------------------------------------
-NTRIP_HOST = os.environ.get("NTRIP_HOST", "caster.emlid.com")
-NTRIP_PORT = int(os.environ.get("NTRIP_PORT", "2101"))
-_NTRIP_MOUNTPT_ENV = os.environ.get("NTRIP_MOUNTPT")
-if not _NTRIP_MOUNTPT_ENV:
-    raise RuntimeError(
-        "NTRIP_MOUNTPT environment variable is required (no default). "
-        "Add NTRIP_MOUNTPT=<your_mountpoint> to config/ntrip.env and restart."
+NTRIP_HOST = ""
+NTRIP_PORT = 2101
+NTRIP_MOUNTPT = ""
+_NTRIP_USER = ""
+_NTRIP_PASS = ""
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Stream RTCM3 corrections from an NTRIP caster into MAVROS."
     )
-NTRIP_MOUNTPT = _NTRIP_MOUNTPT_ENV
+    parser.add_argument("--host", required=True, help="NTRIP caster hostname or IP")
+    parser.add_argument("--port", required=True, type=int, help="NTRIP caster TCP port")
+    parser.add_argument("--mountpoint", required=True, help="NTRIP mountpoint")
+    parser.add_argument("--user", required=True, help="NTRIP username")
+    parser.add_argument(
+        "--pass-stdin",
+        action="store_true",
+        required=True,
+        help="Read the NTRIP password from stdin instead of argv",
+    )
+    parser.add_argument(
+        "--status-file",
+        help="Optional JSON status file for the FastAPI RTK manager",
+    )
+    return parser.parse_args(argv)
 
-_NTRIP_USER = os.environ.get("NTRIP_USER")
-_NTRIP_PASS = os.environ.get("NTRIP_PASS")
 
-if not _NTRIP_USER:
-    raise RuntimeError("NTRIP_USER environment variable is required (no default)")
-if not _NTRIP_PASS:
-    raise RuntimeError("NTRIP_PASS environment variable is required (no default)")
+def configure_from_args(args) -> None:
+    global NTRIP_HOST, NTRIP_PORT, NTRIP_MOUNTPT, _NTRIP_USER, _NTRIP_PASS
+    NTRIP_HOST = args.host
+    NTRIP_PORT = args.port
+    NTRIP_MOUNTPT = args.mountpoint
+    _NTRIP_USER = args.user
+    _NTRIP_PASS = sys.stdin.readline().rstrip("\r\n")
+    if not _NTRIP_PASS:
+        raise RuntimeError("NTRIP password was not provided on stdin")
 
 # RTCM3 frame constants
 _RTCM3_PREAMBLE = 0xD3
@@ -73,8 +97,9 @@ def _nmea_checksum(sentence: str) -> str:
 class NtripNode(Node):
     """ROS2 node that streams RTCM3 corrections from an NTRIP caster to MAVROS."""
 
-    def __init__(self):
+    def __init__(self, status_file: str | None = None):
         super().__init__("ntrip_rtcm_node")
+        self._status_file = Path(status_file) if status_file else None
 
         # -- Publisher: RELIABLE to match MAVROS gps_rtk plugin subscription --
         rtcm_qos = QoSProfile(
@@ -102,8 +127,6 @@ class NtripNode(Node):
         # -- Thread control --
         self._stop_event = threading.Event()
         self._gga_lock = threading.Lock()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
 
         # -- Health monitoring --
         self._last_data_time = self.get_clock().now()
@@ -111,7 +134,13 @@ class NtripNode(Node):
         self._stats_lock = threading.Lock()
         self._frame_count = 0
         self._byte_count = 0
+        self._total_frame_count = 0
+        self._total_byte_count = 0
+        self._connected = False
+        self._last_error = None
+        self._last_frame_wall_time = None
         self.create_timer(30.0, self._check_health)
+        self.create_timer(1.0, lambda: self._write_status("connected" if self._connected else "connecting"))
 
         # -- GGA back-feed timer (every 10 s) --
         self._gga_sock = None  # set after connect
@@ -121,6 +150,30 @@ class NtripNode(Node):
         self.get_logger().info(
             f"Starting NTRIP client: {NTRIP_HOST}:{NTRIP_PORT}/{NTRIP_MOUNTPT}"
         )
+        self._write_status("starting")
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _write_status(self, state: str):
+        if self._status_file is None:
+            return
+        with self._stats_lock:
+            payload = {
+                "mode": "ntrip",
+                "state": state,
+                "connected": self._connected,
+                "frames": self._total_frame_count,
+                "bytes": self._total_byte_count,
+                "last_frame_time": self._last_frame_wall_time,
+                "last_error": self._last_error,
+                "updated_at": time.time(),
+            }
+        tmp_path = self._status_file.with_suffix(".tmp")
+        try:
+            tmp_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+            os.replace(tmp_path, self._status_file)
+        except Exception as exc:
+            self.get_logger().debug(f"Failed to write status file: {exc}")
 
     # ------------------------------------------------------------------
     # GPS callback — store latest fix for GGA sentence
@@ -281,6 +334,10 @@ class NtripNode(Node):
         s.settimeout(30)
         with self._gga_lock:
             self._gga_sock = s
+        with self._stats_lock:
+            self._connected = True
+            self._last_error = None
+        self._write_status("connected")
         return s, leftover
 
     # ------------------------------------------------------------------
@@ -379,13 +436,24 @@ class NtripNode(Node):
                         with self._stats_lock:
                             self._frame_count += 1
                             self._byte_count += len(frame)
+                            self._total_frame_count += 1
+                            self._total_byte_count += len(frame)
+                            self._last_frame_wall_time = time.time()
+                            self._last_error = None
+                        self._write_status("streaming")
 
             except Exception as e:
                 self._reconnect_count += 1
+                with self._stats_lock:
+                    self._connected = False
+                    self._last_error = str(e)
                 self.get_logger().error(
                     f"NTRIP error: {e} — reconnect #{self._reconnect_count}"
                 )
+                self._write_status("error")
             finally:
+                with self._stats_lock:
+                    self._connected = False
                 with self._gga_lock:
                     self._gga_sock = None
                 if sock is not None:
@@ -398,6 +466,7 @@ class NtripNode(Node):
             backoff = min(5 * (2 ** attempt), 60)
             attempt += 1
             self.get_logger().info(f"Reconnecting in {backoff}s...")
+            self._write_status("reconnecting")
             self._stop_event.wait(backoff)  # interruptible sleep
 
     # ------------------------------------------------------------------
@@ -405,22 +474,26 @@ class NtripNode(Node):
     # ------------------------------------------------------------------
     def destroy_node(self):
         self.get_logger().info("Shutting down NTRIP node...")
+        self._write_status("stopping")
         self._stop_event.set()
         if self._thread.is_alive():
             self._thread.join(timeout=5)
         super().destroy_node()
 
 
-def main():
+def main(argv=None):
+    args = parse_args(argv)
+    configure_from_args(args)
+
     rclpy.init()
-    node = NtripNode()
+    node = NtripNode(status_file=args.status_file)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 if __name__ == "__main__":
