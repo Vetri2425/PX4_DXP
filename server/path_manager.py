@@ -327,6 +327,9 @@ class PathManager:
         layer_mapping = kwargs.pop("layer_mapping", None)
         optimize = kwargs.pop("optimize", True)
         compensate_spray = kwargs.pop("compensate_spray", True)
+        enable_path_extensions = kwargs.pop("enable_path_extensions", False)
+        pre_extension_m = kwargs.pop("pre_extension_m", 0.5)
+        aft_extension_m = kwargs.pop("aft_extension_m", 0.5)
         line_spacing = kwargs.pop("line_spacing", 0.05)
         transit_spacing = kwargs.pop("transit_spacing", 0.15)
         marking_speed = kwargs.pop("marking_speed", 0.35)
@@ -340,6 +343,12 @@ class PathManager:
         if name in BUILTIN_PATHS:
             # Builtin preview must match the path that mission/load publishes:
             # these generators are already densified to their tuned spacing.
+            if enable_path_extensions:
+                log.warning(
+                    "enable_path_extensions ignored for builtin path %r: "
+                    "builtins are pre-densified and not run through PathEngine.",
+                    name,
+                )
             pts = list(_cached_builtin(name))
             shifted = [(n + origin[0], e + origin[1]) for n, e in pts]
             mark_length = _path_length(pts)
@@ -373,6 +382,9 @@ class PathManager:
             transit_speed=transit_speed,
             optimize_order=optimize,
             compensate_spray=compensate_spray,
+            enable_path_extensions=enable_path_extensions,
+            pre_extension_m=pre_extension_m,
+            aft_extension_m=aft_extension_m,
         )
 
         # Resolve file path

@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal, Optional, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class VehicleMode(str, Enum):
@@ -251,6 +251,9 @@ class PathPlanRequest(BaseModel):
     transit_speed: float = 0.50  # TRANSIT speed (m/s)
     optimize: bool = True  # Reorder segments for minimal dead-heading
     compensate_spray: bool = True  # Apply spray latency compensation
+    enable_path_extensions: bool = False  # Add PRE/AFT drive extensions around MARK geometry
+    pre_extension_m: float = Field(0.5, ge=0.0)  # Drive-in distance before MARK start (m)
+    aft_extension_m: float = Field(0.5, ge=0.0)  # Drive-out distance after MARK end (m)
     include_waypoints: bool = True  # If False, return summary only (no waypoint arrays)
 
 
