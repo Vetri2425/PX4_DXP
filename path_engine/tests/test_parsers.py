@@ -306,3 +306,18 @@ def test_dxf_arc_parsing():
     assert len(segments) == 1
     # Quarter arc should have multiple waypoints
     assert len(segments[0].points) >= 3
+
+
+def test_dxf_corrupt_file_raises_value_error():
+    """Verify that corrupt DXF files raise a clean ValueError instead of unhandled exception."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".dxf", delete=False) as f:
+        f.write("This is not a valid DXF file content!!!\n")
+        f.flush()
+        fpath = f.name
+    try:
+        import pytest
+        with pytest.raises(ValueError) as excinfo:
+            parse_dxf(fpath)
+        assert "Corrupt DXF file" in str(excinfo.value)
+    finally:
+        os.unlink(fpath)

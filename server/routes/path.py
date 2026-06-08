@@ -160,8 +160,6 @@ async def plan_path(req: PathPlanRequest):
         unsupported.append("overrides")
     if req.order is not None:
         unsupported.append("order")
-    if req.ref_points is not None:
-        unsupported.append("ref_points")
     if unsupported:
         raise HTTPException(
             422,
@@ -171,6 +169,9 @@ async def plan_path(req: PathPlanRequest):
     origin = tuple(req.origin) if req.origin else (0.0, 0.0)
     start_position = tuple(req.start_position) if req.start_position else None
     summary_only = not (req.include_waypoints)
+    origin_gps = tuple(req.origin_gps) if req.origin_gps else None
+    ref_points_dxf = [(pt.dxf_y, pt.dxf_x) for pt in req.ref_points] if req.ref_points is not None else None
+    ref_points_gps = [(pt.lat, pt.lon) for pt in req.ref_points] if req.ref_points is not None else None
 
     try:
         result = await asyncio.wait_for(
@@ -187,6 +188,11 @@ async def plan_path(req: PathPlanRequest):
                 compensate_spray=req.compensate_spray,
                 origin=origin,
                 start_position=start_position,
+                origin_gps=origin_gps,
+                rotation_deg=req.rotation_deg,
+                ref_points_dxf=ref_points_dxf,
+                ref_points_gps=ref_points_gps,
+                close_loop=req.close_loop,
             ),
             timeout=15.0,
         )
@@ -209,6 +215,8 @@ async def plan_path(req: PathPlanRequest):
         segments=result["segments"],
         merged_waypoints=result.get("merged_waypoints", []),
         spray_flags=result.get("spray_flags", []),
+        alignment_metadata=result.get("alignment_metadata"),
+        warnings=result.get("warnings"),
     )
 
 

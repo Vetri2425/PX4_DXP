@@ -331,6 +331,11 @@ class PathManager:
         transit_spacing = kwargs.pop("transit_spacing", 0.15)
         marking_speed = kwargs.pop("marking_speed", 0.35)
         transit_speed = kwargs.pop("transit_speed", 0.50)
+        origin_gps = kwargs.pop("origin_gps", None)
+        rotation_deg = kwargs.pop("rotation_deg", 0.0)
+        ref_points_dxf = kwargs.pop("ref_points_dxf", None)
+        ref_points_gps = kwargs.pop("ref_points_gps", None)
+        close_loop = kwargs.pop("close_loop", False)
 
         if name in BUILTIN_PATHS:
             # Builtin preview must match the path that mission/load publishes:
@@ -351,6 +356,8 @@ class PathManager:
                     "source": f"builtin:{name}",
                     "length_m": round(mark_length, 3),
                 }] if shifted else [],
+                "alignment_metadata": {},
+                "warnings": [],
             }
             if not summary_only:
                 result["merged_waypoints"] = shifted
@@ -358,6 +365,7 @@ class PathManager:
             return result
 
         from path_engine.engine import PathEngine
+        from path_engine.validator import PathValidator
         engine = PathEngine(
             mark_spacing=line_spacing,
             transit_spacing=transit_spacing,
@@ -375,9 +383,18 @@ class PathManager:
                 layer_mapping=layer_mapping,
                 origin=origin,
                 start_position=start_position,
+                origin_gps=origin_gps,
+                rotation_deg=rotation_deg,
+                ref_points_dxf=ref_points_dxf,
+                ref_points_gps=ref_points_gps,
+                close_loop=close_loop,
             )
         else:
             raise FileNotFoundError(f"Path not found: {name!r}")
+
+        # Run safety validation check
+        validator = PathValidator()
+        warnings = validator.validate(plan)
 
         result = {
             "source": source_name,
@@ -395,6 +412,8 @@ class PathManager:
                 }
                 for s in plan.segments
             ],
+            "alignment_metadata": plan.alignment_metadata,
+            "warnings": warnings,
         }
 
         if not summary_only:

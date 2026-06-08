@@ -116,7 +116,10 @@ def parse_dxf(
     if not os.path.isfile(filepath):
         raise FileNotFoundError(f"DXF file not found: {filepath}")
 
-    doc = ezdxf.readfile(filepath)
+    try:
+        doc = ezdxf.readfile(filepath)
+    except Exception as exc:
+        raise ValueError(f"Corrupt DXF file: {exc}") from exc
     msp = doc.modelspace()
 
     # Auto-detect unit scale from the doc we just opened (avoid second readfile)
@@ -377,15 +380,8 @@ def entities_to_segments(
     # Filter out ignored entities
     filtered: list[DXFEntity] = []
     for ent in entities:
-        if layer_mapping:
-            upper = ent.layer.upper()
-            ignored = False
-            for pattern, seg_type in layer_mapping.items():
-                if pattern.upper() in upper and seg_type.upper() == "IGNORE":
-                    ignored = True
-                    break
-            if ignored:
-                continue
+        if ent.classify(layer_mapping) == "ignore":
+            continue
         filtered.append(ent)
 
     for ent in filtered:

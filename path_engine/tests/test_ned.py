@@ -53,38 +53,46 @@ def test_affine_identity():
     """Identity transform (same DXF and NED points)."""
     dxf_pts = [(0.0, 0.0), (1.0, 0.0)]
     ned_pts = [(0.0, 0.0), (1.0, 0.0)]
-    scale, theta, offset_n, offset_e = dxf_to_ned_affine(dxf_pts, ned_pts)
+    scale, theta, offset_n, offset_e, res, rmse = dxf_to_ned_affine(dxf_pts, ned_pts)
     assert abs(scale - 1.0) < 0.001
     assert abs(theta) < 0.001
     assert abs(offset_n) < 0.001
     assert abs(offset_e) < 0.001
+    assert all(r < 0.001 for r in res)
+    assert rmse < 0.001
 
 
 def test_affine_scale_only():
     """Pure scaling (2x) with no rotation or offset."""
     dxf_pts = [(0.0, 0.0), (1.0, 0.0)]
     ned_pts = [(0.0, 0.0), (2.0, 0.0)]
-    scale, theta, offset_n, offset_e = dxf_to_ned_affine(dxf_pts, ned_pts)
+    scale, theta, offset_n, offset_e, res, rmse = dxf_to_ned_affine(dxf_pts, ned_pts)
     assert abs(scale - 2.0) < 0.001
+    assert all(r < 0.001 for r in res)
+    assert rmse < 0.001
 
 
 def test_affine_translation():
     """Pure translation (offset) with no scale or rotation."""
     dxf_pts = [(0.0, 0.0), (1.0, 0.0)]
     ned_pts = [(10.0, 20.0), (11.0, 20.0)]
-    scale, theta, offset_n, offset_e = dxf_to_ned_affine(dxf_pts, ned_pts)
+    scale, theta, offset_n, offset_e, res, rmse = dxf_to_ned_affine(dxf_pts, ned_pts)
     assert abs(scale - 1.0) < 0.001
     assert abs(offset_n - 10.0) < 0.001
     assert abs(offset_e - 20.0) < 0.001
+    assert all(r < 0.001 for r in res)
+    assert rmse < 0.001
 
 
 def test_affine_rotation_90deg():
     """90° rotation: DXF x-axis maps to NED y-axis."""
     dxf_pts = [(0.0, 0.0), (1.0, 0.0)]  # along DXF y (north)
     ned_pts = [(0.0, 0.0), (0.0, 1.0)]  # maps to east
-    scale, theta, offset_n, offset_e = dxf_to_ned_affine(dxf_pts, ned_pts)
+    scale, theta, offset_n, offset_e, res, rmse = dxf_to_ned_affine(dxf_pts, ned_pts)
     assert abs(scale - 1.0) < 0.001
     assert abs(theta - math.pi / 2) < 0.01 or abs(theta + math.pi * 1.5) < 0.01
+    assert all(r < 0.001 for r in res)
+    assert rmse < 0.001
 
 
 def test_affine_insufficient_points():
@@ -103,6 +111,26 @@ def test_affine_coincident_points():
         assert False, "Should have raised ValueError"
     except ValueError:
         pass
+
+
+def test_affine_multipoint_least_squares():
+    """Least-squares alignment with N = 4 points, including noise."""
+    dxf_pts = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
+    # Apply exact transform: scale=2, rotation=0, translation=(5, 5)
+    # Then add small noise to the target points
+    ref_pts = [
+        (5.01, 5.0),    # target (5, 5) + (0.01, 0)
+        (25.0, 4.99),   # target (25, 5) + (0, -0.01)
+        (24.99, 25.0),  # target (25, 25) + (-0.01, 0)
+        (5.0, 25.01)    # target (5, 25) + (0, 0.01)
+    ]
+    scale, theta, off_n, off_e, res, rmse = dxf_to_ned_affine(dxf_pts, ref_pts)
+    assert abs(scale - 2.0) < 0.01
+    assert abs(theta) < 0.01
+    assert abs(off_n - 5.0) < 0.05
+    assert abs(off_e - 5.0) < 0.05
+    assert all(r < 0.02 for r in res)
+    assert rmse < 0.02
 
 
 # ── apply_affine_transform tests ────────────────────────────────────────────────
@@ -132,7 +160,7 @@ def test_apply_affine_roundtrip():
     """Affine transform roundtrip: compute params, then transform another point."""
     dxf_pts = [(0.0, 0.0), (100.0, 0.0)]  # DXF cm
     ned_pts = [(0.0, 0.0), (1.0, 0.0)]    # NED metres (1m = 100cm)
-    scale, theta, off_n, off_e = dxf_to_ned_affine(dxf_pts, ned_pts)
+    scale, theta, off_n, off_e, res, rmse = dxf_to_ned_affine(dxf_pts, ned_pts)
 
     # Transform a DXF point (50, 50)cm → should be (0.5, 0.5)m
     result = apply_affine_transform((50.0, 0.0), scale, theta, off_n, off_e)

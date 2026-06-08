@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
+import re
 from typing import Optional
 
 
@@ -77,25 +78,45 @@ class DXFEntity:
     geometry: dict = field(default_factory=dict)
     unit_scale: float = 0.01  # default: DXF units are centimetres
 
-    def is_mark(self, layer_mapping: dict[str, str] | None = None) -> bool:
-        """Classify this entity as MARK (spray on) or TRANSIT (spray off).
-
-        Default rules (applied when layer_mapping is None or no match):
-          - Layer name contains TRANSIT/TRAVEL → TRANSIT
-          - Everything else → MARK
-        """
+    def classify(self, layer_mapping: dict[str, str] | None = None) -> str:
+        """Classify this entity as 'mark', 'transit', or 'ignore'."""
         if layer_mapping:
-            upper = self.layer.upper()
             for pattern, seg_type in layer_mapping.items():
-                if pattern.upper() in upper:
-                    return seg_type.upper() != "TRANSIT"
+                # Color match
+                if pattern.lower().startswith("color:"):
+                    color_val = pattern.split(":", 1)[1].strip().lower()
+                    color_map = {
+                        "red": 1, "yellow": 2, "green": 3, "cyan": 4,
+                        "blue": 5, "magenta": 6, "white": 7, "black": 7,
+                    }
+                    target_color = None
+                    if color_val.isdigit():
+                        target_color = int(color_val)
+                    elif color_val in color_map:
+                        target_color = color_map[color_val]
+                    if target_color is not None and self.color == target_color:
+                        return seg_type.lower()
+                else:
+                    # Regex/substring match
+                    try:
+                        if re.search(pattern, self.layer, re.IGNORECASE):
+                            return seg_type.lower()
+                    except re.error:
+                        if pattern.upper() in self.layer.upper():
+                            return seg_type.lower()
+
         # Default rules
         upper = self.layer.upper()
         transit_keywords = ("TRANSIT", "TRAVEL", "MOVE", "RAPID")
         for kw in transit_keywords:
             if kw in upper:
-                return False
-        return True
+                return "transit"
+        return "mark"
+
+    def is_mark(self, layer_mapping: dict[str, str] | None = None) -> bool:
+        """Classify this entity as MARK (spray on) or TRANSIT (spray off)."""
+        return self.classify(layer_mapping) != "transit"
+
 
 
 @dataclass
@@ -116,6 +137,7 @@ class PlannedPath:
     total_mark_length: float = 0.0
     total_transit_length: float = 0.0
     origin: tuple[float, float] = (0.0, 0.0)
+    alignment_metadata: dict = field(default_factory=dict)
 
     @property
     def num_waypoints(self) -> int:

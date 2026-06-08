@@ -241,7 +241,10 @@ class PathPlanRequest(BaseModel):
     )
     origin: Optional[list[float]] = None  # [north, east] NED offset
     start_position: Optional[list[float]] = None  # [north, east] rover position for TSP
-    ref_points: Optional[list[RefPoint]] = None  # 2 reference points for DXF→NED affine
+    ref_points: Optional[list[RefPoint]] = None  # reference points for DXF→NED affine
+    origin_gps: Optional[list[float]] = None  # [latitude, longitude] WGS84 reference
+    rotation_deg: float = 0.0  # DXF rotation relative to true north
+    close_loop: bool = False  # True to close open loop paths
     line_spacing: float = 0.05  # MARK waypoint spacing (m)
     transit_spacing: float = 0.15  # TRANSIT waypoint spacing (m)
     marking_speed: float = 0.35  # MARK speed (m/s)
@@ -263,3 +266,6 @@ class PathPlanResponse(BaseModel):
     segments: list[dict]  # [{type, points, speed, source}]
     merged_waypoints: list[list[float]]  # [[north, east], ...]
     spray_flags: list[bool]  # True = MARK
+    alignment_metadata: Optional[dict] = None  # alignment stats/residuals
+    warnings: Optional[list[str]] = None  # geometry/safety warnings
+
