@@ -80,3 +80,24 @@ ros2 bag record /mavros/local_position/pose /mavros/setpoint_raw/local /mavros/s
 - MAVROS pluginlist: `~/PX4_DXP/px4_pluginlists_rover.yaml`
 - FastAPI: port 5001 — `curl http://localhost:5001/api/ping`
 - QGC UDP: 14550 | ROS_DOMAIN_ID: 0
+
+## Telemetry debugging
+
+Use `tools/capture_telemetry.py` to inspect live WebSocket telemetry — prefer this over `curl /api/telemetry/latest` when you need multiple samples or want to watch values change.
+
+```bash
+# From Mac — single snapshot
+ssh flash@192.168.1.102 'cd ~/PX4_DXP && python3 tools/capture_telemetry.py -n 1 --host localhost'
+
+# From Mac — 5 samples (one per 100ms tick at 10 Hz)
+ssh flash@192.168.1.102 'cd ~/PX4_DXP && python3 tools/capture_telemetry.py -n 5 --host localhost'
+
+# From Mac — continuous stream until Ctrl-C
+ssh flash@192.168.1.102 'cd ~/PX4_DXP && python3 tools/capture_telemetry.py -n 0 --host localhost'
+
+# Filter a specific field (e.g. GPS accuracy)
+ssh flash@192.168.1.102 'cd ~/PX4_DXP && python3 tools/capture_telemetry.py -n 5 --host localhost 2>/dev/null' \
+  | python3 -c "import sys,json; [print(json.loads(l)['gps_fix_name'], json.loads(l)['hrms'], json.loads(l)['vrms']) for l in sys.stdin]"
+```
+
+Output is NDJSON (one JSON object per line). Fields: all `TelemetryData` fields + `_captured_at` (UTC ISO-8601). NaN → null.
