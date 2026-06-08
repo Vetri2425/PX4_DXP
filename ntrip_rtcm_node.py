@@ -10,6 +10,7 @@ import argparse
 import base64
 import json
 import os
+import signal
 import socket
 import sys
 import threading
@@ -127,6 +128,8 @@ class NtripNode(Node):
         # -- Thread control --
         self._stop_event = threading.Event()
         self._gga_lock = threading.Lock()
+        self._sock_lock = threading.Lock()
+        self._active_sock = None
 
         # -- Health monitoring --
         self._last_data_time = self.get_clock().now()
@@ -153,6 +156,34 @@ class NtripNode(Node):
         self._write_status("starting")
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+
+    def request_stop(self):
+        self._stop_event.set()
+        self._close_active_socket()
+
+    def _set_active_socket(self, sock):
+        with self._sock_lock:
+            self._active_sock = sock
+
+    def _clear_active_socket(self, sock):
+        with self._sock_lock:
+            if self._active_sock is sock:
+                self._active_sock = None
+
+    def _close_active_socket(self):
+        with self._sock_lock:
+            sock = self._active_sock
+            self._active_sock = None
+        if sock is None:
+            return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
 
     def _write_status(self, state: str):
         if self._status_file is None:
@@ -302,6 +333,7 @@ class NtripNode(Node):
         )
 
         s = socket.socket()
+        self._set_active_socket(s)
         s.settimeout(10)
         s.connect((NTRIP_HOST, NTRIP_PORT))
         s.sendall(req.encode())
@@ -457,10 +489,18 @@ class NtripNode(Node):
                 with self._gga_lock:
                     self._gga_sock = None
                 if sock is not None:
+                    self._clear_active_socket(sock)
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
                     try:
                         sock.close()
-                    except Exception:
+                    except OSError:
                         pass
+
+            if self._stop_event.is_set():
+                break
 
             # Exponential backoff: min(5 * 2^attempt, 60) seconds
             backoff = min(5 * (2 ** attempt), 60)
@@ -475,7 +515,7 @@ class NtripNode(Node):
     def destroy_node(self):
         self.get_logger().info("Shutting down NTRIP node...")
         self._write_status("stopping")
-        self._stop_event.set()
+        self.request_stop()
         if self._thread.is_alive():
             self._thread.join(timeout=5)
         super().destroy_node()
@@ -487,6 +527,15 @@ def main(argv=None):
 
     rclpy.init()
     node = NtripNode(status_file=args.status_file)
+
+    def _handle_signal(signum, _frame):
+        node.get_logger().info(f"Received signal {signum}; stopping NTRIP node")
+        node.request_stop()
+        rclpy.try_shutdown()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

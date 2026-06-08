@@ -47,7 +47,7 @@ class AsyncRTKManager:
         lora_script: Path | None = None,
         python_executable: str | None = None,
         startup_grace_s: float = 0.35,
-        shutdown_grace_s: float = 5.0,
+        shutdown_grace_s: float = 10.0,
     ) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         self._ntrip_script = ntrip_script or (repo_root / "ntrip_rtcm_node.py")
