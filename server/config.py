@@ -71,6 +71,17 @@ BEACON_INTERVAL = 2.0
 ROVER_ID = "drawing_rover_1"
 
 MISSION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "missions")
+# Aligned-DXF missions are staged here before the operator confirms a load.
+STAGING_DIR = os.path.join(MISSION_DIR, "staging")
+
+# ── DXF alignment / mission-handoff ───────────────────────────────────────────
+# Max allowable least-squares RMSE (metres) for multi-point DXF→NED alignment.
+# Plans whose residual exceeds this are rejected (422) and never staged.
+RMSE_MAX = float(os.environ.get("ROVER_ALIGN_RMSE_MAX", "0.05"))
+# Staged-mission lifetime (seconds). Older staging files are pruned on each plan.
+STAGING_TTL_S = float(os.environ.get("ROVER_STAGING_TTL_S", "3600"))
+# Litres of marking material consumed per metre of MARK path (site-tunable).
+SPRAY_LITERS_PER_METER = float(os.environ.get("ROVER_SPRAY_L_PER_M", "0.012"))
 
 # ── Safety / watchdog thresholds ──────────────────────────────────────────────
 POSE_STALE_MS = 500.0  # consider pose stale above this

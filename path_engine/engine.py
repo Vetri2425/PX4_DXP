@@ -158,6 +158,7 @@ class PathEngine:
             ref_points_dxf=ref_points_dxf,
             ref_points_gps=ref_points_gps,
             close_loop=close_loop,
+            ref_unit_scale=detected_unit_scale or 1.0,
         )
         plan.planning_metadata["source"] = {
             "filepath": filepath,
@@ -210,6 +211,7 @@ class PathEngine:
             ref_points_dxf=ref_points_dxf,
             ref_points_gps=ref_points_gps,
             close_loop=close_loop,
+            ref_unit_scale=(entities[0].unit_scale if entities else 1.0),
         )
         plan.planning_metadata["source"] = {
             "extension": ".dxf",
@@ -288,6 +290,7 @@ class PathEngine:
         ref_points_dxf: list[tuple[float, float]] | None = None,
         ref_points_gps: list[tuple[float, float]] | None = None,
         close_loop: bool = False,
+        ref_unit_scale: float = 1.0,
     ) -> PlannedPath:
         """Run the full pipeline on a list of segments.
 
@@ -309,6 +312,11 @@ class PathEngine:
             ref_points_dxf: List of control points in DXF coordinates.
             ref_points_gps: List of control points in WGS84 lat/lon.
             close_loop: True to close open loop paths.
+            ref_unit_scale: Metres per DXF unit for ref_points_dxf. The clicked
+                reference points arrive in raw DXF units while segment geometry
+                has already been scaled to metres by the parser, so the points
+                must be scaled by this factor before the affine solve to keep
+                both in the same metric frame (Gap A).
 
         Returns:
             PlannedPath ready for /path topic publication.
@@ -337,22 +345,30 @@ class PathEngine:
         has_alignment = False
         scale_val, theta_val, offset_n_val, offset_e_val = 1.0, 0.0, 0.0, 0.0
 
-        if ref_points_dxf and ref_points_gps and len(ref_points_dxf) >= 2 and len(ref_points_gps) >= 2:
+        # Gap A: bring clicked reference points into the same metric frame as the
+        # already-scaled segment geometry before fitting/applying the transform.
+        metric_ref_points_dxf = None
+        if ref_points_dxf:
+            metric_ref_points_dxf = [
+                (pt[0] * ref_unit_scale, pt[1] * ref_unit_scale) for pt in ref_points_dxf
+            ]
+
+        if metric_ref_points_dxf and ref_points_gps and len(metric_ref_points_dxf) >= 2 and len(ref_points_gps) >= 2:
             # Multi-point least-squares alignment. Rotation is derived from the
             # point fit, so an explicit rotation_deg is ignored in this mode.
             if rotation_deg:
                 log.warning(
                     "rotation_deg=%.3f ignored: rotation is derived from least-squares "
-                    "fit of the %d reference points.", rotation_deg, len(ref_points_dxf),
+                    "fit of the %d reference points.", rotation_deg, len(metric_ref_points_dxf),
                 )
             ref_gps_origin = origin_gps if origin_gps is not None else ref_points_gps[0]
             ref_ned_points = []
             for gps_pt in ref_points_gps:
                 n, e = latlon_to_ned(gps_pt[0], gps_pt[1], ref_gps_origin[0], ref_gps_origin[1])
                 ref_ned_points.append((n, e))
-            
+
             scale_val, theta_val, offset_n_val, offset_e_val, residuals, rmse = dxf_to_ned_affine(
-                ref_points_dxf, ref_ned_points
+                metric_ref_points_dxf, ref_ned_points
             )
             alignment_meta = {
                 "method": "least_squares",
@@ -362,6 +378,34 @@ class PathEngine:
                 "offset_e": offset_e_val,
                 "residuals": residuals,
                 "rmse": rmse,
+                "origin_gps": ref_gps_origin,
+            }
+            has_alignment = True
+
+        elif metric_ref_points_dxf and ref_points_gps and len(metric_ref_points_dxf) == 1 and len(ref_points_gps) == 1:
+            # Gap B: single reference point + operator heading. One point carries
+            # no scale information (scale=1) and no residual, so this mode bypasses
+            # the RMSE gate by definition. Translation snaps the rotated ref point
+            # onto its NED target; rotation comes from rotation_deg.
+            ref_gps_origin = origin_gps if origin_gps is not None else ref_points_gps[0]
+            n, e = latlon_to_ned(
+                ref_points_gps[0][0], ref_points_gps[0][1],
+                ref_gps_origin[0], ref_gps_origin[1],
+            )
+            scale_val = 1.0
+            theta_val = math.radians(rotation_deg)
+            rp = metric_ref_points_dxf[0]
+            rot_n = rp[0] * math.cos(theta_val) - rp[1] * math.sin(theta_val)
+            rot_e = rp[0] * math.sin(theta_val) + rp[1] * math.cos(theta_val)
+            offset_n_val = n - rot_n
+            offset_e_val = e - rot_e
+            alignment_meta = {
+                "method": "single_point_heading",
+                "scale": scale_val,
+                "rotation_deg": rotation_deg,
+                "offset_n": offset_n_val,
+                "offset_e": offset_e_val,
+                "rmse": 0.0,
                 "origin_gps": ref_gps_origin,
             }
             has_alignment = True

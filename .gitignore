@@ -68,6 +68,9 @@ server/missions/*.dxf
 server/missions/*.csv
 !server/missions/soccer_field_penalty_area.dxf
 
+# Staged aligned-DXF missions (runtime handoff artifacts)
+server/missions/staging/
+
 # Local scratch notes / planning (not for tracking)
 Todos/
 Role_of_Path_engine.md

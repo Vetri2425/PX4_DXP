@@ -10,18 +10,22 @@ DELETE /api/path/{filename}    — delete uploaded file
 """
 from __future__ import annotations
 
+import json
 import math
 import os
-
 import tempfile
+import time
+import uuid
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
 from auth import require_token
-from config import MAX_UPLOAD_BYTES, MISSION_DIR
+from config import MAX_UPLOAD_BYTES, MISSION_DIR, RMSE_MAX, SPRAY_LITERS_PER_METER, STAGING_DIR, STAGING_TTL_S
 from models import (
     DXFEntityInfo,
     DXFParseResponse,
+    LoadMissionRequest,
+    MissionSummary,
     PathPlanRequest,
     PathPlanResponse,
     PathPreviewResponse,
@@ -245,6 +249,25 @@ async def plan_path(req: PathPlanRequest):
     except Exception as exc:
         raise HTTPException(422, f"Planning error: {exc}")
 
+    alignment_meta = result.get("alignment_metadata") or {}
+
+    # Gap D: RMSE quality gate. Only least-squares alignment produces a residual;
+    # single-point/gps-origin modes report rmse=0 and pass by definition.
+    rmse = alignment_meta.get("rmse", 0.0)
+    if rmse > RMSE_MAX:
+        raise HTTPException(
+            422,
+            f"Alignment error too high (rmse={rmse:.3f} m, max {RMSE_MAX:.3f} m). "
+            "Re-verify the reference points.",
+        )
+
+    # Gaps C & E: stage the fully-aligned mission so the operator can confirm and
+    # load exactly what was previewed. Scoped to the aligned-DXF flow only — built-in
+    # and CSV/.waypoints paths keep using /api/mission/load (no alignment to reproduce).
+    mission_summary = None
+    if alignment_meta.get("method") and req.include_waypoints and result.get("merged_waypoints"):
+        mission_summary = _stage_mission(req, result, alignment_meta, rmse)
+
     return PathPlanResponse(
         source=result["source"],
         num_waypoints=result["num_waypoints"],
@@ -255,10 +278,161 @@ async def plan_path(req: PathPlanRequest):
         segments=result["segments"],
         merged_waypoints=result.get("merged_waypoints", []),
         spray_flags=result.get("spray_flags", []),
-        alignment_metadata=result.get("alignment_metadata"),
+        alignment_metadata=alignment_meta or None,
         planning_metadata=result.get("planning_metadata"),
         warnings=result.get("warnings"),
+        mission_summary=mission_summary,
     )
+
+
+def _prune_staging() -> None:
+    """Remove staged missions older than STAGING_TTL_S. Best-effort."""
+    try:
+        now = time.time()
+        for fname in os.listdir(STAGING_DIR):
+            if not fname.endswith(".json"):
+                continue
+            fpath = os.path.join(STAGING_DIR, fname)
+            try:
+                if now - os.path.getmtime(fpath) > STAGING_TTL_S:
+                    os.remove(fpath)
+            except OSError:
+                continue
+    except FileNotFoundError:
+        pass
+
+
+def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
+                   rmse: float) -> MissionSummary:
+    """Write the aligned mission to a staging file and return its summary.
+
+    The staged artifact is the single source of truth for the subsequent
+    /load-to-controller step, so the operator loads exactly what was previewed.
+    """
+    os.makedirs(STAGING_DIR, exist_ok=True)
+    _prune_staging()
+
+    mission_id = f"stg_{uuid.uuid4().hex[:8]}_{int(time.time())}"
+
+    # Gap E: definitive global anchor header for the controller / microcontroller.
+    anchor = None
+    origin_gps = alignment_meta.get("origin_gps")
+    if origin_gps:
+        anchor = {
+            "frame": "local_ned",
+            "lat": origin_gps[0],
+            "lon": origin_gps[1],
+            "rotation_deg": alignment_meta.get("rotation_deg", 0.0),
+            "scale": alignment_meta.get("scale", 1.0),
+        }
+
+    # Anchor leads the artifact (Gap E): the microcontroller/controller consumes
+    # the global anchor header before the waypoint stream.
+    staged_payload = {
+        "anchor": anchor,
+        "mission_id": mission_id,
+        "created_at": time.time(),
+        "waypoints": result.get("merged_waypoints", []),
+        "spray_flags": result.get("spray_flags", []),
+        "alignment_metadata": alignment_meta,
+        "metadata": {
+            "source": result["source"],
+            "mark_length_m": result["mark_length_m"],
+            "transit_length_m": result["transit_length_m"],
+            "total_length_m": result["total_length_m"],
+        },
+    }
+
+    staging_file = os.path.join(STAGING_DIR, f"{mission_id}.json")
+    tmp = staging_file + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(staged_payload, f)
+    os.replace(tmp, staging_file)  # atomic publish
+
+    # Commercial estimates. Speeds are > 0 (engine validates before we get here).
+    paint_l = result["mark_length_m"] * SPRAY_LITERS_PER_METER
+    runtime_s = (
+        result["mark_length_m"] / req.marking_speed
+        + result["transit_length_m"] / req.transit_speed
+    )
+
+    return MissionSummary(
+        mission_id=mission_id,
+        num_waypoints=result["num_waypoints"],
+        total_length_m=result["total_length_m"],
+        estimated_paint_l=round(paint_l, 3),
+        estimated_runtime_s=round(runtime_s, 1),
+        rmse_m=round(rmse, 4),
+    )
+
+
+@path_router.post("/load-to-controller")
+async def load_mission_to_controller(req: LoadMissionRequest):
+    """Commit a previously staged, aligned mission to the OffboardController.
+
+    Reads the staged artifact and pushes the already-aligned waypoints down to
+    the controller — no re-planning, no re-alignment — so the loaded mission is
+    byte-for-byte what the operator confirmed in the preview.
+    """
+    from main import offboard_ctrl
+    from models import MissionState
+
+    if offboard_ctrl is None:
+        raise HTTPException(503, "Controller not ready")
+
+    # Field-safety: refuse to swap the loaded path while a mission is active or
+    # mid-lifecycle. Loading is only meaningful from a settled state; the operator
+    # must stop/abort first. (load_path itself only warns — make it an explicit 409.)
+    _load_blocked = {
+        MissionState.RUNNING,
+        MissionState.LOADING,
+        MissionState.ARMING,
+        MissionState.SWITCHING_OFFBOARD,
+        MissionState.STOPPING,
+        MissionState.DISARMING,
+    }
+    if offboard_ctrl.state in _load_blocked:
+        raise HTTPException(
+            409,
+            f"Controller is {offboard_ctrl.state.value} — stop the active mission "
+            "before loading a new one.",
+        )
+
+    safe_id = os.path.basename(req.mission_id)
+    staging_file = os.path.join(STAGING_DIR, f"{safe_id}.json")
+    if not os.path.isfile(staging_file):
+        raise HTTPException(404, "Staged mission not found or expired.")
+
+    try:
+        with open(staging_file) as f:
+            staged = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(422, f"Could not read staged mission: {exc}")
+
+    waypoints = [tuple(pt) for pt in staged.get("waypoints", [])]
+    if not waypoints:
+        raise HTTPException(422, "Staged mission has no waypoints.")
+
+    anchor = staged.get("anchor")
+    if anchor:
+        import logging
+        logging.getLogger("server.path").info(
+            "loading mission %s with anchor lat=%.7f lon=%.7f rot=%.2f scale=%.4f",
+            safe_id, anchor["lat"], anchor["lon"],
+            anchor.get("rotation_deg", 0.0), anchor.get("scale", 1.0),
+        )
+
+    try:
+        offboard_ctrl.load_path(waypoints, name=safe_id)
+    except Exception as exc:
+        raise HTTPException(409, f"Controller load failed: {exc}")
+
+    return {
+        "status": "success",
+        "mission_id": safe_id,
+        "num_waypoints": len(waypoints),
+        "anchor_loaded": anchor is not None,
+    }
 
 
 # ── Delete ─────────────────────────────────────────────────────────────────────

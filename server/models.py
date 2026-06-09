@@ -299,3 +299,36 @@ class PathPlanResponse(BaseModel):
     alignment_metadata: Optional[dict] = None  # alignment stats/residuals
     planning_metadata: Optional[dict] = None  # counts/timings/bbox/unit metadata
     warnings: Optional[list[str]] = None  # geometry/safety warnings
+    mission_summary: Optional["MissionSummary"] = None  # staged-mission handoff summary
+
+
+class AnchorBlock(BaseModel):
+    """Definitive global anchor for the aligned mission (Gap E).
+
+    Written as the first object of a staged mission so the controller can
+    re-project NED waypoints back to WGS84 if it needs to recompute a
+    deviation mid-run.
+    """
+
+    frame: str = "local_ned"
+    lat: float
+    lon: float
+    rotation_deg: float = 0.0
+    scale: float = 1.0
+
+
+class MissionSummary(BaseModel):
+    """High-level summary returned for operator confirmation (Gap C)."""
+
+    mission_id: str
+    num_waypoints: int
+    total_length_m: float
+    estimated_paint_l: float
+    estimated_runtime_s: float
+    rmse_m: float
+
+
+class LoadMissionRequest(BaseModel):
+    """Payload for committing a staged mission to the controller."""
+
+    mission_id: str

@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import pytest
 from fastapi import HTTPException
 from types import SimpleNamespace
-from models import PathPlanRequest, PathPreviewResponse, RefPoint
+from models import MissionState, PathPlanRequest, PathPreviewResponse, RefPoint
 from routes.path import plan_path, preview_path
 import main
 from path_manager import PathManager
@@ -274,11 +274,12 @@ async def test_plan_api_dxf_simple_rotation():
     assert data.alignment_metadata["rotation_deg"] == 45.0
 
 @pytest.mark.anyio
-async def test_plan_api_insufficient_ref_points():
+async def test_plan_api_single_point_heading():
     if main.path_mgr is None:
         main.path_mgr = PathManager(main.MISSION_DIR)
 
-    # Only 1 ref point - should fail validation or planning with a 422 error
+    # Gap B: one ref point + heading is now a valid alignment mode (was a
+    # silent fall-back to gps_origin about (0,0)).
     req = PathPlanRequest(
         source="soccer_field_penalty_area.dxf",
         include_waypoints=True,
@@ -286,18 +287,21 @@ async def test_plan_api_insufficient_ref_points():
         transit_spacing=0.3,
         marking_speed=0.4,
         transit_speed=0.6,
+        rotation_deg=30.0,
         ref_points=[
-            RefPoint(dxf_x=0.0, dxf_y=0.0, lat=13.0, lon=80.0),
+            RefPoint(dxf_x=5.0, dxf_y=5.0, lat=13.0001, lon=80.0001),
         ],
         origin_gps=[13.0, 80.0]
     )
-    
-    # Having only 1 ref_point should fall back or raise ValueError in dxf_to_ned_affine.
-    # In engine.py: if ref_points_dxf and ref_points_gps and len(...) >= 2:
-    # So with 1 ref point it won't trigger least_squares, it will check origin_gps.
-    # Let's verify it falls back to gps_origin method.
+
     data = await plan_path(req)
-    assert data.alignment_metadata["method"] == "gps_origin"
+    meta = data.alignment_metadata
+    assert meta["method"] == "single_point_heading"
+    assert meta["rotation_deg"] == 30.0
+    assert meta["scale"] == 1.0
+    # Clicked point is offset from origin_gps, so translation must be non-zero.
+    assert meta["offset_n"] != 0.0 or meta["offset_e"] != 0.0
+    assert meta["rmse"] == 0.0
 
 @pytest.mark.anyio
 async def test_plan_api_coincident_ref_points():
@@ -323,3 +327,176 @@ async def test_plan_api_coincident_ref_points():
         await plan_path(req)
     assert exc.value.status_code == 422
     assert "coincident" in exc.value.detail
+
+
+# ── Gap A: unit-scale frame consistency ───────────────────────────────────────
+
+def test_affine_scale_is_unity_when_ref_points_share_metric_frame():
+    """Gap A regression.
+
+    A cm-unit DXF square whose ref points are 10 m apart in GPS must yield an
+    affine scale ≈ 1.0 once the ref points are scaled into the metric frame —
+    not ≈100 (raw cm fed against metric NED) or ≈0.01.
+    """
+    from path_engine.ned import dxf_to_ned_affine
+
+    unit_scale = 0.01  # cm → m
+    # Two ref points 1000 DXF units (= 10 m) apart along DXF-x.
+    raw_dxf = [(0.0, 0.0), (0.0, 1000.0)]  # stored as (dxf_y, dxf_x)
+    ned = [(0.0, 0.0), (0.0, 10.0)]        # 10 m east
+
+    # Wrong (pre-fix): raw cm points vs metric NED → scale ~0.01.
+    raw_scale = dxf_to_ned_affine(raw_dxf, ned)[0]
+    assert abs(raw_scale - 1.0) > 0.5  # demonstrably off
+
+    # Correct (post-fix): scale ref points into metres first.
+    metric_dxf = [(p[0] * unit_scale, p[1] * unit_scale) for p in raw_dxf]
+    fixed_scale = dxf_to_ned_affine(metric_dxf, ned)[0]
+    assert abs(fixed_scale - 1.0) < 1e-6
+
+
+# ── Gap D: RMSE quality gate ───────────────────────────────────────────────────
+
+@pytest.mark.anyio
+async def test_plan_api_rmse_gate_rejects_high_residual(monkeypatch):
+    """Gap D: alignment RMSE above RMSE_MAX returns 422 and stages nothing."""
+    from config import RMSE_MAX
+
+    class FakePathManager:
+        def plan_path(self, source, summary_only=False, **kwargs):
+            return {
+                "source": source,
+                "num_waypoints": 2,
+                "num_segments": 1,
+                "mark_length_m": 1.0,
+                "transit_length_m": 0.0,
+                "total_length_m": 1.0,
+                "segments": [],
+                "merged_waypoints": [(0.0, 0.0), (1.0, 0.0)],
+                "spray_flags": [True, True],
+                "alignment_metadata": {
+                    "method": "least_squares",
+                    "rmse": RMSE_MAX + 0.10,
+                    "origin_gps": (13.0, 80.0),
+                },
+                "warnings": [],
+            }
+
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+    req = PathPlanRequest(source="soccer_field_penalty_area.dxf")
+
+    with pytest.raises(HTTPException) as exc:
+        await plan_path(req)
+    assert exc.value.status_code == 422
+    assert "rmse" in exc.value.detail.lower()
+
+
+# ── Gaps C & E: staging + load-to-controller round-trip ────────────────────────
+
+@pytest.mark.anyio
+async def test_plan_then_load_to_controller_round_trip(monkeypatch, tmp_path):
+    """Gaps C/E: plan stages the aligned mission; load-to-controller pushes the
+    identical waypoints to the controller and forwards the GPS anchor."""
+    import routes.path as path_routes
+    from models import LoadMissionRequest
+
+    staging = tmp_path / "staging"
+    monkeypatch.setattr(path_routes, "STAGING_DIR", str(staging))
+
+    waypoints = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]
+
+    class FakePathManager:
+        def plan_path(self, source, summary_only=False, **kwargs):
+            return {
+                "source": source,
+                "num_waypoints": len(waypoints),
+                "num_segments": 1,
+                "mark_length_m": 2.0,
+                "transit_length_m": 0.0,
+                "total_length_m": 2.0,
+                "segments": [],
+                "merged_waypoints": list(waypoints),
+                "spray_flags": [True, True, True],
+                "alignment_metadata": {
+                    "method": "least_squares",
+                    "rmse": 0.004,
+                    "rotation_deg": 12.0,
+                    "scale": 1.0,
+                    "origin_gps": (13.0, 80.0),
+                },
+                "warnings": [],
+            }
+
+    class FakeController:
+        def __init__(self):
+            self.loaded = None
+            self.state = MissionState.IDLE
+
+        def load_path(self, points, name=None):
+            self.loaded = (list(points), name)
+
+    fake_ctrl = FakeController()
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+    monkeypatch.setattr(main, "offboard_ctrl", fake_ctrl)
+
+    req = PathPlanRequest(source="soccer_field_penalty_area.dxf")
+    data = await plan_path(req)
+
+    assert data.mission_summary is not None
+    mid = data.mission_summary.mission_id
+    assert data.mission_summary.estimated_paint_l > 0
+    assert data.mission_summary.estimated_runtime_s > 0
+    assert (staging / f"{mid}.json").is_file()
+
+    resp = await path_routes.load_mission_to_controller(LoadMissionRequest(mission_id=mid))
+    assert resp["status"] == "success"
+    assert resp["num_waypoints"] == len(waypoints)
+    assert resp["anchor_loaded"] is True
+    # Controller received the exact aligned waypoints.
+    assert fake_ctrl.loaded[0] == waypoints
+
+
+@pytest.mark.anyio
+async def test_load_to_controller_missing_mission_is_404(monkeypatch, tmp_path):
+    import routes.path as path_routes
+    from models import LoadMissionRequest
+
+    monkeypatch.setattr(path_routes, "STAGING_DIR", str(tmp_path / "staging"))
+
+    class FakeController:
+        state = MissionState.IDLE
+
+        def load_path(self, points, name=None):
+            pass
+
+    monkeypatch.setattr(main, "offboard_ctrl", FakeController())
+
+    with pytest.raises(HTTPException) as exc:
+        await path_routes.load_mission_to_controller(
+            LoadMissionRequest(mission_id="stg_does_not_exist")
+        )
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_load_to_controller_rejects_while_running(monkeypatch, tmp_path):
+    """Field-safety: loading a new mission while one is RUNNING returns 409
+    and never reads the staged artifact."""
+    import routes.path as path_routes
+    from models import LoadMissionRequest
+
+    monkeypatch.setattr(path_routes, "STAGING_DIR", str(tmp_path / "staging"))
+
+    class FakeController:
+        state = MissionState.RUNNING
+
+        def load_path(self, points, name=None):
+            raise AssertionError("load_path must not be called while RUNNING")
+
+    monkeypatch.setattr(main, "offboard_ctrl", FakeController())
+
+    with pytest.raises(HTTPException) as exc:
+        await path_routes.load_mission_to_controller(
+            LoadMissionRequest(mission_id="stg_anything")
+        )
+    assert exc.value.status_code == 409
