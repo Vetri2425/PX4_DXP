@@ -551,23 +551,54 @@ class PathPublisherNode(Node):
         )
 
     def _update_spray_and_progress(self, pn: float, pe: float):
-        """Find closest waypoint from current pose, edge-detect spray, update progress."""
+        """Project pose onto path segments, edge-detect spray, update progress.
+
+        I2 fix: previously this used nearest-WAYPOINT Euclidean distance, which
+        matches RPP only for densely spaced paths. RPP projects the pose onto
+        path SEGMENTS (closest point on each segment), so for sparse waypoints
+        (0.5–2 m apart) the spray boundary could fire up to half the spacing
+        early/late. We now use the same segment-projection scheme:
+        continuous path index c = i + t (segment i, projection parameter t),
+        and the spray flag of the last *crossed* waypoint floor(c) is applied.
+        """
         # Search forward from last index in a small window (avoids backtracking)
         search_ahead = 50
-        best = self._waypoints_visited
+        start_i = self._waypoints_visited
+        end_i = min(start_i + search_ahead, self._total_waypoints - 1)
+
+        best_c = float(start_i)   # continuous index = segment_idx + t
         best_d = float("inf")
-        for i in range(self._waypoints_visited,
-                       min(self._waypoints_visited + search_ahead, self._total_waypoints)):
-            wp = self._path_pts[i]
-            d = (wp[0] - pn) ** 2 + (wp[1] - pe) ** 2
-            if d < best_d:
-                best_d = d
-                best = i
-        self._waypoints_visited = best
+
+        if self._total_waypoints == 1:
+            best_c = 0.0
+        else:
+            for i in range(start_i, end_i):
+                ax, ay = self._path_pts[i]
+                bx, by = self._path_pts[i + 1]
+                dx, dy = bx - ax, by - ay
+                seg_len_sq = dx * dx + dy * dy
+                if seg_len_sq < 1e-12:
+                    # Zero-length segment (dwell point) — treat as a point
+                    t = 0.0
+                    cx, cy = ax, ay
+                else:
+                    t = ((pn - ax) * dx + (pe - ay) * dy) / seg_len_sq
+                    t = max(0.0, min(1.0, t))
+                    cx, cy = ax + t * dx, ay + t * dy
+                d = (cx - pn) ** 2 + (cy - pe) ** 2
+                if d < best_d:
+                    best_d = d
+                    best_c = i + t
+
+        # Last crossed waypoint = floor(continuous index); progress + spray
+        # both key off it so the boundary fires where RPP actually places
+        # the rover on the path, not at the nearest discrete waypoint.
+        last_crossed = min(int(best_c), self._total_waypoints - 1)
+        self._waypoints_visited = last_crossed
 
         # Edge-detect spray state change
         if self._spray_flags:
-            state = self._spray_flags[min(best, len(self._spray_flags) - 1)]
+            state = self._spray_flags[min(last_crossed, len(self._spray_flags) - 1)]
             if state != self._last_spray_state:
                 spray_msg = Bool()
                 spray_msg.data = bool(state)

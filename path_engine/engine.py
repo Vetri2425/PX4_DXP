@@ -488,7 +488,7 @@ class PathEngine:
             segments = smoothed
             smoothing_stats["waypoints_after"] = after
 
-        # Step 2: Densify segments
+        # Step 2: Densify segments  (E1 fix: renumbered — was duplicate "Step 2")
         densified: list[PathSegment] = []
         for seg in segments:
             densified.append(densify_segment(seg, self.mark_spacing, self.transit_spacing))
@@ -507,7 +507,7 @@ class PathEngine:
         else:
             resolved_start = self._resolve_start_position(densified, origin, start_position)
 
-        # Step 2: Optimize segment order (nearest-neighbor TSP with endpoint reversal)
+        # Step 3: Optimize segment order (nearest-neighbor TSP with endpoint reversal)
         optimization_stats = {}
         if self.optimize_order and any(s.segment_type == SegmentType.MARK for s in densified):
             ordered = optimize_segment_order(
@@ -530,7 +530,7 @@ class PathEngine:
                 "max_two_opt_segments": self.max_two_opt_segments,
             }
 
-        # Step 3: Apply drive extensions to line-like MARK segments.
+        # Step 4: Apply drive extensions to line-like MARK segments.
         if self.enable_path_extensions:
             extended: list[PathSegment] = []
             for seg in ordered:
@@ -542,7 +542,7 @@ class PathEngine:
                 ))
             ordered = extended
 
-        # Step 4: Apply spray latency compensation to MARK segments
+        # Step 5: Apply spray latency compensation to MARK segments
         if self.compensate_spray:
             compensated: list[PathSegment] = []
             for seg in ordered:
@@ -553,7 +553,7 @@ class PathEngine:
                 ))
             ordered = compensated
 
-        # Step 5: Merge into single polyline with spray flags (and de-duplicate junctions)
+        # Step 6: Merge into single polyline with spray flags (and de-duplicate junctions)
         merged_waypoints: list[tuple[float, float]] = []
         spray_flags: list[bool] = []
         total_mark = 0.0
@@ -590,13 +590,15 @@ class PathEngine:
         if close_loop and merged_waypoints:
             d_start_end = math.hypot(merged_waypoints[-1][0] - merged_waypoints[0][0], merged_waypoints[-1][1] - merged_waypoints[0][1])
             if d_start_end > 0.01:
+                # E2 fix: the closing leg connects the END of the last segment
+                # back to the path START — it is a deadhead (transit) move, not
+                # a marking pass. Copying spray_flags[0] inherited spray ON
+                # whenever the path started on a MARK segment (the common case),
+                # which would paint the closing leg. Always close with spray OFF.
                 merged_waypoints.append(merged_waypoints[0])
-                spray_flags.append(spray_flags[0])
-                # Account for the closing leg in the totals
-                if spray_flags[0]:
-                    total_mark += d_start_end
-                else:
-                    total_transit += d_start_end
+                spray_flags.append(False)
+                # Account for the closing leg in the totals (transit)
+                total_transit += d_start_end
 
         bbox = None
         if merged_waypoints:

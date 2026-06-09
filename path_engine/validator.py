@@ -185,6 +185,15 @@ class PathValidator:
         intersections = []
         # To avoid O(N^2) explosion on large files, we limit check to max 1000 segments
         step = max(1, n_segs // 1000)
+        # V1 fix: when step > 1 only a subset of segment pairs is tested, so a
+        # clean result is NOT a guarantee. Tell the operator instead of giving
+        # false reassurance.
+        if step > 1:
+            warnings.append(
+                f"Self-intersection check is SAMPLED (1 in {step} segments tested "
+                f"of {n_segs}) because the path is large — a clean result does "
+                f"not guarantee the path is intersection-free."
+            )
         for i in range(0, n_segs, step):
             p1, p2 = pts[i], pts[i + 1]
             for j in range(i + 2, n_segs, step):

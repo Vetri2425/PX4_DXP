@@ -241,7 +241,7 @@ class RPPControllerNode(Node):
         self.declare_parameter("p4_zero_vel_threshold",               0.02)   # m/s; floor speed below this to exactly 0 to trigger PX4 P4
 
         # Safety
-        self.declare_parameter("pose_max_age_s",                      0.5)    # 200 ms staleness threshold
+        self.declare_parameter("pose_max_age_s",                      0.5)    # 500 ms staleness threshold (aligned with COM_OF_LOSS_T)
         self.declare_parameter("path_frame_id",                       "local_ned")
 
         # P0.2 — EKF / position-jump detection
@@ -1493,6 +1493,11 @@ class RPPControllerNode(Node):
         """Publish (0, 0, 0) and a diagnostic. Used for IDLE/DONE/STALE/RTK_WAIT/JUMP_SKIP."""
         self._publish_velocity(0.0, 0.0)
         self._publish_yaw_rate(0.0)  # P3.1: zero yaw rate on stop
+        # R8 fix: reset commanded-speed memory so that after a pause
+        # (STALE / RTK_WAIT / JUMP_SKIP) the accel ramp restarts from 0
+        # instead of resuming from the pre-pause speed and bypassing the
+        # motor-start jerk protection.
+        self._last_speed_cmd = 0.0
         self._publish_debug(
             cross_track=float("nan"),
             heading_err=float("nan"),

@@ -122,9 +122,9 @@ class MissionRunnerNode(Node):
         self._was_offboard = False  # track external mode changes
         self._pending_future = None   # active service call future
         self._future_t0 = None        # timestamp when future was created
-        self._running_t0: float | None = None  # wall time when RUNNING entered
+        self._running_t0 = None       # ROS Time when RUNNING entered (M2: ROS clock)
         self._arm_attempts = 0        # number of arm attempts made
-        self._arm_retry_t0: float | None = None  # wall time of last arm rejection
+        self._arm_retry_t0 = None     # ROS Time of last arm rejection (M2: ROS clock)
 
         # ------------------------------------------------------------------
         # QoS
@@ -197,7 +197,8 @@ class MissionRunnerNode(Node):
         # External OFFBOARD exit detection (e.g. RC override, failsafe)
         if self._phase == MissionPhase.RUNNING:
             if self._was_offboard and msg.mode != "OFFBOARD":
-                run_s = (time.time() - self._running_t0) if self._running_t0 else -1
+                run_s = ((self.get_clock().now() - self._running_t0).nanoseconds * 1e-9
+                         if self._running_t0 else -1)
                 self.get_logger().warn(
                     f"OFFBOARD exited externally (mode={msg.mode!r}, "
                     f"armed={msg.armed}, ran_for={run_s:.1f}s) — aborting mission"
@@ -364,10 +365,25 @@ class MissionRunnerNode(Node):
                     throttle_duration_sec=1.0,
                 )
             elif wait_s > pos_timeout:
+                # M4 fix: distinguish the likely causes by RPP state code:
+                #   0  = IDLE     → RPP has no path yet (path_publisher not run?)
+                #   4  = RTK_WAIT → GPS fix below RTK_FIXED (check NTRIP stream)
+                #  -99 = no /rpp/debug received at all (rpp_controller not running?)
+                #  else          → EKF position not valid (check EKF2_REQ_GPS_H)
+                if rpp_state == 0:
+                    hint = ("RPP is IDLE — no path published. "
+                            "Run path_publisher_node / verify /path topic.")
+                elif rpp_state == RPP_STATE_RTK_WAIT:
+                    hint = ("RPP is RTK_WAIT — GPS fix below RTK_FIXED. "
+                            "Check NTRIP stream, or set require_rtk_fix:=false.")
+                elif rpp_state == -99:
+                    hint = ("No /rpp/debug received — is rpp_controller_node running?")
+                else:
+                    hint = ("EKF position not valid. "
+                            "Check EKF2_REQ_GPS_H (should be 1.0, not 10.0).")
                 self.get_logger().error(
-                    f"EKF position not valid after {pos_timeout:.0f}s "
-                    f"(RPP state={rpp_state}) — aborting. "
-                    f"Check EKF2_REQ_GPS_H (should be 1.0, not 10.0)."
+                    f"Position not ready after {pos_timeout:.0f}s "
+                    f"(RPP state={rpp_state}) — aborting. {hint}"
                 )
                 self._phase = MissionPhase.ABORTED
             else:
@@ -392,7 +408,9 @@ class MissionRunnerNode(Node):
             # If we're in a retry backoff, just wait
             if self._arm_retry_t0 is not None:
                 retry_delay = self.get_parameter("arm_retry_delay_s").value
-                waited = time.time() - self._arm_retry_t0
+                # M2 fix: use ROS clock (not time.time()) so bag replay /
+                # simulated time behaves correctly
+                waited = (self.get_clock().now() - self._arm_retry_t0).nanoseconds * 1e-9
                 if waited >= retry_delay:
                     self._arm_retry_t0 = None
                     self.get_logger().info(
@@ -408,7 +426,7 @@ class MissionRunnerNode(Node):
                 ok = bool(r.success) if r else False
                 if ok:
                     self.get_logger().info("Armed — mission running")
-                    self._running_t0 = time.time()
+                    self._running_t0 = self.get_clock().now()  # M2: ROS clock
                     self._phase = MissionPhase.RUNNING
                 else:
                     self._arm_attempts += 1
@@ -420,7 +438,7 @@ class MissionRunnerNode(Node):
                             f"retrying in {retry_delay:.0f}s. "
                             f"See PX4 statustext above for reason."
                         )
-                        self._arm_retry_t0 = time.time()
+                        self._arm_retry_t0 = self.get_clock().now()  # M2: ROS clock
                         # stay in CONFIRM_ARM — retry timer will flip back to ARM
                     else:
                         self.get_logger().error(
@@ -516,11 +534,16 @@ class MissionRunnerNode(Node):
                 self._phase = MissionPhase.FINISHED
 
         elif self._phase == MissionPhase.ABORTED:
-            self.get_logger().error("Mission aborted — disarming and reverting to MANUAL")
-            if not self.get_parameter("dry_run").value:
-                self._call_arm(False)
-                self._call_set_mode("MANUAL")
-            self._phase = MissionPhase.FINISHED
+            # M1 fix: do NOT fire disarm + set_mode back-to-back — both write to
+            # _pending_future and the second call overwrites (drops) the disarm
+            # future before it is awaited, racing disarm vs. mode-revert and
+            # potentially leaving the rover ARMED in MANUAL.
+            # Instead, route through the existing confirmed sequence:
+            #   DISARM → CONFIRM_DISARM (wait for ACK) → EXIT_MANUAL → CONFIRM_MANUAL
+            self.get_logger().error(
+                "Mission aborted — disarming (will revert to MANUAL after disarm ACK)")
+            self._clear_future()  # drop any in-flight future from the aborted phase
+            self._phase = MissionPhase.DISARM
 
         elif self._phase == MissionPhase.FINISHED:
             self.get_logger().info("Mission finished — shutting down node")
@@ -538,14 +561,24 @@ def main():
         if node:
             node.get_logger().info("Ctrl+C — disarming and reverting to MANUAL")
             try:
+                # M3 fix: drain each future with a brief bounded spin so the
+                # disarm/set_mode MAVLink messages actually reach MAVROS before
+                # the node is torn down (call_async alone may never be sent).
                 if node._arm_cli.service_is_ready():
                     req = CommandBool.Request()
                     req.value = False
-                    node._arm_cli.call_async(req)
+                    fut = node._arm_cli.call_async(req)
+                    rclpy.spin_until_future_complete(node, fut, timeout_sec=2.0)
+                    if fut.done() and fut.result() is not None:
+                        node.get_logger().info(
+                            f"Ctrl+C disarm ACK: success={fut.result().success}")
+                    else:
+                        node.get_logger().warn("Ctrl+C disarm: no ACK within 2s")
                 if node._set_mode_cli.service_is_ready():
                     req = SetMode.Request()
                     req.custom_mode = "MANUAL"
-                    node._set_mode_cli.call_async(req)
+                    fut = node._set_mode_cli.call_async(req)
+                    rclpy.spin_until_future_complete(node, fut, timeout_sec=2.0)
             except Exception:
                 pass
     finally:

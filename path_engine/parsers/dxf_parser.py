@@ -231,7 +231,11 @@ def parse_dxf(
             # SPLINE — use ezdxf's make_path + flattening for accurate discretization
             try:
                 path = make_path(entity)
-                flat_pts = list(path.flattening(distance=0.005 * s / unit_scale if unit_scale > 0 else 0.005))
+                # D1 fix: flattening distance is in DXF units. Intended chord
+                # error is 5 mm (0.005 m), so convert metres → DXF units by
+                # DIVIDING by unit_scale. (Old `0.005 * s / unit_scale` always
+                # resolved to 0.005 DXF units — 100× too tight for cm DXFs.)
+                flat_pts = list(path.flattening(distance=0.005 / unit_scale if unit_scale > 0 else 0.005))
                 pts = [(p.y * s, p.x * s) for p in flat_pts]
                 entities.append(DXFEntity(
                     entity_type="SPLINE",
@@ -266,7 +270,8 @@ def parse_dxf(
             # ELLIPSE — use ezdxf's make_path + flattening (more accurate than manual parametric)
             try:
                 path = make_path(entity)
-                flat_pts = list(path.flattening(distance=0.005 * s / unit_scale if unit_scale > 0 else 0.005))
+                # D1 fix: same metres → DXF-units conversion as SPLINE above.
+                flat_pts = list(path.flattening(distance=0.005 / unit_scale if unit_scale > 0 else 0.005))
                 pts = [(p.y * s, p.x * s) for p in flat_pts]
                 entities.append(DXFEntity(
                     entity_type="ELLIPSE",
@@ -304,10 +309,15 @@ def parse_dxf(
 
         # INSERT (block references) — decompose recursively
         elif etype == "INSERT":
+            # D2 fix: previously only LINE sub-entities were extracted; ARC,
+            # CIRCLE, LWPOLYLINE, POINT, SPLINE and ELLIPSE inside blocks were
+            # silently dropped. Mirror the top-level entity switch here.
             try:
                 from ezdxf.disassemble import recursive_decompose
-                for sub_entity in recursive_decompose(entity):
+                for i, sub_entity in enumerate(recursive_decompose([entity])):
                     sub_etype = sub_entity.dxftype()
+                    sub_id = f"{handle}_sub{i}"
+
                     if sub_etype == "LINE":
                         start = sub_entity.dxf.start
                         end = sub_entity.dxf.end
@@ -315,13 +325,101 @@ def parse_dxf(
                             entity_type="LINE",
                             layer=layer,
                             color=color,
-                            entity_id=handle + "_sub",
+                            entity_id=sub_id,
                             geometry={
                                 "start": (start.y * s, start.x * s),
                                 "end": (end.y * s, end.x * s),
                             },
                             unit_scale=unit_scale,
                         ))
+
+                    elif sub_etype == "POINT":
+                        pos = sub_entity.dxf.location
+                        entities.append(DXFEntity(
+                            entity_type="POINT",
+                            layer=layer,
+                            color=color,
+                            entity_id=sub_id,
+                            geometry={
+                                "position": (pos.y * s, pos.x * s),
+                            },
+                            unit_scale=unit_scale,
+                        ))
+
+                    elif sub_etype == "CIRCLE":
+                        c = sub_entity.dxf.center
+                        entities.append(DXFEntity(
+                            entity_type="CIRCLE",
+                            layer=layer,
+                            color=color,
+                            entity_id=sub_id,
+                            geometry={
+                                "center": (c.y * s, c.x * s),
+                                "radius": sub_entity.dxf.radius * s,
+                            },
+                            unit_scale=unit_scale,
+                        ))
+
+                    elif sub_etype == "ARC":
+                        c = sub_entity.dxf.center
+                        entities.append(DXFEntity(
+                            entity_type="ARC",
+                            layer=layer,
+                            color=color,
+                            entity_id=sub_id,
+                            geometry={
+                                "center": (c.y * s, c.x * s),
+                                "radius": sub_entity.dxf.radius * s,
+                                "start_angle": sub_entity.dxf.start_angle,
+                                "end_angle": sub_entity.dxf.end_angle,
+                            },
+                            unit_scale=unit_scale,
+                        ))
+
+                    elif sub_etype == "LWPOLYLINE":
+                        vertices = list(sub_entity.get_points(format="xyb"))
+                        pts = [(v[1] * s, v[0] * s) for v in vertices]
+                        bulges = [v[2] if len(v) > 2 else 0.0 for v in vertices]
+                        entities.append(DXFEntity(
+                            entity_type="LWPOLYLINE",
+                            layer=layer,
+                            color=color,
+                            entity_id=sub_id,
+                            geometry={
+                                "vertices": pts,
+                                "bulges": bulges,
+                                "closed": sub_entity.closed,
+                            },
+                            unit_scale=unit_scale,
+                        ))
+
+                    elif sub_etype in ("SPLINE", "HELIX", "ELLIPSE"):
+                        try:
+                            sub_path = make_path(sub_entity)
+                            flat_pts = list(sub_path.flattening(
+                                distance=0.005 / unit_scale if unit_scale > 0 else 0.005))
+                            pts = [(p.y * s, p.x * s) for p in flat_pts]
+                            if pts:
+                                entities.append(DXFEntity(
+                                    entity_type="SPLINE" if sub_etype != "ELLIPSE" else "ELLIPSE",
+                                    layer=layer,
+                                    color=color,
+                                    entity_id=sub_id,
+                                    geometry={
+                                        "vertices": pts,
+                                        "closed": False,
+                                    },
+                                    unit_scale=unit_scale,
+                                ))
+                        except (ValueError, AttributeError, RuntimeError) as sub_exc:
+                            log.warning(
+                                "INSERT %s sub-%s %s: flattening failed (%s) — skipped",
+                                handle, sub_etype, sub_id, sub_exc)
+
+                    else:
+                        log.warning(
+                            "INSERT %s: skipping unsupported sub-entity type %s "
+                            "(layer=%s)", handle, sub_etype, layer)
             except (ValueError, AttributeError, RuntimeError) as exc:
                 log.warning("INSERT %s on layer %s: decomposition failed (%s)",
                             handle, layer, exc)
@@ -521,12 +619,26 @@ def entities_to_segments(
             # Already flattened by make_path + flattening in parse_dxf
             pts = ent.geometry.get("vertices", [])
             if len(pts) >= 2:
+                # EX1 fix: provide tangent metadata (finite differences from
+                # the densely flattened vertices) so path extensions
+                # (PRE/AFT run-up) are not silently skipped for these entities.
+                def _unit(dx: float, dy: float):
+                    n = math.hypot(dx, dy)
+                    return (dx / n, dy / n) if n > 1e-12 else None
+                start_tan = _unit(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1])
+                end_tan = _unit(pts[-1][0] - pts[-2][0], pts[-1][1] - pts[-2][1])
+                spline_metadata = {"geometry_type": ent.entity_type}
+                if start_tan is not None:
+                    spline_metadata["start_tangent"] = start_tan
+                if end_tan is not None:
+                    spline_metadata["end_tangent"] = end_tan
                 segments.append(PathSegment(
                     segment_type=seg_type,
                     points=list(pts),
                     speed=speed,
                     segment_id=seg_id,
                     source_entity=f"{ent.entity_type}_{ent.entity_id}",
+                    metadata=spline_metadata,
                 ))
                 seg_id += 1
                 total_waypoints += len(pts)

@@ -106,6 +106,13 @@ class TwistToSetpointNode(Node):
         # Parameters
         # ------------------------------------------------------------------
         self.declare_parameter("input_max_age_s", 0.2)   # 200 ms input staleness
+        # T1 fix: dedicated, wider staleness window for yaw_rate feedforward.
+        # Using input_max_age_s for yaw_rate caused a one-cycle FF dropout
+        # (type_mask 455→2503 flip) when the RPP timer and this node's timer
+        # drifted by one executor scheduling slot under CPU load. The yaw_rate
+        # topic is published in the same RPP cycle as velocity, so if velocity
+        # is fresh, a yaw_rate up to ~1.5× older is still the matching sample.
+        self.declare_parameter("yaw_rate_max_age_s", 0.3)
         self.declare_parameter("expected_input_frame", "local_ned")
         # Explicit yaw computed from velocity direction (always on since 2026-05-23).
         # PX4 leaves trajectory_setpoint.yaw=NaN without explicit yaw, causing
@@ -268,7 +275,11 @@ class TwistToSetpointNode(Node):
         yaw_rate_age = float("inf")
         if self._yaw_rate_recv_time is not None:
             yaw_rate_age = (self.get_clock().now() - self._yaw_rate_recv_time).nanoseconds * 1e-9
-        if source == "rpp" and yaw_rate_age <= max_age and abs(self._latest_yaw_rate_body) > 1e-4:
+        # T1 fix: compare against the wider yaw_rate_max_age_s window (not
+        # input_max_age_s) so one slot of executor timer drift cannot drop
+        # the κ·v feedforward for a cycle mid-arc.
+        yaw_rate_max_age = self.get_parameter("yaw_rate_max_age_s").value
+        if source == "rpp" and yaw_rate_age <= yaw_rate_max_age and abs(self._latest_yaw_rate_body) > 1e-4:
             msg.yaw_rate = self._latest_yaw_rate_body    # NED CW+ passed through directly
             msg.type_mask = TYPE_MASK_VEL_YAW_YAWRATE   # 455: vel + yaw + yaw_rate
         else:

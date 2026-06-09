@@ -31,9 +31,12 @@ Metadata survival chain:
 
 from __future__ import annotations
 
+import logging
 import math
 
 from ..core import PathSegment, SegmentType
+
+log = logging.getLogger("path_engine.extensions")
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +201,16 @@ def split_mark_segment_with_extensions(
             return [_copy_segment(segment)]
 
     else:
-        # Priority 3: unknown geometry, no metadata → skip, return copy
+        # Priority 3: unknown geometry, no metadata → skip, return copy.
+        # EX1 fix: warn instead of silently skipping, so the operator knows
+        # this MARK segment will get no PRE/AFT run-up even though
+        # enable_path_extensions is on.
+        log.warning(
+            "Path extension skipped for MARK segment %s (id=%s): no tangent "
+            "metadata and geometry is not line-like — no PRE/AFT run-up "
+            "will be added.",
+            segment.source_entity, segment.segment_id,
+        )
         return [_copy_segment(segment)]
 
     # ── Build result list ───────────────────────────────────────────────────
