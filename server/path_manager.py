@@ -14,7 +14,7 @@ from typing import Optional
 
 from config import ALLOWED_UPLOAD_EXTENSIONS, MAX_UPLOAD_BYTES
 from logging_setup import get_logger
-from models import PathInfo
+from models import PathInfo, PathPreviewResponse
 
 log = get_logger("server.path")
 
@@ -262,6 +262,55 @@ class PathManager:
                 return [(n + origin[0], e + origin[1]) for n, e in pts]
             return self._load_file(fpath)
         raise FileNotFoundError(f"Path not found: {name!r}")
+
+    def preview_path(self, name: str) -> PathPreviewResponse:
+        """Return local-NED points for display without touching mission state."""
+        lookup_name = (
+            name.removeprefix("builtin:")
+            if name.startswith("builtin:")
+            else name
+        )
+        if lookup_name in BUILTIN_PATHS:
+            pts = list(_cached_builtin(lookup_name))
+            spray_flags = [True] * len(pts)
+        else:
+            fpath = os.path.join(self._dir, os.path.basename(name))
+            if not os.path.isfile(fpath):
+                raise FileNotFoundError(f"Path not found: {name!r}")
+            if os.path.splitext(fpath)[1].lower() == ".dxf":
+                from path_engine import PathEngine
+                plan = PathEngine().plan_file(fpath)
+                pts = list(plan.merged_waypoints)
+                spray_flags = list(plan.spray_flags)
+            else:
+                pts = self._load_file(fpath)
+                spray_flags = [True] * len(pts)
+
+        if len(spray_flags) != len(pts):
+            spray_flags = [True] * len(pts)
+
+        waypoints = [
+            {"north": n, "east": e, "spray": spray}
+            for (n, e), spray in zip(pts, spray_flags)
+        ]
+        if pts:
+            norths = [n for n, _ in pts]
+            easts = [e for _, e in pts]
+            bounds = {
+                "north_min": min(norths),
+                "north_max": max(norths),
+                "east_min": min(easts),
+                "east_max": max(easts),
+            }
+        else:
+            bounds = None
+
+        return PathPreviewResponse(
+            name=name,
+            num_points=len(pts),
+            bounds=bounds,
+            waypoints=waypoints,
+        )
 
     def save_uploaded(self, filename: str, content: bytes) -> str:
         """Save raw bytes to missions dir. Validates extension + size + disk quota."""

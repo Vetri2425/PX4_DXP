@@ -1,6 +1,7 @@
 """Path management endpoints (auth-protected).
 
 GET    /api/paths              — list built-in + uploaded paths
+GET    /api/path/{name}/preview — return local-NED points for display
 POST   /api/path/upload        — upload .waypoints, .csv, or .dxf
 POST   /api/path/publish       — publish named path to /path topic
 POST   /api/path/parse-dxf     — parse DXF file, return entity list
@@ -18,7 +19,14 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
 from auth import require_token
 from config import MAX_UPLOAD_BYTES, MISSION_DIR
-from models import PathPublishRequest, PathPlanRequest, DXFParseResponse, DXFEntityInfo, PathPlanResponse
+from models import (
+    DXFEntityInfo,
+    DXFParseResponse,
+    PathPlanRequest,
+    PathPlanResponse,
+    PathPreviewResponse,
+    PathPublishRequest,
+)
 from path_manager import UploadValidationError
 
 # Two distinct routers so the URL structure is explicit and stable.
@@ -34,6 +42,29 @@ path_router  = APIRouter(prefix="/path",  tags=["path"],
 async def list_paths():
     from main import path_mgr
     return [p.model_dump() for p in path_mgr.list_paths()]
+
+
+# ── Preview ───────────────────────────────────────────────────────────────────
+
+@path_router.get("/{name}/preview", response_model=PathPreviewResponse)
+async def preview_path(name: str):
+    # DXF previews run the full PathEngine planner — offload to a thread so a
+    # heavy parse never blocks the event loop (telemetry WS, other endpoints).
+    import asyncio
+    from main import path_mgr
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(path_mgr.preview_path, name),
+            timeout=15.0,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc))
+    except ImportError as exc:
+        raise HTTPException(500, str(exc))
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "Preview timed out (15s limit)")
+    except Exception as exc:
+        raise HTTPException(422, f"Preview failed: {exc}")
 
 
 # ── Upload ────────────────────────────────────────────────────────────────────

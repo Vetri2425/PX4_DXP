@@ -7,10 +7,97 @@ sys.path.insert(0, os.path.dirname(__file__))
 import pytest
 from fastapi import HTTPException
 from types import SimpleNamespace
-from models import PathPlanRequest, RefPoint
-from routes.path import plan_path
+from models import PathPlanRequest, PathPreviewResponse, RefPoint
+from routes.path import plan_path, preview_path
 import main
 from path_manager import PathManager
+
+
+def test_path_manager_preview_returns_bounds_and_local_ned_points(tmp_path):
+    mission_file = tmp_path / "line.csv"
+    mission_file.write_text("0,0\n1.5,-0.25\n2.0,0.75\n", encoding="utf-8")
+
+    mgr = PathManager(str(tmp_path))
+    preview = mgr.preview_path("line.csv")
+
+    assert preview.name == "line.csv"
+    assert preview.frame == "local_ned"
+    assert preview.num_points == 3
+    assert preview.bounds is not None
+    assert preview.bounds.north_min == 0.0
+    assert preview.bounds.north_max == 2.0
+    assert preview.bounds.east_min == -0.25
+    assert preview.bounds.east_max == 0.75
+    assert preview.waypoints[1].north == 1.5
+    assert preview.waypoints[1].east == -0.25
+    assert all(pt.spray is True for pt in preview.waypoints)
+
+
+def test_path_manager_preview_preserves_dxf_spray_flags(tmp_path, monkeypatch):
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+
+    class FakeEngine:
+        def plan_file(self, filepath):
+            assert filepath == str(mission_file)
+            return SimpleNamespace(
+                merged_waypoints=[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+                spray_flags=[True, False, True],
+            )
+
+    import path_engine
+
+    monkeypatch.setattr(path_engine, "PathEngine", FakeEngine)
+
+    mgr = PathManager(str(tmp_path))
+    preview = mgr.preview_path("field.dxf")
+
+    assert [pt.spray for pt in preview.waypoints] == [True, False, True]
+
+
+@pytest.mark.anyio
+async def test_preview_api_returns_path_preview(monkeypatch):
+    class FakePathManager:
+        def preview_path(self, name):
+            return PathPreviewResponse(
+                name=name,
+                num_points=2,
+                bounds={
+                    "north_min": 0.0,
+                    "north_max": 1.0,
+                    "east_min": 0.0,
+                    "east_max": 0.5,
+                },
+                waypoints=[
+                    {"north": 0.0, "east": 0.0, "spray": True},
+                    {"north": 1.0, "east": 0.5, "spray": True},
+                ],
+            )
+
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    data = await preview_path("square_2x2")
+
+    assert data.name == "square_2x2"
+    assert data.frame == "local_ned"
+    assert data.num_points == 2
+    assert data.bounds.north_max == 1.0
+    assert data.waypoints[1].east == 0.5
+
+
+@pytest.mark.anyio
+async def test_preview_api_missing_path_is_404(monkeypatch):
+    class FakePathManager:
+        def preview_path(self, name):
+            raise FileNotFoundError(f"Path not found: {name!r}")
+
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    with pytest.raises(HTTPException) as exc:
+        await preview_path("missing.csv")
+
+    assert exc.value.status_code == 404
+    assert "missing.csv" in exc.value.detail
 
 
 def test_path_plan_request_extension_defaults_are_safe():

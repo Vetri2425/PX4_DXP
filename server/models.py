@@ -102,6 +102,27 @@ class PathInfo(BaseModel):
     source: str  # "builtin" | "file"
 
 
+class PathPreviewPoint(BaseModel):
+    north: float
+    east: float
+    spray: bool = True
+
+
+class PathPreviewBounds(BaseModel):
+    north_min: float
+    north_max: float
+    east_min: float
+    east_max: float
+
+
+class PathPreviewResponse(BaseModel):
+    name: str
+    frame: str = "local_ned"
+    num_points: int
+    bounds: Optional[PathPreviewBounds] = None
+    waypoints: list[PathPreviewPoint]
+
+
 class MissionStatus(BaseModel):
     state: MissionState
     rpp_state: Optional[int] = None
