@@ -44,8 +44,19 @@ path_router  = APIRouter(prefix="/path",  tags=["path"],
 
 @paths_router.get("")
 async def list_paths():
+    import asyncio
     from main import path_mgr
-    return [p.model_dump() for p in path_mgr.list_paths()]
+    # list_paths() parses (and for DXF/CSV fully plans) every file in the
+    # missions dir — seconds each. Offload to a thread so a dir full of DXFs
+    # cannot block the event loop and freeze every other GET/POST behind it.
+    try:
+        paths = await asyncio.wait_for(
+            asyncio.to_thread(path_mgr.list_paths),
+            timeout=30.0,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "Path listing timed out (30s limit)")
+    return [p.model_dump() for p in paths]
 
 
 # ── Preview ───────────────────────────────────────────────────────────────────
