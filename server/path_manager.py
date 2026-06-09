@@ -204,6 +204,46 @@ class PathManager:
     def __init__(self, missions_dir: str) -> None:
         self._dir = missions_dir
         os.makedirs(missions_dir, exist_ok=True)
+        # Listing cache: fpath -> (mtime, size, PathInfo). Avoids re-parsing
+        # unchanged files on every /api/paths call. Invalidated per-file on
+        # mtime/size change; deleted files are evicted on the next listing.
+        self._list_cache: dict[str, tuple[float, int, PathInfo]] = {}
+
+    @staticmethod
+    def _cheap_point_count(fpath: str) -> int:
+        """Fast size metric for the path listing — never runs the planner.
+
+        CSV/.waypoints are already cheap line reads (exact point count). DXF
+        is counted by raw geometry vertices via a parse only (NO densify /
+        2-opt / corner smoothing), so listing stays sub-second regardless of
+        how many files accumulate. This is a coarse size indicator, not the
+        densified planned-waypoint count (use /preview or /plan for that).
+        """
+        ext = os.path.splitext(fpath)[1].lower()
+        if ext == ".waypoints":
+            return len(read_qgc_waypoints(fpath))
+        if ext == ".csv":
+            return len(read_ned_csv(fpath))
+        if ext == ".dxf":
+            from path_engine.parsers.dxf_parser import parse_dxf
+            total = 0
+            for ent in parse_dxf(fpath):
+                geom = ent.geometry
+                verts = geom.get("vertices")
+                if verts is not None:
+                    total += len(verts)
+                elif ent.entity_type == "LINE":
+                    total += 2
+                elif ent.entity_type == "POINT":
+                    total += 1
+                else:  # ARC / CIRCLE / ELLIPSE / SPLINE — nominal
+                    total += 2
+            return total
+        # Unknown extension: fall back to the cheap readers.
+        try:
+            return len(read_qgc_waypoints(fpath))
+        except Exception:
+            return len(read_ned_csv(fpath))
 
     def list_paths(self) -> list[PathInfo]:
         result: list[PathInfo] = []
@@ -213,21 +253,36 @@ class PathManager:
                 name=name, description=info["desc"],
                 num_points=len(pts), source="builtin",
             ))
+        seen: set[str] = set()
         for fname in sorted(os.listdir(self._dir)):
             fpath = os.path.join(self._dir, fname)
             if not os.path.isfile(fpath) or fname.startswith("."):
                 continue
             try:
-                pts = self._load_file(fpath)
-                result.append(PathInfo(
-                    name=fname,
-                    description=f"Uploaded: {fname}",
-                    num_points=len(pts),
-                    source="file",
-                ))
+                st = os.stat(fpath)
+            except OSError:
+                continue
+            seen.add(fpath)
+            cached = self._list_cache.get(fpath)
+            if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+                result.append(cached[2])
+                continue
+            try:
+                n_points = self._cheap_point_count(fpath)
             except Exception as exc:
                 log.warning("skipping uploaded file %s: %s", fname, exc)
                 continue
+            info_obj = PathInfo(
+                name=fname,
+                description=f"Uploaded: {fname}",
+                num_points=n_points,
+                source="file",
+            )
+            self._list_cache[fpath] = (st.st_mtime, st.st_size, info_obj)
+            result.append(info_obj)
+        # Evict cache entries for files that no longer exist.
+        for stale in set(self._list_cache) - seen:
+            self._list_cache.pop(stale, None)
         return result
 
     def load_path(
