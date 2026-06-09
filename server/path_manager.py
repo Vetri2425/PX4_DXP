@@ -49,29 +49,55 @@ def gen_arc_half_1m5(
     ]
 
 
-def gen_lshape_2x2(spacing: float = 0.15) -> list[tuple[float, float]]:
-    pts = [(i * spacing, 0.0) for i in range(int(2.0 / spacing) + 1)]
-    pts += [(2.0, i * spacing) for i in range(1, int(2.0 / spacing) + 1)]
+def _densify_edge(
+    a: tuple[float, float], b: tuple[float, float], spacing: float
+) -> list[tuple[float, float]]:
+    """Points from a (exclusive) to b (INCLUSIVE), ~spacing apart.
+
+    The endpoint b is always emitted exactly, so corners land on their true
+    coordinate regardless of whether the edge length divides evenly by spacing.
+    (The naive `i*spacing` stepping left a `len - floor(len/spacing)*spacing`
+    gap before every corner — e.g. 2.0 m at 0.15 m stopped at 1.95 m.)
+    """
+    length = math.hypot(b[0] - a[0], b[1] - a[1])
+    n = max(1, round(length / spacing))
+    return [
+        (a[0] + (b[0] - a[0]) * i / n, a[1] + (b[1] - a[1]) * i / n)
+        for i in range(1, n + 1)
+    ]
+
+
+def _polyline(
+    corners: list[tuple[float, float]], spacing: float
+) -> list[tuple[float, float]]:
+    """Densify a corner list into a point path; shared corners appear once.
+
+    Pass a closed corner list (last == first) for closed shapes so the path
+    returns exactly to its origin.
+    """
+    pts = [corners[0]]
+    for k in range(len(corners) - 1):
+        pts += _densify_edge(corners[k], corners[k + 1], spacing)
     return pts
+
+
+def gen_lshape_2x2(spacing: float = 0.15) -> list[tuple[float, float]]:
+    # Open L: north 2 m then east 2 m. Corners land exactly at (2,0) and (2,2).
+    return _polyline([(0.0, 0.0), (2.0, 0.0), (2.0, 2.0)], spacing)
 
 
 def gen_square_2x2(spacing: float = 0.15) -> list[tuple[float, float]]:
-    side = 2.0
-    steps = int(side / spacing)
-    pts = [(i * spacing, 0.0) for i in range(steps + 1)]
-    pts += [(side, i * spacing)        for i in range(1, steps + 1)]
-    pts += [(side - i * spacing, side) for i in range(1, steps + 1)]
-    pts += [(0.0, side - i * spacing)  for i in range(1, steps + 1)]
-    return pts
+    # Closed 2x2 square — exact corners, returns to (0,0).
+    return _polyline(
+        [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0)], spacing
+    )
 
 
 def gen_rectangle_3x2(spacing: float = 0.15) -> list[tuple[float, float]]:
-    ln, le = 3.0, 2.0
-    pts  = [(i * spacing, 0.0) for i in range(int(ln / spacing) + 1)]
-    pts += [(ln, i * spacing)       for i in range(1, int(le / spacing) + 1)]
-    pts += [(ln - i * spacing, le)  for i in range(1, int(ln / spacing) + 1)]
-    pts += [(0.0, le - i * spacing) for i in range(1, int(le / spacing) + 1)]
-    return pts
+    # Closed 3 m (north) x 2 m (east) rectangle — exact corners, returns to (0,0).
+    return _polyline(
+        [(0.0, 0.0), (3.0, 0.0), (3.0, 2.0), (0.0, 2.0), (0.0, 0.0)], spacing
+    )
 
 
 def gen_circle_1m5(
