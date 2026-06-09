@@ -121,9 +121,13 @@ async def parse_dxf_file(file: UploadFile = File(...)):
     if ext != ".dxf":
         raise HTTPException(415, f"Expected .dxf file, got {ext!r}")
 
-    # Write to temp file first — only persist to missions dir on successful parse
+    # Write to temp file first — only persist to missions dir on successful parse.
+    # Create the temp IN MISSION_DIR so the final os.replace is same-filesystem:
+    # on the Jetson /tmp is a separate tmpfs, and a cross-device os.replace raises
+    # EXDEV ("Invalid cross-device link"), which would break every DXF upload.
+    os.makedirs(MISSION_DIR, exist_ok=True)
     safe = os.path.basename(filename)
-    tmp = tempfile.NamedTemporaryFile(suffix=".dxf", delete=False)
+    tmp = tempfile.NamedTemporaryFile(suffix=".dxf", delete=False, dir=MISSION_DIR)
     try:
         tmp.write(content)
         tmp.close()
