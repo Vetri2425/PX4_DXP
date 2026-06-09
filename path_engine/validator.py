@@ -3,36 +3,92 @@
 from __future__ import annotations
 
 import math
-from .core import PlannedPath, SegmentType
+from .core import PlannedPath
+
+
+class PathValidationError(ValueError):
+    """Raised when a planned path is unsafe to publish or execute."""
+
+    def __init__(self, errors: list[str]):
+        self.errors = list(errors)
+        super().__init__("; ".join(self.errors))
 
 
 class PathValidator:
     """Validator for verifying the physical and geometric safety of PlannedPaths."""
 
-    def __init__(self, min_turn_radius_m: float = 0.3, max_gap_m: float = 0.5, max_bbox_size_m: float = 1000.0):
+    def __init__(
+        self,
+        min_turn_radius_m: float = 0.3,
+        max_gap_m: float = 0.5,
+        max_bbox_size_m: float = 1000.0,
+        max_waypoints: int = 10000,
+        max_segments: int = 2000,
+    ):
         self.min_turn_radius_m = min_turn_radius_m
         self.max_gap_m = max_gap_m
         self.max_bbox_size_m = max_bbox_size_m
+        self.max_waypoints = max_waypoints
+        self.max_segments = max_segments
 
     def validate(self, plan: PlannedPath) -> list[str]:
         """Run all safety and sanity checks. Returns a list of warning strings."""
-        warnings: list[str] = []
-        if not plan.merged_waypoints:
-            return ["Path contains no waypoints."]
+        warnings, _ = self.validate_detailed(plan)
+        return warnings
 
-        # 1. Bounding Box Check
+    def validate_detailed(self, plan: PlannedPath) -> tuple[list[str], list[str]]:
+        """Run sanity checks and return (warnings, hard_errors)."""
+        warnings: list[str] = []
+        errors: list[str] = []
+        if not plan.merged_waypoints:
+            return ["Path contains no waypoints."], errors
+
+        # 1. Publication size checks
+        self._check_counts(plan, warnings, errors)
+
+        # 2. Bounding Box Check
         self._check_bounding_box(plan.merged_waypoints, warnings)
 
-        # 2. Turning Radius / Curvature Check
+        # 3. Turning Radius / Curvature Check
         self._check_turn_radius(plan.merged_waypoints, warnings)
 
-        # 3. Gap Check
+        # 4. Gap Check
         self._check_gaps(plan.merged_waypoints, warnings)
 
-        # 4. Self-Intersection Check
+        # 5. Self-Intersection Check
         self._check_self_intersections(plan.merged_waypoints, warnings)
 
+        return warnings, errors
+
+    def validate_or_raise(self, plan: PlannedPath) -> list[str]:
+        """Return warnings or raise PathValidationError for hard safety failures."""
+        warnings, errors = self.validate_detailed(plan)
+        if errors:
+            raise PathValidationError(errors)
         return warnings
+
+    def _check_counts(self, plan: PlannedPath, warnings: list[str], errors: list[str]) -> None:
+        n_waypoints = plan.num_waypoints
+        n_segments = len(plan.segments)
+
+        if n_waypoints > self.max_waypoints:
+            errors.append(
+                f"Too many waypoints: {n_waypoints} exceeds limit {self.max_waypoints}. "
+                f"Increase spacing, fix units, or simplify the drawing before publishing."
+            )
+
+        if n_segments > self.max_segments:
+            errors.append(
+                f"Too many path segments: {n_segments} exceeds limit {self.max_segments}. "
+                f"Check for a bad CAD export or split the job into smaller missions."
+            )
+
+        warn_at = int(self.max_waypoints * 0.8)
+        if n_waypoints > warn_at and n_waypoints <= self.max_waypoints:
+            warnings.append(
+                f"High waypoint count: {n_waypoints}/{self.max_waypoints}. "
+                f"Large /path messages can slow ROS2 and mobile clients."
+            )
 
     def _check_bounding_box(self, pts: list[tuple[float, float]], warnings: list[str]) -> None:
         norths = [p[0] for p in pts]

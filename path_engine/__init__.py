@@ -8,7 +8,7 @@ Pipeline:
 """
 from .core import SegmentType, PathSegment, PlannedPath, DXFEntity
 from .engine import PathEngine
-from .validator import PathValidator
+from .validator import PathValidationError, PathValidator
 
 __all__ = [
     "SegmentType",
@@ -16,5 +16,6 @@ __all__ = [
     "PlannedPath",
     "DXFEntity",
     "PathEngine",
+    "PathValidationError",
     "PathValidator",
 ]

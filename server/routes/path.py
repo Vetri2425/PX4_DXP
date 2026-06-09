@@ -189,6 +189,12 @@ async def plan_path(req: PathPlanRequest):
                 enable_path_extensions=req.enable_path_extensions,
                 pre_extension_m=req.pre_extension_m,
                 aft_extension_m=req.aft_extension_m,
+                corner_smooth_radius_m=req.corner_smooth_radius_m,
+                corner_smooth_arc_pts=req.corner_smooth_arc_pts,
+                use_two_opt=req.use_two_opt,
+                max_two_opt_segments=req.max_two_opt_segments,
+                max_waypoints=req.max_waypoints,
+                max_segments=req.max_segments,
                 origin=origin,
                 start_position=start_position,
                 origin_gps=origin_gps,
@@ -219,6 +225,7 @@ async def plan_path(req: PathPlanRequest):
         merged_waypoints=result.get("merged_waypoints", []),
         spray_flags=result.get("spray_flags", []),
         alignment_metadata=result.get("alignment_metadata"),
+        planning_metadata=result.get("planning_metadata"),
         warnings=result.get("warnings"),
     )
 

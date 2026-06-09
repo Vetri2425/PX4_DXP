@@ -13,18 +13,28 @@ from __future__ import annotations
 import logging
 import math
 import os
+import time
 
 from .core import PlannedPath, PathSegment, SegmentType, DXFEntity
 from .parsers import load_mission_file, load_mission_segments, parse_dxf, entities_to_segments
 from .parsers.csv_parser import read_ned_csv_enhanced
 from .parsers.waypoints_parser import read_qgc_waypoints_as_segment
-from .planners.straight_line import densify_line, densify_segment
+from .planners.straight_line import densify_segment
 from .planners.extensions import split_mark_segment_with_extensions
+from .planners.smooth import smooth_corners
 from .optimizers.segment_order import optimize_segment_order
 from .spray import apply_spray_latency_compensation
 from .ned import latlon_to_ned, dxf_to_ned_affine, apply_affine_transform
 
 log = logging.getLogger(__name__)
+
+_SMOOTH_SKIP_GEOMETRY_TYPES = {
+    "ARC",
+    "CIRCLE",
+    "ELLIPSE",
+    "SPLINE",
+    "LWPOLYLINE_BULGE",
+}
 
 
 class PathEngine:
@@ -50,6 +60,10 @@ class PathEngine:
         enable_path_extensions: bool = False,
         pre_extension_m: float = 0.5,
         aft_extension_m: float = 0.5,
+        corner_smooth_radius_m: float = 0.0,
+        corner_smooth_arc_pts: int = 6,
+        use_two_opt: bool = True,
+        max_two_opt_segments: int = 80,
     ):
         if mark_spacing <= 0:
             raise ValueError(f"mark_spacing must be > 0, got {mark_spacing}")
@@ -63,6 +77,14 @@ class PathEngine:
             raise ValueError(f"pre_extension_m must be >= 0.0, got {pre_extension_m}")
         if aft_extension_m < 0.0:
             raise ValueError(f"aft_extension_m must be >= 0.0, got {aft_extension_m}")
+        if corner_smooth_radius_m < 0.0:
+            raise ValueError(
+                f"corner_smooth_radius_m must be >= 0.0, got {corner_smooth_radius_m}"
+            )
+        if corner_smooth_arc_pts < 2:
+            raise ValueError(f"corner_smooth_arc_pts must be >= 2, got {corner_smooth_arc_pts}")
+        if max_two_opt_segments < 0:
+            raise ValueError(f"max_two_opt_segments must be >= 0, got {max_two_opt_segments}")
         self.mark_spacing = mark_spacing
         self.transit_spacing = transit_spacing
         self.marking_speed = marking_speed
@@ -74,6 +96,10 @@ class PathEngine:
         self.enable_path_extensions = enable_path_extensions
         self.pre_extension_m = pre_extension_m
         self.aft_extension_m = aft_extension_m
+        self.corner_smooth_radius_m = corner_smooth_radius_m
+        self.corner_smooth_arc_pts = corner_smooth_arc_pts
+        self.use_two_opt = use_two_opt
+        self.max_two_opt_segments = max_two_opt_segments
 
     def plan_file(
         self,
@@ -113,15 +139,17 @@ class PathEngine:
 
         if ext == ".dxf":
             entities = parse_dxf(filepath, unit_scale=unit_scale)
+            detected_unit_scale = entities[0].unit_scale if entities else unit_scale
             segments = entities_to_segments(
                 entities, layer_mapping=layer_mapping,
                 mark_speed=self.marking_speed, transit_speed=self.transit_speed,
             )
         else:
             # CSV and .waypoints: use the parser dispatcher
+            detected_unit_scale = None
             segments = load_mission_segments(filepath)
 
-        return self._plan_from_segments(
+        plan = self._plan_from_segments(
             segments,
             origin=origin,
             start_position=start_position,
@@ -131,6 +159,12 @@ class PathEngine:
             ref_points_gps=ref_points_gps,
             close_loop=close_loop,
         )
+        plan.planning_metadata["source"] = {
+            "filepath": filepath,
+            "extension": ext,
+            "unit_scale_m_per_unit": detected_unit_scale,
+        }
+        return plan
 
     def plan_dxf_entities(
         self,
@@ -167,7 +201,7 @@ class PathEngine:
             entities, layer_mapping=layer_mapping,
             mark_speed=self.marking_speed, transit_speed=self.transit_speed,
         )
-        return self._plan_from_segments(
+        plan = self._plan_from_segments(
             segments,
             origin=origin,
             start_position=start_position,
@@ -177,6 +211,11 @@ class PathEngine:
             ref_points_gps=ref_points_gps,
             close_loop=close_loop,
         )
+        plan.planning_metadata["source"] = {
+            "extension": ".dxf",
+            "unit_scale_m_per_unit": entities[0].unit_scale if entities else None,
+        }
+        return plan
 
     def plan_segments(
         self,
@@ -277,6 +316,10 @@ class PathEngine:
         if not segments:
             return PlannedPath(origin=origin)
 
+        t0 = time.perf_counter()
+        input_segment_count = len(segments)
+        input_waypoint_count = sum(len(seg.points) for seg in segments)
+
         # Deep-copy input segments to avoid mutating caller's data
         segments = [
             PathSegment(
@@ -355,10 +398,57 @@ class PathEngine:
                     seg.metadata["start_tangent"] = (st[0] * cos_t - st[1] * sin_t, st[0] * sin_t + st[1] * cos_t)
                     seg.metadata["end_tangent"] = (et[0] * cos_t - et[1] * sin_t, et[0] * sin_t + et[1] * cos_t)
 
-        # Step 1: Densify segments
+        # Step 1: Smooth sparse MARK geometry before densification. Running this
+        # after densification makes production corners look too short to round.
+        sparse_waypoint_count = sum(len(seg.points) for seg in segments)
+        smoothing_stats = {
+            "enabled": self.corner_smooth_radius_m > 0.0,
+            "radius_m": self.corner_smooth_radius_m,
+            "arc_pts": self.corner_smooth_arc_pts,
+            "segments_smoothed": 0,
+            "vertices_skipped": 0,
+            "waypoints_before": sparse_waypoint_count,
+            "waypoints_after": sparse_waypoint_count,
+        }
+        if self.corner_smooth_radius_m > 0.0:
+            smoothed: list[PathSegment] = []
+            after = 0
+            for seg in segments:
+                geometry_type = str(seg.metadata.get("geometry_type", "")).upper()
+                is_precurved = (
+                    geometry_type in _SMOOTH_SKIP_GEOMETRY_TYPES
+                    or seg.source_entity.startswith(("ARC_", "CIRCLE_", "ELLIPSE_", "SPLINE_"))
+                )
+                if seg.segment_type == SegmentType.MARK and len(seg.points) >= 3 and not is_precurved:
+                    pts, skipped = smooth_corners(
+                        seg.points,
+                        self.corner_smooth_radius_m,
+                        self.corner_smooth_arc_pts,
+                    )
+                    if pts != seg.points:
+                        smoothing_stats["segments_smoothed"] += 1
+                    smoothing_stats["vertices_skipped"] += skipped
+                    new_seg = PathSegment(
+                        segment_type=seg.segment_type,
+                        points=pts,
+                        speed=seg.speed,
+                        segment_id=seg.segment_id,
+                        source_entity=seg.source_entity,
+                        metadata=dict(seg.metadata),
+                    )
+                    smoothed.append(new_seg)
+                    after += len(pts)
+                else:
+                    smoothed.append(seg)
+                    after += len(seg.points)
+            segments = smoothed
+            smoothing_stats["waypoints_after"] = after
+
+        # Step 2: Densify segments
         densified: list[PathSegment] = []
         for seg in segments:
             densified.append(densify_segment(seg, self.mark_spacing, self.transit_spacing))
+        densified_waypoint_count = sum(len(seg.points) for seg in densified)
 
         # Resolve start position for TSP:
         # If we applied alignment, segments' points are already in the target NED frame.
@@ -374,14 +464,27 @@ class PathEngine:
             resolved_start = self._resolve_start_position(densified, origin, start_position)
 
         # Step 2: Optimize segment order (nearest-neighbor TSP with endpoint reversal)
+        optimization_stats = {}
         if self.optimize_order and any(s.segment_type == SegmentType.MARK for s in densified):
             ordered = optimize_segment_order(
                 densified,
                 start_position=resolved_start,
                 transit_speed=self.transit_speed,
+                use_two_opt=self.use_two_opt,
+                max_two_opt_segments=self.max_two_opt_segments,
+                stats=optimization_stats,
             )
         else:
             ordered = densified
+            optimization_stats = {
+                "method": "disabled",
+                "mark_segments": sum(1 for s in densified if s.segment_type == SegmentType.MARK),
+                "deadhead_before_2opt_m": 0.0,
+                "deadhead_after_2opt_m": 0.0,
+                "two_opt_improvements": 0,
+                "two_opt_skipped_reason": "optimization disabled",
+                "max_two_opt_segments": self.max_two_opt_segments,
+            }
 
         # Step 3: Apply drive extensions to line-like MARK segments.
         if self.enable_path_extensions:
@@ -451,6 +554,45 @@ class PathEngine:
                 else:
                     total_transit += d_start_end
 
+        bbox = None
+        if merged_waypoints:
+            norths = [p[0] for p in merged_waypoints]
+            easts = [p[1] for p in merged_waypoints]
+            bbox = {
+                "min_n": min(norths),
+                "max_n": max(norths),
+                "min_e": min(easts),
+                "max_e": max(easts),
+                "width_m": max(easts) - min(easts),
+                "height_m": max(norths) - min(norths),
+            }
+
+        planning_time_s = time.perf_counter() - t0
+        planning_meta = {
+            "input_segments": input_segment_count,
+            "input_waypoints": input_waypoint_count,
+            "densified_waypoints": densified_waypoint_count,
+            "final_segments": len(ordered),
+            "final_waypoints": len(merged_waypoints),
+            "bbox": bbox,
+            "spacing": {
+                "mark_m": self.mark_spacing,
+                "transit_m": self.transit_spacing,
+            },
+            "smoothing": smoothing_stats,
+            "optimization": optimization_stats,
+            "planning_time_s": planning_time_s,
+        }
+        log.info(
+            "planned path in %.3fs: segments %d -> %d, waypoints %d -> %d, length %.2fm",
+            planning_time_s,
+            input_segment_count,
+            len(ordered),
+            input_waypoint_count,
+            len(merged_waypoints),
+            total_mark + total_transit,
+        )
+
         return PlannedPath(
             segments=ordered,
             merged_waypoints=merged_waypoints,
@@ -459,4 +601,5 @@ class PathEngine:
             total_transit_length=total_transit,
             origin=origin if not has_alignment else (0.0, 0.0),
             alignment_metadata=alignment_meta,
+            planning_metadata=planning_meta,
         )

@@ -254,6 +254,12 @@ class PathPlanRequest(BaseModel):
     enable_path_extensions: bool = False  # Add PRE/AFT drive extensions around MARK geometry
     pre_extension_m: float = Field(0.5, ge=0.0)  # Drive-in distance before MARK start (m)
     aft_extension_m: float = Field(0.5, ge=0.0)  # Drive-out distance after MARK end (m)
+    corner_smooth_radius_m: float = Field(0.0, ge=0.0)  # Planner-side corner radius; 0 disables
+    corner_smooth_arc_pts: int = Field(6, ge=2)  # Points per smoothed corner arc
+    use_two_opt: bool = True  # Improve greedy segment order with 2-opt
+    max_two_opt_segments: int = Field(80, ge=0, le=1000)  # Skip 2-opt above this MARK count
+    max_waypoints: int = Field(10000, ge=100, le=500000)  # Hard publication guard
+    max_segments: int = Field(2000, ge=1, le=100000)  # Hard segment-count guard
     include_waypoints: bool = True  # If False, return summary only (no waypoint arrays)
 
 
@@ -270,5 +276,5 @@ class PathPlanResponse(BaseModel):
     merged_waypoints: list[list[float]]  # [[north, east], ...]
     spray_flags: list[bool]  # True = MARK
     alignment_metadata: Optional[dict] = None  # alignment stats/residuals
+    planning_metadata: Optional[dict] = None  # counts/timings/bbox/unit metadata
     warnings: Optional[list[str]] = None  # geometry/safety warnings
-

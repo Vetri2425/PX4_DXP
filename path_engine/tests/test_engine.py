@@ -653,3 +653,138 @@ def test_engine_validation_zero_speed():
         assert False, "Should have raised ValueError"
     except ValueError as e:
         assert "marking_speed" in str(e)
+
+
+def test_engine_planner_side_corner_smoothing_metadata():
+    engine = PathEngine(
+        optimize_order=False,
+        compensate_spray=False,
+        corner_smooth_radius_m=0.3,
+        corner_smooth_arc_pts=6,
+        mark_spacing=0.05,
+    )
+    seg = PathSegment(
+        segment_type=SegmentType.MARK,
+        points=[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0)],
+        speed=0.35,
+    )
+
+    plan = engine.plan_segments([seg])
+
+    smoothing = plan.planning_metadata["smoothing"]
+    assert smoothing["enabled"] is True
+    assert smoothing["segments_smoothed"] == 1
+    assert smoothing["vertices_skipped"] == 0
+    assert plan.num_waypoints > 0
+    assert (2.0, 0.0) not in plan.merged_waypoints
+
+
+def test_engine_does_not_smooth_precurved_arc_segments():
+    engine = PathEngine(
+        optimize_order=False,
+        compensate_spray=False,
+        corner_smooth_radius_m=0.3,
+        corner_smooth_arc_pts=6,
+    )
+    pts = [(0.0, 1.0), (0.1, 0.995), (0.2, 0.98), (0.3, 0.954)]
+    seg = PathSegment(
+        segment_type=SegmentType.MARK,
+        points=pts,
+        speed=0.35,
+        source_entity="ARC_test",
+        metadata={"geometry_type": "ARC"},
+    )
+
+    plan = engine.plan_segments([seg])
+
+    smoothing = plan.planning_metadata["smoothing"]
+    assert smoothing["enabled"] is True
+    assert smoothing["segments_smoothed"] == 0
+    assert smoothing["vertices_skipped"] == 0
+
+
+def test_engine_records_optimization_stats():
+    engine = PathEngine(optimize_order=True, compensate_spray=False)
+    segments = [
+        PathSegment(segment_type=SegmentType.MARK, points=[(0.0, 0.0), (1.0, 0.0)]),
+        PathSegment(segment_type=SegmentType.MARK, points=[(10.0, 0.0), (11.0, 0.0)]),
+        PathSegment(segment_type=SegmentType.MARK, points=[(2.0, 0.0), (3.0, 0.0)]),
+        PathSegment(segment_type=SegmentType.MARK, points=[(8.0, 0.0), (9.0, 0.0)]),
+    ]
+
+    plan = engine.plan_segments(segments)
+    opt = plan.planning_metadata["optimization"]
+
+    assert opt["method"] == "nearest_neighbor_2opt"
+    assert opt["mark_segments"] == 4
+    assert "deadhead_after_2opt_m" in opt
+    assert plan.planning_metadata["planning_time_s"] >= 0.0
+
+
+def test_engine_skips_two_opt_above_segment_cap():
+    engine = PathEngine(
+        optimize_order=True,
+        compensate_spray=False,
+        use_two_opt=True,
+        max_two_opt_segments=3,
+    )
+    segments = [
+        PathSegment(segment_type=SegmentType.MARK, points=[(float(i), 0.0), (float(i), 1.0)])
+        for i in range(4)
+    ]
+
+    plan = engine.plan_segments(segments)
+    opt = plan.planning_metadata["optimization"]
+
+    assert opt["method"] == "nearest_neighbor"
+    assert opt["two_opt_improvements"] == 0
+    assert "exceeds cap" in opt["two_opt_skipped_reason"]
+
+
+def test_engine_smooths_closed_loop_closure_corner():
+    # A closed square stored as one polyline (first == last). The closure corner
+    # at the start/end vertex must be rounded like every other corner.
+    engine = PathEngine(
+        optimize_order=False,
+        compensate_spray=False,
+        corner_smooth_radius_m=0.3,
+        mark_spacing=0.05,
+    )
+    seg = PathSegment(
+        segment_type=SegmentType.MARK,
+        points=[(0.0, 0.0), (0.0, 2.0), (2.0, 2.0), (2.0, 0.0), (0.0, 0.0)],
+        source_entity="LWPOLYLINE_1",
+        metadata={"geometry_type": "LWPOLYLINE"},
+    )
+
+    plan = engine.plan_segments([seg])
+
+    assert plan.planning_metadata["smoothing"]["segments_smoothed"] == 1
+    # No original corner vertex should survive as a sharp point — including closure.
+    for corner in [(0.0, 0.0), (0.0, 2.0), (2.0, 2.0), (2.0, 0.0)]:
+        assert corner not in plan.merged_waypoints
+
+
+def test_optimizer_stats_keys_consistent_single_segment():
+    from path_engine.optimizers.segment_order import optimize_segment_order
+
+    multi_stats: dict = {}
+    optimize_segment_order(
+        [
+            PathSegment(segment_type=SegmentType.MARK, points=[(0.0, 0.0), (1.0, 0.0)]),
+            PathSegment(segment_type=SegmentType.MARK, points=[(5.0, 0.0), (6.0, 0.0)]),
+        ],
+        start_position=(0.0, 0.0),
+        stats=multi_stats,
+    )
+
+    single_stats: dict = {}
+    optimize_segment_order(
+        [PathSegment(segment_type=SegmentType.MARK, points=[(0.0, 0.0), (1.0, 0.0)])],
+        start_position=(0.0, 0.0),
+        stats=single_stats,
+    )
+
+    # Single-segment route must expose the same telemetry keys as the multi route.
+    assert set(multi_stats) == set(single_stats)
+    assert single_stats["two_opt_skipped_reason"] == "single mark segment"

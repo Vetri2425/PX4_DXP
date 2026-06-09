@@ -1,8 +1,9 @@
 """Unit tests for PathValidator."""
 
 import math
+import pytest
 from path_engine.core import PlannedPath
-from path_engine.validator import PathValidator
+from path_engine.validator import PathValidationError, PathValidator
 
 
 def test_validator_empty_path():
@@ -60,3 +61,24 @@ def test_validator_self_intersection():
     warnings = validator.validate(plan)
     assert len(warnings) > 0
     assert any("intersects" in w for w in warnings)
+
+
+def test_validator_hard_fails_waypoint_explosion():
+    validator = PathValidator(max_waypoints=10)
+    plan = PlannedPath(merged_waypoints=[(i * 0.1, 0.0) for i in range(11)])
+
+    warnings, errors = validator.validate_detailed(plan)
+    assert warnings == []
+    assert len(errors) == 1
+    assert "Too many waypoints" in errors[0]
+
+    with pytest.raises(PathValidationError):
+        validator.validate_or_raise(plan)
+
+
+def test_validator_warns_near_waypoint_limit():
+    validator = PathValidator(max_waypoints=10)
+    plan = PlannedPath(merged_waypoints=[(float(i), 0.0) for i in range(9)])
+
+    warnings = validator.validate_or_raise(plan)
+    assert any("High waypoint count" in w for w in warnings)

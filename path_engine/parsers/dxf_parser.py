@@ -510,6 +510,9 @@ def entities_to_segments(
                     speed=speed,
                     segment_id=seg_id,
                     source_entity=f"LWPOLYLINE_{ent.entity_id}",
+                    metadata={
+                        "geometry_type": "LWPOLYLINE_BULGE" if has_bulge else "LWPOLYLINE",
+                    },
                 ))
                 seg_id += 1
                 total_waypoints += len(pts)

@@ -330,6 +330,12 @@ class PathManager:
         enable_path_extensions = kwargs.pop("enable_path_extensions", False)
         pre_extension_m = kwargs.pop("pre_extension_m", 0.5)
         aft_extension_m = kwargs.pop("aft_extension_m", 0.5)
+        corner_smooth_radius_m = kwargs.pop("corner_smooth_radius_m", 0.0)
+        corner_smooth_arc_pts = kwargs.pop("corner_smooth_arc_pts", 6)
+        use_two_opt = kwargs.pop("use_two_opt", True)
+        max_two_opt_segments = kwargs.pop("max_two_opt_segments", 80)
+        max_waypoints = kwargs.pop("max_waypoints", 10000)
+        max_segments = kwargs.pop("max_segments", 2000)
         line_spacing = kwargs.pop("line_spacing", 0.05)
         transit_spacing = kwargs.pop("transit_spacing", 0.15)
         marking_speed = kwargs.pop("marking_speed", 0.35)
@@ -366,8 +372,22 @@ class PathManager:
                     "length_m": round(mark_length, 3),
                 }] if shifted else [],
                 "alignment_metadata": {},
+                "planning_metadata": {
+                    "source": {"kind": "builtin", "name": name},
+                    "final_waypoints": len(shifted),
+                    "final_segments": 1 if shifted else 0,
+                },
                 "warnings": [],
             }
+            from path_engine.core import PlannedPath, PathSegment, SegmentType
+            from path_engine.validator import PathValidator
+            plan = PlannedPath(
+                segments=[PathSegment(segment_type=SegmentType.MARK, points=shifted)] if shifted else [],
+                merged_waypoints=shifted,
+                spray_flags=[True] * len(shifted),
+            )
+            validator = PathValidator(max_waypoints=max_waypoints, max_segments=max_segments)
+            result["warnings"] = validator.validate_or_raise(plan)
             if not summary_only:
                 result["merged_waypoints"] = shifted
                 result["spray_flags"] = [True] * len(shifted)
@@ -385,6 +405,10 @@ class PathManager:
             enable_path_extensions=enable_path_extensions,
             pre_extension_m=pre_extension_m,
             aft_extension_m=aft_extension_m,
+            corner_smooth_radius_m=corner_smooth_radius_m,
+            corner_smooth_arc_pts=corner_smooth_arc_pts,
+            use_two_opt=use_two_opt,
+            max_two_opt_segments=max_two_opt_segments,
         )
 
         # Resolve file path
@@ -405,8 +429,8 @@ class PathManager:
             raise FileNotFoundError(f"Path not found: {name!r}")
 
         # Run safety validation check
-        validator = PathValidator()
-        warnings = validator.validate(plan)
+        validator = PathValidator(max_waypoints=max_waypoints, max_segments=max_segments)
+        warnings = validator.validate_or_raise(plan)
 
         result = {
             "source": source_name,
@@ -424,7 +448,8 @@ class PathManager:
                 }
                 for s in plan.segments
             ],
-            "alignment_metadata": plan.alignment_metadata,
+            "alignment_metadata": getattr(plan, "alignment_metadata", {}),
+            "planning_metadata": getattr(plan, "planning_metadata", {}),
             "warnings": warnings,
         }
 

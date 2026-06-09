@@ -93,7 +93,13 @@ def test_path_manager_passes_extension_flags_to_engine(tmp_path, monkeypatch):
             )
 
     class FakeValidator:
+        def __init__(self, *args, **kwargs):
+            pass
+
         def validate(self, plan):
+            return []
+
+        def validate_or_raise(self, plan):
             return []
 
     import path_engine.engine as engine_module

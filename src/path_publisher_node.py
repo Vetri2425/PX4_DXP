@@ -69,9 +69,11 @@ from std_msgs.msg import Bool, Float32
 
 try:
     from path_engine import PathEngine as _PathEngine
+    from path_engine.validator import PathValidator as _PathValidator
     _HAS_PATH_ENGINE = True
 except ImportError:
     _PathEngine = None  # type: ignore[assignment,misc]
+    _PathValidator = None  # type: ignore[assignment,misc]
     _HAS_PATH_ENGINE = False
 
 _logger = logging.getLogger("path_publisher")
@@ -326,6 +328,7 @@ class PathPublisherNode(Node):
         self.declare_parameter("mission_file", "")  # empty = use path_name
         self.declare_parameter("frame_id", "local_ned")
         self.declare_parameter("publish_delay_s", 1.0)
+        self.declare_parameter("max_waypoints", 10000)
         # auto_origin: offset path to start at rover's current EKF position.
         # Waits for /mavros/local_position/pose before publishing.
         self.declare_parameter("auto_origin", False)
@@ -453,6 +456,12 @@ class PathPublisherNode(Node):
                         origin=origin,
                         start_position=self._start_position,
                     )
+                    if _PathValidator is not None:
+                        warnings = _PathValidator(
+                            max_waypoints=int(self.get_parameter("max_waypoints").value)
+                        ).validate_or_raise(plan)
+                        for warning in warnings:
+                            self.get_logger().warning(f"Path validation warning: {warning}")
                     pts = plan.merged_waypoints
                     spray_flags = plan.spray_flags
                     origin_applied_by_engine = origin != (0.0, 0.0)
@@ -475,6 +484,14 @@ class PathPublisherNode(Node):
 
         if not pts:
             self.get_logger().error("No waypoints loaded — nothing to publish")
+            return
+
+        max_waypoints = int(self.get_parameter("max_waypoints").value)
+        if len(pts) > max_waypoints:
+            self.get_logger().error(
+                f"Refusing to publish {len(pts)} waypoints; max_waypoints={max_waypoints}. "
+                "Increase spacing, fix units, or simplify the mission."
+            )
             return
 
         # Apply auto-origin offset if enabled

@@ -130,6 +130,8 @@ class PlannedPath:
         total_mark_length: Total metres of spray-on path.
         total_transit_length: Total metres of dead-heading.
         origin: (north_m, east_m) NED origin used for lat/lon conversion.
+        alignment_metadata: Alignment stats/residuals from GPS/DXF reference points.
+        planning_metadata: Counts/timings/sanity metadata from the planning run.
     """
     segments: list[PathSegment] = field(default_factory=list)
     merged_waypoints: list[tuple[float, float]] = field(default_factory=list)
@@ -138,6 +140,7 @@ class PlannedPath:
     total_transit_length: float = 0.0
     origin: tuple[float, float] = (0.0, 0.0)
     alignment_metadata: dict = field(default_factory=dict)
+    planning_metadata: dict = field(default_factory=dict)
 
     @property
     def num_waypoints(self) -> int:
