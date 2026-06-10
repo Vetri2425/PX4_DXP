@@ -90,3 +90,4 @@ firmware/
 
 # GCS analysis scripts (local reference only, not tracked)
 tools/analysis/
+*.bak
