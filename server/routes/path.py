@@ -43,6 +43,7 @@ from models import (
     DXFEntityInfo,
     DXFParseResponse,
     EntityExtensionPreview,
+    EntityTransitPreview,
     LoadMissionRequest,
     MissionSummary,
     PathExtensionConfig,
@@ -194,6 +195,30 @@ def _entity_extension_preview(
     )
 
 
+def _entity_transit_previews(
+    mark_endpoints: list[tuple[str, tuple[float, float], tuple[float, float]]],
+) -> list[EntityTransitPreview]:
+    """Straight no-spray connectors between consecutive MARK entities.
+
+    *mark_endpoints* is (entity_id, first_pt, last_pt) per drawable MARK
+    entity, in DXF/entity order. Callers must already have dropped entities
+    with no preview points, so a degenerate entity cannot break the chain —
+    its drawable neighbours still get connected, like the planner would.
+    """
+    transits = []
+    for (from_id, _, start), (to_id, end, _) in zip(mark_endpoints, mark_endpoints[1:]):
+        length = math.hypot(end[0] - start[0], end[1] - start[1])
+        if length < 1e-9:
+            continue
+        transits.append(EntityTransitPreview(
+            from_entity_id=from_id,
+            to_entity_id=to_id,
+            length_m=round(length, 3),
+            points=[_ned_point(start), _ned_point(end)],
+        ))
+    return transits
+
+
 def _entity_length_m(ent) -> float:
     geom = ent.geometry
     etype = ent.entity_type
@@ -326,11 +351,16 @@ async def path_entities(name: str):
     overrides = await asyncio.to_thread(path_mgr.load_entity_overrides, safe)
     extension_config_data = await asyncio.to_thread(path_mgr.load_extension_config, safe)
     extension_config = PathExtensionConfig(**extension_config_data)
+    # (entity_id, first_pt, last_pt) per drawable MARK entity — endpoints
+    # only, so large per-entity point lists aren't retained past the loop.
+    mark_endpoints: list[tuple[str, tuple[float, float], tuple[float, float]]] = []
     for ent in entities:
         pts = _entity_preview_tuples(ent)
         all_pts.extend(pts)
         default_is_mark = ent.is_mark()
         is_mark = overrides.get(ent.entity_id, default_is_mark)
+        if is_mark and pts:
+            mark_endpoints.append((ent.entity_id, pts[0], pts[-1]))
         extension_preview = _entity_extension_preview(
             ent,
             pts,
@@ -360,6 +390,10 @@ async def path_entities(name: str):
             extension_preview=extension_preview,
         ))
 
+    # Transit connectors join entity endpoints that are already in all_pts,
+    # so bounds cover them without re-adding the points.
+    transit_preview = _entity_transit_previews(mark_endpoints)
+
     bounds = None
     if all_pts:
         norths = [n for n, _ in all_pts]
@@ -376,6 +410,7 @@ async def path_entities(name: str):
         num_entities=len(previews),
         bounds=bounds,
         extension_config=extension_config,
+        transit_preview=transit_preview,
         entities=previews,
     )
 

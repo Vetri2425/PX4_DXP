@@ -269,7 +269,17 @@ class DXFEntitiesResponse(BaseModel):
     num_entities: int
     bounds: Optional[PathPreviewBounds] = None
     extension_config: Optional["PathExtensionConfig"] = None
+    transit_preview: list["EntityTransitPreview"] = Field(default_factory=list)
     entities: list[DXFEntityPreview]
+
+
+class EntityTransitPreview(BaseModel):
+    """Lightweight no-spray connector between consecutive MARK entities."""
+
+    from_entity_id: str
+    to_entity_id: str
+    length_m: float = 0.0
+    points: list[EntityPreviewPoint]
 
 
 class EntityExtensionPreview(BaseModel):

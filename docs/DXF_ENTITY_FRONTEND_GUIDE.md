@@ -79,6 +79,17 @@ Important response fields:
     "pre_extension_m": 0.5,
     "aft_extension_m": 0.5
   },
+  "transit_preview": [
+    {
+      "from_entity_id": "9E",
+      "to_entity_id": "9F",
+      "length_m": 2.0,
+      "points": [
+        { "north": 0.0, "east": 105.0 },
+        { "north": 2.0, "east": 105.0 }
+      ]
+    }
+  ],
   "entities": [
     {
       "entity_id": "9E",
@@ -115,6 +126,8 @@ Frontend use:
 - Use `geometry` for exact anchors such as line endpoints or circle centers.
 - Use `default_is_mark` to show the original backend/layer decision.
 - Use `is_mark` as the current operator-edited spray state.
+- Use top-level `transit_preview` to draw no-spray connector lines between
+  consecutive effective MARK entities in DXF/entity order.
 
 Coordinate frame:
 
@@ -247,6 +260,38 @@ Frontend rendering recommendation:
 - Include extension points when fitting the canvas. The endpoint already expands
   top-level `bounds` to include extension preview points.
 
+## Entity-to-Entity Transit Preview
+
+`GET /entities` also returns a top-level `transit_preview` array. This is the
+lightweight no-spray connector between consecutive entities whose effective
+`is_mark` is `true`.
+
+Example:
+
+```json
+{
+  "transit_preview": [
+    {
+      "from_entity_id": "A1",
+      "to_entity_id": "A2",
+      "length_m": 2.0,
+      "points": [
+        { "north": 1.0, "east": 0.0 },
+        { "north": 1.0, "east": 2.0 }
+      ]
+    }
+  ]
+}
+```
+
+Frontend rendering recommendation:
+
+- Draw `transit_preview[].points` as no-spray/transit style.
+- Treat it as a fast selection-screen preview, not the final optimized route.
+- The full planned transit/deadhead path still comes from `GET /preview` or
+  `POST /plan`, because those endpoints run the planner and return waypoint
+  `spray`/`spray_flags`.
+
 ## Planning Contract
 
 The frontend should not send extension fields in `/api/path/plan`.
@@ -271,4 +316,3 @@ Not this:
 
 Those `/plan` fields are deprecated for API use. The planner reads the saved
 extension config for the file.
-

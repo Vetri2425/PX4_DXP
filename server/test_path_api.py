@@ -294,6 +294,125 @@ async def test_entities_api_includes_extension_preview(tmp_path, monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_entities_api_includes_entity_to_entity_transit_preview(tmp_path, monkeypatch):
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            assert filepath == str(mission_file)
+            return [
+                SimpleNamespace(
+                    entity_id="A1",
+                    entity_type="LINE",
+                    layer="MARKINGS",
+                    color=7,
+                    geometry={
+                        "start": (0.0, 0.0),
+                        "end": (1.0, 0.0),
+                    },
+                    is_mark=lambda: True,
+                ),
+                SimpleNamespace(
+                    entity_id="A2",
+                    entity_type="LINE",
+                    layer="MARKINGS",
+                    color=7,
+                    geometry={
+                        "start": (1.0, 2.0),
+                        "end": (2.0, 2.0),
+                    },
+                    is_mark=lambda: True,
+                ),
+            ]
+
+        def load_entity_overrides(self, filename):
+            return {}
+
+        def load_extension_config(self, filename):
+            return {
+                "enabled": False,
+                "pre_extension_m": 0.5,
+                "aft_extension_m": 0.5,
+            }
+
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    data = await path_entities("field.dxf")
+
+    assert len(data.transit_preview) == 1
+    transit = data.transit_preview[0]
+    assert transit.from_entity_id == "A1"
+    assert transit.to_entity_id == "A2"
+    assert transit.length_m == 2.0
+    assert [pt.model_dump() for pt in transit.points] == [
+        {"north": 1.0, "east": 0.0},
+        {"north": 1.0, "east": 2.0},
+    ]
+
+
+@pytest.mark.anyio
+async def test_transit_preview_skips_pointless_mark_entity_without_breaking_chain(
+    tmp_path, monkeypatch
+):
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+
+    def line(entity_id, start, end):
+        return SimpleNamespace(
+            entity_id=entity_id,
+            entity_type="LINE",
+            layer="MARKINGS",
+            color=7,
+            geometry={"start": start, "end": end},
+            is_mark=lambda: True,
+        )
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            return [
+                line("A1", (0.0, 0.0), (1.0, 0.0)),
+                # MARK entity with no drawable preview points (unsupported
+                # geometry type) — must not break the transit chain.
+                SimpleNamespace(
+                    entity_id="A2",
+                    entity_type="SOLID",
+                    layer="MARKINGS",
+                    color=7,
+                    geometry={},
+                    is_mark=lambda: True,
+                ),
+                line("A3", (3.0, 0.0), (4.0, 0.0)),
+            ]
+
+        def load_entity_overrides(self, filename):
+            return {}
+
+        def load_extension_config(self, filename):
+            return {
+                "enabled": False,
+                "pre_extension_m": 0.5,
+                "aft_extension_m": 0.5,
+            }
+
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    data = await path_entities("field.dxf")
+
+    # A1 and A3 connect across the degenerate A2, like the planner would.
+    assert [(t.from_entity_id, t.to_entity_id) for t in data.transit_preview] == [
+        ("A1", "A3"),
+    ]
+    assert data.transit_preview[0].length_m == 2.0
+
+
+@pytest.mark.anyio
 async def test_save_entities_api_persists_overrides(monkeypatch):
     from models import DXFEntityOverridesRequest, EntityMarkOverride
 
