@@ -1,16 +1,17 @@
 #!/bin/bash
-# RPP Pipeline startup — runs the three always-on controller nodes.
+# RPP Pipeline startup — runs the four always-on controller nodes.
 #
 # Nodes started:
 #   1. twist_to_setpoint_node.py  — 50 Hz OFFBOARD heartbeat (must start first)
 #   2. rpp_controller_node.py     — Regulated Pure Pursuit path follower
-#   3. xtrack_logger_node.py      — CSV telemetry capture for tuning
+#   3. spray_controller_node.py   — MARK actuator via MAV_CMD_DO_SET_ACTUATOR
+#   4. xtrack_logger_node.py      — CSV telemetry capture for tuning
 #
 # NOT started here (server-driven):
 #   - path_publisher_node.py      — server publishes /path directly
 #   - mission_runner_node.py      — server owns OFFBOARD lifecycle
 #
-# Watchdog: if any node dies, it is restarted. If all three die within
+# Watchdog: if any node dies, it is restarted. If all nodes die within
 # FAIL_WINDOW seconds, the script exits (systemd restarts the whole service).
 
 set -euo pipefail
@@ -109,17 +110,19 @@ record_fail() {
 # ── Kill stale instances ──────────────────────────────────────────────────────
 pkill -f "twist_to_setpoint_node" 2>/dev/null || true
 pkill -f "rpp_controller_node" 2>/dev/null || true
+pkill -f "spray_controller_node" 2>/dev/null || true
 pkill -f "xtrack_logger_node" 2>/dev/null || true
 sleep 1
 
 # ── Start nodes in order ──────────────────────────────────────────────────────
 log "====================================================="
 log " RPP Pipeline Starting"
-log " Nodes: twist_to_setpoint, rpp_controller, xtrack_logger"
+log " Nodes: twist_to_setpoint, rpp_controller, spray_controller, xtrack_logger"
 log "====================================================="
 
 start_node "twist_to_setpoint" "${SRC_DIR}/twist_to_setpoint_node.py"
 start_node "rpp_controller" "${SRC_DIR}/rpp_controller_node.py"
+start_node "spray_controller" "${SRC_DIR}/spray_controller_node.py"
 start_node "xtrack_logger" "${SRC_DIR}/xtrack_logger_node.py"
 
 log "All RPP nodes started. Entering watchdog loop..."
@@ -130,7 +133,7 @@ while true; do
     # If a shutdown signal arrived during the sleep, stop — never resurrect
     # nodes that cleanup() is tearing down.
     [[ "$SHUTTING_DOWN" -eq 1 ]] && break
-    for name in "twist_to_setpoint" "rpp_controller" "xtrack_logger"; do
+    for name in "twist_to_setpoint" "rpp_controller" "spray_controller" "xtrack_logger"; do
         local_pid="${NODE_PIDS[$name]:-}"
         if [[ -z "$local_pid" ]] || ! kill -0 "$local_pid" 2>/dev/null; then
             log "WARNING: $name died — restarting in ${NODE_RESTART_DELAY}s..."
@@ -139,6 +142,7 @@ while true; do
             case "$name" in
                 twist_to_setpoint) start_node "$name" "${SRC_DIR}/twist_to_setpoint_node.py" ;;
                 rpp_controller)    start_node "$name" "${SRC_DIR}/rpp_controller_node.py" ;;
+                spray_controller)  start_node "$name" "${SRC_DIR}/spray_controller_node.py" ;;
                 xtrack_logger)     start_node "$name" "${SRC_DIR}/xtrack_logger_node.py" ;;
             esac
         fi
