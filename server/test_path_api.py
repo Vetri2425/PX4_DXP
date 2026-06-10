@@ -8,7 +8,14 @@ import pytest
 from fastapi import HTTPException
 from types import SimpleNamespace
 from models import MissionState, PathPlanRequest, PathPreviewResponse, RefPoint
-from routes.path import path_entities, plan_path, preview_path
+from routes.path import (
+    get_path_extensions,
+    path_entities,
+    plan_path,
+    preview_path,
+    save_path_entity_overrides,
+    save_path_extensions,
+)
 import main
 from path_manager import PathManager
 
@@ -147,6 +154,16 @@ async def test_entities_api_returns_line_preview_points(tmp_path, monkeypatch):
                 )
             ]
 
+        def load_entity_overrides(self, filename):
+            return {}
+
+        def load_extension_config(self, filename):
+            return {
+                "enabled": False,
+                "pre_extension_m": 0.5,
+                "aft_extension_m": 0.5,
+            }
+
     import routes.path as path_route
 
     monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
@@ -169,6 +186,309 @@ async def test_entities_api_returns_line_preview_points(tmp_path, monkeypatch):
     ]
 
 
+def test_path_manager_saves_entity_overrides(tmp_path):
+    from path_engine.core import DXFEntity
+
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+    mgr = PathManager(str(tmp_path))
+    mgr.parse_dxf = lambda *args, **kwargs: [
+        DXFEntity(entity_type="LINE", layer="MARKINGS", entity_id="A1")
+    ]
+
+    saved = mgr.save_entity_overrides("field.dxf", {"A1": False})
+
+    assert saved == 1
+    assert mgr.load_entity_overrides("field.dxf") == {"A1": False}
+
+
+@pytest.mark.anyio
+async def test_entities_api_applies_saved_mark_override(tmp_path, monkeypatch):
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            assert filepath == str(mission_file)
+            return [
+                SimpleNamespace(
+                    entity_id="A1",
+                    entity_type="LINE",
+                    layer="MARKINGS",
+                    color=7,
+                    geometry={
+                        "start": (0.0, 0.0),
+                        "end": (1.0, 0.0),
+                    },
+                    is_mark=lambda: True,
+                )
+            ]
+
+        def load_entity_overrides(self, filename):
+            return {"A1": False}
+
+        def load_extension_config(self, filename):
+            return {
+                "enabled": False,
+                "pre_extension_m": 0.5,
+                "aft_extension_m": 0.5,
+            }
+
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    data = await path_entities("field.dxf")
+
+    assert data.entities[0].default_is_mark is True
+    assert data.entities[0].is_mark is False
+
+
+@pytest.mark.anyio
+async def test_entities_api_includes_extension_preview(tmp_path, monkeypatch):
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            assert filepath == str(mission_file)
+            return [
+                SimpleNamespace(
+                    entity_id="A1",
+                    entity_type="LINE",
+                    layer="MARKINGS",
+                    color=7,
+                    geometry={
+                        "start": (0.0, 0.0),
+                        "end": (1.0, 0.0),
+                    },
+                    is_mark=lambda: True,
+                )
+            ]
+
+        def load_entity_overrides(self, filename):
+            return {}
+
+        def load_extension_config(self, filename):
+            return {
+                "enabled": True,
+                "pre_extension_m": 0.5,
+                "aft_extension_m": 0.25,
+            }
+
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    data = await path_entities("field.dxf")
+
+    ext = data.entities[0].extension_preview
+    assert data.extension_config.enabled is True
+    assert ext.enabled is True
+    assert ext.pre_points[0].north == -0.5
+    assert ext.aft_points[-1].north == 1.25
+    assert data.bounds.north_min == -0.5
+    assert data.bounds.north_max == 1.25
+
+
+@pytest.mark.anyio
+async def test_save_entities_api_persists_overrides(monkeypatch):
+    from models import DXFEntityOverridesRequest, EntityMarkOverride
+
+    captured = {}
+
+    class FakePathManager:
+        def save_entity_overrides(self, name, overrides):
+            captured["name"] = name
+            captured["overrides"] = overrides
+            return len(overrides)
+
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    data = await save_path_entity_overrides(
+        "field.dxf",
+        DXFEntityOverridesRequest(
+            overrides=[EntityMarkOverride(entity_id="A1", is_mark=False)]
+        ),
+    )
+
+    assert data.name == "field.dxf"
+    assert data.num_overrides == 1
+    assert captured["overrides"] == {"A1": False}
+
+
+def test_path_manager_saves_extension_config(tmp_path):
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+
+    mgr = PathManager(str(tmp_path))
+    saved = mgr.save_extension_config("field.dxf", True, 0.4, 0.6)
+
+    assert saved == {
+        "enabled": True,
+        "pre_extension_m": 0.4,
+        "aft_extension_m": 0.6,
+    }
+    assert mgr.load_extension_config("field.dxf") == saved
+
+
+@pytest.mark.anyio
+async def test_extension_config_api_round_trip(tmp_path, monkeypatch):
+    from models import PathExtensionConfig
+
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+
+    mgr = PathManager(str(tmp_path))
+
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", mgr)
+
+    saved = await save_path_extensions(
+        "field.dxf",
+        PathExtensionConfig(
+            enabled=True,
+            pre_extension_m=0.4,
+            aft_extension_m=0.6,
+        ),
+    )
+    loaded = await get_path_extensions("field.dxf")
+
+    assert saved.name == "field.dxf"
+    assert saved.enabled is True
+    assert loaded.pre_extension_m == 0.4
+    assert loaded.aft_extension_m == 0.6
+
+
+def test_path_manager_plan_applies_entity_overrides(tmp_path, monkeypatch):
+    from path_engine.core import DXFEntity, PathSegment, SegmentType
+
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+    captured = {}
+
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            pass
+
+        def plan_dxf_entities(self, entities, **kwargs):
+            captured["is_mark"] = [ent.is_mark() for ent in entities]
+            return SimpleNamespace(
+                num_waypoints=2,
+                segments=[
+                    PathSegment(
+                        segment_type=SegmentType.TRANSIT,
+                        points=[(0.0, 0.0), (1.0, 0.0)],
+                    )
+                ],
+                total_mark_length=0.0,
+                total_transit_length=1.0,
+                total_length=1.0,
+                alignment_metadata={},
+                planning_metadata={},
+                merged_waypoints=[(0.0, 0.0), (1.0, 0.0)],
+                spray_flags=[False, False],
+            )
+
+    class FakeValidator:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def validate_or_raise(self, plan):
+            return []
+
+    import path_engine.engine as engine_module
+    import path_engine.validator as validator_module
+
+    monkeypatch.setattr(engine_module, "PathEngine", FakeEngine)
+    monkeypatch.setattr(validator_module, "PathValidator", FakeValidator)
+
+    mgr = PathManager(str(tmp_path))
+    mgr.parse_dxf = lambda *args, **kwargs: [
+        DXFEntity(entity_type="LINE", layer="MARKINGS", entity_id="A1")
+    ]
+    mgr.save_entity_overrides("field.dxf", {"A1": False})
+
+    result = mgr.plan_path("field.dxf")
+
+    assert captured["is_mark"] == [False]
+    assert result["spray_flags"] == [False, False]
+    assert result["planning_metadata"]["entity_overrides"]["num_overrides"] == 1
+
+
+def test_entity_override_never_beats_ignore_classification():
+    from path_engine.core import DXFEntity
+
+    ent = DXFEntity(entity_type="LINE", layer="MARKINGS", entity_id="A1")
+    ent.is_mark_override = True
+
+    # Override decides MARK/TRANSIT when the entity is plannable...
+    assert ent.classify() == "mark"
+    ent.is_mark_override = False
+    assert ent.classify() == "transit"
+    assert ent.is_mark() is False
+
+    # ...but an 'ignore' layer mapping always wins: ignored entities must
+    # never be planned, overridden or not.
+    ent.is_mark_override = True
+    assert ent.classify({"MARKINGS": "ignore"}) == "ignore"
+
+
+def test_entity_extension_directions_use_analytic_arc_tangents():
+    from path_engine.core import DXFEntity
+    from path_engine.planners.extensions import entity_extension_directions
+
+    # Quarter arc 0°→90°. CCW tangent at θ in (north, east) is (cos θ, -sin θ):
+    # preview directions must come from the same formula the planner uses,
+    # not from finite differences of densified preview points.
+    ent = DXFEntity(
+        entity_type="ARC",
+        layer="MARKINGS",
+        entity_id="A1",
+        geometry={"center": (0.0, 0.0), "radius": 1.0,
+                  "start_angle": 0.0, "end_angle": 90.0},
+    )
+    dirs = entity_extension_directions(ent, [])
+    assert dirs is not None
+    start_dir, end_dir = dirs
+    assert start_dir == pytest.approx((1.0, 0.0))
+    assert end_dir == pytest.approx((0.0, -1.0))
+
+    # POINT entities get no extension, matching the planner guard.
+    point = DXFEntity(entity_type="POINT", layer="MARKINGS", entity_id="P1",
+                      geometry={"position": (0.0, 0.0)})
+    assert entity_extension_directions(point, [(0.0, 0.0), (0.0, 0.0)]) is None
+
+
+def test_parse_dxf_cache_returns_pristine_copies(tmp_path, monkeypatch):
+    from path_engine.core import DXFEntity
+    import path_engine.parsers.dxf_parser as dxf_parser_module
+
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+    calls = {"n": 0}
+
+    def fake_parse(filepath, unit_scale=None, layer_mapping=None):
+        calls["n"] += 1
+        return [DXFEntity(entity_type="LINE", layer="MARKINGS", entity_id="A1")]
+
+    monkeypatch.setattr(dxf_parser_module, "parse_dxf", fake_parse)
+
+    mgr = PathManager(str(tmp_path))
+    first = mgr.parse_dxf(str(mission_file))
+    PathManager.apply_entity_overrides(first, {"A1": False})
+    second = mgr.parse_dxf(str(mission_file))
+
+    assert calls["n"] == 1  # second call served from cache
+    # Override stamped on the first copy must not leak into later parses.
+    assert first[0].is_mark_override is False
+    assert second[0].is_mark_override is None
+
+
 def test_path_plan_request_extension_defaults_are_safe():
     req = PathPlanRequest(source="soccer_field_penalty_area.dxf")
 
@@ -186,7 +506,7 @@ def test_path_plan_request_rejects_negative_extensions():
 
 
 @pytest.mark.anyio
-async def test_plan_api_passes_extension_flags(monkeypatch):
+async def test_plan_api_does_not_pass_extension_flags(monkeypatch):
     captured = {}
 
     class FakePathManager:
@@ -220,9 +540,11 @@ async def test_plan_api_passes_extension_flags(monkeypatch):
     data = await plan_path(req)
 
     assert data.source == "soccer_field_penalty_area.dxf"
-    assert captured["kwargs"]["enable_path_extensions"] is True
-    assert captured["kwargs"]["pre_extension_m"] == 0.25
-    assert captured["kwargs"]["aft_extension_m"] == 0.75
+    assert "enable_path_extensions" not in captured["kwargs"]
+    assert "pre_extension_m" not in captured["kwargs"]
+    assert "aft_extension_m" not in captured["kwargs"]
+    # Old clients setting the deprecated fields must be told they were ignored.
+    assert any("deprecated" in w.lower() for w in (data.warnings or []))
 
 
 def test_path_manager_passes_extension_flags_to_engine(tmp_path, monkeypatch):

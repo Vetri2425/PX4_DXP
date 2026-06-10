@@ -6,7 +6,9 @@ package.
 """
 from __future__ import annotations
 
+import copy
 import csv
+import json
 import math
 import os
 from functools import lru_cache
@@ -238,6 +240,181 @@ class PathManager:
         # preview planning can be expensive; unchanged files can reuse the
         # already materialized response.
         self._preview_cache: dict[str, tuple[int, int, PathPreviewResponse]] = {}
+        # Parsed-entity cache: fpath -> (mtime_ns, size, [DXFEntity]). A full
+        # ezdxf parse can take seconds on large files and runs for the
+        # entities endpoint, override save validation, preview, and planning.
+        # Cached entries are pristine; callers get per-entity shallow copies
+        # so apply_entity_overrides() never mutates the cached objects.
+        self._entity_cache: dict[str, tuple[int, int, list]] = {}
+
+    def _require_dxf(self, filename: str, what: str) -> tuple[str, str]:
+        """Validate *filename* is an existing .dxf in the missions dir.
+
+        Returns (safe_basename, fpath). Raises FileNotFoundError / ValueError.
+        """
+        safe = os.path.basename(filename)
+        fpath = os.path.join(self._dir, safe)
+        if not os.path.isfile(fpath):
+            raise FileNotFoundError(f"Path not found: {filename!r}")
+        if os.path.splitext(fpath)[1].lower() != ".dxf":
+            raise ValueError(f"{what} only available for DXF files")
+        return safe, fpath
+
+    @staticmethod
+    def _write_sidecar(sidecar: str, payload: dict) -> None:
+        """Atomically write a JSON sidecar (tmp + os.replace)."""
+        tmp = sidecar + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, sort_keys=True)
+        os.replace(tmp, sidecar)
+
+    @staticmethod
+    def _entity_overrides_path(fpath: str) -> str:
+        """Hidden sidecar path for per-entity spray overrides."""
+        dirname = os.path.dirname(fpath)
+        basename = os.path.basename(fpath)
+        return os.path.join(dirname, f".{basename}.entities.json")
+
+    @staticmethod
+    def _extension_config_path(fpath: str) -> str:
+        """Hidden sidecar path for per-file extension settings."""
+        dirname = os.path.dirname(fpath)
+        basename = os.path.basename(fpath)
+        return os.path.join(dirname, f".{basename}.extensions.json")
+
+    def load_extension_config(self, filename: str) -> dict[str, float | bool]:
+        """Load saved path extension config for a mission file."""
+        default = {
+            "enabled": False,
+            "pre_extension_m": 0.5,
+            "aft_extension_m": 0.5,
+        }
+        fpath = os.path.join(self._dir, os.path.basename(filename))
+        sidecar = self._extension_config_path(fpath)
+        try:
+            with open(sidecar, encoding="utf-8") as f:
+                payload = json.load(f)
+        except FileNotFoundError:
+            return default
+        except (OSError, ValueError) as exc:
+            log.warning("ignoring invalid extension config sidecar %s: %s", sidecar, exc)
+            return default
+
+        try:
+            pre = float(payload.get("pre_extension_m", default["pre_extension_m"]))
+            aft = float(payload.get("aft_extension_m", default["aft_extension_m"]))
+        except (TypeError, ValueError):
+            return default
+        if pre < 0.0 or aft < 0.0:
+            return default
+        return {
+            "enabled": bool(payload.get("enabled", default["enabled"])),
+            "pre_extension_m": pre,
+            "aft_extension_m": aft,
+        }
+
+    def save_extension_config(
+        self,
+        filename: str,
+        enabled: bool,
+        pre_extension_m: float,
+        aft_extension_m: float,
+    ) -> dict[str, float | bool]:
+        """Persist path extension config for a DXF mission file."""
+        safe, fpath = self._require_dxf(filename, "Path extensions are")
+        if pre_extension_m < 0.0:
+            raise ValueError("pre_extension_m must be >= 0.0")
+        if aft_extension_m < 0.0:
+            raise ValueError("aft_extension_m must be >= 0.0")
+
+        config = {
+            "enabled": bool(enabled),
+            "pre_extension_m": float(pre_extension_m),
+            "aft_extension_m": float(aft_extension_m),
+        }
+        self._write_sidecar(
+            self._extension_config_path(fpath),
+            {"source": safe, **config},
+        )
+        self._preview_cache.pop(fpath, None)
+        return config
+
+    def clear_extension_config(self, filename: str) -> None:
+        """Remove saved extension config for a mission file, if present."""
+        fpath = os.path.join(self._dir, os.path.basename(filename))
+        sidecar = self._extension_config_path(fpath)
+        try:
+            os.remove(sidecar)
+        except FileNotFoundError:
+            pass
+
+    def load_entity_overrides(self, filename: str) -> dict[str, bool]:
+        """Load saved entity_id -> is_mark overrides for a mission file."""
+        fpath = os.path.join(self._dir, os.path.basename(filename))
+        sidecar = self._entity_overrides_path(fpath)
+        try:
+            with open(sidecar, encoding="utf-8") as f:
+                payload = json.load(f)
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            log.warning("ignoring invalid entity override sidecar %s: %s", sidecar, exc)
+            return {}
+
+        raw = payload.get("overrides", {})
+        if not isinstance(raw, dict):
+            return {}
+        overrides: dict[str, bool] = {}
+        for entity_id, value in raw.items():
+            # Canonical shape (the only one save_entity_overrides writes):
+            # {"<entity_id>": {"is_mark": bool}}. Anything else is corrupt —
+            # skip it loudly rather than guessing a spray decision.
+            if isinstance(value, dict) and isinstance(value.get("is_mark"), bool):
+                overrides[str(entity_id)] = value["is_mark"]
+            else:
+                log.warning(
+                    "ignoring malformed entity override %r=%r in %s",
+                    entity_id, value, sidecar,
+                )
+        return overrides
+
+    def save_entity_overrides(self, filename: str, overrides: dict[str, bool]) -> int:
+        """Persist entity_id -> is_mark overrides for a DXF mission file."""
+        safe, fpath = self._require_dxf(filename, "Entity overrides are")
+
+        entities = self.parse_dxf(fpath)
+        valid_ids = {ent.entity_id for ent in entities}
+        unknown = sorted(set(overrides) - valid_ids)
+        if unknown:
+            raise ValueError(f"Unknown entity_id(s): {', '.join(unknown)}")
+
+        cleaned = {str(entity_id): {"is_mark": bool(is_mark)} for entity_id, is_mark in overrides.items()}
+        self._write_sidecar(
+            self._entity_overrides_path(fpath),
+            {"source": safe, "overrides": cleaned},
+        )
+        self._preview_cache.pop(fpath, None)
+        return len(cleaned)
+
+    def clear_entity_overrides(self, filename: str) -> None:
+        """Remove saved per-entity overrides for a mission file, if present."""
+        fpath = os.path.join(self._dir, os.path.basename(filename))
+        sidecar = self._entity_overrides_path(fpath)
+        try:
+            os.remove(sidecar)
+        except FileNotFoundError:
+            pass
+
+    @staticmethod
+    def apply_entity_overrides(entities: list, overrides: dict[str, bool]) -> None:
+        """Stamp saved spray overrides onto parsed entities in-place.
+
+        Sets DXFEntity.is_mark_override; classify() consults it, and an
+        'ignore' layer_mapping classification still wins over the override.
+        """
+        for ent in entities:
+            if ent.entity_id in overrides:
+                ent.is_mark_override = bool(overrides[ent.entity_id])
 
     @staticmethod
     def _cheap_point_count(fpath: str) -> int:
@@ -368,7 +545,14 @@ class PathManager:
                 return cached[2]
             if os.path.splitext(fpath)[1].lower() == ".dxf":
                 from path_engine import PathEngine
-                plan = PathEngine().plan_file(fpath)
+                engine = PathEngine()
+                overrides = self.load_entity_overrides(name)
+                if overrides:
+                    entities = self.parse_dxf(fpath)
+                    self.apply_entity_overrides(entities, overrides)
+                    plan = engine.plan_dxf_entities(entities)
+                else:
+                    plan = engine.plan_file(fpath)
                 pts = list(plan.merged_waypoints)
                 spray_flags = list(plan.spray_flags)
             else:
@@ -423,6 +607,9 @@ class PathManager:
             f.write(content)
         self._list_cache.pop(fpath, None)
         self._preview_cache.pop(fpath, None)
+        self._entity_cache.pop(fpath, None)
+        self.clear_entity_overrides(safe)
+        self.clear_extension_config(safe)
         log.info("uploaded mission file: %s (%d bytes)", safe, len(content))
         return safe
 
@@ -432,6 +619,9 @@ class PathManager:
             os.remove(fpath)
             self._list_cache.pop(fpath, None)
             self._preview_cache.pop(fpath, None)
+            self._entity_cache.pop(fpath, None)
+            self.clear_entity_overrides(filename)
+            self.clear_extension_config(filename)
             log.info("deleted mission file: %s", filename)
             return True
         return False
@@ -449,7 +639,21 @@ class PathManager:
             List of DXFEntity objects.
         """
         from path_engine.parsers.dxf_parser import parse_dxf
-        return parse_dxf(filepath, unit_scale=unit_scale, layer_mapping=layer_mapping)
+        if unit_scale is not None or layer_mapping is not None:
+            # Non-default parse parameters: bypass the cache rather than key on
+            # them — every current caller uses the defaults.
+            return parse_dxf(filepath, unit_scale=unit_scale, layer_mapping=layer_mapping)
+
+        st = os.stat(filepath)
+        cached = self._entity_cache.get(filepath)
+        if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            entities = cached[2]
+        else:
+            entities = parse_dxf(filepath)
+            self._entity_cache[filepath] = (st.st_mtime_ns, st.st_size, entities)
+        # Shallow copies: apply_entity_overrides() mutates is_mark_override,
+        # which must never leak into the pristine cached entities.
+        return [copy.copy(ent) for ent in entities]
 
     def plan_path(self, name: str, summary_only: bool = False, **kwargs) -> dict:
         """Run the full planning pipeline on a file and return PlannedPath info.
@@ -472,9 +676,13 @@ class PathManager:
         layer_mapping = kwargs.pop("layer_mapping", None)
         optimize = kwargs.pop("optimize", True)
         compensate_spray = kwargs.pop("compensate_spray", True)
-        enable_path_extensions = kwargs.pop("enable_path_extensions", False)
-        pre_extension_m = kwargs.pop("pre_extension_m", 0.5)
-        aft_extension_m = kwargs.pop("aft_extension_m", 0.5)
+        extension_kwargs_provided = any(
+            key in kwargs
+            for key in ("enable_path_extensions", "pre_extension_m", "aft_extension_m")
+        )
+        enable_path_extensions = kwargs.pop("enable_path_extensions", None)
+        pre_extension_m = kwargs.pop("pre_extension_m", None)
+        aft_extension_m = kwargs.pop("aft_extension_m", None)
         corner_smooth_radius_m = kwargs.pop("corner_smooth_radius_m", 0.0)
         corner_smooth_arc_pts = kwargs.pop("corner_smooth_arc_pts", 6)
         use_two_opt = kwargs.pop("use_two_opt", True)
@@ -490,6 +698,23 @@ class PathManager:
         ref_points_dxf = kwargs.pop("ref_points_dxf", None)
         ref_points_gps = kwargs.pop("ref_points_gps", None)
         close_loop = kwargs.pop("close_loop", False)
+
+        # Resolve extension settings once, for every branch below. Explicit
+        # kwargs (legacy callers/tests) win; otherwise the per-DXF sidecar
+        # config saved via /api/path/{name}/extensions applies.
+        if extension_kwargs_provided:
+            enable_path_extensions = bool(enable_path_extensions)
+            pre_extension_m = float(pre_extension_m) if pre_extension_m is not None else 0.5
+            aft_extension_m = float(aft_extension_m) if aft_extension_m is not None else 0.5
+        elif name in BUILTIN_PATHS:
+            enable_path_extensions = False
+            pre_extension_m = 0.5
+            aft_extension_m = 0.5
+        else:
+            extension_config = self.load_extension_config(name)
+            enable_path_extensions = bool(extension_config["enabled"])
+            pre_extension_m = float(extension_config["pre_extension_m"])
+            aft_extension_m = float(extension_config["aft_extension_m"])
 
         if name in BUILTIN_PATHS:
             # Builtin preview must match the path that mission/load publishes:
@@ -538,6 +763,11 @@ class PathManager:
                 result["spray_flags"] = [True] * len(shifted)
             return result
 
+        # Resolve file path
+        fpath = os.path.join(self._dir, os.path.basename(name))
+        if not os.path.isfile(fpath):
+            raise FileNotFoundError(f"Path not found: {name!r}")
+
         from path_engine.engine import PathEngine
         from path_engine.validator import PathValidator
         engine = PathEngine(
@@ -556,9 +786,31 @@ class PathManager:
             max_two_opt_segments=max_two_opt_segments,
         )
 
-        # Resolve file path
-        fpath = os.path.join(self._dir, os.path.basename(name))
-        if os.path.isfile(fpath):
+        overrides = (
+            self.load_entity_overrides(name)
+            if os.path.splitext(fpath)[1].lower() == ".dxf"
+            else {}
+        )
+        plan_metadata: dict = {}
+        if overrides:
+            entities = self.parse_dxf(fpath)
+            self.apply_entity_overrides(entities, overrides)
+            plan = engine.plan_dxf_entities(
+                entities,
+                layer_mapping=layer_mapping,
+                origin=origin,
+                start_position=start_position,
+                origin_gps=origin_gps,
+                rotation_deg=rotation_deg,
+                ref_points_dxf=ref_points_dxf,
+                ref_points_gps=ref_points_gps,
+                close_loop=close_loop,
+            )
+            plan_metadata["entity_overrides"] = {
+                "num_overrides": len(overrides),
+                "entity_ids": sorted(overrides),
+            }
+        else:
             plan = engine.plan_file(
                 fpath,
                 layer_mapping=layer_mapping,
@@ -570,8 +822,17 @@ class PathManager:
                 ref_points_gps=ref_points_gps,
                 close_loop=close_loop,
             )
-        else:
-            raise FileNotFoundError(f"Path not found: {name!r}")
+
+        plan_metadata["extension_config"] = {
+            "enabled": enable_path_extensions,
+            "pre_extension_m": pre_extension_m,
+            "aft_extension_m": aft_extension_m,
+        }
+        # PlannedPath always carries planning_metadata, but plan_path is also
+        # exercised with lightweight plan fakes — don't assume the attribute.
+        if getattr(plan, "planning_metadata", None) is None:
+            plan.planning_metadata = {}
+        plan.planning_metadata.update(plan_metadata)
 
         # Run safety validation check
         validator = PathValidator(max_waypoints=max_waypoints, max_segments=max_segments)

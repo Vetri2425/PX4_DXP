@@ -253,10 +253,12 @@ class DXFEntityPreview(BaseModel):
     entity_type: str
     layer: str
     color: int = 7
+    default_is_mark: bool = True
     is_mark: bool = True
     length_m: float = 0.0
     geometry: dict[str, Any] = Field(default_factory=dict)
     preview_points: list[EntityPreviewPoint]
+    extension_preview: Optional["EntityExtensionPreview"] = None
 
 
 class DXFEntitiesResponse(BaseModel):
@@ -266,7 +268,54 @@ class DXFEntitiesResponse(BaseModel):
     frame: str = "local_ned"
     num_entities: int
     bounds: Optional[PathPreviewBounds] = None
+    extension_config: Optional["PathExtensionConfig"] = None
     entities: list[DXFEntityPreview]
+
+
+class EntityExtensionPreview(BaseModel):
+    """Lightweight PRE/AFT extension geometry for an entity preview."""
+
+    enabled: bool = False
+    pre_length_m: float = 0.0
+    aft_length_m: float = 0.0
+    pre_points: list[EntityPreviewPoint] = Field(default_factory=list)
+    aft_points: list[EntityPreviewPoint] = Field(default_factory=list)
+
+
+class EntityMarkOverride(BaseModel):
+    """User-editable spray classification for a single DXF entity."""
+
+    entity_id: str
+    is_mark: bool
+
+
+class DXFEntityOverridesRequest(BaseModel):
+    """Persist per-entity spray overrides for a DXF file."""
+
+    overrides: list[EntityMarkOverride]
+
+
+class DXFEntityOverridesResponse(BaseModel):
+    """Response from POST /api/path/{name}/entities."""
+
+    name: str
+    saved: bool = True
+    num_overrides: int
+
+
+class PathExtensionConfig(BaseModel):
+    """Per-file path extension settings."""
+
+    enabled: bool = False
+    pre_extension_m: float = Field(0.5, ge=0.0)
+    aft_extension_m: float = Field(0.5, ge=0.0)
+
+
+class PathExtensionConfigResponse(PathExtensionConfig):
+    """Response from GET/POST /api/path/{name}/extensions."""
+
+    name: str
+    saved: bool = True
 
 
 class DXFParseResponse(BaseModel):
@@ -312,9 +361,12 @@ class PathPlanRequest(BaseModel):
     transit_speed: float = 0.50  # TRANSIT speed (m/s)
     optimize: bool = True  # Reorder segments for minimal dead-heading
     compensate_spray: bool = True  # Apply spray latency compensation
-    enable_path_extensions: bool = False  # Add PRE/AFT drive extensions around MARK geometry
-    pre_extension_m: float = Field(0.5, ge=0.0)  # Drive-in distance before MARK start (m)
-    aft_extension_m: float = Field(0.5, ge=0.0)  # Drive-out distance after MARK end (m)
+    # Deprecated trio: ignored by /api/path/plan (a warning is logged and
+    # returned in the response `warnings` when set explicitly). Configure
+    # extensions via GET/POST /api/path/{name}/extensions instead.
+    enable_path_extensions: bool = False
+    pre_extension_m: float = Field(0.5, ge=0.0)
+    aft_extension_m: float = Field(0.5, ge=0.0)
     corner_smooth_radius_m: float = Field(0.0, ge=0.0)  # Planner-side corner radius; 0 disables
     corner_smooth_arc_pts: int = Field(6, ge=2)  # Points per smoothed corner arc
     use_two_opt: bool = True  # Improve greedy segment order with 2-opt

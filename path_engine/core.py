@@ -4,8 +4,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
+import math
 import re
 from typing import Optional
+
+
+def dxf_arc_tangent(angle_deg: float) -> tuple[float, float]:
+    """CCW travel tangent at DXF angle θ (0°=East), in (north, east).
+
+    Single source of truth for the formula used by dxf_parser metadata and
+    the entity extension preview: tangent = (cos θ, -sin θ). Verified against
+    arc_waypoints() point ordering (Stage 7A audit).
+    """
+    a = math.radians(angle_deg)
+    return (math.cos(a), -math.sin(a))
 
 
 class SegmentType(IntEnum):
@@ -70,6 +82,10 @@ class DXFEntity:
             ELLIPSE: center=(N,E), major_axis=(dN,dE), ratio, start_param, end_param
             POINT: position=(N,E)
         unit_scale: DXF-to-metres conversion factor applied.
+        is_mark_override: Operator spray decision (True=mark, False=transit).
+            None means no override. An 'ignore' classification from
+            layer_mapping always wins over the override — ignored entities
+            must never be planned, overridden or not.
     """
     entity_type: str
     layer: str
@@ -77,9 +93,18 @@ class DXFEntity:
     entity_id: str = ""
     geometry: dict = field(default_factory=dict)
     unit_scale: float = 0.01  # default: DXF units are centimetres
+    is_mark_override: Optional[bool] = None
 
     def classify(self, layer_mapping: dict[str, str] | None = None) -> str:
         """Classify this entity as 'mark', 'transit', or 'ignore'."""
+        base = self._classify_by_rules(layer_mapping)
+        if base == "ignore":
+            return "ignore"
+        if self.is_mark_override is not None:
+            return "mark" if self.is_mark_override else "transit"
+        return base
+
+    def _classify_by_rules(self, layer_mapping: dict[str, str] | None = None) -> str:
         if layer_mapping:
             for pattern, seg_type in layer_mapping.items():
                 # Color match

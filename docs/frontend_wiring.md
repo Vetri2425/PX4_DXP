@@ -5,6 +5,9 @@ flow exposed by the rover server. It is implementation-agnostic: it specifies
 *what* to call, *in what order*, *what each call returns*, and *how to branch* —
 not how to render anything. Build the UI however you like.
 
+For entity-level DXF selection, per-entity spray toggles, and PRE/AFT extension
+configuration, see `docs/DXF_ENTITY_FRONTEND_GUIDE.md`.
+
 - Base URL: `http://<jetson>:5001` (default `192.168.1.102`).
 - Auth: send header `X-Rover-Token: <token>` unless the server runs with
   `ROVER_DISABLE_AUTH` set.

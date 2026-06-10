@@ -3,6 +3,9 @@
 GET    /api/paths              — list built-in + uploaded paths
 GET    /api/path/{name}/preview — return local-NED points for display
 GET    /api/path/{name}/entities — return per-entity DXF geometry for selection
+POST   /api/path/{name}/entities — save per-entity DXF spray overrides
+GET    /api/path/{name}/extensions — return saved DXF extension config
+POST   /api/path/{name}/extensions — save DXF extension config
 POST   /api/path/upload        — upload .waypoints, .csv, or .dxf
 POST   /api/path/publish       — publish named path to /path topic
 POST   /api/path/parse-dxf     — parse DXF file, return entity list
@@ -11,7 +14,9 @@ DELETE /api/path/{filename}    — delete uploaded file
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import math
 import os
 import tempfile
@@ -32,11 +37,16 @@ from config import (
 )
 from models import (
     DXFEntitiesResponse,
+    DXFEntityOverridesRequest,
+    DXFEntityOverridesResponse,
     DXFEntityPreview,
     DXFEntityInfo,
     DXFParseResponse,
+    EntityExtensionPreview,
     LoadMissionRequest,
     MissionSummary,
+    PathExtensionConfig,
+    PathExtensionConfigResponse,
     PathPlanRequest,
     PathPlanResponse,
     PathPreviewBounds,
@@ -44,6 +54,8 @@ from models import (
     PathPublishRequest,
 )
 from path_manager import UploadValidationError
+
+log = logging.getLogger("server.routes.path")
 
 # Two distinct routers so the URL structure is explicit and stable.
 paths_router = APIRouter(prefix="/paths", tags=["path"],
@@ -56,7 +68,6 @@ path_router  = APIRouter(prefix="/path",  tags=["path"],
 
 @paths_router.get("")
 async def list_paths():
-    import asyncio
     from main import path_mgr
     # list_paths() parses (and for DXF/CSV fully plans) every file in the
     # missions dir — seconds each. Offload to a thread so a dir full of DXFs
@@ -77,7 +88,6 @@ async def list_paths():
 async def preview_path(name: str):
     # DXF previews run the full PathEngine planner — offload to a thread so a
     # heavy parse never blocks the event loop (telemetry WS, other endpoints).
-    import asyncio
     from main import path_mgr
     try:
         return await asyncio.wait_for(
@@ -134,6 +144,54 @@ def _subsample_points(
         return pts[:max_points]
     step = (len(pts) - 1) / (max_points - 1)
     return [pts[round(i * step)] for i in range(max_points)]
+
+
+def _entity_extension_preview(
+    ent,
+    preview_pts: list[tuple[float, float]],
+    enabled: bool,
+    is_mark: bool,
+    pre_extension_m: float,
+    aft_extension_m: float,
+) -> EntityExtensionPreview:
+    # Direction math is shared with the planner (analytic arc tangents,
+    # finite differences for line-like geometry) so the preview cannot
+    # drift from what split_mark_segment_with_extensions() actually plans.
+    from path_engine.planners.extensions import (
+        entity_extension_directions,
+        offset_point,
+    )
+
+    if not enabled or not is_mark or len(preview_pts) < 2:
+        return EntityExtensionPreview(enabled=False)
+
+    dirs = entity_extension_directions(ent, preview_pts)
+    if dirs is None:
+        return EntityExtensionPreview(enabled=False)
+    start_dir, end_dir = dirs
+
+    pre_points = []
+    aft_points = []
+    if pre_extension_m > 0:
+        start = preview_pts[0]
+        pre_points = [
+            _ned_point(offset_point(start, start_dir, -pre_extension_m)),
+            _ned_point(start),
+        ]
+    if aft_extension_m > 0:
+        end = preview_pts[-1]
+        aft_points = [
+            _ned_point(end),
+            _ned_point(offset_point(end, end_dir, aft_extension_m)),
+        ]
+
+    return EntityExtensionPreview(
+        enabled=bool(pre_points or aft_points),
+        pre_length_m=pre_extension_m if pre_points else 0.0,
+        aft_length_m=aft_extension_m if aft_points else 0.0,
+        pre_points=pre_points,
+        aft_points=aft_points,
+    )
 
 
 def _entity_length_m(ent) -> float:
@@ -216,10 +274,30 @@ def _jsonable_geometry(geometry: dict) -> dict:
     return {str(k): convert(v) for k, v in geometry.items()}
 
 
+async def _sidecar_call(fn, *args, what: str, timeout: float = 5.0):
+    """Run a blocking PathManager sidecar operation off the event loop.
+
+    Maps the shared exception set to HTTP errors: 404 missing file,
+    422 invalid input, 504 timeout, 500 anything else (server bug — never
+    blame the client for it).
+    """
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(fn, *args), timeout=timeout)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc))
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    except ImportError as exc:
+        raise HTTPException(500, str(exc))
+    except asyncio.TimeoutError:
+        raise HTTPException(504, f"{what} timed out ({timeout:.0f}s limit)")
+    except Exception as exc:
+        raise HTTPException(500, f"{what} failed: {exc}")
+
+
 @path_router.get("/{name}/entities", response_model=DXFEntitiesResponse)
 async def path_entities(name: str):
     """Return per-entity DXF preview geometry without full path planning."""
-    import asyncio
     from main import path_mgr
 
     safe = os.path.basename(name)
@@ -243,9 +321,26 @@ async def path_entities(name: str):
 
     previews = []
     all_pts: list[tuple[float, float]] = []
+    # Sidecar reads are tiny, but keep ALL filesystem work off the event loop
+    # (same rule as the parse above — telemetry WS shares this loop).
+    overrides = await asyncio.to_thread(path_mgr.load_entity_overrides, safe)
+    extension_config_data = await asyncio.to_thread(path_mgr.load_extension_config, safe)
+    extension_config = PathExtensionConfig(**extension_config_data)
     for ent in entities:
         pts = _entity_preview_tuples(ent)
         all_pts.extend(pts)
+        default_is_mark = ent.is_mark()
+        is_mark = overrides.get(ent.entity_id, default_is_mark)
+        extension_preview = _entity_extension_preview(
+            ent,
+            pts,
+            enabled=extension_config.enabled,
+            is_mark=is_mark,
+            pre_extension_m=extension_config.pre_extension_m,
+            aft_extension_m=extension_config.aft_extension_m,
+        )
+        for ext_pt in extension_preview.pre_points + extension_preview.aft_points:
+            all_pts.append((ext_pt.north, ext_pt.east))
         geometry = ent.geometry
         if ent.entity_type in ("SPLINE", "ELLIPSE"):
             # Flattened spline/ellipse vertices duplicate preview_points
@@ -257,10 +352,12 @@ async def path_entities(name: str):
             entity_type=ent.entity_type,
             layer=ent.layer,
             color=ent.color,
-            is_mark=ent.is_mark(),
+            default_is_mark=default_is_mark,
+            is_mark=is_mark,
             length_m=round(_entity_length_m(ent), 3),
             geometry=_jsonable_geometry(geometry),
             preview_points=[_ned_point(pt) for pt in pts],
+            extension_preview=extension_preview,
         ))
 
     bounds = None
@@ -278,7 +375,66 @@ async def path_entities(name: str):
         name=safe,
         num_entities=len(previews),
         bounds=bounds,
+        extension_config=extension_config,
         entities=previews,
+    )
+
+
+@path_router.post("/{name}/entities", response_model=DXFEntityOverridesResponse)
+async def save_path_entity_overrides(name: str, req: DXFEntityOverridesRequest):
+    """Persist per-entity spray ON/OFF decisions for a DXF file."""
+    from main import path_mgr
+
+    overrides = {item.entity_id: item.is_mark for item in req.overrides}
+    num_overrides = await _sidecar_call(
+        path_mgr.save_entity_overrides, name, overrides,
+        what="Saving entity overrides",
+    )
+    return DXFEntityOverridesResponse(
+        name=os.path.basename(name),
+        num_overrides=num_overrides,
+    )
+
+
+def _load_extension_config_checked(path_mgr, name: str) -> dict:
+    """Blocking helper: validate the DXF exists, then load its config."""
+    safe = os.path.basename(name)
+    fpath = os.path.join(MISSION_DIR, safe)
+    if not os.path.isfile(fpath):
+        raise FileNotFoundError(f"Path not found: {name!r}")
+    if os.path.splitext(fpath)[1].lower() != ".dxf":
+        raise ValueError("Path extensions are only configurable for DXF files")
+    return path_mgr.load_extension_config(safe)
+
+
+@path_router.get("/{name}/extensions", response_model=PathExtensionConfigResponse)
+async def get_path_extensions(name: str):
+    """Return saved PRE/AFT extension config for a DXF file."""
+    from main import path_mgr
+
+    config = await _sidecar_call(
+        _load_extension_config_checked, path_mgr, name,
+        what="Loading extension config",
+    )
+    return PathExtensionConfigResponse(
+        name=os.path.basename(name), saved=True, **config,
+    )
+
+
+@path_router.post("/{name}/extensions", response_model=PathExtensionConfigResponse)
+async def save_path_extensions(name: str, req: PathExtensionConfig):
+    """Persist PRE/AFT extension config for a DXF file."""
+    from main import path_mgr
+
+    config = await _sidecar_call(
+        path_mgr.save_extension_config,
+        name, req.enabled, req.pre_extension_m, req.aft_extension_m,
+        what="Saving extension config",
+    )
+    return PathExtensionConfigResponse(
+        name=os.path.basename(name),
+        saved=True,
+        **config,
     )
 
 
@@ -385,6 +541,8 @@ async def parse_dxf_file(file: UploadFile = File(...)):
         # Parse succeeded — move temp file to final location
         final_path = os.path.join(MISSION_DIR, safe)
         os.replace(fpath, final_path)
+        path_mgr.clear_entity_overrides(safe)
+        path_mgr.clear_extension_config(safe)
 
         return DXFParseResponse(
             filename=safe,
@@ -406,7 +564,6 @@ async def parse_dxf_file(file: UploadFile = File(...)):
 @path_router.post("/plan")
 async def plan_path(req: PathPlanRequest):
     """Run the full planning pipeline and return merged waypoints with spray flags."""
-    import asyncio
     from main import path_mgr
 
     unsupported = []
@@ -421,6 +578,22 @@ async def plan_path(req: PathPlanRequest):
             422,
             "Preview fields not implemented yet: " + ", ".join(unsupported),
         )
+
+    # Extension fields moved to GET/POST /api/path/{name}/extensions — tell
+    # old clients their explicit values are being ignored instead of silently
+    # planning with different settings.
+    deprecation_warning = None
+    deprecated_set = {
+        "enable_path_extensions", "pre_extension_m", "aft_extension_m",
+    } & req.model_fields_set
+    if deprecated_set:
+        deprecation_warning = (
+            "Ignored deprecated field(s) "
+            + ", ".join(sorted(deprecated_set))
+            + ": path extensions are configured per DXF via "
+            "GET/POST /api/path/{name}/extensions."
+        )
+        log.warning("/api/path/plan: %s", deprecation_warning)
 
     origin = tuple(req.origin) if req.origin else (0.0, 0.0)
     start_position = tuple(req.start_position) if req.start_position else None
@@ -442,9 +615,9 @@ async def plan_path(req: PathPlanRequest):
                 layer_mapping=req.layer_mapping,
                 optimize=req.optimize,
                 compensate_spray=req.compensate_spray,
-                enable_path_extensions=req.enable_path_extensions,
-                pre_extension_m=req.pre_extension_m,
-                aft_extension_m=req.aft_extension_m,
+                # Extension settings are configured per DXF via
+                # GET/POST /api/path/{name}/extensions, then loaded by
+                # PathManager during planning.
                 corner_smooth_radius_m=req.corner_smooth_radius_m,
                 corner_smooth_arc_pts=req.corner_smooth_arc_pts,
                 use_two_opt=req.use_two_opt,
@@ -469,6 +642,9 @@ async def plan_path(req: PathPlanRequest):
         raise HTTPException(504, "Planning timed out (15s limit)")
     except Exception as exc:
         raise HTTPException(422, f"Planning error: {exc}")
+
+    if deprecation_warning:
+        result["warnings"] = list(result.get("warnings") or []) + [deprecation_warning]
 
     alignment_meta = result.get("alignment_metadata") or {}
 

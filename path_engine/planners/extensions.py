@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 import math
 
-from ..core import PathSegment, SegmentType
+from ..core import DXFEntity, PathSegment, SegmentType, dxf_arc_tangent
 
 log = logging.getLogger("path_engine.extensions")
 
@@ -118,6 +118,58 @@ def _normalise(v: tuple[float, float]) -> tuple[float, float] | None:
     if length < 1e-9:
         return None
     return (v[0] / length, v[1] / length)
+
+
+def entity_extension_directions(
+    entity: DXFEntity,
+    points: list[tuple[float, float]],
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    """Start/end unit tangents for PRE/AFT extensions of one DXF entity.
+
+    Entity-level mirror of split_mark_segment_with_extensions() direction
+    priority, used by the server's extension *preview* so that preview and
+    planned geometry come from the same formulas:
+
+      - ARC / CIRCLE: analytic tangents (dxf_arc_tangent — same source as
+        the dxf_parser segment metadata).
+      - LINE / LWPOLYLINE / SPLINE / ELLIPSE: finite differences from the
+        densified *points*, matching the planner's line-like inference and
+        the spline/ellipse finite-difference metadata.
+      - POINT / unknown / degenerate geometry: None (the planner adds no
+        extension for these either).
+
+    Returns (start_dir, end_dir) unit vectors in (north, east), or None when
+    no extension direction can be derived.
+    """
+    etype = entity.entity_type
+    if etype == "ARC":
+        geom = entity.geometry
+        return (
+            dxf_arc_tangent(geom.get("start_angle", 0.0)),
+            dxf_arc_tangent(geom.get("end_angle", 360.0)),
+        )
+    if etype == "CIRCLE":
+        # densify_circle starts at 0° (East point) and travels CCW; a full
+        # circle ends where it started.
+        return (dxf_arc_tangent(0.0), dxf_arc_tangent(0.0))
+    if etype in ("LINE", "LWPOLYLINE", "POLYLINE", "SPLINE", "ELLIPSE"):
+        if len(points) < 2:
+            return None
+        start_dir = _unit_vector(points[0], points[1])
+        end_dir = _unit_vector(points[-2], points[-1])
+        if start_dir is None or end_dir is None:
+            return None
+        return (start_dir, end_dir)
+    return None
+
+
+def offset_point(
+    p: tuple[float, float],
+    direction: tuple[float, float],
+    distance: float,
+) -> tuple[float, float]:
+    """Public alias of _offset_point for preview/extension consumers."""
+    return _offset_point(p, direction, distance)
 
 
 # ---------------------------------------------------------------------------
