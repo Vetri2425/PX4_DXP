@@ -36,7 +36,7 @@ from rclpy.qos import (
 
 from geometry_msgs.msg import PoseStamped, Vector3Stamped
 from nav_msgs.msg import Path
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray
 
 from config import SRV_RPP_GET_PARAMS, SRV_RPP_LIST_PARAMS, SRV_RPP_SET_PARAMS
 from logging_setup import get_logger
@@ -173,6 +173,7 @@ class RosBridgeNode(Node):
         # B1 — predictive κ and pre-clamp Ld for tuning analysis
         "l_d_raw_m": 0.0,
         "kappa_speed": 0.0,
+        "spraying": False,
     }
 
     def __init__(self) -> None:
@@ -245,6 +246,13 @@ class RosBridgeNode(Node):
             Vector3Stamped,
             "/rpp/velocity_ned",
             self._cb_rpp_velocity,
+            _qos_best_effort(),
+            callback_group=self._sub_group,
+        )
+        self.create_subscription(
+            Bool,
+            "/spray/state",
+            self._cb_spray_state,
             _qos_best_effort(),
             callback_group=self._sub_group,
         )
@@ -379,11 +387,17 @@ class RosBridgeNode(Node):
                 self._state["kappa_speed"] = (
                     data[9] if len(data) >= 10 else float("nan")
                 )
+                if len(data) >= 40:
+                    self._state["spray_active"] = data[39] > 0.5
 
     def _cb_rpp_velocity(self, msg: Vector3Stamped) -> None:
         with self._lock:
             self._state["v_north"] = msg.vector.x
             self._state["v_east"] = msg.vector.y
+
+    def _cb_spray_state(self, msg: Bool) -> None:
+        with self._lock:
+            self._state["spraying"] = bool(msg.data)
 
     # ── Public API: state ─────────────────────────────────────────────────────
 
@@ -739,22 +753,42 @@ class RosBridgeNode(Node):
     # ── Public API: path publishing ───────────────────────────────────────────
 
     def publish_path(
-        self, points: list[tuple[float, float]], frame_id: str = "local_ned"
+        self,
+        points: list[tuple[float, float]],
+        frame_id: str = "local_ned",
+        spray_flags: list[bool] | None = None,
     ) -> None:
         """Publish nav_msgs/Path. Empty list → see publish_stop_path()."""
+        if spray_flags is None:
+            flags = [False] * len(points)
+        elif len(spray_flags) != len(points):
+            log.warning(
+                "publish_path: spray_flags length %d != points length %d — forcing all OFF",
+                len(spray_flags),
+                len(points),
+            )
+            flags = [False] * len(points)
+        else:
+            flags = [bool(f) for f in spray_flags]
+
         path = Path()
         path.header.stamp = self.get_clock().now().to_msg()
         path.header.frame_id = frame_id
-        for n, e in points:
+        for (n, e), spray in zip(points, flags):
             ps = PoseStamped()
             ps.header = path.header
             ps.pose.position.x = float(n)
             ps.pose.position.y = float(e)
-            ps.pose.position.z = 0.0
+            ps.pose.position.z = 1.0 if spray else 0.0
             ps.pose.orientation.w = 1.0
             path.poses.append(ps)
         self._path_pub.publish(path)
-        log.info("published path: %d points → %s", len(points), frame_id)
+        log.info(
+            "published path: %d points → %s (spray_on=%d)",
+            len(points),
+            frame_id,
+            sum(1 for f in flags if f),
+        )
 
     def publish_stop_path(
         self, frame_id: str = "local_ned"

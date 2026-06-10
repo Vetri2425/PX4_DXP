@@ -16,6 +16,7 @@ from mission_loading import (
     MissionLoadConflict,
     load_path_for_controller,
     pose_origin_or_error,
+    spray_flags_for_path,
 )
 from models import MissionLoadRequest, MissionStartRequest, MissionStatus
 
@@ -37,7 +38,8 @@ async def load_mission(req: MissionLoadRequest):
         raise HTTPException(404, str(exc))
     except Exception as exc:
         raise HTTPException(400, f"Load failed: {exc}")
-    offboard_ctrl.load_path(pts, name=name)
+    spray_flags = spray_flags_for_path(path_mgr, name, len(pts))
+    offboard_ctrl.load_path(pts, name=name, spray_flags=spray_flags)
     return {"loaded": name, "num_points": len(pts)}
 
 

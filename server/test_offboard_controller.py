@@ -29,8 +29,8 @@ class FakeNode:
     def get_rpp_monitor(self):
         return FakeRppMonitor()
 
-    def publish_path(self, points):
-        self.calls.append(("publish_path", list(points)))
+    def publish_path(self, points, frame_id="local_ned", spray_flags=None):
+        self.calls.append(("publish_path", list(points), spray_flags))
 
     async def arm_async(self, arm):
         self.calls.append(("arm", arm))
@@ -62,7 +62,7 @@ def test_start_publishes_path_before_arm_and_offboard():
         assert msg == "running"
         assert ctrl.state == MissionState.RUNNING
         assert node.calls == [
-            ("publish_path", [(1.0, 2.0), (3.0, 4.0)]),
+            ("publish_path", [(1.0, 2.0), (3.0, 4.0)], None),
             ("arm", True),
             ("set_mode", "OFFBOARD"),
         ]
@@ -87,7 +87,7 @@ def test_start_disarms_if_rpp_stays_idle_after_path_publish():
         assert "RPP IDLE after path publish" in msg
         assert ctrl.state == MissionState.ERROR
         assert node.calls == [
-            ("publish_path", [(1.0, 2.0), (3.0, 4.0)]),
+            ("publish_path", [(1.0, 2.0), (3.0, 4.0)], None),
             ("arm", True),
             ("arm", False),
         ]

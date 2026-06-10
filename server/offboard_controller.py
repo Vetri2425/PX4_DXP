@@ -48,6 +48,7 @@ class OffboardController:
         self._log        = activity_log
         self._state      = MissionState.IDLE
         self._loaded_pts: list[tuple[float, float]] | None = None
+        self._loaded_spray_flags: list[bool] | None = None
         self._path_name: str | None = None
         self._lock       = asyncio.Lock()  # serialise lifecycle calls
 
@@ -68,7 +69,10 @@ class OffboardController:
     # ── Path management ───────────────────────────────────────────────────────
 
     def load_path(
-        self, points: list[tuple[float, float]], name: Optional[str] = None
+        self,
+        points: list[tuple[float, float]],
+        name: Optional[str] = None,
+        spray_flags: Optional[list[bool]] = None,
     ) -> None:
         if self._state == MissionState.RUNNING:
             self._log_entry(
@@ -77,6 +81,16 @@ class OffboardController:
                 f"Stop the mission first if this is unintentional.",
             )
         self._loaded_pts = points
+        if spray_flags is not None and len(spray_flags) == len(points):
+            self._loaded_spray_flags = [bool(f) for f in spray_flags]
+        elif spray_flags is not None:
+            self._loaded_spray_flags = None
+            self._log_entry(
+                "warning",
+                f"spray_flags length mismatch for {name or 'unknown'} — loading path with spray OFF",
+            )
+        else:
+            self._loaded_spray_flags = None
         self._path_name  = name or "unknown"
         if self._state in (MissionState.COMPLETED, MissionState.ABORTED, MissionState.ERROR):
             self._state = MissionState.IDLE
@@ -155,6 +169,7 @@ class OffboardController:
                 return False, msg
 
             pts_to_publish = self._loaded_pts
+            spray_flags_to_publish = self._loaded_spray_flags
             if auto_origin:
                 pose_origin = pose_origin_or_error(self._node.get_state())
                 if isinstance(pose_origin, str):
@@ -175,7 +190,10 @@ class OffboardController:
                 # Publish the mission path before the OFFBOARD request so the
                 # 50 Hz setpoint stream carries mission setpoints, not just the
                 # streamer's zero-velocity bootstrap, when PX4 evaluates entry.
-                self._node.publish_path(pts_to_publish)
+                self._node.publish_path(
+                    pts_to_publish,
+                    spray_flags=spray_flags_to_publish,
+                )
 
                 # ── Arm ───────────────────────────────────────────────────────
                 self._state = MissionState.ARMING

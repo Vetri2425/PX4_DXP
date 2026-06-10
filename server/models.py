@@ -77,6 +77,8 @@ class TelemetryData(BaseModel):
     pose_age_ms: Optional[float] = None
     rpp_state: Optional[Literal[-1, 0, 1, 2, 3, 4, 5]] = None
     rpp_state_name: Optional[str] = None
+    spraying: Optional[bool] = None
+    marking_state: Optional[Literal["marking", "transit", "off"]] = None
     # FCU
     armed: Optional[bool] = None
     mode: Optional[str] = None

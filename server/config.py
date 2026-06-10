@@ -82,6 +82,8 @@ RMSE_MAX = float(os.environ.get("ROVER_ALIGN_RMSE_MAX", "0.05"))
 STAGING_TTL_S = float(os.environ.get("ROVER_STAGING_TTL_S", "3600"))
 # Litres of marking material consumed per metre of MARK path (site-tunable).
 SPRAY_LITERS_PER_METER = float(os.environ.get("ROVER_SPRAY_L_PER_M", "0.012"))
+# Default MARK flags for built-in / legacy non-DXF paths that carry no spray metadata.
+SPRAY_DEFAULT_ON = os.environ.get("ROVER_SPRAY_DEFAULT_ON", "1") == "1"
 
 # ── Safety / watchdog thresholds ──────────────────────────────────────────────
 POSE_STALE_MS = 500.0  # consider pose stale above this

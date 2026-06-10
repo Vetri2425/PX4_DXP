@@ -501,8 +501,8 @@ async def test_plan_then_load_to_controller_round_trip(monkeypatch, tmp_path):
             self.loaded = None
             self.state = MissionState.IDLE
 
-        def load_path(self, points, name=None):
-            self.loaded = (list(points), name)
+        def load_path(self, points, name=None, spray_flags=None):
+            self.loaded = (list(points), name, spray_flags)
 
     fake_ctrl = FakeController()
     monkeypatch.setattr(main, "path_mgr", FakePathManager())
@@ -535,7 +535,7 @@ async def test_load_to_controller_missing_mission_is_404(monkeypatch, tmp_path):
     class FakeController:
         state = MissionState.IDLE
 
-        def load_path(self, points, name=None):
+        def load_path(self, points, name=None, spray_flags=None):
             pass
 
     monkeypatch.setattr(main, "offboard_ctrl", FakeController())
@@ -559,7 +559,7 @@ async def test_load_to_controller_rejects_while_running(monkeypatch, tmp_path):
     class FakeController:
         state = MissionState.RUNNING
 
-        def load_path(self, points, name=None):
+        def load_path(self, points, name=None, spray_flags=None):
             raise AssertionError("load_path must not be called while RUNNING")
 
     monkeypatch.setattr(main, "offboard_ctrl", FakeController())

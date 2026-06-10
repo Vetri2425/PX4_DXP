@@ -507,13 +507,18 @@ class PathPublisherNode(Node):
         path.header.stamp = self.get_clock().now().to_msg()
         path.header.frame_id = frame_id
 
-        for (n, e) in pts:
+        if spray_flags is None or len(spray_flags) != len(pts):
+            path_spray_flags = [True] * len(pts)
+        else:
+            path_spray_flags = [bool(f) for f in spray_flags]
+
+        for (n, e), spray in zip(pts, path_spray_flags):
             ps = PoseStamped()
             ps.header.stamp = path.header.stamp
             ps.header.frame_id = frame_id
             ps.pose.position.x = float(n)
             ps.pose.position.y = float(e)
-            ps.pose.position.z = 0.0
+            ps.pose.position.z = 1.0 if spray else 0.0
             ps.pose.orientation.w = 1.0
             path.poses.append(ps)
 

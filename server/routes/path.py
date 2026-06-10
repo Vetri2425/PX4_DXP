@@ -21,7 +21,15 @@ import uuid
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
 from auth import require_token
-from config import MAX_UPLOAD_BYTES, MISSION_DIR, RMSE_MAX, SPRAY_LITERS_PER_METER, STAGING_DIR, STAGING_TTL_S
+from config import (
+    MAX_UPLOAD_BYTES,
+    MISSION_DIR,
+    RMSE_MAX,
+    SPRAY_DEFAULT_ON,
+    SPRAY_LITERS_PER_METER,
+    STAGING_DIR,
+    STAGING_TTL_S,
+)
 from models import (
     DXFEntitiesResponse,
     DXFEntityPreview,
@@ -304,7 +312,13 @@ async def publish_path(req: PathPublishRequest):
         pts = path_mgr.load_path(name)
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc))
-    ros_node.publish_path(pts, frame_id=req.frame_id)
+    spray_flags: list[bool] | None = None
+    try:
+        preview = path_mgr.preview_path(name)
+        spray_flags = [bool(wp.spray) for wp in preview.waypoints]
+    except Exception:
+        spray_flags = [SPRAY_DEFAULT_ON] * len(pts)
+    ros_node.publish_path(pts, frame_id=req.frame_id, spray_flags=spray_flags)
     return {"published": name, "num_points": len(pts)}
 
 
@@ -630,7 +644,8 @@ async def load_mission_to_controller(req: LoadMissionRequest):
         )
 
     try:
-        offboard_ctrl.load_path(waypoints, name=safe_id)
+        spray_flags = [bool(f) for f in staged.get("spray_flags", [])]
+        offboard_ctrl.load_path(waypoints, name=safe_id, spray_flags=spray_flags)
     except Exception as exc:
         raise HTTPException(409, f"Controller load failed: {exc}")
 

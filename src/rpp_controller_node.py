@@ -150,6 +150,7 @@ Topic:  /rpp/debug   (std_msgs/Float32MultiArray, layout encoded below)
         [36] max_linear_accel         (param — m/s²)
         [37] max_linear_decel         (param — m/s²)
         [38] mission_speed            (param — m/s)
+        [39] spray_active             (Phase 3: 1.0 MARK, 0.0 TRANSIT/OFF)
 Layout is append-only: indices [0..7] keep their meaning forever. Consumers
 that only read [0..7] continue to work.
 
@@ -162,6 +163,8 @@ Frame conventions
 - All math after the pose-input boundary is NED.
 """
 
+from __future__ import annotations
+
 import math
 from enum import IntEnum
 
@@ -173,7 +176,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 from geometry_msgs.msg import PoseStamped, Vector3Stamped
 from mavros_msgs.msg import GPSRAW          # P0.3 RTK fix gate
 from nav_msgs.msg import Path
-from std_msgs.msg import Float32MultiArray, MultiArrayDimension, Float32
+from std_msgs.msg import Bool, Float32MultiArray, MultiArrayDimension, Float32
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +342,7 @@ class RPPControllerNode(Node):
         # Internal state
         # ------------------------------------------------------------------
         self._path: list[PoseStamped] = []
+        self._spray_flags: list[bool] = []
         self._pose: PoseStamped | None = None
         self._pose_recv_time: RclTime | None = None
         self._path_done = False
@@ -407,6 +411,9 @@ class RPPControllerNode(Node):
         self._yaw_rate_pub = self.create_publisher(
             Float32, "/rpp/yaw_rate_body", be_qos
         )
+        self._spray_active_pub = self.create_publisher(
+            Bool, "/spray/active", be_qos
+        )
 
         # ------------------------------------------------------------------
         # Subscribers
@@ -472,6 +479,7 @@ class RPPControllerNode(Node):
         # Operates on (north, east) tuples to keep the geometry code simple,
         # then converts back to PoseStamped at the end.
         raw_pts = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
+        raw_flags = [p.pose.position.z > 0.5 for p in msg.poses]
         n_raw = len(raw_pts)
 
         resample_dx = float(self.get_parameter("path_resample_spacing_m").value)
@@ -479,25 +487,31 @@ class RPPControllerNode(Node):
         arc_pts     = int(self.get_parameter("corner_smooth_arc_pts").value)
 
         cond_pts = raw_pts
+        cond_flags = raw_flags
         if corner_r > 0.0 and len(cond_pts) >= 3:
-            cond_pts = self._smooth_corners(cond_pts, corner_r, max(2, arc_pts))
+            cond_pts, cond_flags = self._smooth_corners(
+                cond_pts, corner_r, max(2, arc_pts), cond_flags
+            )
         if resample_dx > 0.0 and len(cond_pts) >= 2:
-            cond_pts = self._resample_path(cond_pts, resample_dx)
+            cond_pts, cond_flags = self._resample_path(
+                cond_pts, resample_dx, cond_flags
+            )
 
         # Build PoseStamped list in the same NED frame
         stamp = msg.header.stamp
         new_path: list[PoseStamped] = []
-        for n, e in cond_pts:
+        for (n, e), flag in zip(cond_pts, cond_flags):
             ps = PoseStamped()
             ps.header.stamp = stamp
             ps.header.frame_id = expected
             ps.pose.position.x = float(n)
             ps.pose.position.y = float(e)
-            ps.pose.position.z = 0.0
+            ps.pose.position.z = 1.0 if flag else 0.0
             ps.pose.orientation.w = 1.0
             new_path.append(ps)
 
         self._path = new_path
+        self._spray_flags = list(cond_flags)
         self._path_done = False
         self._path_travel_m = 0.0   # reset travel distance on new path
         # P1.4 — reset hint so search starts from beginning of new path
@@ -689,15 +703,25 @@ class RPPControllerNode(Node):
     # ==================================================================
     @staticmethod
     def _resample_path(pts: list[tuple[float, float]],
-                       spacing: float) -> list[tuple[float, float]]:
+                       spacing: float,
+                       flags: list[bool] | None = None
+                       ) -> list[tuple[float, float]] | tuple[list[tuple[float, float]], list[bool]]:
         """Linearly resample a polyline to uniform spacing.
 
         The first and last points are kept exactly; intermediate samples are
         placed every `spacing` metres along the cumulative arc length.
         Geometry is preserved (straight segments stay straight).
         """
+        carry_flags = flags is not None
+        if flags is None:
+            flags = [False] * len(pts)
+        elif len(flags) != len(pts):
+            flags = [False] * len(pts)
+
         if len(pts) < 2 or spacing <= 0.0:
-            return list(pts)
+            out_pts = list(pts)
+            out_flags = list(flags)
+            return (out_pts, out_flags) if carry_flags else out_pts
 
         # Cumulative arc length per vertex
         cum = [0.0]
@@ -706,10 +730,13 @@ class RPPControllerNode(Node):
                                             pts[i][1] - pts[i - 1][1]))
         total = cum[-1]
         if total < spacing:
-            return [pts[0], pts[-1]]
+            out_pts = [pts[0], pts[-1]]
+            out_flags = [bool(flags[0]), bool(flags[-1])]
+            return (out_pts, out_flags) if carry_flags else out_pts
 
         n_samples = max(2, int(math.ceil(total / spacing)) + 1)
         out: list[tuple[float, float]] = []
+        out_flags: list[bool] = []
         seg = 0
         for k in range(n_samples):
             target = (k / (n_samples - 1)) * total
@@ -719,20 +746,31 @@ class RPPControllerNode(Node):
             seg_len = cum[seg + 1] - cum[seg]
             if seg_len < 1e-12:
                 out.append(pts[seg])
+                out_flags.append(bool(flags[seg]))
                 continue
             t = (target - cum[seg]) / seg_len
             t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
             n = pts[seg][0] + t * (pts[seg + 1][0] - pts[seg][0])
             e = pts[seg][1] + t * (pts[seg + 1][1] - pts[seg][1])
             out.append((n, e))
+            if k == 0:
+                out_flags.append(bool(flags[0]))
+            elif k == n_samples - 1:
+                out_flags.append(bool(flags[-1]))
+            else:
+                out_flags.append(bool(flags[seg] and flags[seg + 1]))
         # Force exact endpoints
         out[0] = pts[0]
         out[-1] = pts[-1]
-        return out
+        out_flags[0] = bool(flags[0])
+        out_flags[-1] = bool(flags[-1])
+        return (out, out_flags) if carry_flags else out
 
     def _smooth_corners(self, pts: list[tuple[float, float]],
                         radius: float,
-                        arc_pts: int) -> list[tuple[float, float]]:
+                        arc_pts: int,
+                        flags: list[bool] | None = None
+                        ) -> list[tuple[float, float]] | tuple[list[tuple[float, float]], list[bool]]:
         """Replace each interior vertex with an inscribed circular arc.
 
         Bounds path curvature at κ_max = 1/radius.
@@ -744,11 +782,20 @@ class RPPControllerNode(Node):
         short to support the arc) and a warning is logged.
         Endpoints are always kept.
         """
+        carry_flags = flags is not None
+        if flags is None:
+            flags = [False] * len(pts)
+        elif len(flags) != len(pts):
+            flags = [False] * len(pts)
+
         n = len(pts)
         if n < 3 or radius <= 0.0:
-            return list(pts)
+            out_pts = list(pts)
+            out_flags = list(flags)
+            return (out_pts, out_flags) if carry_flags else out_pts
 
         out: list[tuple[float, float]] = [pts[0]]
+        out_flags: list[bool] = [bool(flags[0])]
         skipped = 0
         for i in range(1, n - 1):
             ax, ay = pts[i - 1]
@@ -772,6 +819,7 @@ class RPPControllerNode(Node):
             if theta < 1e-3 or math.pi - theta < 1e-3:
                 # Nearly collinear; no smoothing needed, no chord taken
                 out.append(pts[i])
+                out_flags.append(bool(flags[i]))
                 continue
 
             # Tangent length from P to the arc start
@@ -780,6 +828,7 @@ class RPPControllerNode(Node):
                 # Segments too short for this radius — keep sharp corner
                 skipped += 1
                 out.append(pts[i])
+                out_flags.append(bool(flags[i]))
                 continue
 
             # Arc start (toward A) and end (toward B)
@@ -795,6 +844,7 @@ class RPPControllerNode(Node):
             bl = math.hypot(bx_n, bx_e)
             if bl < 1e-9:
                 out.append(pts[i])
+                out_flags.append(bool(flags[i]))
                 continue
             bx_n /= bl
             bx_e /= bl
@@ -822,21 +872,26 @@ class RPPControllerNode(Node):
                     sweep -= 2.0 * math.pi
 
             # Discretise the arc
+            arc_flag = bool(flags[i - 1] and flags[i] and flags[i + 1])
             out.append((sa_n, sa_e))
+            out_flags.append(arc_flag)
             for k in range(1, arc_pts):
                 a = ang1 + sweep * (k / arc_pts)
                 out.append((cx_n + radius * math.cos(a),
                             cx_e + radius * math.sin(a)))
+                out_flags.append(arc_flag)
             out.append((sb_n, sb_e))
+            out_flags.append(arc_flag)
 
         out.append(pts[-1])
+        out_flags.append(bool(flags[-1]))
         if skipped > 0:
             self.get_logger().warn(
                 f"corner_smooth: skipped {skipped} vertices — "
                 f"adjacent segments shorter than {radius:.2f} m allows. "
                 f"Reduce corner_smooth_radius_m or densify the path."
             )
-        return out
+        return (out, out_flags) if carry_flags else out
 
     # ==================================================================
     # P1.1 — Predictive curvature (path-intrinsic Menger curvature)
@@ -1276,6 +1331,7 @@ class RPPControllerNode(Node):
         seg_idx, t, foot_n, foot_e, signed_xtrack = self._project_onto_path(
             pos_n, pos_e
         )
+        spray_active = self._segment_spray_active(seg_idx)
 
         # ---- Step 2: P0.1 + P1.2 — Closed-loop, xtrack-adaptive lookahead ----
         # P0.1: use last commanded speed (lookahead_time param is now live).
@@ -1453,6 +1509,7 @@ class RPPControllerNode(Node):
             l_d_raw=l_d_raw,                   # B1
             kappa_speed=kappa_speed,           # B1
             yaw_rate=yaw_rate_body,            # P3.1
+            spray_active=spray_active,
         )
 
         r_eff = (1.0 / kappa_speed) if kappa_speed > 1e-9 else float("inf")
@@ -1510,7 +1567,22 @@ class RPPControllerNode(Node):
             l_d_raw=float("nan"),       # B1
             kappa_speed=float("nan"),   # B1
             yaw_rate=0.0,               # P3.1
+            spray_active=False,
         )
+
+    def _segment_spray_active(self, seg_idx: int) -> bool:
+        """Return True iff the currently tracked conditioned segment is MARK."""
+        if self._path_done or len(self._path) < 2:
+            return False
+        if len(self._spray_flags) != len(self._path):
+            return False
+        seg = max(0, min(seg_idx, len(self._path) - 2))
+        return bool(self._spray_flags[seg] and self._spray_flags[seg + 1])
+
+    def _publish_spray_active(self, active: bool):
+        msg = Bool()
+        msg.data = bool(active)
+        self._spray_active_pub.publish(msg)
 
     def _publish_debug(
         self,
@@ -1525,6 +1597,7 @@ class RPPControllerNode(Node):
         l_d_raw: float = float("nan"),       # B1: requested Ld before clamp
         kappa_speed: float = float("nan"),   # B1: predictive κ used for speed
         yaw_rate: float = 0.0,               # P3.1: final clamped body yaw rate cmd
+        spray_active: bool = False,
     ):
         """Publish /rpp/debug Float32MultiArray.
 
@@ -1533,10 +1606,12 @@ class RPPControllerNode(Node):
         Indices [11..38]: snapshot of all tunable RPP parameters. Every bag
         message is self-contained — you can replay and correlate parameter
         values with tracking performance without needing a separate param dump.
+        Index [39]: spray_active.
         """
+        self._publish_spray_active(spray_active)
         msg = Float32MultiArray()
         msg.layout.dim.append(MultiArrayDimension(label="rpp_debug",
-                                                  size=39, stride=39))
+                                                  size=40, stride=40))
 
         # ---- Snapshot all parameters once for this cycle ----
         p_max_linear_vel = float(self.get_parameter("max_linear_vel").value)
@@ -1608,6 +1683,7 @@ class RPPControllerNode(Node):
             p_max_accel,               # [36] max_linear_accel
             p_max_decel,               # [37] max_linear_decel
             p_mission_speed,           # [38] mission_speed
+            1.0 if spray_active else 0.0,  # [39] spray_active
         ]
         self._dbg_pub.publish(msg)
 
@@ -1629,6 +1705,7 @@ def main():
             # twist_to_setpoint_node will continue heartbeats with its own zero.
             try:
                 node._publish_velocity(0.0, 0.0)
+                node._publish_spray_active(False)
             except Exception:
                 pass
             node.destroy_node()

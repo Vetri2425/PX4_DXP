@@ -7,18 +7,30 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from config import GPS_FIX_NAMES, RPP_STATE_NAMES
-from models import TelemetryData
+from models import MissionState, TelemetryData
 
 router = APIRouter(prefix="/telemetry", tags=["telemetry"])
 
 
 @router.get("/latest", response_model=TelemetryData)
 async def telemetry_latest():
-    from main import ros_node
+    from main import offboard_ctrl, ros_node
     if ros_node is None:
         return TelemetryData()
     s = ros_node.get_state()
     code = s.get("rpp_state", 0)
+    spraying = bool(s.get("spraying", False))
+    mission_running = (
+        offboard_ctrl is not None
+        and offboard_ctrl.state == MissionState.RUNNING
+        and bool(s.get("armed", False))
+    )
+    if not mission_running:
+        marking_state = "off"
+    elif spraying:
+        marking_state = "marking"
+    else:
+        marking_state = "transit"
     return TelemetryData(
         pos_n           = s.get("pos_n"),
         pos_e           = s.get("pos_e"),
@@ -32,6 +44,8 @@ async def telemetry_latest():
         pose_age_ms     = s.get("pose_age_ms"),
         rpp_state       = code,
         rpp_state_name  = RPP_STATE_NAMES.get(code, "UNKNOWN"),
+        spraying        = spraying,
+        marking_state   = marking_state,
         armed           = s.get("armed"),
         mode            = s.get("mode"),
         connected       = s.get("connected"),

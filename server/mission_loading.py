@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Optional
 
-from config import POSE_STALE_MS
+from config import POSE_STALE_MS, SPRAY_DEFAULT_ON
 from models import MissionState
 
 MIN_MISSION_POINTS = 2
@@ -35,6 +35,18 @@ def validate_point_count(points: list[tuple[float, float]]) -> None:
             f"Mission path must contain at least {MIN_MISSION_POINTS} points "
             f"(got {len(points)})"
         )
+
+
+def spray_flags_for_path(path_mgr, name: str, points_len: int) -> list[bool]:
+    """Return per-point spray flags for a loaded path, or a configured legacy default."""
+    try:
+        preview = path_mgr.preview_path(name)
+        flags = [bool(wp.spray) for wp in preview.waypoints]
+    except Exception:
+        flags = [SPRAY_DEFAULT_ON] * points_len
+    if len(flags) != points_len:
+        flags = [SPRAY_DEFAULT_ON] * points_len
+    return flags
 
 
 def pose_origin_or_error(state: dict) -> tuple[float, float] | str:
@@ -77,10 +89,11 @@ async def load_path_for_controller(
                 start_position=start_position,
             )
             validate_point_count(points)
+            spray_flags = spray_flags_for_path(path_mgr, name, len(points))
         except Exception:
             offboard_ctrl.state = prior_state
             raise
 
         offboard_ctrl.state = prior_state
-        offboard_ctrl.load_path(points, name=name)
+        offboard_ctrl.load_path(points, name=name, spray_flags=spray_flags)
         return points

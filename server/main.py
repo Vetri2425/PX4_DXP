@@ -294,6 +294,18 @@ async def _telemetry_loop() -> None:
                 s = ros_node.get_state()
                 code = s.get("rpp_state", 0)
                 now = time.time()
+                spraying = bool(s.get("spraying", False))
+                mission_running = (
+                    offboard_ctrl is not None
+                    and offboard_ctrl.state == MissionState.RUNNING
+                    and bool(s.get("armed", False))
+                )
+                if not mission_running:
+                    marking_state = "off"
+                elif spraying:
+                    marking_state = "marking"
+                else:
+                    marking_state = "transit"
 
                 # ── 1. Push telemetry ──────────────────────────────────────────
                 telem = {
@@ -309,6 +321,8 @@ async def _telemetry_loop() -> None:
                     "pose_age_ms": s.get("pose_age_ms"),
                     "rpp_state": code,
                     "rpp_state_name": RPP_STATE_NAMES.get(code, "UNKNOWN"),
+                    "spraying": spraying,
+                    "marking_state": marking_state,
                     "armed": s.get("armed"),
                     "mode": s.get("mode"),
                     "connected": s.get("connected"),

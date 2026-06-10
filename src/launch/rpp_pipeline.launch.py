@@ -4,9 +4,10 @@
 Brings up:
   1. twist_to_setpoint_node   — streams /mavros/setpoint_raw/local at 50 Hz
   2. rpp_controller_node      — computes /rpp/velocity_ned at 50 Hz
-  3. xtrack_logger_node       — captures CSV for offline tuning analysis
-  4. path_publisher_node      — publishes the requested test path
-  5. mission_runner_node      — drives OFFBOARD lifecycle (off by default)
+  3. spray_controller_node    — drives PX4 actuator-set AUX output from /spray/active
+  4. xtrack_logger_node       — captures CSV for offline tuning analysis
+  5. path_publisher_node      — publishes the requested test path
+  6. mission_runner_node      — drives OFFBOARD lifecycle (off by default)
 
 This launch file uses ExecuteProcess directly because the repo is not yet
 packaged as a colcon ament_python package. When you create a package later,
@@ -126,6 +127,16 @@ def _build(context, *args, **kwargs):
         emulate_tty=True,
     )
 
+    spray_proc = ExecuteProcess(
+        cmd=_node_cmd(
+            os.path.join(src_dir, "spray_controller_node.py"),
+            log_level,
+        ),
+        name="spray_controller",
+        output="screen",
+        emulate_tty=True,
+    )
+
     path_proc = ExecuteProcess(
         cmd=_node_cmd(
             os.path.join(src_dir, "path_publisher_node.py"),
@@ -152,6 +163,7 @@ def _build(context, *args, **kwargs):
         # Phase 1: streamer + controller + logger come up together
         twist_proc,
         rpp_proc,
+        spray_proc,
         xtrack_proc,
         # Phase 2: path publisher waits 2s so subscribers are ready
         TimerAction(period=0.3, actions=[path_proc]),
