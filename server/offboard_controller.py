@@ -50,7 +50,17 @@ class OffboardController:
         self._loaded_pts: list[tuple[float, float]] | None = None
         self._loaded_spray_flags: list[bool] | None = None
         self._path_name: str | None = None
-        self._lock       = asyncio.Lock()  # serialise lifecycle calls
+        # Serialises lifecycle calls. Created lazily on first use: on
+        # Python 3.9 asyncio.Lock() binds an event loop at construction,
+        # and the controller is built at server startup outside any loop.
+        self._lock: asyncio.Lock | None = None
+
+    def _lifecycle_lock(self) -> asyncio.Lock:
+        # Only ever called from coroutines on the server's single event
+        # loop, so the check-then-create is race-free.
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -121,7 +131,7 @@ class OffboardController:
         return f"start: RPP unhealthy (code={rpp_code})"
 
     async def start_async(self, auto_origin: bool = False) -> tuple[bool, str]:
-        async with self._lock:
+        async with self._lifecycle_lock():
             if self._node is None:
                 return False, "ROS node not available"
 
@@ -254,7 +264,7 @@ class OffboardController:
         publish a stop-path at the rover's current position. RPP treats it
         as DONE immediately and outputs zero velocity. Vehicle stays armed.
         """
-        async with self._lock:
+        async with self._lifecycle_lock():
             if self._node is None:
                 msg = "stop: ROS node not available"
                 self._log_entry("warning", msg)
@@ -327,7 +337,7 @@ class OffboardController:
 
     async def abort_async(self) -> dict[str, Any]:
         """Hard abort: stop-path + MANUAL + disarm."""
-        async with self._lock:
+        async with self._lifecycle_lock():
             if self._node is None:
                 msg = "abort: ROS node not available"
                 self._log_entry("warning", msg)
@@ -424,7 +434,7 @@ class OffboardController:
             return result
 
     async def disarm_async(self) -> bool:
-        async with self._lock:
+        async with self._lifecycle_lock():
             if self._node is None:
                 self._log_entry("warning", "disarm: ROS node not available")
                 return False
