@@ -2,6 +2,7 @@
 
 GET    /api/paths              — list built-in + uploaded paths
 GET    /api/path/{name}/preview — return local-NED points for display
+GET    /api/path/{name}/entities — return per-entity DXF geometry for selection
 POST   /api/path/upload        — upload .waypoints, .csv, or .dxf
 POST   /api/path/publish       — publish named path to /path topic
 POST   /api/path/parse-dxf     — parse DXF file, return entity list
@@ -22,12 +23,15 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from auth import require_token
 from config import MAX_UPLOAD_BYTES, MISSION_DIR, RMSE_MAX, SPRAY_LITERS_PER_METER, STAGING_DIR, STAGING_TTL_S
 from models import (
+    DXFEntitiesResponse,
+    DXFEntityPreview,
     DXFEntityInfo,
     DXFParseResponse,
     LoadMissionRequest,
     MissionSummary,
     PathPlanRequest,
     PathPlanResponse,
+    PathPreviewBounds,
     PathPreviewResponse,
     PathPublishRequest,
 )
@@ -80,6 +84,194 @@ async def preview_path(name: str):
         raise HTTPException(504, "Preview timed out (15s limit)")
     except Exception as exc:
         raise HTTPException(422, f"Preview failed: {exc}")
+
+
+# ── Entity-level DXF preview ──────────────────────────────────────────────────
+
+def _ned_point(pt) -> dict[str, float]:
+    return {"north": float(pt[0]), "east": float(pt[1])}
+
+
+def _arc_points(
+    center: tuple[float, float],
+    radius: float,
+    start_angle_deg: float,
+    end_angle_deg: float,
+    min_points: int = 4,
+    full_circle_points: int = 64,
+) -> list[tuple[float, float]]:
+    if radius < 1e-9:
+        return [center]
+    sweep_deg = (end_angle_deg - start_angle_deg) % 360.0
+    if abs(sweep_deg) < 1e-9:
+        sweep_deg = 360.0
+    n_points = max(min_points, math.ceil(sweep_deg / 360.0 * full_circle_points) + 1)
+    start = math.radians(start_angle_deg)
+    sweep = math.radians(sweep_deg)
+    cn, ce = center
+    return [
+        (cn + radius * math.sin(start + sweep * i / (n_points - 1)),
+         ce + radius * math.cos(start + sweep * i / (n_points - 1)))
+        for i in range(n_points)
+    ]
+
+
+def _subsample_points(
+    pts: list[tuple[float, float]],
+    max_points: int = 200,
+) -> list[tuple[float, float]]:
+    if len(pts) <= max_points:
+        return pts
+    if max_points < 2:
+        return pts[:max_points]
+    step = (len(pts) - 1) / (max_points - 1)
+    return [pts[round(i * step)] for i in range(max_points)]
+
+
+def _entity_length_m(ent) -> float:
+    geom = ent.geometry
+    etype = ent.entity_type
+    if etype == "LINE":
+        s = geom.get("start", (0.0, 0.0))
+        e = geom.get("end", (0.0, 0.0))
+        return math.hypot(s[0] - e[0], s[1] - e[1])
+    if etype == "CIRCLE":
+        return 2.0 * math.pi * geom.get("radius", 0.0)
+    if etype == "ARC":
+        sweep_deg = (geom.get("end_angle", 360.0) - geom.get("start_angle", 0.0)) % 360.0
+        if abs(sweep_deg) < 1e-9:
+            sweep_deg = 360.0
+        return geom.get("radius", 0.0) * math.radians(sweep_deg)
+
+    pts = _entity_preview_tuples(ent, max_points=10000)
+    return sum(
+        math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
+        for i in range(1, len(pts))
+    )
+
+
+def _entity_preview_tuples(ent, max_points: int = 200) -> list[tuple[float, float]]:
+    geom = ent.geometry
+    etype = ent.entity_type
+
+    if etype == "LINE":
+        pts = [geom.get("start", (0.0, 0.0)), geom.get("end", (0.0, 0.0))]
+    elif etype == "POINT":
+        pts = [geom.get("position", (0.0, 0.0))]
+    elif etype == "CIRCLE":
+        center = geom.get("center", (0.0, 0.0))
+        radius = geom.get("radius", 0.0)
+        pts = _arc_points(center, radius, 0.0, 360.0, min_points=65, full_circle_points=64)
+    elif etype == "ARC":
+        pts = _arc_points(
+            geom.get("center", (0.0, 0.0)),
+            geom.get("radius", 0.0),
+            geom.get("start_angle", 0.0),
+            geom.get("end_angle", 360.0),
+        )
+    elif etype == "LWPOLYLINE":
+        vertices = list(geom.get("vertices", []))
+        bulges = list(geom.get("bulges", [0.0] * len(vertices)))
+        closed = bool(geom.get("closed", False))
+        if any(abs(b) > 1e-9 for b in bulges):
+            from path_engine.planners.arc_curve import densify_lwpolyline_bulge
+            pts = densify_lwpolyline_bulge(
+                vertices,
+                bulges,
+                closed,
+                chord_error=0.05,
+                min_spacing=0.05,
+                max_spacing=0.50,
+            )
+        else:
+            pts = vertices
+            if closed and pts and math.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1]) > 1e-9:
+                pts = pts + [pts[0]]
+    elif etype in ("SPLINE", "ELLIPSE"):
+        pts = list(geom.get("vertices", []))
+    else:
+        pts = []
+
+    return _subsample_points([(float(n), float(e)) for n, e in pts], max_points=max_points)
+
+
+def _jsonable_geometry(geometry: dict) -> dict:
+    def convert(value):
+        if isinstance(value, tuple):
+            return [convert(v) for v in value]
+        if isinstance(value, list):
+            return [convert(v) for v in value]
+        if isinstance(value, dict):
+            return {str(k): convert(v) for k, v in value.items()}
+        return value
+
+    return {str(k): convert(v) for k, v in geometry.items()}
+
+
+@path_router.get("/{name}/entities", response_model=DXFEntitiesResponse)
+async def path_entities(name: str):
+    """Return per-entity DXF preview geometry without full path planning."""
+    import asyncio
+    from main import path_mgr
+
+    safe = os.path.basename(name)
+    fpath = os.path.join(MISSION_DIR, safe)
+    if not os.path.isfile(fpath):
+        raise HTTPException(404, f"Path not found: {name!r}")
+    if os.path.splitext(fpath)[1].lower() != ".dxf":
+        raise HTTPException(415, "Entity preview is only available for DXF files")
+
+    try:
+        entities = await asyncio.wait_for(
+            asyncio.to_thread(path_mgr.parse_dxf, fpath),
+            timeout=5.0,
+        )
+    except ImportError as exc:
+        raise HTTPException(500, str(exc))
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "Entity preview timed out (5s limit)")
+    except Exception as exc:
+        raise HTTPException(422, f"DXF entity preview failed: {exc}")
+
+    previews = []
+    all_pts: list[tuple[float, float]] = []
+    for ent in entities:
+        pts = _entity_preview_tuples(ent)
+        all_pts.extend(pts)
+        geometry = ent.geometry
+        if ent.entity_type in ("SPLINE", "ELLIPSE"):
+            # Flattened spline/ellipse vertices duplicate preview_points
+            # (same flattening, just unsubsampled) — strip them so a
+            # spline-heavy file doesn't ship the shape twice.
+            geometry = {k: v for k, v in geometry.items() if k != "vertices"}
+        previews.append(DXFEntityPreview(
+            entity_id=ent.entity_id,
+            entity_type=ent.entity_type,
+            layer=ent.layer,
+            color=ent.color,
+            is_mark=ent.is_mark(),
+            length_m=round(_entity_length_m(ent), 3),
+            geometry=_jsonable_geometry(geometry),
+            preview_points=[_ned_point(pt) for pt in pts],
+        ))
+
+    bounds = None
+    if all_pts:
+        norths = [n for n, _ in all_pts]
+        easts = [e for _, e in all_pts]
+        bounds = PathPreviewBounds(
+            north_min=min(norths),
+            north_max=max(norths),
+            east_min=min(easts),
+            east_max=max(easts),
+        )
+
+    return DXFEntitiesResponse(
+        name=safe,
+        num_entities=len(previews),
+        bounds=bounds,
+        entities=previews,
+    )
 
 
 # ── Upload ────────────────────────────────────────────────────────────────────

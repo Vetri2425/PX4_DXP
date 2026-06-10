@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Literal, Optional, Union
+from typing import Any, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -227,6 +227,36 @@ class DXFEntityInfo(BaseModel):
     entity_id: str = ""  # ezdxf handle
     is_mark: bool = True  # True = spray ON, False = TRANSIT
     length_m: float = 0.0  # Approximate arc length in metres
+
+
+class EntityPreviewPoint(BaseModel):
+    """Lightweight local-NED point used to render/select a DXF entity."""
+
+    north: float
+    east: float
+
+
+class DXFEntityPreview(BaseModel):
+    """Entity-level DXF preview geometry for canvas rendering and hit-testing."""
+
+    entity_id: str
+    entity_type: str
+    layer: str
+    color: int = 7
+    is_mark: bool = True
+    length_m: float = 0.0
+    geometry: dict[str, Any] = Field(default_factory=dict)
+    preview_points: list[EntityPreviewPoint]
+
+
+class DXFEntitiesResponse(BaseModel):
+    """Response from /api/path/{name}/entities."""
+
+    name: str
+    frame: str = "local_ned"
+    num_entities: int
+    bounds: Optional[PathPreviewBounds] = None
+    entities: list[DXFEntityPreview]
 
 
 class DXFParseResponse(BaseModel):

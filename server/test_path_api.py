@@ -8,7 +8,7 @@ import pytest
 from fastapi import HTTPException
 from types import SimpleNamespace
 from models import MissionState, PathPlanRequest, PathPreviewResponse, RefPoint
-from routes.path import plan_path, preview_path
+from routes.path import path_entities, plan_path, preview_path
 import main
 from path_manager import PathManager
 
@@ -55,6 +55,31 @@ def test_path_manager_preview_preserves_dxf_spray_flags(tmp_path, monkeypatch):
     assert [pt.spray for pt in preview.waypoints] == [True, False, True]
 
 
+def test_path_manager_preview_caches_uploaded_file_result(tmp_path, monkeypatch):
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+    calls = {"count": 0}
+
+    class FakeEngine:
+        def plan_file(self, filepath):
+            calls["count"] += 1
+            return SimpleNamespace(
+                merged_waypoints=[(0.0, 0.0), (1.0, 0.0)],
+                spray_flags=[True, True],
+            )
+
+    import path_engine
+
+    monkeypatch.setattr(path_engine, "PathEngine", FakeEngine)
+
+    mgr = PathManager(str(tmp_path))
+    first = mgr.preview_path("field.dxf")
+    second = mgr.preview_path("field.dxf")
+
+    assert calls["count"] == 1
+    assert first is second
+
+
 @pytest.mark.anyio
 async def test_preview_api_returns_path_preview(monkeypatch):
     class FakePathManager:
@@ -98,6 +123,50 @@ async def test_preview_api_missing_path_is_404(monkeypatch):
 
     assert exc.value.status_code == 404
     assert "missing.csv" in exc.value.detail
+
+
+@pytest.mark.anyio
+async def test_entities_api_returns_line_preview_points(tmp_path, monkeypatch):
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            assert filepath == str(mission_file)
+            return [
+                SimpleNamespace(
+                    entity_id="A1",
+                    entity_type="LINE",
+                    layer="MARKING",
+                    color=7,
+                    geometry={
+                        "start": (0.0, 0.0),
+                        "end": (1.0, 2.0),
+                    },
+                    is_mark=lambda: True,
+                )
+            ]
+
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    data = await path_entities("field.dxf")
+
+    assert data.name == "field.dxf"
+    assert data.frame == "local_ned"
+    assert data.num_entities == 1
+    assert data.bounds.north_max == 1.0
+    assert data.bounds.east_max == 2.0
+    ent = data.entities[0]
+    assert ent.entity_id == "A1"
+    assert ent.entity_type == "LINE"
+    assert ent.length_m == pytest.approx(2.236, abs=0.001)
+    assert [pt.model_dump() for pt in ent.preview_points] == [
+        {"north": 0.0, "east": 0.0},
+        {"north": 1.0, "east": 2.0},
+    ]
 
 
 def test_path_plan_request_extension_defaults_are_safe():

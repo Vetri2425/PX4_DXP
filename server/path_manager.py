@@ -234,6 +234,10 @@ class PathManager:
         # unchanged files on every /api/paths call. Invalidated per-file on
         # mtime/size change; deleted files are evicted on the next listing.
         self._list_cache: dict[str, tuple[float, int, PathInfo]] = {}
+        # Preview cache: fpath -> (mtime_ns, size, PathPreviewResponse). DXF
+        # preview planning can be expensive; unchanged files can reuse the
+        # already materialized response.
+        self._preview_cache: dict[str, tuple[int, int, PathPreviewResponse]] = {}
 
     @staticmethod
     def _cheap_point_count(fpath: str) -> int:
@@ -358,6 +362,10 @@ class PathManager:
             fpath = os.path.join(self._dir, os.path.basename(name))
             if not os.path.isfile(fpath):
                 raise FileNotFoundError(f"Path not found: {name!r}")
+            st = os.stat(fpath)
+            cached = self._preview_cache.get(fpath)
+            if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+                return cached[2]
             if os.path.splitext(fpath)[1].lower() == ".dxf":
                 from path_engine import PathEngine
                 plan = PathEngine().plan_file(fpath)
@@ -386,12 +394,15 @@ class PathManager:
         else:
             bounds = None
 
-        return PathPreviewResponse(
+        response = PathPreviewResponse(
             name=name,
             num_points=len(pts),
             bounds=bounds,
             waypoints=waypoints,
         )
+        if lookup_name not in BUILTIN_PATHS:
+            self._preview_cache[fpath] = (st.st_mtime_ns, st.st_size, response)
+        return response
 
     def save_uploaded(self, filename: str, content: bytes) -> str:
         """Save raw bytes to missions dir. Validates extension + size + disk quota."""
@@ -410,6 +421,8 @@ class PathManager:
         fpath = os.path.join(self._dir, safe)
         with open(fpath, "wb") as f:
             f.write(content)
+        self._list_cache.pop(fpath, None)
+        self._preview_cache.pop(fpath, None)
         log.info("uploaded mission file: %s (%d bytes)", safe, len(content))
         return safe
 
@@ -417,6 +430,8 @@ class PathManager:
         fpath = os.path.join(self._dir, os.path.basename(filename))
         if os.path.isfile(fpath):
             os.remove(fpath)
+            self._list_cache.pop(fpath, None)
+            self._preview_cache.pop(fpath, None)
             log.info("deleted mission file: %s", filename)
             return True
         return False
