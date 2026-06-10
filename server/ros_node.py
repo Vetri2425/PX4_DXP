@@ -174,6 +174,8 @@ class RosBridgeNode(Node):
         "l_d_raw_m": 0.0,
         "kappa_speed": 0.0,
         "spraying": False,
+        "spray_active": False,
+        "spray_manual": False,
     }
 
     def __init__(self) -> None:
@@ -256,9 +258,19 @@ class RosBridgeNode(Node):
             _qos_best_effort(),
             callback_group=self._sub_group,
         )
+        self.create_subscription(
+            Bool,
+            "/spray/manual_state",
+            self._cb_spray_manual_state,
+            _qos_best_effort(),
+            callback_group=self._sub_group,
+        )
 
         # ── Publishers ────────────────────────────────────────────────────────
         self._path_pub = self.create_publisher(Path, "/path", _qos_reliable_tl())
+        # Manual spray override command — reliable VOLATILE (depth 1): must
+        # arrive, but a stale override must never replay to a restarted node.
+        self._spray_manual_pub = self.create_publisher(Bool, "/spray/manual", 1)
 
         # ── Service clients (reentrant group, can be called from any thread) ──
         self._arming_cli = None
@@ -398,6 +410,19 @@ class RosBridgeNode(Node):
     def _cb_spray_state(self, msg: Bool) -> None:
         with self._lock:
             self._state["spraying"] = bool(msg.data)
+
+    def _cb_spray_manual_state(self, msg: Bool) -> None:
+        with self._lock:
+            self._state["spray_manual"] = bool(msg.data)
+
+    # ── Public API: spray manual override ────────────────────────────────────
+
+    def publish_spray_manual(self, on: bool) -> None:
+        """Command the spray_controller manual override (True=ON, False=cancel)."""
+        msg = Bool()
+        msg.data = bool(on)
+        self._spray_manual_pub.publish(msg)
+        log.info("published /spray/manual: %s", "ON" if on else "OFF")
 
     # ── Public API: state ─────────────────────────────────────────────────────
 

@@ -5,6 +5,15 @@ Subscribes to /spray/active (desired MARK state from RPP), applies debounce
 and safety gates, then commands MAV_CMD_DO_SET_ACTUATOR. The controller only
 drives an already-configured PX4 actuator set output; QGC remains the source
 of truth for AUX pin/function/PWM limits.
+
+Manual override (/spray/manual, std_msgs/Bool) lets the server bench-test the
+actuator: True holds spray ON for at most `manual_override_timeout_s`
+(node-side hard expiry — never latches), False cancels immediately. The
+override is subordinate to every fail-safe: disarm, mode loss, and node
+shutdown all clear it. While the override is active the /spray/active
+staleness watchdog only clears the *auto* desire (manual has its own timeout
+and does not depend on the RPP stream). Actual override state is reported on
+/spray/manual_state for the server.
 """
 
 from __future__ import annotations
@@ -57,6 +66,7 @@ class SprayControllerNode(Node):
         self.declare_parameter("reassert_hz", 2.0)
         self.declare_parameter("require_offboard", True)
         self.declare_parameter("active_timeout_s", 0.5)
+        self.declare_parameter("manual_override_timeout_s", 10.0)
         self.declare_parameter("command_service", "/mavros/cmd/command")
 
         self._group = ReentrantCallbackGroup()
@@ -66,6 +76,8 @@ class SprayControllerNode(Node):
         self._desired_debounced = False
         self._commanded = False
         self._last_active_time = None
+        self._manual_active = False
+        self._manual_deadline_ns: Optional[int] = None
         self._armed = False
         self._mode = "UNKNOWN"
         self._service_ready = False
@@ -78,11 +90,28 @@ class SprayControllerNode(Node):
         )
 
         self._state_pub = self.create_publisher(Bool, "/spray/state", _best_effort_qos())
+        self._manual_state_pub = self.create_publisher(
+            Bool, "/spray/manual_state", _best_effort_qos()
+        )
         self.create_subscription(
             Bool,
             "/spray/active",
             self._active_cb,
             _best_effort_qos(),
+            callback_group=self._group,
+        )
+        # Reliable VOLATILE (depth 1): a manual command must arrive, but a
+        # stale override must never be re-delivered to a restarted node.
+        self.create_subscription(
+            Bool,
+            "/spray/manual",
+            self._manual_cb,
+            QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.VOLATILE,
+                history=HistoryPolicy.KEEP_LAST,
+            ),
             callback_group=self._group,
         )
         self.create_subscription(
@@ -132,6 +161,38 @@ class SprayControllerNode(Node):
         self._desired_raw = bool(msg.data)
         self._apply_debounce()
 
+    def _manual_cb(self, msg: Bool) -> None:
+        if msg.data:
+            if not self._safety_allows_on():
+                self.get_logger().warn(
+                    "manual spray ON rejected: safety gate (disarmed or wrong mode)"
+                )
+                self._manual_active = False
+                self._manual_deadline_ns = None
+            else:
+                timeout_s = max(
+                    0.5,
+                    float(self.get_parameter("manual_override_timeout_s").value),
+                )
+                self._manual_active = True
+                self._manual_deadline_ns = (
+                    self.get_clock().now().nanoseconds + int(timeout_s * 1e9)
+                )
+                self.get_logger().info(
+                    f"manual spray ON (expires in {timeout_s:.1f}s)"
+                )
+        else:
+            if self._manual_active:
+                self.get_logger().info("manual spray override cancelled")
+            self._manual_active = False
+            self._manual_deadline_ns = None
+        self._commit_desired_state()
+        self._publish_manual_state()
+
+    def _effective_desired(self) -> bool:
+        """Manual ON-override wins over the auto (MARK-segment) desire."""
+        return True if self._manual_active else self._desired_debounced
+
     def _apply_debounce(self) -> None:
         if self._candidate is None or self._candidate != self._desired_raw:
             self._candidate = self._desired_raw
@@ -143,7 +204,7 @@ class SprayControllerNode(Node):
         if self._candidate_count < max(1, debounce_samples):
             return
         if self._desired_debounced == self._candidate:
-            if self._desired_debounced != self._commanded:
+            if self._effective_desired() != self._commanded:
                 self._commit_desired_state()
             return
 
@@ -151,6 +212,14 @@ class SprayControllerNode(Node):
         self._commit_desired_state()
 
     def _watchdog_tick(self) -> None:
+        # Manual override hard expiry — never latches, independent of /spray/active.
+        if self._manual_active and self._manual_deadline_ns is not None:
+            if self.get_clock().now().nanoseconds >= self._manual_deadline_ns:
+                self._manual_active = False
+                self._manual_deadline_ns = None
+                self.get_logger().info("manual spray override expired — reverting")
+                self._commit_desired_state()
+
         timeout_s = max(0.0, float(self.get_parameter("active_timeout_s").value))
         if self._last_active_time is not None:
             age_s = (self.get_clock().now() - self._last_active_time).nanoseconds * 1e-9
@@ -159,21 +228,27 @@ class SprayControllerNode(Node):
                 self._desired_debounced = False
                 self._candidate = False
                 self._candidate_count = 0
-                self._force_off(f"/spray/active stale ({age_s:.2f}s)")
-                return
+                # Staleness kills the *auto* desire only; an active manual
+                # override has its own timeout and does not depend on RPP.
+                if not self._manual_active:
+                    self._force_off(f"/spray/active stale ({age_s:.2f}s)")
+                    self._publish_manual_state()
+                    return
         if not self._safety_allows_on():
             self._force_off("safety gate")
+        self._publish_manual_state()
 
     def _reassert_tick(self) -> None:
         if self._commanded and self._safety_allows_on():
             self._send_command(True, reason="reassert")
 
     def _commit_desired_state(self) -> None:
-        if self._desired_debounced and not self._safety_allows_on():
+        desired = self._effective_desired()
+        if desired and not self._safety_allows_on():
             self._force_off("desired ON blocked by safety gate")
             return
-        if self._desired_debounced != self._commanded:
-            self._send_command(self._desired_debounced, reason="edge")
+        if desired != self._commanded:
+            self._send_command(desired, reason="edge")
 
     def _safety_allows_on(self) -> bool:
         if not self._armed:
@@ -184,6 +259,10 @@ class SprayControllerNode(Node):
         return True
 
     def _force_off(self, reason: str) -> None:
+        # Fail-safes outrank the manual override — clear it so spray cannot
+        # come back ON without a fresh, safety-gated manual command.
+        self._manual_active = False
+        self._manual_deadline_ns = None
         if self._commanded:
             self.get_logger().warn(f"forcing spray OFF: {reason}", throttle_duration_sec=1.0)
             self._send_command(False, reason="failsafe")
@@ -252,9 +331,16 @@ class SprayControllerNode(Node):
         msg.data = bool(active)
         self._state_pub.publish(msg)
 
+    def _publish_manual_state(self) -> None:
+        msg = Bool()
+        msg.data = bool(self._manual_active)
+        self._manual_state_pub.publish(msg)
+
     def shutdown_off(self) -> None:
         self._desired_raw = False
         self._desired_debounced = False
+        self._manual_active = False
+        self._manual_deadline_ns = None
         self._send_command(False, reason="shutdown")
 
 

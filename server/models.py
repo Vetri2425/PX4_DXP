@@ -54,6 +54,14 @@ class MissionLoadRequest(BaseModel):
     mission_file: Optional[str] = None
 
 
+class SprayTestRequest(BaseModel):
+    on: bool
+    # Seconds to hold manual spray ON before server-side auto-off.
+    # Clamped to MAX_SPRAY_TEST_DURATION_S; the node's
+    # manual_override_timeout_s is the hard backstop.
+    duration_s: Optional[float] = None
+
+
 class ParamSetRequest(BaseModel):
     # PX4 has int (SYS_AUTOSTART), float (RO_YAW_RATE_P), and bool params.
     value: Union[bool, int, float, str]
