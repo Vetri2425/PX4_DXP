@@ -165,7 +165,12 @@ def test_smoke():
             raise
 
         # Segment profile should simplify a generated square and publish the
-        # actual internal path for bag-based analysis.
+        # actual internal path for bag-based analysis. Forced profile keeps
+        # the square as ONE run so the in-run corner machinery (lookahead
+        # clamp, corner align) is exercised; auto mode would sub-split the
+        # square into per-side runs (covered by the L-shape test below).
+        from rclpy.parameter import Parameter
+        node.set_parameters([Parameter("tracking_profile", value="segment")])
         square_msg = Path()
         square_msg.header.frame_id = "local_ned"
         square_msg.header.stamp = node.get_clock().now().to_msg()
@@ -222,6 +227,7 @@ def test_smoke():
         # Mixed mission (line entity + transit + arc entity): auto profile
         # must split into per-entity runs at spray-flag boundaries and
         # classify each run independently — line→segment, arc→smooth.
+        node.set_parameters([Parameter("tracking_profile", value="auto")])
         mixed_msg = Path()
         mixed_msg.header.frame_id = "local_ned"
         mixed_msg.header.stamp = node.get_clock().now().to_msg()

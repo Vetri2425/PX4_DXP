@@ -846,10 +846,15 @@ class RPPControllerNode(Node):
         if max(deltas) >= threshold:
             return "segment"
 
-        total_turn = sum(deltas)
-        if total_turn <= math.radians(10.0):
-            return "segment"
-        return "smooth"
+        # Smooth requires SUSTAINED turning: several distinct turning
+        # vertices accumulating real heading change, the signature of a
+        # discretized arc/circle/spline. One or two shallow bends — a cut
+        # corner from waypoint sampling, a slight kink between chained
+        # lines — must stay segment.
+        turning = [d for d in deltas if d > math.radians(2.0)]
+        if len(turning) >= 3 and sum(turning) > math.radians(20.0):
+            return "smooth"
+        return "segment"
 
     # ------------------------------------------------------------------
     # Per-entity run management (auto profile)
