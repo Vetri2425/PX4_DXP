@@ -86,6 +86,10 @@ def _build(context, *args, **kwargs):
         "max_yaw_rate_body", "yaw_rate_feedback_gain",
         "max_linear_vel", "min_linear_vel", "mission_speed",
         "xtrack_lookahead_gain", "max_linear_accel",
+        "tracking_profile", "segment_corner_threshold_deg",
+        "segment_slowdown_dist", "segment_min_corner_speed",
+        "segment_corner_acceptance_radius", "segment_heading_tolerance_deg",
+        "segment_yaw_rate_gain",
     ):
         val = LaunchConfiguration(name).perform(context)
         if val != "__unset__":
@@ -201,5 +205,12 @@ def generate_launch_description():
         DeclareLaunchArgument("mission_speed",                       default_value="__unset__"),
         DeclareLaunchArgument("xtrack_lookahead_gain",               default_value="__unset__"),
         DeclareLaunchArgument("max_linear_accel",                    default_value="__unset__"),
+        DeclareLaunchArgument("tracking_profile",                    default_value="__unset__"),
+        DeclareLaunchArgument("segment_corner_threshold_deg",         default_value="__unset__"),
+        DeclareLaunchArgument("segment_slowdown_dist",               default_value="__unset__"),
+        DeclareLaunchArgument("segment_min_corner_speed",             default_value="__unset__"),
+        DeclareLaunchArgument("segment_corner_acceptance_radius",     default_value="__unset__"),
+        DeclareLaunchArgument("segment_heading_tolerance_deg",        default_value="__unset__"),
+        DeclareLaunchArgument("segment_yaw_rate_gain",                default_value="__unset__"),
         OpaqueFunction(function=_build),
     ])

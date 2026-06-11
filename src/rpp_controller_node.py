@@ -151,6 +151,13 @@ Topic:  /rpp/debug   (std_msgs/Float32MultiArray, layout encoded below)
         [37] max_linear_decel         (param — m/s²)
         [38] mission_speed            (param — m/s)
         [39] spray_active             (Phase 3: 1.0 MARK, 0.0 TRANSIT/OFF)
+        [40] tracking_profile_code    (0 auto/unknown, 1 segment, 2 smooth)
+        [41] segment_corner_threshold_deg
+        [42] segment_slowdown_dist
+        [43] segment_min_corner_speed
+        [44] segment_corner_acceptance_radius
+        [45] segment_heading_tolerance_deg
+        [46] segment_yaw_rate_gain
 Layout is append-only: indices [0..7] keep their meaning forever. Consumers
 that only read [0..7] continue to work.
 
@@ -195,6 +202,14 @@ class StateCode(IntEnum):
     # the actual reason in telemetry.
     RTK_WAIT = 4    # GPS fix < RTK_FIXED; refusing to drive (P0.3 gate)
     JUMP_SKIP = 5   # one-cycle skip due to position jump (P0.2 EKF guard)
+
+
+class SegmentStateCode(IntEnum):
+    INACTIVE = 0
+    TRACK_SEGMENT = 1
+    PRE_CORNER_SLOWDOWN = 2
+    CORNER_ALIGN = 3
+    DONE = 4
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +302,19 @@ class RPPControllerNode(Node):
         self.declare_parameter("corner_smooth_radius_m",              0.5)
         self.declare_parameter("corner_smooth_arc_pts",               6)
 
+        # Tracking profile:
+        #   auto    — classify each received path as segment or smooth
+        #   segment — straight/polyline/polygon tracker with corner align
+        #   smooth  — existing RPP with optional corner smoothing
+        # `sharp` is accepted as a runtime alias for `segment`.
+        self.declare_parameter("tracking_profile",                    "auto")
+        self.declare_parameter("segment_corner_threshold_deg",         45.0)
+        self.declare_parameter("segment_slowdown_dist",               0.50)
+        self.declare_parameter("segment_min_corner_speed",             0.08)
+        self.declare_parameter("segment_corner_acceptance_radius",     0.05)
+        self.declare_parameter("segment_heading_tolerance_deg",        7.5)
+        self.declare_parameter("segment_yaw_rate_gain",                1.5)
+
         # P2.4 — Velocity-based pose extrapolation (latency closure)
         # When enabled, dead-reckon the pose forward by `vel_ned * pose_age`
         # to close the gap between when MAVROS published the pose and when
@@ -343,6 +371,17 @@ class RPPControllerNode(Node):
         # ------------------------------------------------------------------
         self._path: list[PoseStamped] = []
         self._spray_flags: list[bool] = []
+        self._active_tracking_profile: str = "smooth"
+        # Per-entity run queue (see _split_runs_by_flag / _apply_run)
+        self._runs: list[dict] = []
+        self._run_idx: int = 0
+        self._segment_idx: int = 0
+        self._segment_state: SegmentStateCode = SegmentStateCode.INACTIVE
+        self._segment_ff_warned: bool = False
+        self._last_segment_debug: tuple[float, ...] = (
+            0.0, 0.0, 0.0, float("nan"), float("nan"),
+            float("nan"), float("nan"), float("nan"), 0.0,
+        )
         self._pose: PoseStamped | None = None
         self._pose_recv_time: RclTime | None = None
         self._path_done = False
@@ -406,6 +445,12 @@ class RPPControllerNode(Node):
         )
         self._dbg_pub = self.create_publisher(
             Float32MultiArray, "/rpp/debug", be_qos
+        )
+        self._segment_dbg_pub = self.create_publisher(
+            Float32MultiArray, "/rpp/segment_debug", be_qos
+        )
+        self._conditioned_path_pub = self.create_publisher(
+            Path, "/rpp/conditioned_path", path_qos
         )
         # P3.1: optional yaw rate (body-rate mode) publisher
         self._yaw_rate_pub = self.create_publisher(
@@ -485,59 +530,74 @@ class RPPControllerNode(Node):
         resample_dx = float(self.get_parameter("path_resample_spacing_m").value)
         corner_r    = float(self.get_parameter("corner_smooth_radius_m").value)
         arc_pts     = int(self.get_parameter("corner_smooth_arc_pts").value)
+        requested = self._normalize_tracking_profile(
+            self.get_parameter("tracking_profile").value
+        )
+        threshold = float(
+            self.get_parameter("segment_corner_threshold_deg").value
+        )
 
-        cond_pts = raw_pts
-        cond_flags = raw_flags
-        if corner_r > 0.0 and len(cond_pts) >= 3:
-            cond_pts, cond_flags = self._smooth_corners(
-                cond_pts, corner_r, max(2, arc_pts), cond_flags
-            )
-        if resample_dx > 0.0 and len(cond_pts) >= 2:
-            cond_pts, cond_flags = self._resample_path(
-                cond_pts, resample_dx, cond_flags
-            )
+        # Auto profile resolves PER RUN, not per path: a DXF mission mixes
+        # line entities (segment tracking) and arc/circle entities (smooth
+        # RPP) in one Path. Spray-flag transitions are the entity boundaries
+        # the planner gives us, so each contiguous same-flag run is
+        # classified and conditioned independently, then the runs are
+        # tracked in sequence (see _apply_run/_advance_run). A forced
+        # profile keeps the whole path as a single run.
+        if requested == "auto":
+            raw_runs = self._split_runs_by_flag(raw_pts, raw_flags)
+        else:
+            raw_runs = [(raw_pts, raw_flags)]
 
-        # Build PoseStamped list in the same NED frame
         stamp = msg.header.stamp
-        new_path: list[PoseStamped] = []
-        for (n, e), flag in zip(cond_pts, cond_flags):
-            ps = PoseStamped()
-            ps.header.stamp = stamp
-            ps.header.frame_id = expected
-            ps.pose.position.x = float(n)
-            ps.pose.position.y = float(e)
-            ps.pose.position.z = 1.0 if flag else 0.0
-            ps.pose.orientation.w = 1.0
-            new_path.append(ps)
+        runs: list[dict] = []
+        for run_pts, run_flags in raw_runs:
+            profile = (
+                requested if requested != "auto"
+                else self._classify_auto_profile(run_pts, threshold)
+            )
+            if profile == "segment":
+                c_pts, c_flags = self._simplify_path_for_profile(
+                    run_pts, run_flags
+                )
+            else:
+                c_pts, c_flags = run_pts, run_flags
+                if corner_r > 0.0 and len(c_pts) >= 3:
+                    c_pts, c_flags = self._smooth_corners(
+                        c_pts, corner_r, max(2, arc_pts), c_flags
+                    )
+                if resample_dx > 0.0 and len(c_pts) >= 2:
+                    c_pts, c_flags = self._resample_path(
+                        c_pts, resample_dx, c_flags
+                    )
+            runs.append({
+                "poses": self._build_poses(c_pts, c_flags, stamp, expected),
+                "flags": list(c_flags),
+                "profile": profile,
+                "length": self._pts_length(c_pts),
+            })
 
-        self._path = new_path
-        self._spray_flags = list(cond_flags)
-        self._path_done = False
-        self._path_travel_m = 0.0   # reset travel distance on new path
-        # P1.4 — reset hint so search starts from beginning of new path
-        self._closest_seg_hint = 0
-        # P1.4 fixup — force full scan on first projection after re-plan
-        self._hint_valid = False
+        self._runs = runs
+        # Mission-level resets; per-run state is reset inside _apply_run.
         # P0.1 — reset last speed so L_d bootstraps cleanly on new path
         self._last_speed_cmd = 0.0
         # P0.2 — reset jump guard; first pose on new path is always "valid"
         self._last_pos = None
+        self._apply_run(0)
+        self._publish_conditioned_path(stamp, expected)
 
-        first = self._path[0].pose.position
-        last = self._path[-1].pose.position
-        if len(self._path) != n_raw:
-            self.get_logger().info(
-                f"Path conditioned: {n_raw} → {len(self._path)} waypoints "
-                f"(resample={resample_dx:.2f}m, corner_r={corner_r:.2f}m), "
-                f"first=({first.x:.2f}N, {first.y:.2f}E), "
-                f"last=({last.x:.2f}N, {last.y:.2f}E)"
-            )
-        else:
-            self.get_logger().info(
-                f"Path accepted: {len(self._path)} waypoints, "
-                f"first=({first.x:.2f}N, {first.y:.2f}E), "
-                f"last=({last.x:.2f}N, {last.y:.2f}E)"
-            )
+        n_cond = sum(len(r["poses"]) for r in runs)
+        n_seg_runs = sum(1 for r in runs if r["profile"] == "segment")
+        first = runs[0]["poses"][0].pose.position
+        last = runs[-1]["poses"][-1].pose.position
+        self.get_logger().info(
+            f"Path accepted: {n_raw} → {n_cond} waypoints in {len(runs)} "
+            f"run(s) ({n_seg_runs} segment, {len(runs) - n_seg_runs} smooth; "
+            f"requested={requested}, resample={resample_dx:.2f}m, "
+            f"corner_r={corner_r:.2f}m), "
+            f"first=({first.x:.2f}N, {first.y:.2f}E), "
+            f"last=({last.x:.2f}N, {last.y:.2f}E)"
+        )
 
     def _pose_cb(self, msg: PoseStamped):
         """Store latest pose. Frame conversion happens at use-site."""
@@ -671,6 +731,276 @@ class RPPControllerNode(Node):
     @staticmethod
     def _dist(ax: float, ay: float, bx: float, by: float) -> float:
         return math.hypot(ax - bx, ay - by)
+
+    @staticmethod
+    def _angle_wrap(angle: float) -> float:
+        return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+    @staticmethod
+    def _profile_code(profile: str) -> float:
+        if profile == "segment":
+            return 1.0
+        if profile == "smooth":
+            return 2.0
+        return 0.0
+
+    @staticmethod
+    def _normalize_tracking_profile(value: object) -> str:
+        profile = str(value).strip().lower()
+        if profile == "sharp":
+            return "segment"
+        if profile in ("auto", "segment", "smooth"):
+            return profile
+        return "auto"
+
+    @staticmethod
+    def _segment_heading(a: tuple[float, float], b: tuple[float, float]) -> float:
+        return math.atan2(b[1] - a[1], b[0] - a[0])
+
+    @classmethod
+    def _heading_delta(cls, h0: float, h1: float) -> float:
+        return abs(cls._angle_wrap(h1 - h0))
+
+    @classmethod
+    def _simplify_path_for_profile(
+        cls,
+        pts: list[tuple[float, float]],
+        flags: list[bool] | None = None,
+        collinear_tol_deg: float = 5.0,
+    ) -> tuple[list[tuple[float, float]], list[bool]]:
+        """Remove duplicate and same-heading vertices while preserving corners.
+
+        This is used for segment-mode decisions and tracking. Generated
+        squares/rectangles often arrive as many collinear samples per side;
+        segment mode needs the side endpoints, not every resampled point.
+        Flag changes are preserved so mark/transit boundaries are not erased.
+        """
+        if flags is None or len(flags) != len(pts):
+            flags = [False] * len(pts)
+        if not pts:
+            return [], []
+
+        clean_pts: list[tuple[float, float]] = [pts[0]]
+        clean_flags: list[bool] = [bool(flags[0])]
+        for pt, flag in zip(pts[1:], flags[1:]):
+            if math.hypot(pt[0] - clean_pts[-1][0], pt[1] - clean_pts[-1][1]) < 1e-6:
+                clean_flags[-1] = bool(clean_flags[-1] or flag)
+                continue
+            clean_pts.append(pt)
+            clean_flags.append(bool(flag))
+
+        if len(clean_pts) < 3:
+            return clean_pts, clean_flags
+
+        tol = math.radians(collinear_tol_deg)
+        out_pts: list[tuple[float, float]] = [clean_pts[0]]
+        out_flags: list[bool] = [clean_flags[0]]
+        for i in range(1, len(clean_pts) - 1):
+            prev_pt = out_pts[-1]
+            this_pt = clean_pts[i]
+            next_pt = clean_pts[i + 1]
+            h0 = cls._segment_heading(prev_pt, this_pt)
+            h1 = cls._segment_heading(this_pt, next_pt)
+            heading_change = cls._heading_delta(h0, h1)
+            flag_boundary = clean_flags[i - 1] != clean_flags[i] or clean_flags[i] != clean_flags[i + 1]
+            if heading_change <= tol and not flag_boundary:
+                continue
+            out_pts.append(this_pt)
+            out_flags.append(clean_flags[i])
+
+        out_pts.append(clean_pts[-1])
+        out_flags.append(clean_flags[-1])
+        return out_pts, out_flags
+
+    @classmethod
+    def _classify_auto_profile(
+        cls,
+        pts: list[tuple[float, float]],
+        threshold_deg: float,
+    ) -> str:
+        """Classify raw path geometry as segment or smooth.
+
+        Segment covers straight lines and hard-corner polylines. Smooth covers
+        continuous-curvature paths where heading changes accumulate gradually.
+        """
+        simple, _ = cls._simplify_path_for_profile(pts, collinear_tol_deg=5.0)
+        if len(simple) <= 2:
+            return "segment"
+
+        headings: list[float] = []
+        for a, b in zip(simple[:-1], simple[1:]):
+            if math.hypot(b[0] - a[0], b[1] - a[1]) > 1e-6:
+                headings.append(cls._segment_heading(a, b))
+        if len(headings) <= 1:
+            return "segment"
+
+        threshold = math.radians(max(0.0, threshold_deg))
+        deltas = [cls._heading_delta(a, b) for a, b in zip(headings[:-1], headings[1:])]
+        if not deltas:
+            return "segment"
+        if max(deltas) >= threshold:
+            return "segment"
+
+        total_turn = sum(deltas)
+        if total_turn <= math.radians(10.0):
+            return "segment"
+        return "smooth"
+
+    # ------------------------------------------------------------------
+    # Per-entity run management (auto profile)
+    #
+    # A mission Path is split into "runs" at spray-flag transitions —
+    # the planner toggles the flag at every entity↔transit boundary, so
+    # each run is one entity (or one transit hop). Runs are classified
+    # and conditioned independently in _path_cb, then tracked one at a
+    # time: the active run IS self._path, so every existing single-
+    # profile code path works unchanged. Completion checks call
+    # _advance_run() instead of declaring DONE; DONE is only published
+    # after the last run, which is what the server's mission-complete
+    # settling logic watches for.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _pts_length(pts: list[tuple[float, float]]) -> float:
+        return sum(
+            math.hypot(b[0] - a[0], b[1] - a[1])
+            for a, b in zip(pts[:-1], pts[1:])
+        )
+
+    @staticmethod
+    def _split_runs_by_flag(
+        pts: list[tuple[float, float]], flags: list[bool]
+    ) -> list[tuple[list[tuple[float, float]], list[bool]]]:
+        """Split a path into contiguous same-flag runs (entity boundaries).
+
+        Each run after the first is prepended with the previous run's last
+        point so consecutive runs share their boundary vertex and the
+        concatenated geometry stays gap-free. The prepended point takes the
+        run's own flag so each run stays flag-homogeneous.
+        """
+        groups: list[tuple[list[tuple[float, float]], list[bool]]] = []
+        start = 0
+        for i in range(1, len(pts)):
+            if flags[i] != flags[i - 1]:
+                groups.append((list(pts[start:i]), list(flags[start:i])))
+                start = i
+        groups.append((list(pts[start:]), list(flags[start:])))
+
+        out: list[tuple[list[tuple[float, float]], list[bool]]] = []
+        for k, (rp, rf) in enumerate(groups):
+            if k > 0:
+                rp = [groups[k - 1][0][-1]] + rp
+                rf = [rf[0]] + rf
+            out.append((rp, rf))
+        return out
+
+    @staticmethod
+    def _build_poses(
+        pts: list[tuple[float, float]],
+        flags: list[bool],
+        stamp,
+        frame_id: str,
+    ) -> list[PoseStamped]:
+        poses: list[PoseStamped] = []
+        for (n, e), flag in zip(pts, flags):
+            ps = PoseStamped()
+            ps.header.stamp = stamp
+            ps.header.frame_id = frame_id
+            ps.pose.position.x = float(n)
+            ps.pose.position.y = float(e)
+            ps.pose.position.z = 1.0 if flag else 0.0
+            ps.pose.orientation.w = 1.0
+            poses.append(ps)
+        return poses
+
+    def _apply_run(self, idx: int) -> None:
+        """Make run `idx` the actively tracked path; reset per-run state."""
+        run = self._runs[idx]
+        self._run_idx = idx
+        self._path = run["poses"]
+        self._spray_flags = list(run["flags"])
+        self._active_tracking_profile = run["profile"]
+        self._segment_idx = 0
+        self._segment_state = (
+            SegmentStateCode.TRACK_SEGMENT
+            if run["profile"] == "segment" and len(self._path) >= 2
+            else SegmentStateCode.INACTIVE
+        )
+        self._segment_ff_warned = False
+        self._path_done = False
+        self._path_travel_m = 0.0   # reset travel distance per run
+        # P1.4 — reset hint so search starts from beginning of the run
+        self._closest_seg_hint = 0
+        self._hint_valid = False
+        self._last_segment_debug = (
+            self._profile_code(run["profile"]),
+            float(self._segment_state.value),
+            0.0,
+            float("nan"), float("nan"), float("nan"),
+            float("nan"), float("nan"), 0.0,
+        )
+
+    def _advance_run(self) -> bool:
+        """Switch to the next run, if any. False means mission complete."""
+        if self._run_idx + 1 >= len(self._runs):
+            return False
+        self._apply_run(self._run_idx + 1)
+        run = self._runs[self._run_idx]
+        self.get_logger().info(
+            f"Run {self._run_idx + 1}/{len(self._runs)} started "
+            f"(profile={run['profile']}, {len(run['poses'])} waypoints, "
+            f"{run['length']:.2f} m)"
+        )
+        return True
+
+    def _run_min_travel(self) -> float:
+        """min_goal_travel_m capped at half the active run length.
+
+        The param guards against instant-DONE on closed-loop missions; a
+        single run is one entity or transit hop and can be far shorter
+        than the param, which would otherwise deadlock run completion.
+        """
+        min_travel = float(self.get_parameter("min_goal_travel_m").value)
+        if not self._runs:
+            return min_travel
+        return min(min_travel, 0.5 * self._runs[self._run_idx]["length"])
+
+    def _segment_angle_deg(self, idx: int) -> float:
+        if idx < 0 or idx + 2 >= len(self._path):
+            return float("nan")
+        a = self._path[idx].pose.position
+        b = self._path[idx + 1].pose.position
+        c = self._path[idx + 2].pose.position
+        h0 = math.atan2(b.y - a.y, b.x - a.x)
+        h1 = math.atan2(c.y - b.y, c.x - b.x)
+        return math.degrees(self._heading_delta(h0, h1))
+
+    def _project_onto_segment(self, pos_n: float, pos_e: float, seg_idx: int):
+        n_pts = len(self._path)
+        if n_pts == 1:
+            wp = self._path[0].pose.position
+            d = self._dist(pos_n, pos_e, wp.x, wp.y)
+            return 0.0, wp.x, wp.y, 0.0, d
+
+        seg_idx = max(0, min(seg_idx, n_pts - 2))
+        a = self._path[seg_idx].pose.position
+        b = self._path[seg_idx + 1].pose.position
+        dx = b.x - a.x
+        dy = b.y - a.y
+        seg_sq = dx * dx + dy * dy
+        if seg_sq < 1e-12:
+            d = self._dist(pos_n, pos_e, a.x, a.y)
+            return 0.0, a.x, a.y, 0.0, d
+
+        t_raw = ((pos_n - a.x) * dx + (pos_e - a.y) * dy) / seg_sq
+        t = self._clamp(t_raw, 0.0, 1.0)
+        foot_n = a.x + t * dx
+        foot_e = a.y + t * dy
+        d = self._dist(pos_n, pos_e, foot_n, foot_e)
+        cross_z = dx * (pos_e - foot_e) - dy * (pos_n - foot_n)
+        signed_e = math.copysign(d, cross_z) if d > 0.0 else 0.0
+        seg_len = math.sqrt(seg_sq)
+        dist_to_end_along = (1.0 - t) * seg_len
+        return t, foot_n, foot_e, signed_e, dist_to_end_along
 
     def _path_curvature_at(self, seg_idx: int) -> float:
         """Estimate path curvature at the projection foot using Menger
@@ -1146,6 +1476,259 @@ class RPPControllerNode(Node):
             next_n = self._path[i].pose.position.x
             next_e = self._path[i].pose.position.y
 
+    def _control_segment_profile(
+        self,
+        pos_n: float,
+        pos_e: float,
+        yaw_ned: float,
+        pose_age_s: float,
+        dist_to_goal: float,
+    ) -> None:
+        """Track straight/polyline/polygon paths one segment at a time."""
+        n_pts = len(self._path)
+        if n_pts < 2:
+            # Single-point run (e.g. a POINT entity): advance immediately;
+            # the next control cycle tracks the new run.
+            if self._advance_run():
+                return
+            self._segment_state = SegmentStateCode.DONE
+            self._path_done = True
+            self._publish_zero(
+                StateCode.DONE,
+                pose_age_ms=pose_age_s * 1000.0,
+                dist_to_goal=dist_to_goal,
+            )
+            self._publish_segment_debug(
+                self._segment_state, 0, float("nan"), dist_to_goal,
+                float("nan"), float("nan"), float("nan"), 0.0,
+            )
+            return
+
+        while self._segment_idx < n_pts - 2:
+            a = self._path[self._segment_idx].pose.position
+            b = self._path[self._segment_idx + 1].pose.position
+            if self._dist(a.x, a.y, b.x, b.y) >= 1e-6:
+                break
+            self._segment_idx += 1
+
+        self._segment_idx = max(0, min(self._segment_idx, n_pts - 2))
+        seg_idx = self._segment_idx
+        a = self._path[seg_idx].pose.position
+        b = self._path[seg_idx + 1].pose.position
+        seg_len = self._dist(a.x, a.y, b.x, b.y)
+        if seg_len < 1e-6:
+            self._publish_zero(
+                StateCode.IDLE,
+                pose_age_ms=pose_age_s * 1000.0,
+                dist_to_goal=dist_to_goal,
+            )
+            return
+
+        final_segment = seg_idx >= n_pts - 2
+        t, foot_n, foot_e, signed_xtrack, dist_to_end_along = self._project_onto_segment(
+            pos_n, pos_e, seg_idx
+        )
+        dist_to_corner = self._dist(pos_n, pos_e, b.x, b.y)
+        corner_angle = self._segment_angle_deg(seg_idx)
+        spray_active = self._segment_spray_active(seg_idx)
+
+        goal_tol = float(self.get_parameter("xy_goal_tolerance").value)
+        min_travel = self._run_min_travel()
+        if final_segment and dist_to_corner <= goal_tol and self._path_travel_m >= min_travel:
+            # End of run: switch to the next run's profile and continue
+            # this same cycle if it is also segment-tracked; a smooth run
+            # is picked up by the main loop on the next 20 ms cycle.
+            if self._advance_run():
+                if self._active_tracking_profile == "segment":
+                    self._control_segment_profile(
+                        pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
+                    )
+                return
+            self.get_logger().info(
+                f"Segment path complete — within {dist_to_corner * 100:.1f} cm "
+                f"of final point (tol={goal_tol * 100:.1f} cm)"
+            )
+            self._path_done = True
+            self._segment_state = SegmentStateCode.DONE
+            self._publish_zero(
+                StateCode.DONE,
+                pose_age_ms=pose_age_s * 1000.0,
+                dist_to_goal=dist_to_corner,
+            )
+            self._publish_segment_debug(
+                self._segment_state, seg_idx, dist_to_end_along, dist_to_corner,
+                corner_angle, float("nan"), float("nan"), 0.0,
+            )
+            return
+
+        acceptance = float(self.get_parameter("segment_corner_acceptance_radius").value)
+        heading_tol = math.radians(
+            float(self.get_parameter("segment_heading_tolerance_deg").value)
+        )
+        yaw_gain = float(self.get_parameter("segment_yaw_rate_gain").value)
+        use_ff_yaw_rate = bool(self.get_parameter("use_feedforward_yaw_rate").value)
+        max_yr = float(self.get_parameter("max_yaw_rate_body").value)
+
+        if not final_segment and dist_to_corner <= acceptance:
+            c = self._path[seg_idx + 2].pose.position
+            target_heading = math.atan2(c.y - b.y, c.x - b.x)
+            heading_err = self._angle_wrap(target_heading - yaw_ned)
+            if abs(heading_err) <= heading_tol:
+                self._segment_idx += 1
+                self._segment_state = SegmentStateCode.TRACK_SEGMENT
+                self._publish_segment_debug(
+                    self._segment_state, self._segment_idx, float("nan"),
+                    dist_to_corner, corner_angle, target_heading, heading_err, 0.0,
+                )
+                self._control_segment_profile(
+                    pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
+                )
+                return
+
+            self._segment_state = SegmentStateCode.CORNER_ALIGN
+            # Corner align pivots in place: velocity is zero, so yaw rate is
+            # the ONLY actuation. Honoring use_feedforward_yaw_rate=False here
+            # would command (0 vel, 0 yaw rate) forever and deadlock the
+            # mission at the first corner — so the flag is ignored in this
+            # state and a one-time warning is logged instead.
+            if not use_ff_yaw_rate and not self._segment_ff_warned:
+                self._segment_ff_warned = True
+                self.get_logger().warn(
+                    "use_feedforward_yaw_rate=false ignored during segment "
+                    "CORNER_ALIGN — yaw rate is the only actuation while "
+                    "pivoting at a corner"
+                )
+            yaw_rate_body = yaw_gain * heading_err
+            if max_yr > 0.0:
+                yaw_rate_body = self._clamp(yaw_rate_body, -max_yr, max_yr)
+            self._last_speed_cmd = 0.0
+            self._publish_velocity(0.0, 0.0)
+            self._publish_yaw_rate(yaw_rate_body)
+            self._publish_debug(
+                cross_track=signed_xtrack,
+                heading_err=heading_err,
+                lookahead=dist_to_corner,
+                speed=0.0,
+                kappa=0.0,
+                dist_goal=dist_to_goal,
+                pose_age_ms=pose_age_s * 1000.0,
+                state=StateCode.TRACKING,
+                l_d_raw=float("nan"),
+                kappa_speed=0.0,
+                yaw_rate=yaw_rate_body,
+                spray_active=spray_active,
+            )
+            self._publish_segment_debug(
+                self._segment_state, seg_idx, dist_to_end_along, dist_to_corner,
+                corner_angle, target_heading, heading_err, yaw_rate_body,
+            )
+            return
+
+        hw_max_v = float(self.get_parameter("max_linear_vel").value)
+        mission_v = float(self.get_parameter("mission_speed").value)
+        max_v = min(hw_max_v, mission_v)
+        min_v = float(self.get_parameter("min_linear_vel").value)
+        l_min = float(self.get_parameter("min_lookahead_dist").value)
+        l_max = float(self.get_parameter("max_lookahead_dist").value)
+        ld_gain = float(self.get_parameter("lookahead_time").value)
+        xt_ld_gain = float(self.get_parameter("xtrack_lookahead_gain").value)
+
+        v_for_ld = max(min_v, self._last_speed_cmd if self._last_speed_cmd > 0.0
+                       else max_v * 0.5)
+        v_for_ld = 0.7 * v_for_ld + 0.3 * max_v
+        l_d_raw = ld_gain * v_for_ld + xt_ld_gain * abs(signed_xtrack)
+        l_d = self._clamp(l_d_raw, l_min, l_max)
+
+        dir_n = (b.x - a.x) / seg_len
+        dir_e = (b.y - a.y) / seg_len
+        lookahead_along = min(max(0.0, dist_to_end_along), l_d)
+        if lookahead_along <= 1e-6:
+            lh_n, lh_e = b.x, b.y
+        else:
+            lh_n = foot_n + dir_n * lookahead_along
+            lh_e = foot_e + dir_e * lookahead_along
+
+        dn = lh_n - pos_n
+        de = lh_e - pos_e
+        x_body = dn * math.cos(yaw_ned) + de * math.sin(yaw_ned)
+        y_body = -dn * math.sin(yaw_ned) + de * math.cos(yaw_ned)
+        l_actual = math.hypot(x_body, y_body)
+        if l_actual < 1e-6:
+            dn = b.x - pos_n
+            de = b.y - pos_e
+            x_body = dn * math.cos(yaw_ned) + de * math.sin(yaw_ned)
+            y_body = -dn * math.sin(yaw_ned) + de * math.cos(yaw_ned)
+            l_actual = math.hypot(x_body, y_body)
+            if l_actual < 1e-6:
+                self._publish_zero(
+                    StateCode.IDLE,
+                    pose_age_ms=pose_age_s * 1000.0,
+                    dist_to_goal=dist_to_goal,
+                )
+                return
+
+        theta_e = math.atan2(y_body, x_body)
+        speed = max_v
+        slowdown = float(self.get_parameter("segment_slowdown_dist").value)
+        min_corner_speed = float(self.get_parameter("segment_min_corner_speed").value)
+        self._segment_state = SegmentStateCode.TRACK_SEGMENT
+        if not final_segment and slowdown > 1e-6 and dist_to_corner < slowdown:
+            scale = self._clamp(dist_to_corner / slowdown, 0.0, 1.0)
+            speed = max(min_corner_speed, max_v * scale)
+            self._segment_state = SegmentStateCode.PRE_CORNER_SLOWDOWN
+
+        max_accel = float(self.get_parameter("max_linear_accel").value)
+        speed_before_accel = speed
+        if max_accel > 0.0:
+            speed = min(speed, self._last_speed_cmd + max_accel / self.CONTROL_HZ)
+
+        p4_floor = float(self.get_parameter("p4_zero_vel_threshold").value)
+        if speed < p4_floor and speed_before_accel < p4_floor and self._last_speed_cmd > 0.0:
+            speed = 0.0
+        self._last_speed_cmd = speed
+
+        yaw_rate_body = yaw_gain * theta_e if use_ff_yaw_rate else 0.0
+        if max_yr > 0.0:
+            yaw_rate_body = self._clamp(yaw_rate_body, -max_yr, max_yr)
+
+        unit_n = dn / l_actual
+        unit_e = de / l_actual
+        v_n = speed * unit_n
+        v_e = speed * unit_e
+        speed_mag = math.hypot(v_n, v_e)
+        if speed_mag > 0.01:
+            self._last_yaw_cmd = math.atan2(v_e, v_n)
+
+        self._publish_velocity(v_n, v_e)
+        self._publish_yaw_rate(yaw_rate_body)
+        self._publish_debug(
+            cross_track=signed_xtrack,
+            heading_err=theta_e,
+            lookahead=l_actual,
+            speed=speed,
+            kappa=0.0,
+            dist_goal=dist_to_goal,
+            pose_age_ms=pose_age_s * 1000.0,
+            state=StateCode.TRACKING,
+            l_d_raw=l_d_raw,
+            kappa_speed=0.0,
+            yaw_rate=yaw_rate_body,
+            spray_active=spray_active,
+        )
+        self._publish_segment_debug(
+            self._segment_state, seg_idx, dist_to_end_along, dist_to_corner,
+            corner_angle, math.atan2(b.y - a.y, b.x - a.x), theta_e,
+            yaw_rate_body,
+        )
+
+        self.get_logger().debug(
+            f"[SEGMENT/{self._segment_state.name}] seg={seg_idx} "
+            f"xtrack={signed_xtrack * 100:+.2f}cm dcorner={dist_to_corner:.2f}m "
+            f"ld={l_actual:.2f}m v=({v_n:+.3f},{v_e:+.3f})m/s "
+            f"speed={speed:.3f} θe={math.degrees(theta_e):+.1f}° "
+            f"yaw_rate={yaw_rate_body:+.3f}rad/s"
+        )
+
     # ==================================================================
     # Main control loop (50 Hz)
     # ==================================================================
@@ -1313,17 +1896,31 @@ class RPPControllerNode(Node):
         # Skip until the rover has traveled min_goal_travel_m along the path.
         # Prevents immediate DONE on closed-loop paths where the rover starts
         # at the final waypoint (e.g., square_2x2 with auto_origin).
-        min_travel = self.get_parameter("min_goal_travel_m").value
+        min_travel = self._run_min_travel()
         final = self._path[-1].pose.position
         dist_to_goal = self._dist(pos_n, pos_e, final.x, final.y)
         if dist_to_goal <= goal_tol and self._path_travel_m >= min_travel:
-            self.get_logger().info(
-                f"Path complete — within {dist_to_goal * 100:.1f} cm of goal "
-                f"(tol={goal_tol * 100:.1f} cm)"
+            # End of the active run: advance to the next run (per-entity
+            # profile switching) and keep tracking this same cycle. DONE is
+            # only published after the last run — the server's mission-
+            # complete settling watches for it.
+            if self._advance_run():
+                final = self._path[-1].pose.position
+                dist_to_goal = self._dist(pos_n, pos_e, final.x, final.y)
+            else:
+                self.get_logger().info(
+                    f"Path complete — within {dist_to_goal * 100:.1f} cm of goal "
+                    f"(tol={goal_tol * 100:.1f} cm)"
+                )
+                self._path_done = True
+                self._publish_zero(StateCode.DONE, pose_age_ms=pose_age_s * 1000,
+                                   dist_to_goal=dist_to_goal)
+                return
+
+        if self._active_tracking_profile == "segment":
+            self._control_segment_profile(
+                pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
             )
-            self._path_done = True
-            self._publish_zero(StateCode.DONE, pose_age_ms=pose_age_s * 1000,
-                               dist_to_goal=dist_to_goal)
             return
 
         # ---- Step 1: Closest-point projection (segment, not vertex) ----
@@ -1526,6 +2123,59 @@ class RPPControllerNode(Node):
     # ==================================================================
     # Publishers
     # ==================================================================
+    def _publish_conditioned_path(self, stamp, frame_id: str):
+        """Publish the full conditioned mission (all runs concatenated).
+
+        Runs after the first share their boundary vertex with the previous
+        run, so the duplicate first pose is skipped to keep the published
+        geometry clean for bag-based comparison.
+        """
+        msg = Path()
+        msg.header.stamp = stamp
+        msg.header.frame_id = frame_id
+        msg.poses = []
+        run_pose_lists = (
+            [run["poses"] for run in self._runs] if self._runs
+            else [self._path]
+        )
+        for k, poses in enumerate(run_pose_lists):
+            for src in (poses[1:] if k > 0 else poses):
+                ps = PoseStamped()
+                ps.header.stamp = stamp
+                ps.header.frame_id = frame_id
+                ps.pose = src.pose
+                msg.poses.append(ps)
+        self._conditioned_path_pub.publish(msg)
+
+    def _publish_segment_debug(
+        self,
+        state: SegmentStateCode,
+        seg_idx: int,
+        dist_to_segment_end: float,
+        dist_to_corner: float,
+        corner_angle_deg: float,
+        target_heading_ned: float,
+        heading_error_rad: float,
+        yaw_rate_body: float,
+    ):
+        msg = Float32MultiArray()
+        msg.layout.dim.append(
+            MultiArrayDimension(label="rpp_segment_debug", size=9, stride=9)
+        )
+        msg.data = [
+            self._profile_code(self._active_tracking_profile),  # [0] profile: 1 segment, 2 smooth
+            float(state.value),                                 # [1] segment state
+            float(seg_idx),                                     # [2] current segment index
+            float(dist_to_segment_end),                         # [3] along-track distance to segment end
+            float(dist_to_corner),                              # [4] Euclidean distance to corner/end
+            float(corner_angle_deg),                            # [5] next-corner angle
+            float(target_heading_ned),                          # [6] target heading, NED CW+
+            float(heading_error_rad),                           # [7] target-current heading error
+            float(yaw_rate_body),                               # [8] yaw-rate command
+        ]
+        self._last_segment_debug = tuple(msg.data)
+        self._segment_dbg_pub.publish(msg)
+
     def _publish_velocity(self, v_n: float, v_e: float):
         msg = Vector3Stamped()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -1569,6 +2219,21 @@ class RPPControllerNode(Node):
             yaw_rate=0.0,               # P3.1
             spray_active=False,
         )
+        if self._active_tracking_profile == "segment":
+            seg_idx = max(0, min(self._segment_idx, max(0, len(self._path) - 2)))
+            dbg_state = self._segment_state
+            if state == StateCode.DONE:
+                dbg_state = SegmentStateCode.DONE
+            self._publish_segment_debug(
+                dbg_state,
+                seg_idx,
+                float("nan"),
+                dist_to_goal,
+                self._segment_angle_deg(seg_idx) if len(self._path) >= 3 else float("nan"),
+                float("nan"),
+                float("nan"),
+                0.0,
+            )
 
     def _segment_spray_active(self, seg_idx: int) -> bool:
         """Return True iff the currently tracked conditioned segment is MARK."""
@@ -1607,11 +2272,12 @@ class RPPControllerNode(Node):
         message is self-contained — you can replay and correlate parameter
         values with tracking performance without needing a separate param dump.
         Index [39]: spray_active.
+        Indices [40..46]: active tracking profile and segment-mode params.
         """
         self._publish_spray_active(spray_active)
         msg = Float32MultiArray()
         msg.layout.dim.append(MultiArrayDimension(label="rpp_debug",
-                                                  size=40, stride=40))
+                                                  size=47, stride=47))
 
         # ---- Snapshot all parameters once for this cycle ----
         p_max_linear_vel = float(self.get_parameter("max_linear_vel").value)
@@ -1642,6 +2308,13 @@ class RPPControllerNode(Node):
         p_max_accel = float(self.get_parameter("max_linear_accel").value)
         p_max_decel = float(self.get_parameter("max_linear_decel").value)
         p_mission_speed = float(self.get_parameter("mission_speed").value)
+        p_profile_code = self._profile_code(self._active_tracking_profile)
+        p_segment_corner_threshold = float(self.get_parameter("segment_corner_threshold_deg").value)
+        p_segment_slowdown = float(self.get_parameter("segment_slowdown_dist").value)
+        p_segment_min_speed = float(self.get_parameter("segment_min_corner_speed").value)
+        p_segment_acceptance = float(self.get_parameter("segment_corner_acceptance_radius").value)
+        p_segment_heading_tol = float(self.get_parameter("segment_heading_tolerance_deg").value)
+        p_segment_yaw_gain = float(self.get_parameter("segment_yaw_rate_gain").value)
 
         msg.data = [
             float(cross_track),        # [0]  cross_track_error_m, signed
@@ -1684,6 +2357,13 @@ class RPPControllerNode(Node):
             p_max_decel,               # [37] max_linear_decel
             p_mission_speed,           # [38] mission_speed
             1.0 if spray_active else 0.0,  # [39] spray_active
+            p_profile_code,            # [40] tracking_profile_code
+            p_segment_corner_threshold,  # [41] segment_corner_threshold_deg
+            p_segment_slowdown,        # [42] segment_slowdown_dist
+            p_segment_min_speed,       # [43] segment_min_corner_speed
+            p_segment_acceptance,      # [44] segment_corner_acceptance_radius
+            p_segment_heading_tol,     # [45] segment_heading_tolerance_deg
+            p_segment_yaw_gain,        # [46] segment_yaw_rate_gain
         ]
         self._dbg_pub.publish(msg)
 
