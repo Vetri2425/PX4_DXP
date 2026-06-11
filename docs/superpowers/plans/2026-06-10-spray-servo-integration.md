@@ -1,8 +1,7 @@
 # Phase 3 — Spray / Marking Servo Integration (Pixhawk AUX)
 
-**Date:** 2026-06-10 (rev 2 — fixes from plan review: flag transport via `/path` z-channel,
-flag propagation through path conditioning, armed-any-mode bench test, `/spray/active`
-staleness watchdog, boundary flag convention pinned)
+**Date:** 2026-06-10 (rev 3 — codebase audit on 2026-06-11; software implementation reconciled
+against current source)
 **Author:** Vetri
 **Scope:** Wire a marking servo/solenoid to a CubeOrangePlus AUX output, drive it from the
 runtime MARK/TRANSIT state with low-latency `rclpy` commands, and surface a
@@ -12,33 +11,50 @@ FastAPI server, frontend telemetry.
 
 ---
 
-## 0. Current state — what exists vs. what is missing
+## 0. Current codebase audit — 2026-06-11
 
-### Already built (planning layer only)
-- `path_engine/core.py` — `SegmentType.MARK / TRANSIT`, `PathSegment.segment_type`,
-  `PlannedPath.spray_flags: list[bool]` parallel to `merged_waypoints`.
-- `path_engine/spray.py` — `apply_spray_latency_compensation()` already shifts the
-  MARK start/end **spatially** (`latency × speed`) to pre-compensate solenoid lag.
-- `server/path_manager.py` — produces `spray_flags` (lines ~360–383, 602–603).
-- `server/routes/path.py` + `server/models.py` — `/path/preview` returns per-point
-  `spray: bool`; `MissionState` enum exists.
+This document started as an implementation plan. The runtime software items below are now
+implemented in the current repo; keep only hardware/field-validation items in the tracker.
 
-### Missing (everything runtime / hardware)
-1. **Spray flags are dropped before runtime.** `ros_node.publish_path()`
-   (`server/ros_node.py:741`) publishes a bare `nav_msgs/Path` of `(n, e)` tuples — the
-   `spray_flags` never reach any ROS topic. The RPP controller has **no idea** which
-   segment is MARK at runtime.
-2. **No runtime spray state machine.** Nothing converts "rover is currently on a MARK
-   segment" into an actuator command.
-3. **No actuator command to the FCU.** `ros_node` has clients for arming / set_mode /
-   params, but **no `CommandLong` client** for `/mavros/cmd/command`.
-4. **No servo controller node.**
-5. **No FCU output mapping** — no AUX pin assigned to an actuator function.
-6. **No frontend marking status** — `TelemetryData` has no `spraying` / `marking_state`.
+### Implemented in source
+
+- `server/ros_node.py` — `publish_path(points, spray_flags=...)` writes `pose.position.z`
+  (`1.0` MARK, `0.0` TRANSIT/OFF), subscribes `/spray/state` and `/spray/manual_state`,
+  and publishes `/spray/manual` for bench override.
+- `server/mission_loading.py`, `server/routes/mission.py`, `server/routes/path.py`,
+  `server/sockets/events.py`, and `server/offboard_controller.py` forward `spray_flags`
+  into controller-loaded/published paths.
+- `path_engine/core.py`, `path_engine/engine.py`, and `path_engine/spray.py` carry
+  `PlannedPath.spray_flags`, MARK/TRANSIT segments, entity overrides, and spray latency
+  compensation.
+- `src/rpp_controller_node.py` reads flags from `/path` z, propagates them through
+  `_smooth_corners()` and `_resample_path()`, applies the endpoint AND rule, publishes
+  `/spray/active`, and exposes `/rpp/debug[39]` through `[46]`.
+- `src/spray_controller_node.py` exists and drives `MAV_CMD_DO_SET_ACTUATOR` with
+  debounce, 2 Hz reassert, staleness watchdog, manual override, and fail-safe OFF on
+  disarm / non-OFFBOARD / shutdown.
+- `src/launch/rpp_pipeline.launch.py` and `rpp_start.sh` both start
+  `spray_controller_node.py`; systemd uses `rpp_start.sh`.
+- `server/routes/spray.py`, `server/models.py`, `server/routes/telemetry.py`, and
+  `server/main.py` expose `/api/spray/test`, `/api/spray/status`, `spraying`, and
+  `marking_state`.
+- Tests exist for the high-risk software paths: `src/test_spray_flag_conditioning.py`,
+  `src/test_spray_manual_override.py`, `server/test_spray_routes.py`, and
+  `path_engine/tests/test_spray.py`.
+
+### Still open outside source
+
+- QGC AUX function/min/max/disarmed/failsafe configuration on the hardware.
+- Solenoid/relay/MOSFET wiring, flyback protection, and isolated supply.
+- Bench confirmation that `MAV_CMD_DO_SET_ACTUATOR` command 187 moves the chosen AUX pin.
+- Hardware safety validation: disarm, E-stop, non-OFFBOARD, staleness, and shutdown all
+  force spray OFF with the real actuator.
+- Latency calibration with the real solenoid/driver and production debounce settings.
+- Frontend/mobile status-pill verification in the GCS app, which is outside this repo.
 
 ### Key existing hooks we will reuse
 - `rpp_controller_node` already tracks the **current segment index** (`_closest_seg_hint`)
-  at 50 Hz and publishes `/rpp/debug` (append-only `Float32MultiArray`, indices `[0..38]`
+  at 50 Hz and publishes `/rpp/debug` (append-only `Float32MultiArray`, indices `[0..46]`
   used). This is the natural, lowest-latency place to decide "are we on a MARK segment."
 - `twist_to_setpoint_node` owns the OFFBOARD heartbeat — **do not** add actuator logic
   there; keep it pure.
@@ -115,7 +131,7 @@ abandoned per CLAUDE.md.)
 
 ## 2. Companion (Jetson) — ROS2 / MAVROS implementation
 
-### Data flow (target)
+### Data flow (implemented)
 
 ```
 Planner (spray_flags) ──► server.publish_path() ──► /path  (nav_msgs/Path)
@@ -156,12 +172,12 @@ of "on a MARK segment." The dedicated **servo node** owns the actuator contract
 separation (`rpp_controller` = geometry, `twist_to_setpoint` = OFFBOARD contract) and
 satisfies the "create a proper node for servo controller" requirement.
 
-### 2.1 Propagate spray flags to runtime (via `/path` z-channel)
+### 2.1 Propagate spray flags to runtime (via `/path` z-channel) — implemented
 
 **`server/ros_node.py`**
-- Extend `publish_path()` (line ~741) to accept `spray_flags: list[bool] | None = None`
-  and set `ps.pose.position.z = 1.0 if flag else 0.0` per point. `None` or a
-  length-mismatched list → all `0.0` (spray off, fail-safe) + one warning log.
+- `publish_path()` accepts `spray_flags: list[bool] | None = None` and sets
+  `ps.pose.position.z = 1.0 if flag else 0.0` per point. `None` or a length-mismatched
+  list → all `0.0` (spray off, fail-safe) + one warning log.
 - `publish_stop_path()` needs **no change**: it calls `publish_path([(n, e)])` with no
   flags → the single point carries `z = 0.0` → spray off. (Belt-and-braces: the
   single-point path is DONE on the first tick, and the controller forces
@@ -182,13 +198,11 @@ satisfies the "create a proper node for servo controller" requirement.
   feedback absorbs it. Do not change the convention after latency calibration without
   re-measuring.
 
-**Callers** (`server/routes/path.py:307`, mission load path): pass the
-`spray_flags` already produced by `path_manager` (currently dropped). When a built-in or
-non-DXF path has no MARK info, default to all-`True` (matches existing
-`BUILTIN_PATHS` behaviour) **or** all-`False` if the operator wants spray off on test
-paths — make this an explicit server param (`spray_default_on`, default `True`).
+**Callers:** current mission/path routes and Socket.IO load handlers pass the
+`spray_flags` produced by `path_manager` / staged plans. Built-in or legacy paths without
+MARK metadata use the configured legacy default from `server/config.py`.
 
-### 2.2 `rpp_controller_node` — decide MARK state (no actuator I/O here)
+### 2.2 `rpp_controller_node` — decide MARK state (no actuator I/O here) — implemented
 
 **Critical constraint this design must respect:** `_path_cb` conditions the path —
 `_smooth_corners()` then `_resample_path()` (P1.3) — so `len(self._path)` ≠ the
@@ -197,12 +211,11 @@ published waypoint count whenever `corner_smooth_radius_m > 0` or
 indexes the **conditioned** path. Spray flags must therefore be **propagated through
 conditioning**, never index-matched against the raw path.
 
-- In `_path_cb`, read per-point flags from the incoming poses:
+- `_path_cb` reads per-point flags from the incoming poses:
   `raw_flags = [p.pose.position.z > 0.5 for p in msg.poses]` (alongside the existing
-  `raw_pts` extraction at line ~474).
-- **Propagate flags through conditioning.** Extend `_smooth_corners()` and
-  `_resample_path()` to carry a parallel flag list (or operate on `(n, e, flag)`
-  triples):
+  `raw_pts` extraction).
+- **Flags propagate through conditioning.** `_smooth_corners()` and `_resample_path()`
+  carry a parallel flag list:
   - *Resampling:* an interpolated point inherits the flag of the **raw segment** it
     lies on, evaluated with the §2.1 AND rule (`flags[i] and flags[i+1]`).
   - *Corner smoothing:* arc points replacing corner `i` inherit
@@ -210,7 +223,7 @@ conditioning**, never index-matched against the raw path.
     adjoining segments are MARK) — errs toward OFF at mixed corners.
   - Unit-test both propagations (raw→conditioned flag mapping) — this is the highest
     bug-risk step in the whole plan.
-- Store `self._spray_flags` (parallel to `self._path`, conditioned) and reset alongside
+- `self._spray_flags` is stored parallel to `self._path` after conditioning and resets with
   `_closest_seg_hint` (line ~504). Old-format paths (all `z = 0.0`) yield all-`False`.
 - In the 50 Hz control tick, after the segment projection updates `_closest_seg_hint`:
   `seg = self._closest_seg_hint` →
@@ -218,17 +231,17 @@ conditioning**, never index-matched against the raw path.
   Force `spray_active = False` whenever the controller is not actively tracking
   (state `DONE`, `RTK_WAIT`, `JUMP_SKIP`, emergency-stop, or pose stale) — never spray
   while parked or in fault.
-- Publish:
+- Publishes:
   - `/spray/active` — `std_msgs/Bool`, **best-effort, depth 1**, every tick (50 Hz).
     A dedicated typed topic is lower-latency for the servo node than decoding the float
     debug array.
-  - `/rpp/debug[39]` — append `spray_active` (1.0/0.0). Keep the append-only contract
-    (indices `[0..7]` unchanged); update the layout docstring (`[39] spray_active`).
+  - `/rpp/debug[39]` — `spray_active` (1.0/0.0). The current layout extends through
+    `[46]`; indices `[0..7]` remain unchanged.
 
-### 2.3 NEW `src/spray_controller_node.py` (rclpy) — the servo controller
+### 2.3 `src/spray_controller_node.py` (rclpy) — implemented servo controller
 
 Responsibilities: edge-detect the desired spray state, debounce, fire the MAVLink
-actuator command with minimal latency, and enforce fail-safes.
+actuator command with minimal latency, expose manual bench override, and enforce fail-safes.
 
 Design for **low latency** (`rclpy`):
 - Subscribe `/spray/active` (`Bool`, best-effort depth 1) on a `ReentrantCallbackGroup`.
@@ -276,14 +289,15 @@ req.broadcast    = False
 # OFF: req.param1 = -1.0
 ```
 
-Params (declare with defaults): `actuator_set_index` (1), `on_value` (1.0),
+Params (declared with defaults): `actuator_set_index` (1), `on_value` (1.0),
 `off_value` (-1.0), `debounce_samples` (3), `reassert_hz` (2.0),
 `require_offboard` (True), `active_timeout_s` (0.5),
-`command_service` ("/mavros/cmd/command").
+`manual_override_timeout_s` (10.0), `command_service` ("/mavros/cmd/command").
 
-### 2.4 Launch + service wiring
+### 2.4 Launch + service wiring — implemented
 
-- `src/launch/rpp_pipeline.launch.py` — add `spray_controller_node`.
+- `src/launch/rpp_pipeline.launch.py` includes `spray_controller_node`.
+- `rpp_start.sh` starts and watchdogs `spray_controller_node`; this is the systemd path.
 - Confirm the `command` plugin loads (it is not denied). If `/mavros/cmd/command` is
   missing at runtime, the node logs and idles (no crash).
 - systemd: `spray_controller` belongs to the `rpp-pipeline` unit (Python-only, ~2 s
@@ -293,8 +307,10 @@ Params (declare with defaults): `actuator_set_index` (1), `on_value` (1.0),
 
 ## 3. Server + frontend — `marking / transit` status
 
+**Backend status:** implemented.
+
 **`server/ros_node.py`**
-- Subscribe `/spray/state` (`Bool`); store `self._state["spraying"]`.
+- Subscribes `/spray/state` (`Bool`); stores `self._state["spraying"]`.
 
 **`server/models.py` — `TelemetryData`**
 - Add `spraying: Optional[bool] = None`
@@ -308,9 +324,9 @@ Params (declare with defaults): `actuator_set_index` (1), `on_value` (1.0),
 - Push over the existing WebSocket telemetry stream (10 Hz).
 
 **Frontend (web + mobile)**
-- Add a status pill: green **MARKING** / grey **TRANSIT** / dim **OFF**, bound to
-  `telemetry.marking_state`. Optionally tint the live path overlay segment currently
-  being sprayed.
+- Verify the mobile/frontend repo displays `telemetry.marking_state` as MARKING /
+  TRANSIT / OFF. That repo is outside `PX4_DXP`, so this remains an external UI
+  verification task rather than a backend-code task here.
 
 ---
 
@@ -380,43 +396,42 @@ This split (spatial compensation in planning + edge-fire at runtime) is what kee
   command send; or `ros2 bag record /spray/active /spray/state /mavros/local_position/pose`
   and correlate the boundary crossing vs. measured actuation. Feed result into §4 step 2.
 
-**Unit tests:**
-- `spray_controller_node`: edge detection, debounce, fail-safe OFF on disarm / non-OFFBOARD
-  / shutdown / **staleness timeout**, correct `CommandLong` field values for
-  `actuator_set_index` 1..6 (ON/OFF), re-assert cadence
-  (mock the service client; follow `server/test_offboard_controller.py` style).
-- **Flag propagation (highest bug-risk surface):** `_smooth_corners` /
-  `_resample_path` flag carry-through — raw flags in, conditioned flags out, for:
-  all-ON, all-OFF, MARK→TRANSIT boundary mid-edge, boundary exactly at a smoothed
-  corner, lead-in point from `apply_spray_latency_compensation`, single-point
-  (stop) path, old-format path (all `z = 0.0`).
+**Unit tests implemented in this repo:**
+- `src/test_spray_manual_override.py` covers manual override, timeout, fail-safe priority,
+  staleness scoping, shutdown OFF, and command value behavior.
+- `src/test_spray_flag_conditioning.py` covers resampling, smoothing, and endpoint AND
+  behavior for propagated flags.
+- `server/test_spray_routes.py` covers `/api/spray/test` and `/api/spray/status`.
+- `path_engine/tests/test_spray.py` covers latency-compensation geometry.
+
+**Still needs hardware/integration validation:** real AUX output movement, solenoid
+latency, and fail-safe OFF behavior on the wired actuator.
 
 ---
 
 ## 6. File-by-file change checklist
 
-| File | Change |
+| File | Status / Change |
 |---|---|
-| **QGC (Mac)** | Assign AUX output function = 301; set MIN/MAX/DISARMED/FAILSAFE PWM (OFF disarmed) |
-| `server/ros_node.py` | Extend `publish_path()` to write spray flag into `pose.position.z`; subscribe `/spray/state`; store `spraying` |
-| `server/path_manager.py` / `server/routes/path.py` | Pass `spray_flags` through to `publish_path()` (stop dropping them); add `spray_default_on` param |
-| `server/models.py` | `TelemetryData.spraying`, `TelemetryData.marking_state` |
-| `server/sockets/events.py` (telemetry builder) | Derive + emit `marking_state` |
-| `src/rpp_controller_node.py` | Read flags from `pose.position.z` in `_path_cb`; **propagate flags through `_smooth_corners` + `_resample_path`**; compute `spray_active` (AND rule); publish `/spray/active` + `/rpp/debug[39]`; force OFF when not tracking |
-| `src/spray_controller_node.py` | **NEW** servo controller: edge-detect, debounce, staleness watchdog, `DO_SET_ACTUATOR` via `CommandLong` (param field from `actuator_set_index`), ack-check + log, re-assert, fail-safe OFF, publish `/spray/state` |
-| `src/launch/rpp_pipeline.launch.py` | Add `spray_controller_node` |
-| `src/test_spray_controller.py` | **NEW** unit tests |
-| Frontend (web + mobile) | MARKING / TRANSIT / OFF status pill bound to `marking_state` |
+| **QGC (Mac)** | Open: assign AUX output function = 301; set MIN/MAX/DISARMED/FAILSAFE PWM (OFF disarmed) |
+| `server/ros_node.py` | Implemented: writes spray flag into `pose.position.z`; subscribes `/spray/state`; stores `spraying`; publishes `/spray/manual` |
+| `server/path_manager.py` / `server/routes/path.py` | Implemented: `spray_flags` are planned, previewed, staged, and forwarded to runtime |
+| `server/models.py` | Implemented: `TelemetryData.spraying`, `TelemetryData.marking_state`, `SprayTestRequest` |
+| `server/main.py` / `server/routes/telemetry.py` | Implemented: derive + emit `marking_state` |
+| `src/rpp_controller_node.py` | Implemented: reads z flags, conditions flags, computes `spray_active`, publishes `/spray/active` + `/rpp/debug[39]`, forces OFF when not tracking |
+| `src/spray_controller_node.py` | Implemented: edge-detect, debounce, staleness watchdog, manual override, `DO_SET_ACTUATOR`, ack-check + log, re-assert, fail-safe OFF, publish `/spray/state` |
+| `src/launch/rpp_pipeline.launch.py` / `rpp_start.sh` | Implemented: `spray_controller_node` included in launch and systemd startup path |
+| Tests | Implemented for spray flag conditioning, manual override, server routes, and path-engine compensation |
+| Frontend (web + mobile) | External verification remains: MARKING / TRANSIT / OFF status pill bound to `marking_state` |
 
-### Suggested build order
+### Remaining validation order
 1. FCU config in QGC + bench-verify `DO_SET_ACTUATOR` manually (§5.1–5.2). *Proves the
    hardware path before any code.*
-2. `spray_controller_node` driven by a manual `/spray/active` (`ros2 topic pub`). *Proves
-   the node + fail-safes.*
-3. Spray-flag propagation (server → `/path` z-channel → conditioning carry-through →
-   `/spray/active`), with the flag-propagation unit tests landing first.
-4. Frontend status.
-5. Latency measurement + feed back into planner compensation.
+2. Endpoint-level manual test through `/api/spray/test`.
+3. Mixed MARK/TRANSIT mission-path check with real actuator disconnected or safely benched.
+4. Hardware fail-safe validation: disarm, E-stop, mode exit, upstream staleness, shutdown.
+5. Frontend status verification in the GCS repo.
+6. Latency measurement + feed back into planner compensation.
 
 ---
 

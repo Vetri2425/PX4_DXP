@@ -116,7 +116,7 @@ This runs the RPP and translator pipelines without publishing arming commands, a
 * **MAVROS Pose**: Published in **ENU** (`x = East`, `y = North`) per REP-103. The controller swaps these coordinates on read.
 * **RPP Velocity Output**: Published to `/rpp/velocity_ned` in **NED** (`x = vN`, `y = vE`).
 * **Heartbeat Translator Output**: Published in MAVROS ENU coordinates (`velocity.x = vE`, `velocity.y = vN`, `velocity.z = -vD`).
-* **Feedforward Yaw Rate**: Published on `/rpp/yaw_rate_body` in body frame (rad/s). If active, the type mask changes to `455` (ignores yaw, sends yaw rate). Otherwise, it sends velocity + explicit yaw under mask `2503`.
+* **Feedforward Yaw Rate**: Published on `/rpp/yaw_rate_body` in body frame (rad/s). If active and fresh, the type mask is `455` (velocity + explicit yaw + yaw-rate). Otherwise, it sends velocity + explicit yaw under mask `2503` and ignores yaw-rate.
 
 ---
 
@@ -124,7 +124,7 @@ This runs the RPP and translator pipelines without publishing arming commands, a
 
 ### Telemetry Debug Format (`/rpp/debug`)
 
-The node publishes a 39-field diagnostic payload. Below is the structured register:
+The node publishes a 47-field diagnostic payload. Indices `0..7` are stable for legacy consumers; newer fields are append-only.
 
 | Index | Field | Description / Units |
 | :--- | :--- | :--- |
@@ -140,6 +140,9 @@ The node publishes a 39-field diagnostic payload. Below is the structured regist
 | `9` | `kappa_speed` | Curvature value used to scale velocity limits ($1/m$) |
 | `10` | `yaw_rate_cmd` | Computed body-rate yaw command (rad/s) |
 | `11..38` | `params` | Snapshot of active controller parameters (for post-run parsing) |
+| `39` | `spray_active` | Phase 3 MARK/TRANSIT state: `1.0` = MARK, `0.0` = TRANSIT/OFF |
+| `40` | `tracking_profile_code` | `0` auto/unknown, `1` segment, `2` smooth |
+| `41..46` | `segment_profile_params` | Segment-profile tuning snapshot: corner threshold, slowdown distance, min corner speed, acceptance radius, heading tolerance, yaw-rate gain |
 
 ### Real-Time Parameter Adjustment
 
@@ -164,7 +167,7 @@ Tuning guidance is summarized in the table below:
 
 ## 🛡 Safety & Failsafe Guards
 
-* **Pose Loss (Staleness)**: Commands an emergency-stop `(0,0,0)` if no MAVROS pose is received for `200 ms` to keep the OFFBOARD stream active without tripping failsafes.
+* **Pose Loss (Staleness)**: Commands an emergency-stop `(0,0,0)` if no MAVROS pose is received within `pose_max_age_s` (default `0.5 s`) to keep the OFFBOARD stream active without tripping failsafes.
 * **Pose Extrapolation (Latency Closure)**: If `use_imu_extrapolation=true` is enabled, predicts pose forward by `v_ned * pose_age` to handle message latency.
 * **Input Staleness**: `twist_to_setpoint_node` immediately commands zero velocity if RPP stops publishing for `200 ms`.
 * **External Interrupts**: The `mission_runner` immediately releases controller lock and yields to MANUAL mode control if the operator triggers an RC override.

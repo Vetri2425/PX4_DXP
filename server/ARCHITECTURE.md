@@ -56,11 +56,14 @@ These 5 ROS2 nodes already exist in `PX4_DXP/src/`. The server interacts with th
 
 ```
 Server PUBLISHES:
-  /path                    [nav_msgs/Path, RELIABLE+TRANSIENT_LOCAL]  — inject mission path
+  /path                    [nav_msgs/Path, RELIABLE+TRANSIENT_LOCAL]  — inject mission path; pose.position.z carries spray flag
+  /spray/manual            [std_msgs/Bool]                            — timed manual bench-test override
 
 Server SUBSCRIBES:
-  /rpp/debug               [std_msgs/Float32MultiArray]              — 39-field RPP diagnostics; server consumes [0..9]
+  /rpp/debug               [std_msgs/Float32MultiArray]              — 47-field RPP diagnostics; server consumes stable fields [0..9] and spray flag [39] when present
   /rpp/velocity_ned        [geometry_msgs/Vector3Stamped]            — NED velocity output
+  /spray/state             [std_msgs/Bool]                           — actual commanded spray state
+  /spray/manual_state      [std_msgs/Bool]                           — manual override state
   /mavros/state             [mavros_msgs/State]                       — armed, mode, connected
   /mavros/local_position/pose  [geometry_msgs/PoseStamped]            — ENU pose (convert to NED)
   /mavros/battery           [sensor_msgs/BatteryState]               — voltage, percentage
@@ -89,11 +92,14 @@ Server CALLS SERVICES:
 [9] kappa_speed       — predictive curvature used for speed scaling
 [10] yaw_rate_cmd     — body yaw-rate command from RPP
 [11..38]              — controller parameter snapshot for bag analysis
+[39] spray_active     — 1=MARK, 0=TRANSIT/OFF
+[40] profile_code     — 0=auto/unknown, 1=segment, 2=smooth
+[41..46]              — segment-profile parameter snapshot
 ```
 
 The server keeps backward compatibility with legacy 8-field producers. Current
-runtime code publishes 39 values; `ros_node.py` stores `[8]` and `[9]` for
-telemetry and ignores the param snapshot.
+runtime code publishes 47 values; `ros_node.py` stores `[8]`, `[9]`, and `[39]`
+when present and ignores the parameter snapshots.
 
 ### ENU to NED Conversion (CRITICAL)
 

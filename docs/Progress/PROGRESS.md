@@ -4,6 +4,16 @@ Running log of all work. Each entry: what built, what fixed, what's next, time s
 
 ---
 
+## 2026-06-11 — Codebase/Tracker Audit
+
+### Current source-of-truth updates
+- `/rpp/debug` is currently a 47-field append-only payload. Legacy consumers should keep reading stable indices `0..7`; spray/profile fields live at `39..46`.
+- Phase 3 spray software is implemented in this repo: path z-channel flags, RPP flag conditioning, `/spray/active`, `spray_controller_node.py`, launch/service wiring, `/api/spray/*`, and `marking_state` telemetry.
+- Remaining spray blockers are hardware/QGC/bench validation: AUX function 301 config, solenoid/driver wiring, command 187 bench test, latency measurement, and real fail-safe validation.
+- Sensor fusion remains blocked by hardware and code: there is no `localization_node.py`, `robot_localization.yaml`, `/wheel_odom` bridge, or RPP `/odom` subscriber in the current codebase.
+
+---
+
 ## 2026-05-15 — Phase 1 Start (3 sessions)
 
 ### Built
@@ -176,7 +186,7 @@ Running log of all work. Each entry: what built, what fixed, what's next, time s
   - Approach scaling: linear deceleration in last 0.6m to goal
   - P4 zero-vel floor: below 2 cm/s, set speed=0 to trigger heading-hold
   - Pose freshness check: stale >200ms → emergency stop (0,0,0), OFFBOARD stays alive
-  - Publishes /rpp/debug (now 39 fields: stable runtime fields, yaw-rate, and per-message RPP parameter snapshot)
+  - Publishes /rpp/debug (was 39 fields at this point; current 2026-06-11 layout is 47 fields)
   - No rotate-to-heading FSM — PX4 spot-turn handles large heading errors (RD_TRANS_DRV_TRN)
 - **twist_to_setpoint_node.py** (~231 lines) — MAVROS OFFBOARD heartbeat bridge
   - 50Hz PositionTarget stream, FRAME_LOCAL_NED, velocity + explicit yaw by default
@@ -397,7 +407,7 @@ Running log of all work. Each entry: what built, what fixed, what's next, time s
   - P1.2: Adaptive lookahead — `xtrack_lookahead_gain` (default 1.0), `L_d = clamp(k_v·v + k_e·|e⊥|, L_min, L_max)`
   - P1.3: Path conditioning — `path_resample_spacing_m`, `corner_smooth_radius_m`, `corner_smooth_arc_pts` (all opt-in, default 0=off)
 - **Phase B — Observability + Perf** (9 files):
-  - B1+: `/rpp/debug` is now 39 fields. `[0..7]` remain append-only/stable, `[8..10]` add lookahead/curvature/yaw-rate observability, and `[11..38]` snapshot active RPP parameters into every message.
+  - B1+: `/rpp/debug` expanded to 39 fields in this historical entry. Current 2026-06-11 layout is 47 fields: `[0..7]` remain append-only/stable, `[8..10]` add lookahead/curvature/yaw-rate observability, `[11..38]` snapshot active RPP parameters, and `[39..46]` carry spray/profile state.
   - B2: `RTK_WAIT=4` and `JUMP_SKIP=5` state codes replace `STALE=-1` for GPS-gate and EKF-jump cases. All 5 consumers updated: `config.py` (RPP_UNHEALTHY_CODES={-1,4,5}), `models.py` (Literal extended), `main.py` (watchdog uses set), `offboard_controller.py` (start guard with code-specific messages), `mission_runner_node.py` (throttled warns per code). Dependency order: consumers first, producer last.
   - B3: Single-pass `_walk_path_samples()` replaces N×O(P) walks in `_max_preview_curvature`. ~7.5× speedup at N=3. Bit-exact verified (Test 14: max diff = 0.00e+00).
 - **Tests**: `test_sprint2_geometry.py` — 15 offline geometry tests, all pass. Covers: resample, smooth_corners, Menger κ, predictive κ integration, `_hint_valid` projection (full-scan, hint walk, stale-hint regression), single-pass walker bit-exact verification.
@@ -419,7 +429,7 @@ GLM-5.1 shipped Phase C (C1 RT scheduling, C2 velocity extrapolation under the l
 
 **Bug 6 is the headline.** `py_compile` misses runtime symbol errors. Geometry tests don't import the controller module. Smoke test written to catch this class of bug.
 
-**P2.4 realistic gain:** ~20mm at 0.4 m/s (= pose_age × v), NOT the 30-40mm originally claimed with acceleration integration. All Phase C performance numbers are **predictions** pending bench data.
+**P2.4 realistic gain:** ~20mm at 0.4 m/s (= pose_age × v), NOT the 30-40mm originally claimed with acceleration integration. Phase C performance numbers in this historical entry were predictions until bench/field data.
 
 **Current runtime correction:** `/rpp/yaw_setpoint_ned` is gone. `twist_to_setpoint_node.py` computes explicit yaw from `/rpp/velocity_ned` and conditionally includes fresh non-zero `/rpp/yaw_rate_body` in PositionTarget (`455` with yaw_rate, `2503` without).
 
@@ -429,7 +439,7 @@ GLM-5.1 shipped Phase C (C1 RT scheduling, C2 velocity extrapolation under the l
 ### Next
 - **Phase A: Hardware validation** — flash 617cce5a, bench-verify motor direction, cold-boot test, OFFBOARD straight-line test, verify FIFO grant (`chrt -p`), audit twist_to_setpoint_node.py
 - **Phase D: Production hardening** — remove ROVER_DISABLE_AUTH, sd_notify, pytest suite, QGC origin re-anchor
-- **Doc corrections** — RPP_PARAMETERS_REFERENCE.md and RPP_UPGRADE_SESSION_COMPLETION.md are stale (Kiro audit corrections pending, GLM-5.1's lane per role split)
+- **Doc corrections** — superseded by later source-code audit notes; do not use this historical "Next" list as the active tracker.
 
 ---
 

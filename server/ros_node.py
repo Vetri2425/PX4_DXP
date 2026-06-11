@@ -380,8 +380,8 @@ class RosBridgeNode(Node):
             self._state["gps_sat"] = msg.satellites_visible
 
     def _cb_rpp_debug(self, msg: Float32MultiArray) -> None:
-        # B1: layout is 10 fields; fall back gracefully to legacy 8-field
-        # producers (old replays). New fields default to NaN when absent.
+        # /rpp/debug is append-only. Consume stable legacy fields first and
+        # read newer fields only when present so old bag replays still work.
         if len(msg.data) >= 8:
             data = list(msg.data)
             self._rpp_monitor.update(data)

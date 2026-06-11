@@ -43,13 +43,17 @@ by `imu_max_extrap_age_s`. Debug logs use `P2.4 v-extrapolation`.
 
 ## Debug Array
 
-`/rpp/debug` is now a 39-field `Float32MultiArray`:
+`/rpp/debug` was 39 fields at this session. Current 2026-06-11 source publishes a
+47-field append-only `Float32MultiArray`:
 
 - `[0..7]`: stable runtime fields used by legacy consumers
 - `[8]`: `l_d_raw_m`
 - `[9]`: `kappa_speed`
 - `[10]`: `yaw_rate_cmd_rad_s`
 - `[11..38]`: active RPP parameter snapshot for every bag sample
+- `[39]`: `spray_active`
+- `[40]`: `tracking_profile_code`
+- `[41..46]`: segment-profile parameter snapshot
 
 State code `[7]` values:
 

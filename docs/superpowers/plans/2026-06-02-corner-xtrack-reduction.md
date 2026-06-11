@@ -14,6 +14,11 @@
 
 **Baseline (log 59, 2026-05-23):** max xtrack 9.4cm corners, 1-3cm straights. That older run used P3.1 yaw-rate feedforward with `yaw_rate_feedback_gain=1.2`. Current mainline defaults to pure feedforward (`yaw_rate_feedback_gain=0.0`) with `max_yaw_rate_body=0.45`.
 
+**Codebase audit (2026-06-11):**
+- Runtime code is current for this sprint: `/rpp/debug` is now a 47-field append-only payload (`0..7` stable, `39..46` spray/profile fields), `/rpp/yaw_rate_body` exists, and `twist_to_setpoint_node.py` uses type mask `455` only when fresh non-zero yaw-rate is active.
+- The remaining Sprint 1 items are field/Jetson validation and tuning tasks, not missing source-code tasks.
+- Sensor-fusion Sprint 2 is still blocked in this repo: no `localization_node.py`, no `robot_localization.yaml`, no `/wheel_odom` bridge, and no `use_fused_odom` subscriber exist in current source.
+
 ---
 
 ## Diagnostic: Why 9.4cm at corners?
@@ -33,7 +38,7 @@ Corner xtrack is dominated by **yaw lag** (P3.1 k_ψ too high → overshoot) or 
 
 ## Sprint 1 — Tune existing RPP to ≤5cm corners (field-testable in hours)
 
-**Entry condition:** Current code on Jetson has the 39-field `/rpp/debug` layout, `/rpp/yaw_rate_body`, and current `twist_to_setpoint_node.py` yaw handling deployed.
+**Entry condition:** Current code on Jetson has the 47-field `/rpp/debug` layout, `/rpp/yaw_rate_body`, and current `twist_to_setpoint_node.py` yaw handling deployed.
 
 ### Task 1: Deploy and verify the current RPP runtime
 
@@ -67,7 +72,7 @@ Expected: `RPP controller started` log line visible within 3s.
 ros2 topic echo /rpp/debug --once | grep -E "size|stride"
 ```
 
-Expected: `size: 39`, `stride: 39`.
+Expected: `size: 47`, `stride: 47`.
 
 - [ ] **Step 1.4 — Verify yaw-rate path**
 
