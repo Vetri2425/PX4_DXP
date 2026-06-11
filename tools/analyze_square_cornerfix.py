@@ -10,7 +10,8 @@ import struct
 import math
 import sys
 
-DB = "bags/square_cornerfix_20260611_174508/square_cornerfix_20260611_174508_0.db3"
+DB = sys.argv[1] if len(sys.argv) > 1 else \
+    "bags/square_cornerfix_20260611_174508/square_cornerfix_20260611_174508_0.db3"
 
 SEG_STATE = {0: "INACTIVE", 1: "TRACK_SEGMENT", 2: "PRE_CORNER_SLOWDOWN",
              3: "CORNER_ALIGN", 4: "DONE"}
