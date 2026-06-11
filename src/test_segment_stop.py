@@ -68,5 +68,97 @@ class TestSegmentStop(unittest.TestCase):
         self.assertGreater(self.APPROACH_V, 0.01)
 
 
+class CornerStopDwell:
+    """Mirror of rpp_controller_node._corner_stop_satisfied (time injected)."""
+
+    THRESH = 0.02   # segment_stop_speed_threshold
+    DWELL = 0.30    # segment_stop_dwell_s
+    MAX_HOLD = 2.0  # _CORNER_STOP_MAX_HOLD_S
+
+    def __init__(self):
+        self.entered = None
+        self.low_since = None
+
+    def step(self, now, speed):
+        """speed=None models missing/stale velocity data."""
+        if self.entered is None:
+            self.entered = now
+        if speed is not None and speed > self.THRESH:
+            self.low_since = None
+        else:
+            if self.low_since is None:
+                self.low_since = now
+            elif now - self.low_since >= self.DWELL:
+                return True
+        if now - self.entered >= self.MAX_HOLD:
+            return True
+        return False
+
+
+class TestCornerStopDwell(unittest.TestCase):
+    """CORNER_STOP must hold until the rover is physically stopped — and must
+    never deadlock if velocity data is missing or noisy."""
+
+    def test_holds_while_moving(self):
+        d = CornerStopDwell()
+        t = 0.0
+        for _ in range(20):  # 1 s of decaying-but-moving speed
+            self.assertFalse(d.step(t, 0.09))
+            t += 0.05
+
+    def test_releases_after_dwell_at_rest(self):
+        d = CornerStopDwell()
+        t = 0.0
+        released = None
+        for _ in range(40):
+            if d.step(t, 0.005):
+                released = t
+                break
+            t += 0.05
+        self.assertIsNotNone(released)
+        self.assertGreaterEqual(released, d.DWELL - 0.06)  # not before dwell
+        self.assertLess(released, 0.6)                     # promptly after
+
+    def test_motion_blip_restarts_dwell(self):
+        d = CornerStopDwell()
+        t = 0.0
+        # settle 0.2s, blip of motion, then settle again
+        for _ in range(4):
+            self.assertFalse(d.step(t, 0.005)); t += 0.05
+        self.assertFalse(d.step(t, 0.05)); t += 0.05      # blip > threshold
+        released = None
+        for _ in range(20):
+            if d.step(t, 0.005):
+                released = t
+                break
+            t += 0.05
+        # full dwell must elapse again after the blip (blip at t=0.20)
+        self.assertGreaterEqual(released, 0.20 + d.DWELL - 0.06)
+
+    def test_no_velocity_data_falls_back_to_dwell(self):
+        d = CornerStopDwell()
+        t = 0.0
+        released = None
+        for _ in range(40):
+            if d.step(t, None):
+                released = t
+                break
+            t += 0.05
+        self.assertIsNotNone(released)
+        self.assertLess(released, d.MAX_HOLD)  # dwell path, not the hard cap
+
+    def test_hard_cap_prevents_deadlock(self):
+        d = CornerStopDwell()
+        t = 0.0
+        released = None
+        for _ in range(100):  # speed hovers just above threshold forever
+            if d.step(t, 0.03):
+                released = t
+                break
+            t += 0.05
+        self.assertIsNotNone(released)
+        self.assertAlmostEqual(released, d.MAX_HOLD, delta=0.06)
+
+
 if __name__ == "__main__":
     unittest.main()

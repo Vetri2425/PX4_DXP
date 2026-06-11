@@ -210,6 +210,12 @@ class SegmentStateCode(IntEnum):
     PRE_CORNER_SLOWDOWN = 2
     CORNER_ALIGN = 3
     DONE = 4
+    # Stop-and-spin corner execution: zero velocity is held at the corner
+    # point until the rover is PHYSICALLY stopped (actual speed below
+    # segment_stop_speed_threshold for segment_stop_dwell_s), and only then
+    # does CORNER_ALIGN pivot toward the next heading. Prevents approach
+    # momentum from carrying the rover past the corner during the pivot.
+    CORNER_STOP = 5
 
 
 # ---------------------------------------------------------------------------
@@ -312,8 +318,23 @@ class RPPControllerNode(Node):
         self.declare_parameter("segment_slowdown_dist",               0.50)
         self.declare_parameter("segment_min_corner_speed",             0.08)
         self.declare_parameter("segment_corner_acceptance_radius",     0.05)
-        self.declare_parameter("segment_heading_tolerance_deg",        7.5)
+        # Pivot exit tolerance. 2.0° gives the "spin in place, exit facing the
+        # next point" behaviour; pair with FCU param RD_TRANS_TRN_DRV lowered
+        # to the same angle (set via QGC) or the firmware starts driving
+        # forward at its own 5° default while RPP is still waiting.
+        self.declare_parameter("segment_heading_tolerance_deg",        2.0)
         self.declare_parameter("segment_yaw_rate_gain",                1.5)
+        # CORNER_STOP: confirm the rover is physically stopped at the corner
+        # before pivoting. Speed comes from /mavros/local_position/velocity_local
+        # (always subscribed); the dwell debounces EKF velocity noise. The
+        # 2 s hard cap prevents a stop-confirmation deadlock if the velocity
+        # topic goes quiet or hovers around the threshold.
+        self.declare_parameter("segment_stop_speed_threshold",         0.02)   # m/s
+        self.declare_parameter("segment_stop_dwell_s",                 0.30)   # s
+        # Pivot watchdog: at tight (2°) tolerance with RTK yaw noise the
+        # alignment can hunt; rather than deadlock, accept the best-effort
+        # heading after this long and move on.
+        self.declare_parameter("segment_turn_timeout_s",               5.0)    # s
 
         # P2.4 — Velocity-based pose extrapolation (latency closure)
         # When enabled, dead-reckon the pose forward by `vel_ned * pose_age`
@@ -378,6 +399,13 @@ class RPPControllerNode(Node):
         self._run_align_pending: bool = False
         self._segment_idx: int = 0
         self._segment_state: SegmentStateCode = SegmentStateCode.INACTIVE
+        # CORNER_STOP / pivot-watchdog state (shared by the segment corner and
+        # run-transition pivots — only one corner is active at a time).
+        self._corner_stop_entered: RclTime | None = None   # when CORNER_STOP began
+        self._corner_stop_low_since: RclTime | None = None  # actual speed below threshold since
+        self._corner_stop_complete: bool = False            # stop confirmed; pivoting now
+        self._pivot_started: RclTime | None = None          # when CORNER_ALIGN actuation began
+        self._pivot_timeout_warned: bool = False
         self._last_segment_debug: tuple[float, ...] = (
             0.0, 0.0, 0.0, float("nan"), float("nan"),
             float("nan"), float("nan"), float("nan"), 0.0,
@@ -992,6 +1020,7 @@ class RPPControllerNode(Node):
         # before tracking it (see _run_alignment_hold). The first run keeps
         # the existing drive-from-anywhere start behavior.
         self._run_align_pending = idx > 0
+        self._reset_corner_pivot_state()
         self._run_idx = idx
         self._path = run["poses"]
         self._spray_flags = list(run["flags"])
@@ -1068,9 +1097,45 @@ class RPPControllerNode(Node):
         heading_tol = math.radians(
             float(self.get_parameter("segment_heading_tolerance_deg").value)
         )
-        if abs(heading_err) <= heading_tol:
+        if abs(heading_err) <= heading_tol or (
+            self._corner_stop_complete and self._pivot_timed_out()
+        ):
             self._run_align_pending = False
+            self._reset_corner_pivot_state()
             return False
+
+        final = self._path[-1].pose.position
+        dist_to_goal = self._dist(pos_n, pos_e, final.x, final.y)
+
+        # Stop-and-spin: hold zero velocity at the corner until the rover is
+        # physically stopped (approach momentum gone), THEN pivot. Without
+        # this the residual ~0.09 m/s arrival speed carries the rover past
+        # the corner point during the first part of the turn.
+        if not self._corner_stop_complete:
+            if not self._corner_stop_satisfied():
+                self._last_speed_cmd = 0.0
+                self._publish_velocity(0.0, 0.0)
+                self._publish_yaw_rate(0.0)
+                self._publish_debug(
+                    cross_track=0.0,
+                    heading_err=heading_err,
+                    lookahead=float("nan"),
+                    speed=0.0,
+                    kappa=0.0,
+                    dist_goal=dist_to_goal,
+                    pose_age_ms=pose_age_s * 1000.0,
+                    state=StateCode.TRACKING,
+                    l_d_raw=float("nan"),
+                    kappa_speed=0.0,
+                    yaw_rate=0.0,
+                    spray_active=False,
+                )
+                self._publish_segment_debug(
+                    SegmentStateCode.CORNER_STOP, 0, float("nan"), float("nan"),
+                    float("nan"), target_heading, heading_err, 0.0,
+                )
+                return True
+            self._corner_stop_complete = True
 
         # Firmware-aware pivot (see segment CORNER_ALIGN for the full
         # rationale): the differential rover turns by chasing the velocity-
@@ -1083,8 +1148,6 @@ class RPPControllerNode(Node):
         )
         v_n, v_e = self._corner_pivot_velocity(yaw_ned, heading_err, corner_speed)
 
-        final = self._path[-1].pose.position
-        dist_to_goal = self._dist(pos_n, pos_e, final.x, final.y)
         self._last_speed_cmd = corner_speed
         self._publish_velocity(v_n, v_e)
         self._publish_yaw_rate(0.0)
@@ -1713,9 +1776,12 @@ class RPPControllerNode(Node):
             c = self._path[seg_idx + 2].pose.position
             target_heading = math.atan2(c.y - b.y, c.x - b.x)
             heading_err = self._angle_wrap(target_heading - yaw_ned)
-            if abs(heading_err) <= heading_tol:
+            if abs(heading_err) <= heading_tol or (
+                self._corner_stop_complete and self._pivot_timed_out()
+            ):
                 self._segment_idx += 1
                 self._segment_state = SegmentStateCode.TRACK_SEGMENT
+                self._reset_corner_pivot_state()
                 self._publish_segment_debug(
                     self._segment_state, self._segment_idx, float("nan"),
                     dist_to_corner, corner_angle, target_heading, heading_err, 0.0,
@@ -1724,6 +1790,36 @@ class RPPControllerNode(Node):
                     pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
                 )
                 return
+
+            # Stop-and-spin: confirm the rover is physically stopped at the
+            # corner before pivoting (see _run_alignment_hold for the twin).
+            if not self._corner_stop_complete:
+                if not self._corner_stop_satisfied():
+                    self._segment_state = SegmentStateCode.CORNER_STOP
+                    self._last_speed_cmd = 0.0
+                    self._publish_velocity(0.0, 0.0)
+                    self._publish_yaw_rate(0.0)
+                    self._publish_debug(
+                        cross_track=signed_xtrack,
+                        heading_err=heading_err,
+                        lookahead=dist_to_corner,
+                        speed=0.0,
+                        kappa=0.0,
+                        dist_goal=dist_to_goal,
+                        pose_age_ms=pose_age_s * 1000.0,
+                        state=StateCode.TRACKING,
+                        l_d_raw=float("nan"),
+                        kappa_speed=0.0,
+                        yaw_rate=0.0,
+                        spray_active=spray_active,
+                    )
+                    self._publish_segment_debug(
+                        self._segment_state, seg_idx, dist_to_end_along,
+                        dist_to_corner, corner_angle, target_heading,
+                        heading_err, 0.0,
+                    )
+                    return
+                self._corner_stop_complete = True
 
             self._segment_state = SegmentStateCode.CORNER_ALIGN
             # Corner pivot — firmware-aware actuation.
@@ -2379,6 +2475,79 @@ class RPPControllerNode(Node):
         )
         cmd_bearing = yaw_ned + step
         return corner_speed * math.cos(cmd_bearing), corner_speed * math.sin(cmd_bearing)
+
+    # Hard cap on how long CORNER_STOP may hold before proceeding to the
+    # pivot anyway — guards against a missing/noisy velocity_local topic
+    # turning stop-confirmation into a deadlock.
+    _CORNER_STOP_MAX_HOLD_S = 2.0
+
+    def _reset_corner_pivot_state(self):
+        self._corner_stop_entered = None
+        self._corner_stop_low_since = None
+        self._corner_stop_complete = False
+        self._pivot_started = None
+        self._pivot_timeout_warned = False
+
+    def _corner_stop_satisfied(self) -> bool:
+        """True once the rover is confirmed physically stopped at the corner.
+
+        Confirmation = actual ground speed (from velocity_local) below
+        segment_stop_speed_threshold continuously for segment_stop_dwell_s.
+        If velocity data is unavailable the dwell timer alone decides; either
+        way the hold is capped at _CORNER_STOP_MAX_HOLD_S.
+        """
+        now = self.get_clock().now()
+        if self._corner_stop_entered is None:
+            self._corner_stop_entered = now
+
+        thresh = float(self.get_parameter("segment_stop_speed_threshold").value)
+        dwell = float(self.get_parameter("segment_stop_dwell_s").value)
+
+        speed = None
+        if self._latest_vel_time is not None:
+            vel_age = (now - self._latest_vel_time).nanoseconds * 1e-9
+            if vel_age < 0.3:
+                v_n, v_e = self._latest_vel_ned
+                speed = math.hypot(v_n, v_e)
+
+        if speed is not None and speed > thresh:
+            self._corner_stop_low_since = None  # still moving — restart dwell
+        else:
+            # Below threshold, or no fresh velocity data (assume settling).
+            if self._corner_stop_low_since is None:
+                self._corner_stop_low_since = now
+            elif (now - self._corner_stop_low_since).nanoseconds * 1e-9 >= dwell:
+                return True
+
+        if (now - self._corner_stop_entered).nanoseconds * 1e-9 >= self._CORNER_STOP_MAX_HOLD_S:
+            self.get_logger().warn(
+                "CORNER_STOP hold cap reached without speed confirmation — "
+                "proceeding to pivot",
+                throttle_duration_sec=5.0,
+            )
+            return True
+        return False
+
+    def _pivot_timed_out(self) -> bool:
+        """Watchdog for the in-place pivot: True once CORNER_ALIGN has run
+        longer than segment_turn_timeout_s without meeting the heading
+        tolerance — caller should accept the best-effort heading and advance."""
+        now = self.get_clock().now()
+        if self._pivot_started is None:
+            self._pivot_started = now
+            return False
+        timeout = float(self.get_parameter("segment_turn_timeout_s").value)
+        if timeout <= 0.0:
+            return False
+        if (now - self._pivot_started).nanoseconds * 1e-9 < timeout:
+            return False
+        if not self._pivot_timeout_warned:
+            self._pivot_timeout_warned = True
+            self.get_logger().warn(
+                f"Corner pivot timed out after {timeout:.1f}s — accepting "
+                f"current heading and advancing"
+            )
+        return True
 
     def _publish_velocity(self, v_n: float, v_e: float):
         msg = Vector3Stamped()
