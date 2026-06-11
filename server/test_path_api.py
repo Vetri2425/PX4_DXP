@@ -45,6 +45,9 @@ def test_path_manager_preview_preserves_dxf_spray_flags(tmp_path, monkeypatch):
     mission_file.write_text("0\nEOF\n", encoding="utf-8")
 
     class FakeEngine:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
         def plan_file(self, filepath):
             assert filepath == str(mission_file)
             return SimpleNamespace(
@@ -68,6 +71,9 @@ def test_path_manager_preview_caches_uploaded_file_result(tmp_path, monkeypatch)
     calls = {"count": 0}
 
     class FakeEngine:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
         def plan_file(self, filepath):
             calls["count"] += 1
             return SimpleNamespace(
@@ -1010,3 +1016,98 @@ async def test_load_to_controller_rejects_while_running(monkeypatch, tmp_path):
             LoadMissionRequest(mission_id="stg_anything")
         )
     assert exc.value.status_code == 409
+
+
+# ── Extension-aware auto-origin (server flow) ───────────────────────────────
+
+def _write_line_dxf(path):
+    """Author a single LINE heading north (DXF (0,0)->(0,5)) in metres.
+
+    The DXF parser maps DXF x->east, y->north, so a DXF segment ending at
+    (0,5) heads due north in NED. $INSUNITS=6 makes unit_scale 1.0.
+    """
+    import ezdxf
+
+    doc = ezdxf.new()
+    doc.header["$INSUNITS"] = 6  # metres → unit_scale 1.0
+    msp = doc.modelspace()
+    msp.add_line((0.0, 0.0), (0.0, 5.0))
+    doc.saveas(str(path))
+
+
+def test_load_path_auto_origin_anchors_pre_point_at_rover(tmp_path):
+    """With extensions enabled + auto_origin, the executed path's first point
+    (the PRE run-up point) lands on the rover pose, and disabling auto_origin
+    keeps the historical drawing-origin anchoring (PRE point behind rover)."""
+    try:
+        import ezdxf  # noqa: F401
+    except ImportError:
+        pytest.skip("ezdxf not installed")
+
+    dxf = tmp_path / "line.dxf"
+    _write_line_dxf(dxf)
+
+    mgr = PathManager(str(tmp_path))
+    mgr.save_extension_config("line.dxf", True, 0.5, 0.5)
+
+    rover = (10.0, 20.0)
+
+    # auto_origin=True → anchor the first driven waypoint (PRE point) at rover.
+    pts_anchored = mgr.load_path("line.dxf", origin=rover, start_position=rover, auto_origin=True)
+    assert len(pts_anchored) >= 2
+    assert abs(pts_anchored[0][0] - rover[0]) < 1e-3
+    assert abs(pts_anchored[0][1] - rover[1]) < 1e-3
+
+    # auto_origin=False → drawing-origin anchoring: PRE point is 0.5 m behind
+    # the rover (south) since the DXF line starts heading north from (0,0).
+    pts_drawing = mgr.load_path("line.dxf", origin=rover, start_position=rover, auto_origin=False)
+    assert abs(pts_drawing[0][0] - (rover[0] - 0.5)) < 1e-3
+
+    # Same geometry, just translated: identical waypoint count.
+    assert len(pts_anchored) == len(pts_drawing)
+
+
+def test_load_path_executes_with_extension_config(tmp_path):
+    """Regression for the prerequisite fix: the executed path honors the saved
+    extension config (PRE/AFT legs present), not a bare default engine."""
+    try:
+        import ezdxf  # noqa: F401
+    except ImportError:
+        pytest.skip("ezdxf not installed")
+
+    dxf = tmp_path / "line.dxf"
+    _write_line_dxf(dxf)
+    mgr = PathManager(str(tmp_path))
+
+    # Extensions OFF → no run-up; line starts at (0,0) (modulo a small spray
+    # lead-in of ~0.035 m from latency compensation).
+    mgr.save_extension_config("line.dxf", False, 0.5, 0.5)
+    pts_off = mgr.load_path("line.dxf")
+    assert abs(pts_off[0][0]) < 0.1  # near drawing origin (spray lead-in only)
+
+    # Extensions ON → PRE leg prepended; path now starts 0.5 m before (0,0).
+    mgr.save_extension_config("line.dxf", True, 0.5, 0.5)
+    pts_on = mgr.load_path("line.dxf")
+    assert pts_on[0][0] < -0.4  # PRE run-up point south of origin
+    assert len(pts_on) > len(pts_off)
+
+
+def test_preview_spray_flags_match_executed_path_with_extensions(tmp_path):
+    """Preview spray-flag length matches the executed path so the controller
+    does not fall back to spray-OFF on a length mismatch."""
+    try:
+        import ezdxf  # noqa: F401
+    except ImportError:
+        pytest.skip("ezdxf not installed")
+
+    dxf = tmp_path / "line.dxf"
+    _write_line_dxf(dxf)
+    mgr = PathManager(str(tmp_path))
+    mgr.save_extension_config("line.dxf", True, 0.5, 0.5)
+
+    preview = mgr.preview_path("line.dxf")
+    executed = mgr.load_path("line.dxf")
+    assert preview.num_points == len(executed)
+    # PRE/AFT extensions are TRANSIT → spray OFF at the ends.
+    assert preview.waypoints[0].spray is False
+    assert preview.waypoints[-1].spray is False

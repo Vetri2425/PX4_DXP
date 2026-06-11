@@ -788,3 +788,112 @@ def test_optimizer_stats_keys_consistent_single_segment():
     # Single-segment route must expose the same telemetry keys as the multi route.
     assert set(multi_stats) == set(single_stats)
     assert single_stats["two_opt_skipped_reason"] == "single mark segment"
+
+
+# ── Extension-aware auto-origin (anchor mode) ───────────────────────────────
+
+def _line_seg(start=(0.0, 0.0), end=(5.0, 0.0)):
+    return PathSegment(
+        segment_type=SegmentType.MARK,
+        points=[start, end],
+        speed=0.35,
+        source_entity="LINE_1",
+    )
+
+
+def test_anchor_default_is_drawing_origin():
+    """Without anchor arg, behavior is unchanged (drawing origin at rover)."""
+    engine = PathEngine(optimize_order=False, compensate_spray=False)
+    rover = (10.0, 20.0)
+    plan_default = engine.plan_segments([_line_seg()], origin=rover)
+    plan_drawing = engine.plan_segments(
+        [_line_seg()], origin=rover, anchor="drawing_origin"
+    )
+    assert plan_default.merged_waypoints == plan_drawing.merged_waypoints
+    # First local point is (0,0); drawing-origin anchoring places it at rover.
+    first = plan_drawing.merged_waypoints[0]
+    assert abs(first[0] - rover[0]) < 1e-6
+    assert abs(first[1] - rover[1]) < 1e-6
+
+
+def test_anchor_first_waypoint_no_extensions_matches_drawing_origin():
+    """With extensions OFF, first_waypoint and drawing_origin are identical.
+
+    The first local waypoint is the drawing origin (0,0) for a segment that
+    starts there, so the two anchor modes coincide (backward compat, Req 1).
+    """
+    engine = PathEngine(optimize_order=False, compensate_spray=False)
+    rover = (3.0, -4.0)
+    plan_draw = engine.plan_segments([_line_seg()], origin=rover, anchor="drawing_origin")
+    plan_first = engine.plan_segments([_line_seg()], origin=rover, anchor="first_waypoint")
+    assert plan_draw.merged_waypoints == plan_first.merged_waypoints
+
+
+def test_anchor_first_waypoint_with_extensions_places_pre_at_rover():
+    """With extensions ON, the PRE run-up point lands on the rover, and the
+    original Point A ends up pre_extension_m ahead (north) of the rover."""
+    engine = PathEngine(
+        optimize_order=False,
+        compensate_spray=False,
+        enable_path_extensions=True,
+        pre_extension_m=0.5,
+        aft_extension_m=0.5,
+    )
+    rover = (10.0, 20.0)
+    plan = engine.plan_segments([_line_seg()], origin=rover, anchor="first_waypoint")
+    first = plan.merged_waypoints[0]
+    # PRE point lands exactly on the rover.
+    assert abs(first[0] - rover[0]) < 1e-3
+    assert abs(first[1] - rover[1]) < 1e-3
+    # Drawing-origin anchoring would instead place the PRE point 0.5 m behind.
+    plan_draw = engine.plan_segments([_line_seg()], origin=rover, anchor="drawing_origin")
+    first_draw = plan_draw.merged_waypoints[0]
+    assert abs(first_draw[0] - (rover[0] - 0.5)) < 1e-3
+
+
+def test_anchor_first_waypoint_preserves_shape():
+    """Anchoring only translates; pairwise distances are unchanged."""
+    engine = PathEngine(
+        optimize_order=False,
+        compensate_spray=False,
+        enable_path_extensions=True,
+        pre_extension_m=0.5,
+        aft_extension_m=0.5,
+    )
+    rover = (7.0, 1.0)
+    plan_draw = engine.plan_segments([_line_seg()], origin=rover, anchor="drawing_origin")
+    plan_first = engine.plan_segments([_line_seg()], origin=rover, anchor="first_waypoint")
+    assert len(plan_draw.merged_waypoints) == len(plan_first.merged_waypoints)
+    # Same shape: every point differs by one constant translation vector.
+    d0 = (
+        plan_first.merged_waypoints[0][0] - plan_draw.merged_waypoints[0][0],
+        plan_first.merged_waypoints[0][1] - plan_draw.merged_waypoints[0][1],
+    )
+    for a, b in zip(plan_draw.merged_waypoints, plan_first.merged_waypoints):
+        assert abs((b[0] - a[0]) - d0[0]) < 1e-9
+        assert abs((b[1] - a[1]) - d0[1]) < 1e-9
+
+
+def test_anchor_first_waypoint_pre_extension_zero():
+    """pre_extension_m=0 → no PRE leg → first waypoint is Point A at rover."""
+    engine = PathEngine(
+        optimize_order=False,
+        compensate_spray=False,
+        enable_path_extensions=True,
+        pre_extension_m=0.0,
+        aft_extension_m=0.5,
+    )
+    rover = (2.0, 2.0)
+    plan = engine.plan_segments([_line_seg()], origin=rover, anchor="first_waypoint")
+    first = plan.merged_waypoints[0]
+    assert abs(first[0] - rover[0]) < 1e-3
+    assert abs(first[1] - rover[1]) < 1e-3
+
+
+def test_anchor_metadata_recorded():
+    """planning_metadata records the anchor mode and effective offset."""
+    engine = PathEngine(optimize_order=False, compensate_spray=False)
+    plan = engine.plan_segments([_line_seg()], origin=(1.0, 2.0), anchor="first_waypoint")
+    anchor_meta = plan.planning_metadata["anchor"]
+    assert anchor_meta["mode"] == "first_waypoint"
+    assert anchor_meta["requested_origin"] == (1.0, 2.0)

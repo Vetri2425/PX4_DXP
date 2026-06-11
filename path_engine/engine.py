@@ -113,6 +113,7 @@ class PathEngine:
         ref_points_dxf: list[tuple[float, float]] | None = None,
         ref_points_gps: list[tuple[float, float]] | None = None,
         close_loop: bool = False,
+        anchor: str = "drawing_origin",
     ) -> PlannedPath:
         """Parse a file and run the full planning pipeline.
 
@@ -131,6 +132,11 @@ class PathEngine:
             ref_points_dxf: DXF coordinates of alignment points.
             ref_points_gps: GPS coordinates (lat, lon) of alignment points.
             close_loop: True to close open loop paths.
+            anchor: Which point the ``origin`` offset places at the rover.
+                "drawing_origin" (default) anchors the DXF drawing origin (0,0)
+                — the historical behavior. "first_waypoint" anchors the first
+                driven merged waypoint (the PRE run-up point when extensions add
+                one) so the rover starts driving forward from ``origin``.
 
         Returns:
             PlannedPath with merged waypoints and spray flags.
@@ -159,6 +165,7 @@ class PathEngine:
             ref_points_gps=ref_points_gps,
             close_loop=close_loop,
             ref_unit_scale=detected_unit_scale or 1.0,
+            anchor=anchor,
         )
         plan.planning_metadata["source"] = {
             "filepath": filepath,
@@ -178,6 +185,7 @@ class PathEngine:
         ref_points_dxf: list[tuple[float, float]] | None = None,
         ref_points_gps: list[tuple[float, float]] | None = None,
         close_loop: bool = False,
+        anchor: str = "drawing_origin",
     ) -> PlannedPath:
         """Plan from pre-parsed DXF entities.
 
@@ -194,6 +202,8 @@ class PathEngine:
             ref_points_dxf: DXF coordinates of alignment points.
             ref_points_gps: GPS coordinates (lat, lon) of alignment points.
             close_loop: True to close open loop paths.
+            anchor: "drawing_origin" (default) or "first_waypoint" — see
+                ``plan_file`` for semantics.
 
         Returns:
             PlannedPath with merged waypoints and spray flags.
@@ -212,6 +222,7 @@ class PathEngine:
             ref_points_gps=ref_points_gps,
             close_loop=close_loop,
             ref_unit_scale=(entities[0].unit_scale if entities else 1.0),
+            anchor=anchor,
         )
         plan.planning_metadata["source"] = {
             "extension": ".dxf",
@@ -229,6 +240,7 @@ class PathEngine:
         ref_points_dxf: list[tuple[float, float]] | None = None,
         ref_points_gps: list[tuple[float, float]] | None = None,
         close_loop: bool = False,
+        anchor: str = "drawing_origin",
     ) -> PlannedPath:
         """Plan from pre-built PathSegments.
 
@@ -243,6 +255,8 @@ class PathEngine:
             ref_points_dxf: DXF coordinates of alignment points.
             ref_points_gps: GPS coordinates (lat, lon) of alignment points.
             close_loop: True to close open loop paths.
+            anchor: "drawing_origin" (default) or "first_waypoint" — see
+                ``plan_file`` for semantics.
 
         Returns:
             PlannedPath with merged waypoints and spray flags.
@@ -256,6 +270,7 @@ class PathEngine:
             ref_points_dxf=ref_points_dxf,
             ref_points_gps=ref_points_gps,
             close_loop=close_loop,
+            anchor=anchor,
         )
 
     def _resolve_start_position(
@@ -291,6 +306,7 @@ class PathEngine:
         ref_points_gps: list[tuple[float, float]] | None = None,
         close_loop: bool = False,
         ref_unit_scale: float = 1.0,
+        anchor: str = "drawing_origin",
     ) -> PlannedPath:
         """Run the full pipeline on a list of segments.
 
@@ -317,6 +333,9 @@ class PathEngine:
                 has already been scaled to metres by the parser, so the points
                 must be scaled by this factor before the affine solve to keep
                 both in the same metric frame (Gap A).
+            anchor: "drawing_origin" (default) anchors the DXF drawing origin
+                (0,0) at ``origin``; "first_waypoint" anchors the first driven
+                merged waypoint at ``origin`` (extension-aware auto-origin).
 
         Returns:
             PlannedPath ready for /path topic publication.
@@ -559,6 +578,26 @@ class PathEngine:
         total_mark = 0.0
         total_transit = 0.0
 
+        # Resolve the effective translation. With anchor="first_waypoint" the
+        # origin offset is shifted so the first driven merged waypoint
+        # (ordered[0].points[0] — the PRE run-up point when extensions add one)
+        # lands exactly at `origin` (the rover pose), instead of anchoring the
+        # drawing origin (0,0). Geometry shape is preserved either way since the
+        # offset is uniform. Skipped when GPS/affine alignment already placed
+        # the points in the target NED frame.
+        effective_offset = origin
+        if (
+            anchor == "first_waypoint"
+            and not has_alignment
+            and ordered
+            and ordered[0].points
+        ):
+            first_local = ordered[0].points[0]
+            effective_offset = (
+                origin[0] - first_local[0],
+                origin[1] - first_local[1],
+            )
+
         for seg in ordered:
             is_mark = seg.segment_type == SegmentType.MARK
             for i, pt in enumerate(seg.points):
@@ -566,7 +605,7 @@ class PathEngine:
                 if has_alignment:
                     offset_pt = pt
                 else:
-                    offset_pt = (pt[0] + origin[0], pt[1] + origin[1])
+                    offset_pt = (pt[0] + effective_offset[0], pt[1] + effective_offset[1])
 
                 # Junction de-duplication: skip adjacent duplicate points within 1 cm
                 if merged_waypoints:
@@ -628,6 +667,11 @@ class PathEngine:
             "smoothing": smoothing_stats,
             "optimization": optimization_stats,
             "planning_time_s": planning_time_s,
+            "anchor": {
+                "mode": anchor,
+                "requested_origin": origin,
+                "effective_offset": effective_offset,
+            },
         }
         log.info(
             "planned path in %.3fs: segments %d -> %d, waypoints %d -> %d, length %.2fm",

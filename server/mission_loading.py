@@ -72,6 +72,7 @@ async def load_path_for_controller(
     *,
     origin: tuple[float, float] = (0.0, 0.0),
     start_position: tuple[float, float] | None = None,
+    auto_origin: bool = False,
 ) -> list[tuple[float, float]]:
     """Load and validate a path without blocking the FastAPI event loop."""
     async with _load_lock:
@@ -87,6 +88,7 @@ async def load_path_for_controller(
                 name,
                 origin=origin,
                 start_position=start_position,
+                auto_origin=auto_origin,
             )
             validate_point_count(points)
             spray_flags = spray_flags_for_path(path_mgr, name, len(points))

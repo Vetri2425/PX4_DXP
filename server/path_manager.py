@@ -313,6 +313,26 @@ class PathManager:
             "aft_extension_m": aft,
         }
 
+    def resolve_extension_settings(
+        self, name: str
+    ) -> tuple[bool, float, float]:
+        """Resolve (enabled, pre_extension_m, aft_extension_m) for a path name.
+
+        Builtin paths never run through the extension stage, so they always
+        resolve to disabled. Other paths use the saved per-file sidecar config.
+        This is the single source of truth shared by preview_path() and
+        plan_path() so the displayed preview, the spray-flag schedule, and the
+        executed mission stay in lock-step.
+        """
+        if name in BUILTIN_PATHS:
+            return False, 0.5, 0.5
+        cfg = self.load_extension_config(name)
+        return (
+            bool(cfg["enabled"]),
+            float(cfg["pre_extension_m"]),
+            float(cfg["aft_extension_m"]),
+        )
+
     def save_extension_config(
         self,
         filename: str,
@@ -497,6 +517,7 @@ class PathManager:
         name: str,
         origin: tuple[float, float] = (0.0, 0.0),
         start_position: tuple[float, float] | None = None,
+        auto_origin: bool = False,
     ) -> list[tuple[float, float]]:
         if name.startswith("builtin:"):
             name = name.removeprefix("builtin:")
@@ -508,7 +529,20 @@ class PathManager:
         fpath = os.path.join(self._dir, os.path.basename(name))
         if os.path.isfile(fpath):
             ext = os.path.splitext(fpath)[1].lower()
-            if ext in (".dxf", ".csv") and (
+            if ext == ".dxf":
+                # Route DXF through the full planning pipeline so the executed
+                # mission honors the saved per-file extension config + tuning
+                # (and extension-aware auto-origin), matching the preview. A bare
+                # PathEngine() here would silently drop PRE/AFT legs and tuning.
+                result = self.plan_path(
+                    name,
+                    summary_only=False,
+                    origin=origin,
+                    start_position=start_position,
+                    auto_origin=auto_origin,
+                )
+                return result["merged_waypoints"]
+            if ext == ".csv" and (
                 origin != (0.0, 0.0) or start_position is not None
             ):
                 from path_engine import PathEngine
@@ -545,7 +579,17 @@ class PathManager:
                 return cached[2]
             if os.path.splitext(fpath)[1].lower() == ".dxf":
                 from path_engine import PathEngine
-                engine = PathEngine()
+                # Honor the saved extension config so the preview, its spray
+                # schedule, and the executed mission (load_path → plan_path)
+                # all share the same waypoint count and spray flags. A bare
+                # PathEngine() here would drop PRE/AFT legs and desync the
+                # spray-flag length from the executed path.
+                enabled, pre_m, aft_m = self.resolve_extension_settings(name)
+                engine = PathEngine(
+                    enable_path_extensions=enabled,
+                    pre_extension_m=pre_m,
+                    aft_extension_m=aft_m,
+                )
                 overrides = self.load_entity_overrides(name)
                 if overrides:
                     entities = self.parse_dxf(fpath)
@@ -673,6 +717,7 @@ class PathManager:
 
         origin = kwargs.pop("origin", (0.0, 0.0))
         start_position = kwargs.pop("start_position", None)
+        auto_origin = bool(kwargs.pop("auto_origin", False))
         layer_mapping = kwargs.pop("layer_mapping", None)
         optimize = kwargs.pop("optimize", True)
         compensate_spray = kwargs.pop("compensate_spray", True)
@@ -711,10 +756,21 @@ class PathManager:
             pre_extension_m = 0.5
             aft_extension_m = 0.5
         else:
-            extension_config = self.load_extension_config(name)
-            enable_path_extensions = bool(extension_config["enabled"])
-            pre_extension_m = float(extension_config["pre_extension_m"])
-            aft_extension_m = float(extension_config["aft_extension_m"])
+            enable_path_extensions, pre_extension_m, aft_extension_m = (
+                self.resolve_extension_settings(name)
+            )
+
+        # Extension-aware auto-origin: when the rover is anchoring the mission to
+        # its current pose AND drive extensions are active, anchor the first
+        # driven waypoint (the PRE run-up point) at the rover instead of the DXF
+        # drawing origin, so the rover drives forward through the run-up rather
+        # than starting with the run-up point behind it. Builtins never run
+        # through the extension stage, so they always keep drawing-origin.
+        anchor = (
+            "first_waypoint"
+            if (auto_origin and enable_path_extensions and name not in BUILTIN_PATHS)
+            else "drawing_origin"
+        )
 
         if name in BUILTIN_PATHS:
             # Builtin preview must match the path that mission/load publishes:
@@ -805,6 +861,7 @@ class PathManager:
                 ref_points_dxf=ref_points_dxf,
                 ref_points_gps=ref_points_gps,
                 close_loop=close_loop,
+                anchor=anchor,
             )
             plan_metadata["entity_overrides"] = {
                 "num_overrides": len(overrides),
@@ -821,6 +878,7 @@ class PathManager:
                 ref_points_dxf=ref_points_dxf,
                 ref_points_gps=ref_points_gps,
                 close_loop=close_loop,
+                anchor=anchor,
             )
 
         plan_metadata["extension_config"] = {

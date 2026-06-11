@@ -77,6 +77,7 @@ async def start_mission(req: MissionStartRequest | None = None):
                 name,
                 origin=origin,
                 start_position=start_position,
+                auto_origin=auto_origin,
             )
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc))
