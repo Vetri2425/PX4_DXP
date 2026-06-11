@@ -582,6 +582,18 @@ class RPPControllerNode(Node):
                 "length": self._pts_length(c_pts),
             })
 
+        # Drop degenerate slivers (e.g. the ~3 cm reversed stub that spray
+        # compensation folds back at a mark start): each would command a
+        # pointless stop + double 180° pivot. The next run starts within
+        # goal tolerance of the dropped geometry, so nothing is lost.
+        if len(runs) > 1:
+            kept = [r for r in runs if r["length"] >= 0.05]
+            if kept and len(kept) < len(runs):
+                self.get_logger().info(
+                    f"Dropped {len(runs) - len(kept)} sliver run(s) < 5 cm"
+                )
+                runs = kept
+
         self._runs = runs
         # Mission-level resets; per-run state is reset inside _apply_run.
         # P0.1 — reset last speed so L_d bootstraps cleanly on new path
