@@ -378,7 +378,6 @@ class RPPControllerNode(Node):
         self._run_align_pending: bool = False
         self._segment_idx: int = 0
         self._segment_state: SegmentStateCode = SegmentStateCode.INACTIVE
-        self._segment_ff_warned: bool = False
         self._last_segment_debug: tuple[float, ...] = (
             0.0, 0.0, 0.0, float("nan"), float("nan"),
             float("nan"), float("nan"), float("nan"), 0.0,
@@ -1003,7 +1002,6 @@ class RPPControllerNode(Node):
             if run["profile"] == "segment" and len(self._path) >= 2
             else SegmentStateCode.INACTIVE
         )
-        self._segment_ff_warned = False
         self._path_done = False
         self._path_travel_m = 0.0   # reset travel distance per run
         # P1.4 — reset hint so search starts from beginning of the run
@@ -1074,34 +1072,39 @@ class RPPControllerNode(Node):
             self._run_align_pending = False
             return False
 
-        yaw_gain = float(self.get_parameter("segment_yaw_rate_gain").value)
-        max_yr = float(self.get_parameter("max_yaw_rate_body").value)
-        yaw_rate_body = yaw_gain * heading_err
-        if max_yr > 0.0:
-            yaw_rate_body = self._clamp(yaw_rate_body, -max_yr, max_yr)
+        # Firmware-aware pivot (see segment CORNER_ALIGN for the full
+        # rationale): the differential rover turns by chasing the velocity-
+        # vector bearing, not the MAVROS yaw_rate field, and freezes heading
+        # below 0.01 m/s. Command a small velocity vector at the run's initial
+        # heading so the firmware spot-turns in place to it, then rolls out.
+        corner_speed = max(
+            0.05, float(self.get_parameter("segment_min_corner_speed").value)
+        )
+        v_n = corner_speed * math.cos(target_heading)
+        v_e = corner_speed * math.sin(target_heading)
 
         final = self._path[-1].pose.position
         dist_to_goal = self._dist(pos_n, pos_e, final.x, final.y)
-        self._last_speed_cmd = 0.0
-        self._publish_velocity(0.0, 0.0)
-        self._publish_yaw_rate(yaw_rate_body)
+        self._last_speed_cmd = corner_speed
+        self._publish_velocity(v_n, v_e)
+        self._publish_yaw_rate(0.0)
         self._publish_debug(
             cross_track=0.0,
             heading_err=heading_err,
             lookahead=float("nan"),
-            speed=0.0,
+            speed=corner_speed,
             kappa=0.0,
             dist_goal=dist_to_goal,
             pose_age_ms=pose_age_s * 1000.0,
             state=StateCode.TRACKING,
             l_d_raw=float("nan"),
             kappa_speed=0.0,
-            yaw_rate=yaw_rate_body,
+            yaw_rate=0.0,
             spray_active=False,   # spray only once tracking the run begins
         )
         self._publish_segment_debug(
             SegmentStateCode.CORNER_ALIGN, 0, float("nan"), float("nan"),
-            float("nan"), target_heading, heading_err, yaw_rate_body,
+            float("nan"), target_heading, heading_err, 0.0,
         )
         return True
 
@@ -1723,41 +1726,52 @@ class RPPControllerNode(Node):
                 return
 
             self._segment_state = SegmentStateCode.CORNER_ALIGN
-            # Corner align pivots in place: velocity is zero, so yaw rate is
-            # the ONLY actuation. Honoring use_feedforward_yaw_rate=False here
-            # would command (0 vel, 0 yaw rate) forever and deadlock the
-            # mission at the first corner — so the flag is ignored in this
-            # state and a one-time warning is logged instead.
-            if not use_ff_yaw_rate and not self._segment_ff_warned:
-                self._segment_ff_warned = True
-                self.get_logger().warn(
-                    "use_feedforward_yaw_rate=false ignored during segment "
-                    "CORNER_ALIGN — yaw rate is the only actuation while "
-                    "pivoting at a corner"
-                )
-            yaw_rate_body = yaw_gain * heading_err
-            if max_yr > 0.0:
-                yaw_rate_body = self._clamp(yaw_rate_body, -max_yr, max_yr)
-            self._last_speed_cmd = 0.0
-            self._publish_velocity(0.0, 0.0)
-            self._publish_yaw_rate(yaw_rate_body)
+            # Corner pivot — firmware-aware actuation.
+            #
+            # PX4 rover_differential (DifferentialVelControl) in OFFBOARD
+            # velocity mode derives heading SOLELY from the velocity-vector
+            # bearing = atan2(vE, vN); it ignores the MAVROS yaw and yaw_rate
+            # fields entirely. When |v| < 0.01 m/s it holds the current
+            # heading. So publishing (0 vel, yaw_rate) — the old behaviour —
+            # made the firmware freeze heading and discard the yaw_rate, which
+            # deadlocked the mission at the first corner (square bag
+            # 20260611_170539: 0.7° of yaw change at the corner, never
+            # advanced to side 2).
+            #
+            # Instead, command a small velocity VECTOR pointing at the exit
+            # heading. The firmware's native state machine sees a large
+            # heading error (>RD_TRANS_DRV_TRN, 10°), enters SPOT_TURNING
+            # (zero forward throttle), and rotates in place to that bearing;
+            # once aligned (<RD_TRANS_TRN_DRV, 5°) it transitions to DRIVING
+            # and rolls out along side 2. Magnitude only sets the post-turn
+            # drive-out speed and must clear the firmware's 0.01 m/s freeze
+            # threshold with margin. yaw_rate is left zero — it is inert on
+            # this rover and a non-zero value only muddies the setpoint mask.
+            corner_speed = max(
+                0.05, float(self.get_parameter("segment_min_corner_speed").value)
+            )
+            v_n = corner_speed * math.cos(target_heading)
+            v_e = corner_speed * math.sin(target_heading)
+            self._last_speed_cmd = corner_speed
+            self._publish_velocity(v_n, v_e)
+            self._publish_yaw_rate(0.0)
             self._publish_debug(
                 cross_track=signed_xtrack,
                 heading_err=heading_err,
                 lookahead=dist_to_corner,
-                speed=0.0,
+                speed=corner_speed,
                 kappa=0.0,
                 dist_goal=dist_to_goal,
                 pose_age_ms=pose_age_s * 1000.0,
                 state=StateCode.TRACKING,
                 l_d_raw=float("nan"),
                 kappa_speed=0.0,
-                yaw_rate=yaw_rate_body,
+                yaw_rate=0.0,
                 spray_active=spray_active,
             )
             self._publish_segment_debug(
                 self._segment_state, seg_idx, dist_to_end_along, dist_to_corner,
-                corner_angle, target_heading, heading_err, yaw_rate_body,
+                corner_angle, target_heading, heading_err, 0.0,
             )
             return
 
