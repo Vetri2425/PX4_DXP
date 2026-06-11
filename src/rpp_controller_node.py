@@ -1076,12 +1076,12 @@ class RPPControllerNode(Node):
         # rationale): the differential rover turns by chasing the velocity-
         # vector bearing, not the MAVROS yaw_rate field, and freezes heading
         # below 0.01 m/s. Command a small velocity vector at the run's initial
-        # heading so the firmware spot-turns in place to it, then rolls out.
+        # heading (forward-cone clamped) so the firmware spot-turns in place
+        # the short way to it, then rolls out.
         corner_speed = max(
             0.05, float(self.get_parameter("segment_min_corner_speed").value)
         )
-        v_n = corner_speed * math.cos(target_heading)
-        v_e = corner_speed * math.sin(target_heading)
+        v_n, v_e = self._corner_pivot_velocity(yaw_ned, heading_err, corner_speed)
 
         final = self._path[-1].pose.position
         dist_to_goal = self._dist(pos_n, pos_e, final.x, final.y)
@@ -1738,20 +1738,20 @@ class RPPControllerNode(Node):
             # 20260611_170539: 0.7° of yaw change at the corner, never
             # advanced to side 2).
             #
-            # Instead, command a small velocity VECTOR pointing at the exit
-            # heading. The firmware's native state machine sees a large
-            # heading error (>RD_TRANS_DRV_TRN, 10°), enters SPOT_TURNING
-            # (zero forward throttle), and rotates in place to that bearing;
-            # once aligned (<RD_TRANS_TRN_DRV, 5°) it transitions to DRIVING
-            # and rolls out along side 2. Magnitude only sets the post-turn
-            # drive-out speed and must clear the firmware's 0.01 m/s freeze
-            # threshold with margin. yaw_rate is left zero — it is inert on
-            # this rover and a non-zero value only muddies the setpoint mask.
+            # Instead, command a small velocity VECTOR aimed at the exit
+            # heading (but kept inside the forward cone — see
+            # _corner_pivot_velocity). The firmware's native state machine
+            # sees a large heading error (>RD_TRANS_DRV_TRN, 10°), enters
+            # SPOT_TURNING (zero forward throttle), and rotates in place the
+            # short way; once aligned (<RD_TRANS_TRN_DRV, 5°) it transitions
+            # to DRIVING and rolls out along side 2. Magnitude only sets the
+            # post-turn drive-out speed and must clear the firmware's 0.01 m/s
+            # freeze threshold with margin. yaw_rate is left zero — it is
+            # inert on this rover and only muddies the setpoint mask.
             corner_speed = max(
                 0.05, float(self.get_parameter("segment_min_corner_speed").value)
             )
-            v_n = corner_speed * math.cos(target_heading)
-            v_e = corner_speed * math.sin(target_heading)
+            v_n, v_e = self._corner_pivot_velocity(yaw_ned, heading_err, corner_speed)
             self._last_speed_cmd = corner_speed
             self._publish_velocity(v_n, v_e)
             self._publish_yaw_rate(0.0)
@@ -2332,6 +2332,33 @@ class RPPControllerNode(Node):
         ]
         self._last_segment_debug = tuple(msg.data)
         self._segment_dbg_pub.publish(msg)
+
+    # Max bearing offset from the nose during a corner pivot. Beyond ~90° the
+    # PX4 rover_differential reverse-detection (fwd_component < 0) flips the
+    # command to reverse + opposite bearing, spot-turning the rover the WRONG
+    # way into the 180° heading singularity where it deadlocks (observed in
+    # bag square_cornerfix_20260611_174508: target +90°, rover ran to -90°).
+    # Clamping the commanded velocity bearing into the forward cone keeps
+    # fwd_component > 0, so the firmware spot-turns the short way, forward,
+    # and the bearing converges to the exit heading as the rover rotates.
+    _CORNER_MAX_BEARING_OFFSET_RAD = math.radians(75.0)
+
+    def _corner_pivot_velocity(
+        self, yaw_ned: float, heading_err: float, corner_speed: float
+    ) -> tuple[float, float]:
+        """NED velocity vector for a corner/alignment pivot.
+
+        Points at the exit heading, but no more than ±75° off the current nose
+        so PX4's reverse-detection never flips the turn. heading_err is the
+        wrapped (target_heading - yaw_ned).
+        """
+        step = self._clamp(
+            heading_err,
+            -self._CORNER_MAX_BEARING_OFFSET_RAD,
+            self._CORNER_MAX_BEARING_OFFSET_RAD,
+        )
+        cmd_bearing = yaw_ned + step
+        return corner_speed * math.cos(cmd_bearing), corner_speed * math.sin(cmd_bearing)
 
     def _publish_velocity(self, v_n: float, v_e: float):
         msg = Vector3Stamped()
