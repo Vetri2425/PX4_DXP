@@ -251,6 +251,35 @@ def test_smoke():
         assert node._run_min_travel() <= 0.5 * node._runs[1]["length"] + 1e-9
         print("PASS: mixed mission splits into per-entity runs (segment/segment/smooth)")
 
+        # A chained mark run with a hard corner (planner output is not
+        # entity-clean) must sub-split at the corner so each piece stays
+        # geometrically pure, with a pivot (alignment hold) at the boundary.
+        l_msg = Path()
+        l_msg.header.frame_id = "local_ned"
+        l_msg.header.stamp = node.get_clock().now().to_msg()
+        leg1 = [(i * 0.1, 0.0) for i in range(11)]            # 1 m north
+        leg2 = [(1.0, i * 0.1) for i in range(1, 11)]         # 1 m east
+        l_msg.poses = [_make_path_pose(n, e, mark=True) for n, e in leg1 + leg2]
+        node._path_cb(l_msg)
+        assert len(node._runs) == 2, f"L-shape should sub-split at the corner, got {len(node._runs)} run(s)"
+        assert [r["profile"] for r in node._runs] == ["segment", "segment"]
+        assert not node._run_align_pending, "First run must not require alignment"
+        assert node._advance_run() and node._run_align_pending, (
+            "Run transition at a hard corner must request alignment pivot"
+        )
+        # Misaligned at the corner (facing north, next leg goes east):
+        # alignment hold publishes zero velocity + yaw rate toward east.
+        cap_vel.messages.clear()
+        cap_yaw.messages.clear()
+        held = node._run_alignment_hold(1.0, 0.0, 0.0, 0.02)
+        assert held, "Hold must engage while misaligned"
+        assert abs(cap_vel.last.vector.x) < 1e-9 and abs(cap_vel.last.vector.y) < 1e-9
+        assert cap_yaw.last.data > 1e-4, "Pivot toward east must be CW-positive in NED"
+        # Aligned (facing east): hold releases and clears the pending flag.
+        assert not node._run_alignment_hold(1.0, 0.0, 1.5708, 0.02)
+        assert not node._run_align_pending
+        print("PASS: hard-corner sub-split with alignment pivot at run transition")
+
         node.destroy_node()
         print("\n=== ALL SMOKE TESTS PASSED ===")
         return True

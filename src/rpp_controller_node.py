@@ -375,6 +375,7 @@ class RPPControllerNode(Node):
         # Per-entity run queue (see _split_runs_by_flag / _apply_run)
         self._runs: list[dict] = []
         self._run_idx: int = 0
+        self._run_align_pending: bool = False
         self._segment_idx: int = 0
         self._segment_state: SegmentStateCode = SegmentStateCode.INACTIVE
         self._segment_ff_warned: bool = False
@@ -545,7 +546,11 @@ class RPPControllerNode(Node):
         # tracked in sequence (see _apply_run/_advance_run). A forced
         # profile keeps the whole path as a single run.
         if requested == "auto":
-            raw_runs = self._split_runs_by_flag(raw_pts, raw_flags)
+            raw_runs = [
+                sub
+                for run in self._split_runs_by_flag(raw_pts, raw_flags)
+                for sub in self._split_run_at_corners(*run, threshold)
+            ]
         else:
             raw_runs = [(raw_pts, raw_flags)]
 
@@ -893,6 +898,57 @@ class RPPControllerNode(Node):
             out.append((rp, rf))
         return out
 
+    @classmethod
+    def _split_run_at_corners(
+        cls,
+        pts: list[tuple[float, float]],
+        flags: list[bool],
+        threshold_deg: float,
+    ) -> list[tuple[list[tuple[float, float]], list[bool]]]:
+        """Sub-split one run at hard corners so each piece is geometrically
+        homogeneous.
+
+        Real planner output is not entity-clean: consecutive mark entities
+        chain without a transit between them, and the bridge from a transit
+        into an entity can reverse direction (~180°). A single hard corner
+        like that would otherwise flip a whole circle run to the segment
+        profile. Splitting at hard corners yields pure pieces — straight
+        sides classify segment, arcs/circles classify smooth — and the
+        corner itself becomes a run transition, where _run_alignment_hold
+        pivots the rover before the next piece starts.
+        """
+        simple, _ = cls._simplify_path_for_profile(pts)
+        if len(simple) < 3:
+            return [(pts, flags)]
+
+        corner_pts: list[tuple[float, float]] = []
+        for i in range(1, len(simple) - 1):
+            h0 = cls._segment_heading(simple[i - 1], simple[i])
+            h1 = cls._segment_heading(simple[i], simple[i + 1])
+            if math.degrees(cls._heading_delta(h0, h1)) >= threshold_deg:
+                corner_pts.append(simple[i])
+        if not corner_pts:
+            return [(pts, flags)]
+
+        # Simplification preserves the original point tuples, so corner
+        # vertices can be located in the raw run by exact equality, in order.
+        splits: list[int] = []
+        ci = 0
+        for idx, p in enumerate(pts):
+            if ci < len(corner_pts) and p == corner_pts[ci]:
+                splits.append(idx)
+                ci += 1
+
+        out: list[tuple[list[tuple[float, float]], list[bool]]] = []
+        start = 0
+        for s in splits:
+            if s > start:
+                out.append((pts[start:s + 1], flags[start:s + 1]))
+                start = s
+        if start < len(pts) - 1:
+            out.append((pts[start:], flags[start:]))
+        return out or [(pts, flags)]
+
     @staticmethod
     def _build_poses(
         pts: list[tuple[float, float]],
@@ -915,6 +971,11 @@ class RPPControllerNode(Node):
     def _apply_run(self, idx: int) -> None:
         """Make run `idx` the actively tracked path; reset per-run state."""
         run = self._runs[idx]
+        # Runs after the first may start at a hard corner (sub-split) or a
+        # transit↔entity boundary: pivot toward the run's initial heading
+        # before tracking it (see _run_alignment_hold). The first run keeps
+        # the existing drive-from-anywhere start behavior.
+        self._run_align_pending = idx > 0
         self._run_idx = idx
         self._path = run["poses"]
         self._spray_flags = list(run["flags"])
@@ -963,6 +1024,69 @@ class RPPControllerNode(Node):
         if not self._runs:
             return min_travel
         return min(min_travel, 0.5 * self._runs[self._run_idx]["length"])
+
+    def _run_alignment_hold(
+        self, pos_n: float, pos_e: float, yaw_ned: float, pose_age_s: float
+    ) -> bool:
+        """Pivot in place toward the new run's initial heading.
+
+        Returns True while holding (zero velocity + yaw rate published);
+        False once aligned (or alignment is not applicable), letting the
+        normal control flow proceed. Already-aligned transitions (e.g. a
+        transit continuing straight into an entity) pass through with no
+        stop. Like segment CORNER_ALIGN, yaw rate is the only actuation
+        here, so use_feedforward_yaw_rate is intentionally not consulted.
+        """
+        if not self._run_align_pending:
+            return False
+        if len(self._path) < 2:
+            self._run_align_pending = False
+            return False
+        a = self._path[0].pose.position
+        b = self._path[1].pose.position
+        if self._dist(a.x, a.y, b.x, b.y) < 1e-6:
+            self._run_align_pending = False
+            return False
+
+        target_heading = math.atan2(b.y - a.y, b.x - a.x)
+        heading_err = self._angle_wrap(target_heading - yaw_ned)
+        heading_tol = math.radians(
+            float(self.get_parameter("segment_heading_tolerance_deg").value)
+        )
+        if abs(heading_err) <= heading_tol:
+            self._run_align_pending = False
+            return False
+
+        yaw_gain = float(self.get_parameter("segment_yaw_rate_gain").value)
+        max_yr = float(self.get_parameter("max_yaw_rate_body").value)
+        yaw_rate_body = yaw_gain * heading_err
+        if max_yr > 0.0:
+            yaw_rate_body = self._clamp(yaw_rate_body, -max_yr, max_yr)
+
+        final = self._path[-1].pose.position
+        dist_to_goal = self._dist(pos_n, pos_e, final.x, final.y)
+        self._last_speed_cmd = 0.0
+        self._publish_velocity(0.0, 0.0)
+        self._publish_yaw_rate(yaw_rate_body)
+        self._publish_debug(
+            cross_track=0.0,
+            heading_err=heading_err,
+            lookahead=float("nan"),
+            speed=0.0,
+            kappa=0.0,
+            dist_goal=dist_to_goal,
+            pose_age_ms=pose_age_s * 1000.0,
+            state=StateCode.TRACKING,
+            l_d_raw=float("nan"),
+            kappa_speed=0.0,
+            yaw_rate=yaw_rate_body,
+            spray_active=False,   # spray only once tracking the run begins
+        )
+        self._publish_segment_debug(
+            SegmentStateCode.CORNER_ALIGN, 0, float("nan"), float("nan"),
+            float("nan"), target_heading, heading_err, yaw_rate_body,
+        )
+        return True
 
     def _segment_angle_deg(self, idx: int) -> float:
         if idx < 0 or idx + 2 >= len(self._path):
@@ -1535,14 +1659,10 @@ class RPPControllerNode(Node):
         goal_tol = float(self.get_parameter("xy_goal_tolerance").value)
         min_travel = self._run_min_travel()
         if final_segment and dist_to_corner <= goal_tol and self._path_travel_m >= min_travel:
-            # End of run: switch to the next run's profile and continue
-            # this same cycle if it is also segment-tracked; a smooth run
-            # is picked up by the main loop on the next 20 ms cycle.
+            # End of run: advance and return — the next 20 ms cycle runs
+            # _run_alignment_hold (pivot if needed), then the new run's
+            # profile takes over.
             if self._advance_run():
-                if self._active_tracking_profile == "segment":
-                    self._control_segment_profile(
-                        pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
-                    )
                 return
             self.get_logger().info(
                 f"Segment path complete — within {dist_to_corner * 100:.1f} cm "
@@ -1892,6 +2012,12 @@ class RPPControllerNode(Node):
 
         self._last_pos = (pos_n, pos_e)
 
+        # ---- Run-transition alignment (per-entity profile switching) ----
+        # After advancing to a new run, pivot toward its initial heading
+        # before tracking it. No-op when already aligned.
+        if self._run_alignment_hold(pos_n, pos_e, yaw_ned, pose_age_s):
+            return
+
         # ---- Goal check ----
         # Skip until the rover has traveled min_goal_travel_m along the path.
         # Prevents immediate DONE on closed-loop paths where the rover starts
@@ -1901,12 +2027,12 @@ class RPPControllerNode(Node):
         dist_to_goal = self._dist(pos_n, pos_e, final.x, final.y)
         if dist_to_goal <= goal_tol and self._path_travel_m >= min_travel:
             # End of the active run: advance to the next run (per-entity
-            # profile switching) and keep tracking this same cycle. DONE is
-            # only published after the last run — the server's mission-
+            # profile switching). The next 20 ms cycle pivots via
+            # _run_alignment_hold if needed, then tracks the new run. DONE
+            # is only published after the last run — the server's mission-
             # complete settling watches for it.
             if self._advance_run():
-                final = self._path[-1].pose.position
-                dist_to_goal = self._dist(pos_n, pos_e, final.x, final.y)
+                return
             else:
                 self.get_logger().info(
                     f"Path complete — within {dist_to_goal * 100:.1f} cm of goal "
