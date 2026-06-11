@@ -1828,6 +1828,26 @@ class RPPControllerNode(Node):
             speed = max(min_corner_speed, max_v * scale)
             self._segment_state = SegmentStateCode.PRE_CORNER_SLOWDOWN
 
+        # Final-segment goal-approach deceleration.
+        # The corner slowdown above is gated to NON-final segments, so a
+        # straight line used to drive at full speed into its endpoint B and
+        # only zero velocity once within xy_goal_tolerance — arriving fast, it
+        # coasted PAST B. Mirror the smooth/arc profile's approach scaling
+        # (see _control) so the rover brakes to a low speed before B and stops
+        # ON the point. This also tightens run-to-run corner overshoot, since
+        # a run endpoint is a final segment too.
+        if final_segment:
+            max_decel = float(self.get_parameter("max_linear_decel").value)
+            approach_v = float(self.get_parameter("min_approach_linear_velocity").value)
+            approach_d = max(
+                float(self.get_parameter("approach_velocity_scaling_dist").value),
+                (max_v * max_v) / (2.0 * max_decel) + 0.10,
+            )
+            if dist_to_corner < approach_d:
+                scale = self._clamp(dist_to_corner / approach_d, 0.0, 1.0)
+                speed = min(speed, max(approach_v, max_v * scale))
+                self._segment_state = SegmentStateCode.PRE_CORNER_SLOWDOWN
+
         max_accel = float(self.get_parameter("max_linear_accel").value)
         speed_before_accel = speed
         if max_accel > 0.0:
