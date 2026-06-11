@@ -51,13 +51,15 @@ Not your job: PX4 firmware, waypoint gen, log analysis — those live on Mac GCS
 | SSH to Jetson | `ssh flash@192.168.1.102` |
 | QGC | QGroundControl on macOS |
 
-## Current status (2026-06-06)
+## Current status (2026-06-11)
 
 - Phase 2 OFFBOARD stack running; FastAPI + mobile frontend built
 - Arc tuning at arc_fix_28; arc_fix_16 validated 1.5m arc at **2.57cm median xtrack**
 - Active goal: corner xtrack **≤5cm** (plan: `docs/superpowers/plans/2026-06-02-corner-xtrack-reduction.md`)
 - Validated RPP params: `max_yaw_rate_body=0.45`, `a_lat_max=0.3`, `corner_smooth_radius_m=0.5`
-- Phase 3 (spray GPIO) and robot_localization fusion: not yet built
+- Tracking profiles live: `tracking_profile=auto|segment|smooth` — auto splits missions into per-entity runs (spray-flag + hard-corner splits), lines→segment (stop-and-pivot corners), arcs/circles→smooth RPP; pivot-align at run transitions. Bench-verified, not yet field-tested
+- Phase 3 spray: **built & live** — `spray_controller_node.py` drives PX4 AUX via `MAV_CMD_DO_SET_ACTUATOR` (MAVROS), safety-gated (armed+OFFBOARD, staleness watchdog, debounce); manual test via `POST /api/spray/test`. QGC owns AUX pin/PWM config
+- robot_localization fusion: not yet built
 
 ## Hard rules
 
