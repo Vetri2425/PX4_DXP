@@ -12,30 +12,47 @@ currently bows out the post-corner legs (bags 12-06-2026).
 Why this command shape
 ----------------------
 PX4 rover_differential (DifferentialVelControl, OFFBOARD velocity mode)
-derives heading SOLELY from the velocity-vector bearing atan2(vE, vN) and
-ignores the MAVROS yaw / yaw_rate fields. When |v| < 0.01 m/s it freezes
-heading. So the ONLY way to make it turn is to publish a velocity VECTOR
-pointing where we want the nose; the firmware spot-turns toward it (zero
-forward throttle while heading error > RD_TRANS_DRV_TRN). This is NOT a
-"formal" forward/path command — it is a pure spin-in-place primitive.
+derives heading PRIMARILY from the velocity-vector bearing atan2(vE, vN). When
+|v| < 0.01 m/s it freezes heading. So to make it turn we publish a velocity
+VECTOR pointing where we want the nose; the firmware spot-turns toward it
+(zero forward throttle while heading error > RD_TRANS_DRV_TRN). As a
+feedforward we ALSO send the matching yaw_rate (type_mask 455, exactly like
+twist_to_setpoint_node) so PX4's yaw controller tracks the sweep without phase
+lag instead of deriving everything from the vector bearing.
 
-The current RPP pivot lets the firmware turn at its own max rate (~62°/s in
-the bags) and overshoots ~20°. This script instead commands the *target*
-bearing as a rate-limited sweep that DECELERATES into the final heading, so
-the firmware tracks a gentle trapezoidal yaw profile and (hopefully) arrives
-with little residual rate. We measure the result.
+Smooth profile (matches rpp_controller_node, fixes the old jerky version)
+-------------------------------------------------------------------------
+The previous version led the *measured* heading by a CONSTANT offset
+(`yaw0 + direction*(rotated + lead)`). Working the algebra through, the
+commanded bearing always sat a fixed `lead` ahead of the live heading, so PX4
+saw a constant large heading error and spot-turned at its own max rate (~62°/s)
+the entire spin — a bang-bang turn, not a controlled one — and the residual
+lead caused overshoot at the end.
+
+This version mirrors rpp_controller_node._corner_pivot_velocity instead:
+  - A time-parameterized TRAPEZOIDAL yaw sweep advances an internal target
+    heading from yaw0 to yaw0 + direction*total: ramp the rate up at
+    `yaw_accel`, cruise at `yaw_rate_max`, then ramp DOWN so it arrives with
+    ~zero rate (classic accel/cruise/decel profile).
+  - The commanded bearing is CLOSED-LOOP on the live heading:
+        cmd_bearing = yaw + clamp(target_heading - yaw, ±cone)
+    so the firmware's perceived error — and thus its spot-turn rate — decays
+    smoothly to zero as the rover catches the (now stationary) target. No
+    constant max-rate turn, no overshoot.
+  - The sweep's instantaneous angular rate is sent as a yaw_rate feedforward
+    (NED CW+) so PX4 bypasses pure atan2 heading derivation lag.
+  - The velocity magnitude is ramped up from 0 at `mag_accel` to avoid the
+    step-input torque jerk at spin start.
 
 Method
 ------
 1. Standard OFFBOARD bring-up (stream → OFFBOARD → arm), copied from
    offboard_test.py conventions (FRAME_LOCAL_NED, 50 Hz, async services).
 2. Record yaw0.
-3. Spin: each cycle, command bearing = yaw0 + direction * min(rotated + lead,
-   total), where `lead` keeps the firmware spot-turning and is ramped DOWN
-   over the last `decel_deg` so the rover eases into the final heading.
-   Magnitude is a small fixed `spin_speed` (only sets bearing; firmware
-   applies zero forward throttle while spot-turning).
-4. Once the full rotation is reached, command ZERO velocity and let it settle.
+3. Spin: trapezoidal target sweep + closed-loop clamped bearing + yaw_rate
+   feedforward + magnitude ramp (see above).
+4. Once the sweep reaches the full rotation and the measured heading has
+   settled, command ZERO velocity and let it settle.
 5. Report: total rotation achieved, peak yaw rate, overshoot past target, and
    final heading error vs yaw0. PASS if |final error| <= pass_tol_deg.
 
@@ -44,7 +61,7 @@ Usage (on the Jetson, MAVROS up):
   # or with params:
   ros2 run px4_dxp spin_in_place_test.py --ros-args \
       -p spin_deg:=360.0 -p direction:=cw -p spin_speed:=0.08 \
-      -p lead_max_deg:=25.0 -p lead_min_deg:=4.0 -p decel_deg:=45.0
+      -p yaw_rate_max_deg:=25.0 -p yaw_accel_deg:=40.0 -p bearing_cone_deg:=75.0
 
 Safety:
   - Streams zero-velocity >=1 s before OFFBOARD (PX4 requirement).
@@ -78,13 +95,23 @@ IGNORE_AFZ = 256
 IGNORE_YAW = 1024
 IGNORE_YAW_RATE = 2048
 
-# Velocity + explicit yaw (matches twist_to_setpoint_node so results transfer
-# 1:1 to the real RPP pipeline). yaw is inert on the differential rover but we
-# send it for parity. mask 2503.
+# Velocity + explicit yaw, yaw_rate IGNORED. mask 2503. Used when the yaw_rate
+# feedforward is zero/inactive (e.g. preflight, settle, stop) — matches
+# twist_to_setpoint_node's TYPE_MASK_VELOCITY_AND_YAW.
 TYPE_MASK_VEL_YAW = (
     IGNORE_PX | IGNORE_PY | IGNORE_PZ
     | IGNORE_AFX | IGNORE_AFY | IGNORE_AFZ
     | IGNORE_YAW_RATE
+)
+
+# Velocity + explicit yaw + yaw_rate feedforward. mask 455. This is the smooth
+# path twist_to_setpoint_node uses (TYPE_MASK_VEL_YAW_YAWRATE): PX4's yaw
+# controller tracks the commanded rate directly instead of deriving it from the
+# velocity-vector bearing, eliminating the phase lag / oscillation that made
+# the constant-lead version jerky.
+TYPE_MASK_VEL_YAW_YAWRATE = (
+    IGNORE_PX | IGNORE_PY | IGNORE_PZ
+    | IGNORE_AFX | IGNORE_AFY | IGNORE_AFZ
 )
 
 
@@ -105,19 +132,30 @@ class SpinInPlaceTest(Node):
         # ---- Parameters ----
         self.declare_parameter("spin_deg", 360.0)       # total rotation
         self.declare_parameter("direction", "cw")        # cw (NED +) or ccw (-)
-        self.declare_parameter("spin_speed", 0.08)       # m/s vector magnitude
-        self.declare_parameter("lead_max_deg", 25.0)     # bearing lead while spinning
-        self.declare_parameter("lead_min_deg", 4.0)      # lead at the very end
-        self.declare_parameter("decel_deg", 45.0)        # ramp lead down over last N deg
+        self.declare_parameter("spin_speed", 0.08)       # m/s vector magnitude (cruise)
+        # Trapezoidal yaw-sweep profile (replaces the old constant-lead scheme).
+        # yaw_rate_max matches rpp_controller_node max_yaw_rate_body (0.45 rad/s
+        # ≈ 25.8°/s validated). yaw_accel sets how fast the sweep ramps in/out.
+        self.declare_parameter("yaw_rate_max_deg", 25.0)  # deg/s cruise yaw rate
+        self.declare_parameter("yaw_accel_deg", 40.0)     # deg/s² sweep ramp
+        # Closed-loop bearing cone: command no more than ±this off the live
+        # nose, so PX4's reverse-detection never flips the turn. Matches
+        # rpp_controller_node._CORNER_MAX_BEARING_OFFSET_RAD (75°).
+        self.declare_parameter("bearing_cone_deg", 75.0)
+        # Velocity magnitude ramp (m/s²) so the spin start is not a step input.
+        self.declare_parameter("mag_accel", 0.35)
+        self.declare_parameter("settle_tol_deg", 2.0)    # measured-heading settle band
         self.declare_parameter("pass_tol_deg", 3.0)      # verdict tolerance
         self.declare_parameter("max_spin_time_s", 40.0)  # watchdog
 
         self.spin_deg = float(self.get_parameter("spin_deg").value)
         self.direction = 1.0 if str(self.get_parameter("direction").value).lower() == "cw" else -1.0
         self.spin_speed = float(self.get_parameter("spin_speed").value)
-        self.lead_max = math.radians(float(self.get_parameter("lead_max_deg").value))
-        self.lead_min = math.radians(float(self.get_parameter("lead_min_deg").value))
-        self.decel = math.radians(float(self.get_parameter("decel_deg").value))
+        self.yaw_rate_max = math.radians(float(self.get_parameter("yaw_rate_max_deg").value))
+        self.yaw_accel = math.radians(float(self.get_parameter("yaw_accel_deg").value))
+        self.bearing_cone = math.radians(float(self.get_parameter("bearing_cone_deg").value))
+        self.mag_accel = float(self.get_parameter("mag_accel").value)
+        self.settle_tol = math.radians(float(self.get_parameter("settle_tol_deg").value))
         self.pass_tol = float(self.get_parameter("pass_tol_deg").value)
         self.max_spin_time = float(self.get_parameter("max_spin_time_s").value)
         self.total = math.radians(self.spin_deg)
@@ -135,6 +173,11 @@ class SpinInPlaceTest(Node):
         self.peak_rotated = 0.0      # max |rotated| reached (rad) — for overshoot
         self._spin_start_t = None
         self._last_log = 0.0
+        # Trapezoidal sweep state
+        self._target_progress = 0.0  # commanded swept angle so far (rad, 0..total)
+        self._sweep_rate = 0.0       # current sweep angular rate (rad/s, >=0)
+        self._mag = 0.0              # current ramped velocity magnitude (m/s)
+        self._last_sweep_t = None    # wall clock of previous sweep update
 
         # ---- QoS ----
         sp_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -153,9 +196,10 @@ class SpinInPlaceTest(Node):
 
         self.get_logger().info(
             f"spin_in_place_test: spin {self.spin_deg:.0f}° "
-            f"{'CW' if self.direction > 0 else 'CCW'}, speed={self.spin_speed} m/s, "
-            f"lead {math.degrees(self.lead_max):.0f}→{math.degrees(self.lead_min):.0f}° "
-            f"over last {math.degrees(self.decel):.0f}°"
+            f"{'CW' if self.direction > 0 else 'CCW'}, cruise={self.spin_speed} m/s, "
+            f"yaw_rate_max={math.degrees(self.yaw_rate_max):.0f}°/s, "
+            f"yaw_accel={math.degrees(self.yaw_accel):.0f}°/s², "
+            f"cone=±{math.degrees(self.bearing_cone):.0f}° (trapezoidal sweep + yaw_rate FF)"
         )
         self.set_mode_cli.wait_for_service(timeout_sec=10.0)
         self.arming_cli.wait_for_service(timeout_sec=10.0)
@@ -210,19 +254,31 @@ class SpinInPlaceTest(Node):
                              1.0 - 2.0 * (q.y * q.y + q.z * q.z))
         return wrap_pi(math.pi / 2.0 - yaw_enu)
 
-    def _make_setpoint(self, bearing_ned: float, speed: float) -> PositionTarget:
+    def _make_setpoint(self, bearing_ned: float, speed: float,
+                       yaw_rate_ned: float = 0.0) -> PositionTarget:
         """Velocity vector at `bearing_ned` (NED), magnitude `speed`, + explicit
-        yaw = bearing (ENU). Matches twist_to_setpoint_node output exactly."""
+        yaw = bearing (ENU), + optional yaw_rate feedforward (NED CW+).
+
+        Matches twist_to_setpoint_node output: when |yaw_rate| > 1e-4 we send
+        type_mask 455 (velocity + yaw + yaw_rate) so PX4's yaw controller tracks
+        the commanded rate directly; otherwise 2503 (velocity + yaw, ignore
+        yaw_rate) so PX4 derives heading from the vector bearing."""
         v_n = speed * math.cos(bearing_ned)
         v_e = speed * math.sin(bearing_ned)
         msg = PositionTarget()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.coordinate_frame = FRAME_LOCAL_NED
-        msg.type_mask = TYPE_MASK_VEL_YAW
         msg.velocity.x = v_e        # ENU East
         msg.velocity.y = v_n        # ENU North
         msg.velocity.z = 0.0
-        msg.yaw = wrap_pi(math.pi / 2.0 - bearing_ned)   # ENU yaw (inert on diff rover)
+        msg.yaw = wrap_pi(math.pi / 2.0 - bearing_ned)   # ENU yaw
+        # MAVROS LOCAL_NED passes yaw_rate through without negation (NED CW+).
+        if abs(yaw_rate_ned) > 1e-4:
+            msg.yaw_rate = yaw_rate_ned
+            msg.type_mask = TYPE_MASK_VEL_YAW_YAWRATE   # 455
+        else:
+            msg.yaw_rate = 0.0
+            msg.type_mask = TYPE_MASK_VEL_YAW           # 2503
         return msg
 
     def _make_stop(self) -> PositionTarget:
@@ -243,51 +299,76 @@ class SpinInPlaceTest(Node):
         if self.phase != "spin":
             return
 
-        # ---- live spin control ----
+        # ---- live spin control (trapezoidal sweep + closed-loop bearing) ----
         yaw = self._yaw_ned()
+        now = time.time()
         if self._prev_yaw is not None:
             d = wrap_pi(yaw - self._prev_yaw)
             self.rotated += d
-            now = time.time()
-            dt = now - (self._last_rate_t if hasattr(self, "_last_rate_t") else now)
-            if dt > 0:
-                rate = abs(math.degrees(d) / dt)
+            dt_rate = now - (self._last_rate_t if hasattr(self, "_last_rate_t") else now)
+            if dt_rate > 0:
+                rate = abs(math.degrees(d) / dt_rate)
                 self.peak_rate = max(self.peak_rate, rate)
             self._last_rate_t = now
         self._prev_yaw = yaw
         self.peak_rotated = max(self.peak_rotated, abs(self.rotated))
 
-        signed_done = self.direction * self.rotated   # progress toward +total
-        remaining = self.total - signed_done
+        # dt for the sweep/magnitude integrators
+        dt = now - (self._last_sweep_t if self._last_sweep_t is not None else now)
+        self._last_sweep_t = now
+        dt = max(0.0, min(dt, 0.1))   # guard against scheduling hiccups
 
-        # lead ramps down over the last `decel` rad so the firmware decelerates
-        if remaining < self.decel:
-            frac = max(0.0, remaining / self.decel)
-            lead = self.lead_min + (self.lead_max - self.lead_min) * frac
+        # Trapezoidal target-heading sweep: ramp the sweep rate up at yaw_accel,
+        # cruise at yaw_rate_max, then ramp DOWN over the braking distance so the
+        # target arrives at `total` with ~zero rate. The commanded error then
+        # decays to zero → no overshoot, unlike the old constant-lead scheme.
+        remaining = self.total - self._target_progress
+        # distance needed to bleed the current rate to zero at yaw_accel
+        brake_dist = (self._sweep_rate * self._sweep_rate) / (2.0 * self.yaw_accel) if self.yaw_accel > 0 else 0.0
+        if remaining <= brake_dist:
+            self._sweep_rate = max(0.0, self._sweep_rate - self.yaw_accel * dt)
         else:
-            lead = self.lead_max
+            self._sweep_rate = min(self.yaw_rate_max, self._sweep_rate + self.yaw_accel * dt)
+        self._target_progress = min(self.total, self._target_progress + self._sweep_rate * dt)
 
-        # commanded bearing = yaw0 + direction * min(progress+lead, total)
-        cmd_progress = min(signed_done + lead, self.total)
-        bearing = wrap_pi(self.yaw0 + self.direction * cmd_progress)
-        self.sp_pub.publish(self._make_setpoint(bearing, self.spin_speed))
+        # Ramp the velocity magnitude up from 0 (no step input at spin start).
+        self._mag = min(self.spin_speed, self._mag + self.mag_accel * dt)
 
+        # Closed-loop bearing: command the live heading plus the clamped error
+        # to the instantaneous target (mirrors _corner_pivot_velocity). The
+        # firmware's perceived error shrinks to zero as it catches the target.
+        target_heading = wrap_pi(self.yaw0 + self.direction * self._target_progress)
+        heading_err = wrap_pi(target_heading - yaw)
+        step = max(-self.bearing_cone, min(self.bearing_cone, heading_err))
+        bearing = wrap_pi(yaw + step)
+
+        # yaw_rate feedforward = signed sweep rate (NED CW+), matching the
+        # twist_to_setpoint_node mask-455 path. Zero near the end so the mask
+        # falls back to vector-derived heading for the final settle.
+        yaw_rate_ff = self.direction * self._sweep_rate
+        self.sp_pub.publish(self._make_setpoint(bearing, self._mag, yaw_rate_ff))
+
+        signed_done = self.direction * self.rotated
         # progress log at ~2 Hz
-        if time.time() - self._last_log > 0.5:
-            self._last_log = time.time()
+        if now - self._last_log > 0.5:
+            self._last_log = now
             self.get_logger().info(
                 f"spin: rotated={math.degrees(signed_done):6.1f}/{self.spin_deg:.0f}°  "
-                f"err_to_final={math.degrees(remaining):6.1f}°  "
-                f"rate≈{self.peak_rate:4.0f}°/s(peak)  lead={math.degrees(lead):.0f}°"
+                f"target={math.degrees(self._target_progress):6.1f}°  "
+                f"err={math.degrees(heading_err):+5.1f}°  "
+                f"sweep_rate={math.degrees(self._sweep_rate):4.0f}°/s  "
+                f"rate≈{self.peak_rate:4.0f}°/s(peak)"
             )
 
-        # done when the full rotation is reached
-        if signed_done >= self.total:
-            self.get_logger().info("Reached target rotation — settling.")
+        # Done when the sweep has reached the full rotation AND the measured
+        # heading has settled onto the final target (closed-loop completion).
+        final_err = abs(wrap_pi(yaw - wrap_pi(self.yaw0 + self.direction * self.total)))
+        if self._target_progress >= self.total - 1e-6 and final_err <= self.settle_tol:
+            self.get_logger().info("Reached target rotation and settled — stopping.")
             self.phase = "settle"
 
         # watchdog
-        if self._spin_start_t and (time.time() - self._spin_start_t) > self.max_spin_time:
+        if self._spin_start_t and (now - self._spin_start_t) > self.max_spin_time:
             self.get_logger().warn("Spin time cap reached — settling.")
             self.phase = "settle"
 
@@ -315,6 +396,10 @@ class SpinInPlaceTest(Node):
         self._prev_yaw = self.yaw0
         self.rotated = 0.0
         self.peak_rotated = 0.0
+        self._target_progress = 0.0
+        self._sweep_rate = 0.0
+        self._mag = 0.0
+        self._last_sweep_t = None
         self._spin_start_t = time.time()
         self.get_logger().info(f"Start heading yaw0 = {math.degrees(self.yaw0):+.2f}° NED")
 
@@ -361,8 +446,9 @@ class SpinInPlaceTest(Node):
             )
         else:
             self.get_logger().info(
-                "Overshoot remains — try smaller lead_max_deg, larger decel_deg, "
-                "or lower the FCU yaw-rate/accel limits in QGC, then re-run."
+                "Overshoot remains — try a lower yaw_rate_max_deg, a gentler "
+                "yaw_accel_deg, or lower the FCU yaw-rate/accel limits in QGC, "
+                "then re-run."
             )
 
     # ------------------------------------------------------------------
