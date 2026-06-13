@@ -281,8 +281,29 @@ def test_smoke():
             f"Closed-loop guard {guard:.2f} m must approach the circumference "
             f"{circumference:.2f} m, not the {0.5:.2f} m open-path cap"
         )
+        # ...and it must NOT throttle to approach speed at the seam mid-loop.
+        # The circle's final waypoint ≈ its start, so dist_to_goal ≈ 0 there;
+        # the old approach test (dist_to_goal < approach_d) floored speed to
+        # approach_v and the rover crept at the entry forever (field bag
+        # 20260613_200921). The fix scales on remaining along-loop distance, so
+        # with travel partway round the loop the state stays TRACKING, not
+        # APPROACH. Place the rover back at the seam with mid-loop travel.
+        seam = circ_pts[0]
+        node._pose_cb(_make_mavros_pose_from_ned(seam[0], seam[1], 0.0))
+        node._gps_cb(gps_msg)  # RTK_FIXED
+        node._last_speed_cmd = 0.3
+        node._path_travel_m = 0.7     # mid-loop; far from full circumference
+        node._last_pos = (seam[0], seam[1])
+        cap_dbg.messages.clear()
+        node._control_loop()
+        seam_state = int(cap_dbg.last.data[7])
+        assert seam_state != int(StateCode.APPROACH), (
+            f"Closed loop must not enter APPROACH at the seam mid-loop "
+            f"(state={seam_state}) — that throttles the circle to a crawl"
+        )
         node.set_parameters([Parameter("tracking_profile", value="auto")])
-        print("PASS: closed-loop circle requires full-circumference travel before DONE")
+        print("PASS: closed-loop circle requires full travel before DONE and does "
+              "not throttle at the seam")
 
         # A chained mark run with a hard corner (planner output is not
         # entity-clean) must sub-split at the corner so each piece stays

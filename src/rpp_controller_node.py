@@ -2384,13 +2384,29 @@ class RPPControllerNode(Node):
             speed = max_v
 
         # ---- Step 6: Approach scaling near goal ----
-        # FIX: Gate approach scaling behind min_goal_travel_m.  Without this,
-        # closed-loop paths (e.g. square_2x2) where the start IS the goal
-        # immediately trigger approach scaling, floor speed to approach_v
-        # (0.05 m/s), and the rover can never accelerate — it sits there
-        # yawing in place at 5 cm/s forever.
+        # Open run: gate approach scaling behind min travel so a mission that
+        # starts near its goal does not throttle from cycle 0.
+        #
+        # Closed run (circle): dist_to_goal is the Euclidean distance to the
+        # FINAL waypoint, which ≈ the start (seam), so it stays < approach_d the
+        # whole time the rover is near the seam — flooring speed to approach_v
+        # before the loop is ever traced. Field bag 20260613_200921: the rover
+        # reached the circle entry, then crept at ~3 cm/s for 118 s and never
+        # went around (open line→arc→line U-turns trace fine precisely because
+        # their goal is a full arc-length away and never triggers this). So for
+        # closed runs scale on the REMAINING along-loop distance
+        # (run_length − path_travel): full speed around the loop, decelerate
+        # only in the final approach_d metres back to the seam.
         state_code = StateCode.TRACKING
-        if dist_to_goal < approach_d and self._path_travel_m >= approach_d:
+        run_closed = bool(self._runs and self._runs[self._run_idx].get("closed"))
+        if run_closed:
+            run_len = float(self._runs[self._run_idx]["length"])
+            remaining = max(0.0, run_len - self._path_travel_m)
+            if remaining < approach_d:
+                scale = self._clamp(remaining / approach_d, 0.0, 1.0)
+                speed = min(speed, max(approach_v, speed * scale))
+                state_code = StateCode.APPROACH
+        elif dist_to_goal < approach_d and self._path_travel_m >= approach_d:
             # Linearly scale speed from full → approach_v as dist → 0
             scale = self._clamp(dist_to_goal / approach_d, 0.0, 1.0)
             approach_speed = max(approach_v, speed * scale)
