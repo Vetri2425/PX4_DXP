@@ -4,6 +4,17 @@ Running log of all work. Each entry: what built, what fixed, what's next, time s
 
 ---
 
+## 2026-06-13 — BUG-T1/T2/T3 fixes committed
+
+- **`1af51ac` `fix(rpp): BUG-T2 hard stops at smooth run/segment boundaries`** — eliminates stop-and-go at tangent junctions. Root cause = two forced stop-and-pivots: (1) `_apply_run` pivoted at every run boundary (`idx>0`) ignoring heading; (2) `_control_segment_profile` corner gate keyed off vehicle `heading_err` vs global frame → tracking noise on a straight junction tripped CORNER_STOP/ALIGN. Fix: `_apply_run` pivots only if prev-exit→new-entry heading Δ ≥ `segment_corner_threshold_deg`; transition gate now uses path-intrinsic `_segment_angle_deg` (below threshold → advance without dropping velocity). Hard corners unchanged. Pending live RTK validation (U-turn).
+- **`036f116` `fix(rpp): BUG-T1 corner-pivot oscillation — yaw-rate settle gates`** — CORNER_STOP joint speed+yaw-rate AND gate; CORNER_ALIGN exit needs heading+yaw-rate stable for `segment_align_settle_s`=0.10s; new params `segment_stop_yaw_rate_threshold`=0.05; `segment_debug` 9→10 fields (`[9]`=actual yaw-rate NED). Pending bag validation. **Note:** Opus's "RO_YAW_RATE_LIM 90→35" firmware action is moot — already 30 (validated log_183).
+- **`510be9b` `fix(rpp): forward-cone clamp on first-segment velocity`** — BUG-T3 resolved: rover no longer turns the wrong way / drives reverse when start heading opposes the first segment.
+- Deploy: fast-forward pull on Jetson → `rpp-pipeline` restart (2 s, MAVROS intact) → 3/3 services active, no tracebacks, API ping OK. Three-way sync Mac == origin == Jetson @ `510be9b`. ✓
+- Also live: auto rosbag recorder (`bag-autorecord.service`) — captures every API-started mission to `~/bags_jet`.
+- **Next:** BUG-T1 (stop-pivot corner oscillation/jerk) — now active focus.
+
+---
+
 ## 2026-06-12 — Controller + Tuning Phase CLOSED; pivot to path/spray/pipeline
 
 ### Milestone: tracking validated, controller work frozen

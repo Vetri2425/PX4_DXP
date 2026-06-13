@@ -91,3 +91,22 @@ firmware/
 # GCS analysis scripts (local reference only, not tracked)
 tools/analysis/
 *.bak
+
+# Local hardware / encoder experiments (not for tracking)
+Encoder_Fix/
+
+# GCS-imported PX4 params by date (local reference only)
+PX4_params/
+
+# DXF demo files (local scratch, not for tracking)
+Simple Demo/
+
+# Architecture and TODO scratch docs (local planning only)
+docs/Architecture/
+docs/TODO/
+
+# Field analysis images (local reference only)
+image_ref/
+
+# Rosbag topic lists (local scratch)
+tools/rosbag.txt
