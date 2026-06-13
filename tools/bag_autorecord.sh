@@ -2,7 +2,7 @@
 # Wrapper for the auto rosbag recorder: source ROS2, then exec the daemon.
 set -euo pipefail
 
-source /opt/ros/humble/setup.bash
+set +u; source /opt/ros/humble/setup.bash; set -u
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"
 export ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-0}"
 
