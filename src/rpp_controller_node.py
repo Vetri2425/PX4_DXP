@@ -1022,12 +1022,19 @@ class RPPControllerNode(Node):
 
     def _apply_run(self, idx: int) -> None:
         """Make run `idx` the actively tracked path; reset per-run state."""
+        prev_run = self._runs[idx - 1] if idx > 0 else None
         run = self._runs[idx]
-        # Runs after the first may start at a hard corner (sub-split) or a
-        # transit↔entity boundary: pivot toward the run's initial heading
-        # before tracking it (see _run_alignment_hold). The first run keeps
-        # the existing drive-from-anywhere start behavior.
-        self._run_align_pending = idx > 0
+        self._run_align_pending = False
+        if prev_run and len(prev_run["poses"]) > 1 and len(run["poses"]) > 1:
+            p0 = prev_run["poses"][-2].pose.position
+            p1 = prev_run["poses"][-1].pose.position
+            h0 = math.atan2(p1.y - p0.y, p1.x - p0.x)
+            n0 = run["poses"][0].pose.position
+            n1 = run["poses"][1].pose.position
+            h1 = math.atan2(n1.y - n0.y, n1.x - n0.x)
+            threshold = math.radians(float(self.get_parameter("segment_corner_threshold_deg").value))
+            if abs(self._heading_delta(h0, h1)) >= threshold:
+                self._run_align_pending = True
         self._reset_corner_pivot_state()
         self._run_idx = idx
         self._path = run["poses"]
@@ -1793,6 +1800,8 @@ class RPPControllerNode(Node):
         max_yr = float(self.get_parameter("max_yaw_rate_body").value)
 
         if not final_segment and dist_to_corner <= acceptance:
+            path_corner_deg = abs(self._segment_angle_deg(seg_idx))
+            threshold_deg = float(self.get_parameter("segment_corner_threshold_deg").value)
             c = self._path[seg_idx + 2].pose.position
             target_heading = math.atan2(c.y - b.y, c.x - b.x)
             heading_err = self._angle_wrap(target_heading - yaw_ned)
@@ -1809,7 +1818,9 @@ class RPPControllerNode(Node):
             else:
                 self._align_settle_since = None
                 settled = False
-            if settled or timed_out:
+            # Advance immediately for geometrically tangent junctions; otherwise
+            # require the corner-stop settle/timeout gate for hard corners.
+            if path_corner_deg < threshold_deg or settled or timed_out:
                 self._segment_idx += 1
                 self._segment_state = SegmentStateCode.TRACK_SEGMENT
                 self._last_speed_cmd = 0.0
