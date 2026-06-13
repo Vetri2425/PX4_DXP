@@ -260,6 +260,20 @@ class RPPControllerNode(Node):
         # the goal check activates. Prevents DONE on closed-loop paths where
         # the rover starts at the final waypoint. Set to 0 to disable.
         self.declare_parameter("min_goal_travel_m",                   0.5)    # m
+        # Closed-loop completion guard. A circle (or any closed entity) has
+        # first ≈ last waypoint, so Euclidean dist-to-goal is small from the
+        # very start; the min_goal_travel_m cap (0.5·len) lets it declare DONE
+        # after barely moving. For runs whose endpoints close within
+        # close_loop_threshold_m AND whose length exceeds close_loop_min_len_m,
+        # require closed_loop_min_travel_frac of the full run length to be
+        # traversed before DONE is permitted.
+        # 15 cm: must exceed one waypoint spacing — the planner's junction
+        # de-dup drops a closed run's coincident seam point, so RPP sees the
+        # endpoints ~one spacing apart rather than exactly coincident — while
+        # staying far below any genuinely-open shape's endpoint gap.
+        self.declare_parameter("close_loop_threshold_m",              0.15)   # endpoint gap → "closed"
+        self.declare_parameter("close_loop_min_len_m",                1.0)    # only guard runs longer than this
+        self.declare_parameter("closed_loop_min_travel_frac",         0.9)    # fraction of circumference required
         self.declare_parameter("approach_velocity_scaling_dist",      0.6)    # m
         self.declare_parameter("min_approach_linear_velocity",        0.1)
         self.declare_parameter("p4_zero_vel_threshold",               0.02)   # m/s; floor speed below this to exactly 0 to trigger PX4 P4
@@ -613,6 +627,7 @@ class RPPControllerNode(Node):
                 "flags": list(c_flags),
                 "profile": profile,
                 "length": self._pts_length(c_pts),
+                "closed": self._is_closed_run(c_pts),
             })
 
         # Drop degenerate slivers (e.g. the ~3 cm reversed stub that spray
@@ -1072,17 +1087,48 @@ class RPPControllerNode(Node):
         )
         return True
 
-    def _run_min_travel(self) -> float:
-        """min_goal_travel_m capped at half the active run length.
+    def _is_closed_run(self, pts: list[tuple[float, float]]) -> bool:
+        """True when a run is a closed loop (e.g. a circle entity).
 
-        The param guards against instant-DONE on closed-loop missions; a
-        single run is one entity or transit hop and can be far shorter
-        than the param, which would otherwise deadlock run completion.
+        A closed run has its first and last waypoint within
+        close_loop_threshold_m, AND a total length above close_loop_min_len_m
+        (so a short stub that happens to fold back is not mistaken for a loop).
+        Closed runs need a circumference-based completion guard — see
+        _run_min_travel — because their endpoints coincide, defeating the
+        Euclidean dist-to-goal check.
+        """
+        if len(pts) < 3:
+            return False
+        thr = float(self.get_parameter("close_loop_threshold_m").value)
+        min_len = float(self.get_parameter("close_loop_min_len_m").value)
+        if self._pts_length(pts) < min_len:
+            return False
+        gap = math.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1])
+        return gap <= thr
+
+    def _run_min_travel(self) -> float:
+        """Along-path travel required before the active run may declare DONE.
+
+        Open run: min_goal_travel_m, capped at half the run length. The param
+        guards against instant-DONE on missions where the rover starts near
+        the goal; the cap keeps a short entity/transit hop from deadlocking
+        (its half-length can be below the param).
+
+        Closed run (circle, closed polyline): first ≈ last waypoint, so the
+        Euclidean dist-to-goal is small from the very start and the open-path
+        cap (0.5·len) lets the loop "complete" after ~half a metre without
+        tracing it. Require closed_loop_min_travel_frac of the FULL run length
+        instead, forcing the rover to traverse nearly the whole circumference.
         """
         min_travel = float(self.get_parameter("min_goal_travel_m").value)
         if not self._runs:
             return min_travel
-        return min(min_travel, 0.5 * self._runs[self._run_idx]["length"])
+        run = self._runs[self._run_idx]
+        length = float(run["length"])
+        if run.get("closed"):
+            frac = float(self.get_parameter("closed_loop_min_travel_frac").value)
+            return frac * length
+        return min(min_travel, 0.5 * length)
 
     def _run_alignment_hold(
         self, pos_n: float, pos_e: float, yaw_ned: float, pose_age_s: float

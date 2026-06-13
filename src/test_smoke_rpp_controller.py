@@ -257,6 +257,33 @@ def test_smoke():
         assert node._run_min_travel() <= 0.5 * node._runs[1]["length"] + 1e-9
         print("PASS: mixed mission splits into per-entity runs (segment/segment/smooth)")
 
+        # Closed-loop (circle) completion guard: a run whose first ≈ last
+        # waypoint must require nearly the full circumference of travel before
+        # it can declare DONE — otherwise the Euclidean dist-to-goal check fires
+        # immediately (start ≈ goal) and the loop "completes" after ~0.5 m.
+        node.set_parameters([Parameter("tracking_profile", value="smooth")])
+        circ_msg = Path()
+        circ_msg.header.frame_id = "local_ned"
+        circ_msg.header.stamp = node.get_clock().now().to_msg()
+        r_circ = 1.0
+        circ_pts = [
+            (r_circ * math.cos(2 * math.pi * k / 60),
+             r_circ * math.sin(2 * math.pi * k / 60))
+            for k in range(61)  # 0..60 → closes back on the first point
+        ]
+        circ_msg.poses = [_make_path_pose(n, e, mark=True) for n, e in circ_pts]
+        node._path_cb(circ_msg)
+        circ_run = node._runs[node._run_idx]
+        assert circ_run.get("closed"), "Full circle run must be flagged closed"
+        circumference = 2 * math.pi * r_circ
+        guard = node._run_min_travel()
+        assert guard >= 0.85 * circumference, (
+            f"Closed-loop guard {guard:.2f} m must approach the circumference "
+            f"{circumference:.2f} m, not the {0.5:.2f} m open-path cap"
+        )
+        node.set_parameters([Parameter("tracking_profile", value="auto")])
+        print("PASS: closed-loop circle requires full-circumference travel before DONE")
+
         # A chained mark run with a hard corner (planner output is not
         # entity-clean) must sub-split at the corner so each piece stays
         # geometrically pure, with a pivot (alignment hold) at the boundary.

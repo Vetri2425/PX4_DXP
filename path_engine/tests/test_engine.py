@@ -231,11 +231,19 @@ def test_transit_segments_have_correct_attributes():
     )
     plan = engine.plan_segments([seg1, seg2])
 
-    # Check TRANSIT segment attributes
+    # Check TRANSIT segment attributes. Inserted transits are now densified
+    # (Step 4b) so they carry multiple spray=False samples instead of a single
+    # isolated point — endpoints preserved, interior sampled at transit_spacing.
     for seg in plan.segments:
         if seg.segment_type == SegmentType.TRANSIT:
             assert seg.speed == 0.50, f"TRANSIT speed should be 0.5, got {seg.speed}"
-            assert len(seg.points) == 2, "TRANSIT should have exactly 2 points (start, end)"
+            assert len(seg.points) >= 2, "TRANSIT should have at least its 2 endpoints"
+            assert seg.points[0] == (2.0, 0.0)
+            assert seg.points[-1] == (10.0, 0.0)
+            for i in range(1, len(seg.points)):
+                d = math.hypot(seg.points[i][0] - seg.points[i - 1][0],
+                               seg.points[i][1] - seg.points[i - 1][1])
+                assert d <= engine.transit_spacing + 1e-6
 
     # Check spray_flags for transit waypoints
     transit_wp_count = 0

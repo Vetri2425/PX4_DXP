@@ -23,6 +23,7 @@ from .planners.straight_line import densify_segment
 from .planners.extensions import split_mark_segment_with_extensions
 from .planners.smooth import smooth_corners
 from .optimizers.segment_order import optimize_segment_order
+from .optimizers.shape_grouping import group_connected_segments
 from .spray import apply_spray_latency_compensation
 from .ned import latlon_to_ned, dxf_to_ned_affine, apply_affine_transform
 
@@ -64,6 +65,8 @@ class PathEngine:
         corner_smooth_arc_pts: int = 6,
         use_two_opt: bool = True,
         max_two_opt_segments: int = 80,
+        group_shapes: bool = True,
+        group_join_tol_m: float = 0.05,
     ):
         if mark_spacing <= 0:
             raise ValueError(f"mark_spacing must be > 0, got {mark_spacing}")
@@ -100,6 +103,8 @@ class PathEngine:
         self.corner_smooth_arc_pts = corner_smooth_arc_pts
         self.use_two_opt = use_two_opt
         self.max_two_opt_segments = max_two_opt_segments
+        self.group_shapes = group_shapes
+        self.group_join_tol_m = group_join_tol_m
 
     def plan_file(
         self,
@@ -513,6 +518,24 @@ class PathEngine:
             densified.append(densify_segment(seg, self.mark_spacing, self.transit_spacing))
         densified_waypoint_count = sum(len(seg.points) for seg in densified)
 
+        # Step 2b: Group connected line-like MARK primitives into shape runs.
+        # Multi-shape DXFs arrive as loose LINE primitives; without grouping the
+        # nearest-neighbour optimizer can interleave and reverse individual
+        # edges, destroying shape-level traversal (square edges mixed into the
+        # triangle, arbitrary shared-edge handoff). Chaining connected edges
+        # into composite runs makes the optimizer order whole shapes and confine
+        # TRANSIT links to the boundaries between them. Curved MARK entities
+        # (circle/arc) are never absorbed, so they keep the smooth profile.
+        grouping_stats = {"enabled": self.group_shapes}
+        if self.group_shapes:
+            before_segs = len(densified)
+            densified = group_connected_segments(densified, tol=self.group_join_tol_m)
+            grouping_stats.update({
+                "segments_before": before_segs,
+                "segments_after": len(densified),
+                "runs_merged": before_segs - len(densified),
+            })
+
         # Resolve start position for TSP:
         # If we applied alignment, segments' points are already in the target NED frame.
         # So we do not de-offset the start_position. Otherwise we de-offset it by origin.
@@ -560,6 +583,25 @@ class PathEngine:
                     transit_speed=self.transit_speed,
                 ))
             ordered = extended
+
+        # Step 4b: Densify TRANSIT connectors created during ordering/extension.
+        # Densification (Step 2) runs BEFORE ordering, so the TRANSIT links the
+        # optimizer inserts between shapes (and any extension run-ups) reach this
+        # point with only their two endpoints. Left sparse, each collapses to a
+        # SINGLE spray=False waypoint in the merge — the start point coincides
+        # with the previous MARK endpoint and is de-duplicated — which gives RPP
+        # no real transit run to split on and makes spray ON/OFF timing brittle.
+        # Re-densify so every transit longer than transit_spacing carries
+        # multiple spray=False samples (≥2 after junction de-dup).
+        redensified: list[PathSegment] = []
+        for seg in ordered:
+            if seg.segment_type == SegmentType.TRANSIT and len(seg.points) >= 2:
+                redensified.append(
+                    densify_segment(seg, self.mark_spacing, self.transit_spacing)
+                )
+            else:
+                redensified.append(seg)
+        ordered = redensified
 
         # Step 5: Apply spray latency compensation to MARK segments
         if self.compensate_spray:
@@ -665,6 +707,7 @@ class PathEngine:
                 "transit_m": self.transit_spacing,
             },
             "smoothing": smoothing_stats,
+            "grouping": grouping_stats,
             "optimization": optimization_stats,
             "planning_time_s": planning_time_s,
             "anchor": {
