@@ -325,12 +325,16 @@ class RPPControllerNode(Node):
         self.declare_parameter("segment_heading_tolerance_deg",        2.0)
         self.declare_parameter("segment_yaw_rate_gain",                1.5)
         # CORNER_STOP: confirm the rover is physically stopped at the corner
-        # before pivoting. Speed comes from /mavros/local_position/velocity_local
-        # (always subscribed); the dwell debounces EKF velocity noise. The
-        # 2 s hard cap prevents a stop-confirmation deadlock if the velocity
-        # topic goes quiet or hovers around the threshold.
+        # before pivoting. Both linear speed AND yaw-rate (from velocity_local)
+        # must be below their thresholds for segment_stop_dwell_s. The 2 s hard
+        # cap prevents a deadlock if the velocity topic goes quiet.
         self.declare_parameter("segment_stop_speed_threshold",         0.02)   # m/s
+        self.declare_parameter("segment_stop_yaw_rate_threshold",      0.05)   # rad/s (~2.9 deg/s)
         self.declare_parameter("segment_stop_dwell_s",                 0.30)   # s
+        # CORNER_ALIGN exit: heading error AND yaw-rate must both be within
+        # tolerance for segment_align_settle_s before the state machine
+        # advances. Prevents premature exit while the rover is still spinning.
+        self.declare_parameter("segment_align_settle_s",               0.10)   # s (5 cycles @ 50 Hz)
         # Pivot watchdog: at tight (2°) tolerance with RTK yaw noise the
         # alignment can hunt; rather than deadlock, accept the best-effort
         # heading after this long and move on.
@@ -401,14 +405,15 @@ class RPPControllerNode(Node):
         self._segment_state: SegmentStateCode = SegmentStateCode.INACTIVE
         # CORNER_STOP / pivot-watchdog state (shared by the segment corner and
         # run-transition pivots — only one corner is active at a time).
-        self._corner_stop_entered: RclTime | None = None   # when CORNER_STOP began
-        self._corner_stop_low_since: RclTime | None = None  # actual speed below threshold since
-        self._corner_stop_complete: bool = False            # stop confirmed; pivoting now
-        self._pivot_started: RclTime | None = None          # when CORNER_ALIGN actuation began
+        self._corner_stop_entered: RclTime | None = None      # when CORNER_STOP began
+        self._corner_stop_settle_since: RclTime | None = None # speed+yaw-rate both OK since
+        self._corner_stop_complete: bool = False               # stop confirmed; pivoting now
+        self._pivot_started: RclTime | None = None             # when CORNER_ALIGN actuation began
         self._pivot_timeout_warned: bool = False
+        self._align_settle_since: RclTime | None = None        # heading+yaw-rate both OK since
         self._last_segment_debug: tuple[float, ...] = (
             0.0, 0.0, 0.0, float("nan"), float("nan"),
-            float("nan"), float("nan"), float("nan"), 0.0,
+            float("nan"), float("nan"), float("nan"), 0.0, 0.0,
         )
         self._pose: PoseStamped | None = None
         self._pose_recv_time: RclTime | None = None
@@ -442,6 +447,7 @@ class RPPControllerNode(Node):
         # we swap x↔y like for pose in _vel_cb().
         self._latest_vel_ned: tuple[float, float] = (0.0, 0.0)
         self._latest_vel_time: RclTime | None = None
+        self._latest_yaw_rate_ned: float = 0.0   # EKF yaw-rate, NED CW+ (rad/s)
 
         # P0.2 — EKF jump detection: last accepted NED position
         self._last_pos: tuple[float, float] | None = None
@@ -663,15 +669,17 @@ class RPPControllerNode(Node):
 
     # P2.4 — Velocity callback for pose extrapolation
     def _vel_cb(self, msg):
-        """Track latest NED linear velocity from MAVROS (already EKF-clean).
+        """Track latest NED linear velocity and yaw-rate from MAVROS (EKF-clean).
 
         MAVROS publishes `/mavros/local_position/velocity_local` in ENU:
-          msg.twist.linear.x = East,  msg.twist.linear.y = North
-        We swap to NED (x=North, y=East) the same way we do for pose.
+          msg.twist.linear.x  = East,  msg.twist.linear.y = North
+          msg.twist.angular.z = yaw-rate ENU (CCW+)
+        We swap linear x↔y to NED. ENU angular.z (CCW+) negates to NED (CW+).
         """
         v_north = msg.twist.linear.y    # ENU y → NED x
         v_east = msg.twist.linear.x     # ENU x → NED y
         self._latest_vel_ned = (v_north, v_east)
+        self._latest_yaw_rate_ned = -msg.twist.angular.z   # ENU CCW+ → NED CW+
         self._latest_vel_time = self.get_clock().now()
 
     # ==================================================================
@@ -1041,7 +1049,7 @@ class RPPControllerNode(Node):
             float(self._segment_state.value),
             0.0,
             float("nan"), float("nan"), float("nan"),
-            float("nan"), float("nan"), 0.0,
+            float("nan"), float("nan"), 0.0, 0.0,
         )
 
     def _advance_run(self) -> bool:
@@ -1097,10 +1105,22 @@ class RPPControllerNode(Node):
         heading_tol = math.radians(
             float(self.get_parameter("segment_heading_tolerance_deg").value)
         )
-        if abs(heading_err) <= heading_tol or (
-            self._corner_stop_complete and self._pivot_timed_out()
-        ):
+        timed_out = self._corner_stop_complete and self._pivot_timed_out()
+        yaw_rate_tol = float(self.get_parameter("segment_stop_yaw_rate_threshold").value)
+        align_settle_s = float(self.get_parameter("segment_align_settle_s").value)
+        now_align = self.get_clock().now()
+        heading_ok = abs(heading_err) <= heading_tol
+        yaw_rate_ok = abs(self._latest_yaw_rate_ned) < yaw_rate_tol
+        if heading_ok and yaw_rate_ok:
+            if self._align_settle_since is None:
+                self._align_settle_since = now_align
+            settled = (now_align - self._align_settle_since).nanoseconds * 1e-9 >= align_settle_s
+        else:
+            self._align_settle_since = None
+            settled = False
+        if settled or timed_out:
             self._run_align_pending = False
+            self._last_speed_cmd = 0.0
             self._reset_corner_pivot_state()
             return False
 
@@ -1776,11 +1796,23 @@ class RPPControllerNode(Node):
             c = self._path[seg_idx + 2].pose.position
             target_heading = math.atan2(c.y - b.y, c.x - b.x)
             heading_err = self._angle_wrap(target_heading - yaw_ned)
-            if abs(heading_err) <= heading_tol or (
-                self._corner_stop_complete and self._pivot_timed_out()
-            ):
+            timed_out = self._corner_stop_complete and self._pivot_timed_out()
+            yaw_rate_tol = float(self.get_parameter("segment_stop_yaw_rate_threshold").value)
+            align_settle_s = float(self.get_parameter("segment_align_settle_s").value)
+            now_align = self.get_clock().now()
+            heading_ok = abs(heading_err) <= heading_tol
+            yaw_rate_ok = abs(self._latest_yaw_rate_ned) < yaw_rate_tol
+            if heading_ok and yaw_rate_ok:
+                if self._align_settle_since is None:
+                    self._align_settle_since = now_align
+                settled = (now_align - self._align_settle_since).nanoseconds * 1e-9 >= align_settle_s
+            else:
+                self._align_settle_since = None
+                settled = False
+            if settled or timed_out:
                 self._segment_idx += 1
                 self._segment_state = SegmentStateCode.TRACK_SEGMENT
+                self._last_speed_cmd = 0.0
                 self._reset_corner_pivot_state()
                 self._publish_segment_debug(
                     self._segment_state, self._segment_idx, float("nan"),
@@ -2441,7 +2473,7 @@ class RPPControllerNode(Node):
     ):
         msg = Float32MultiArray()
         msg.layout.dim.append(
-            MultiArrayDimension(label="rpp_segment_debug", size=9, stride=9)
+            MultiArrayDimension(label="rpp_segment_debug", size=10, stride=10)
         )
         msg.data = [
             self._profile_code(self._active_tracking_profile),  # [0] profile: 1 segment, 2 smooth
@@ -2452,7 +2484,8 @@ class RPPControllerNode(Node):
             float(corner_angle_deg),                            # [5] next-corner angle
             float(target_heading_ned),                          # [6] target heading, NED CW+
             float(heading_error_rad),                           # [7] target-current heading error
-            float(yaw_rate_body),                               # [8] yaw-rate command
+            float(yaw_rate_body),                               # [8] yaw-rate command (RPP FF, 0 during pivot)
+            float(self._latest_yaw_rate_ned),                   # [9] actual yaw-rate NED (EKF, rad/s)
         ]
         self._last_segment_debug = tuple(msg.data)
         self._segment_dbg_pub.publish(msg)
@@ -2534,45 +2567,49 @@ class RPPControllerNode(Node):
 
     def _reset_corner_pivot_state(self):
         self._corner_stop_entered = None
-        self._corner_stop_low_since = None
+        self._corner_stop_settle_since = None
         self._corner_stop_complete = False
         self._pivot_started = None
         self._pivot_timeout_warned = False
+        self._align_settle_since = None
 
     def _corner_stop_satisfied(self) -> bool:
         """True once the rover is confirmed physically stopped at the corner.
 
-        Confirmation = actual ground speed (from velocity_local) below
-        segment_stop_speed_threshold continuously for segment_stop_dwell_s.
-        If velocity data is unavailable the dwell timer alone decides; either
-        way the hold is capped at _CORNER_STOP_MAX_HOLD_S.
+        Confirmation = actual ground speed AND yaw-rate (both from velocity_local)
+        below their thresholds continuously for segment_stop_dwell_s. When the
+        topic is stale (>0.3 s), both checks are skipped and the dwell timer
+        alone decides — the hard cap still fires at _CORNER_STOP_MAX_HOLD_S.
         """
         now = self.get_clock().now()
         if self._corner_stop_entered is None:
             self._corner_stop_entered = now
 
-        thresh = float(self.get_parameter("segment_stop_speed_threshold").value)
+        speed_thresh = float(self.get_parameter("segment_stop_speed_threshold").value)
+        yaw_rate_thresh = float(self.get_parameter("segment_stop_yaw_rate_threshold").value)
         dwell = float(self.get_parameter("segment_stop_dwell_s").value)
 
-        speed = None
+        speed_ok = True       # optimistic if no fresh data
+        yaw_rate_ok = True
         if self._latest_vel_time is not None:
             vel_age = (now - self._latest_vel_time).nanoseconds * 1e-9
             if vel_age < 0.3:
                 v_n, v_e = self._latest_vel_ned
-                speed = math.hypot(v_n, v_e)
+                speed_ok = math.hypot(v_n, v_e) < speed_thresh
+                yaw_rate_ok = abs(self._latest_yaw_rate_ned) < yaw_rate_thresh
 
-        if speed is not None and speed > thresh:
-            self._corner_stop_low_since = None  # still moving — restart dwell
-        else:
-            # Below threshold, or no fresh velocity data (assume settling).
-            if self._corner_stop_low_since is None:
-                self._corner_stop_low_since = now
-            elif (now - self._corner_stop_low_since).nanoseconds * 1e-9 >= dwell:
+        both_ok = speed_ok and yaw_rate_ok
+        if both_ok:
+            if self._corner_stop_settle_since is None:
+                self._corner_stop_settle_since = now
+            elif (now - self._corner_stop_settle_since).nanoseconds * 1e-9 >= dwell:
                 return True
+        else:
+            self._corner_stop_settle_since = None  # any violation resets dwell
 
         if (now - self._corner_stop_entered).nanoseconds * 1e-9 >= self._CORNER_STOP_MAX_HOLD_S:
             self.get_logger().warn(
-                "CORNER_STOP hold cap reached without speed confirmation — "
+                "CORNER_STOP hold cap reached without speed/yaw-rate confirmation — "
                 "proceeding to pivot",
                 throttle_duration_sec=5.0,
             )
