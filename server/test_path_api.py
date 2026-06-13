@@ -170,6 +170,9 @@ async def test_entities_api_returns_line_preview_points(tmp_path, monkeypatch):
                 "aft_extension_m": 0.5,
             }
 
+        def load_entity_order(self, filename):
+            return []
+
     import routes.path as path_route
 
     monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
@@ -240,6 +243,9 @@ async def test_entities_api_applies_saved_mark_override(tmp_path, monkeypatch):
                 "aft_extension_m": 0.5,
             }
 
+        def load_entity_order(self, filename):
+            return []
+
     import routes.path as path_route
 
     monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
@@ -282,6 +288,9 @@ async def test_entities_api_includes_extension_preview(tmp_path, monkeypatch):
                 "pre_extension_m": 0.5,
                 "aft_extension_m": 0.25,
             }
+
+        def load_entity_order(self, filename):
+            return []
 
     import routes.path as path_route
 
@@ -341,6 +350,9 @@ async def test_entities_api_includes_entity_to_entity_transit_preview(tmp_path, 
                 "pre_extension_m": 0.5,
                 "aft_extension_m": 0.5,
             }
+
+        def load_entity_order(self, filename):
+            return []
 
     import routes.path as path_route
 
@@ -403,6 +415,9 @@ async def test_transit_preview_skips_pointless_mark_entity_without_breaking_chai
                 "pre_extension_m": 0.5,
                 "aft_extension_m": 0.5,
             }
+
+        def load_entity_order(self, filename):
+            return []
 
     import routes.path as path_route
 
@@ -1090,6 +1105,425 @@ def test_load_path_executes_with_extension_config(tmp_path):
     pts_on = mgr.load_path("line.dxf")
     assert pts_on[0][0] < -0.4  # PRE run-up point south of origin
     assert len(pts_on) > len(pts_off)
+
+
+# ── Entity ordering tests ────────────────────────────────────────────────────
+
+def _make_line_entity(entity_id: str, is_mark_callable=None):
+    """Build a SimpleNamespace mimicking DXFEntity for ordering tests."""
+    if is_mark_callable is None:
+        is_mark_callable = lambda: True
+    return SimpleNamespace(
+        entity_id=entity_id,
+        entity_type="LINE",
+        layer="MARKINGS",
+        color=7,
+        geometry={"start": (0.0, 0.0), "end": (1.0, 0.0)},
+        is_mark=is_mark_callable,
+    )
+
+
+def test_apply_entity_order_empty_saved_order_returns_parser_order():
+    from routes.path import _apply_entity_order
+
+    entities = [_make_line_entity("A1"), _make_line_entity("A2"), _make_line_entity("A3")]
+    ordered = _apply_entity_order(entities, [])
+    assert [e.entity_id for e in ordered] == ["A1", "A2", "A3"]
+
+
+def test_apply_entity_order_reorders():
+    from routes.path import _apply_entity_order
+
+    entities = [_make_line_entity("A1"), _make_line_entity("A2"), _make_line_entity("A3")]
+    ordered = _apply_entity_order(entities, ["A3", "A1", "A2"])
+    assert [e.entity_id for e in ordered] == ["A3", "A1", "A2"]
+
+
+def test_apply_entity_order_appends_new_entities_at_end():
+    from routes.path import _apply_entity_order
+
+    entities = [_make_line_entity("A1"), _make_line_entity("A2"), _make_line_entity("A3")]
+    ordered = _apply_entity_order(entities, ["A3"])
+    assert [e.entity_id for e in ordered] == ["A3", "A1", "A2"]
+
+
+def test_apply_entity_order_ignores_missing_saved_ids():
+    from routes.path import _apply_entity_order
+
+    entities = [_make_line_entity("A1"), _make_line_entity("A2")]
+    ordered = _apply_entity_order(entities, ["A3", "A1"])
+    assert [e.entity_id for e in ordered] == ["A1", "A2"]
+
+
+def test_apply_entity_order_no_duplicates():
+    from routes.path import _apply_entity_order
+
+    entities = [_make_line_entity("A1"), _make_line_entity("A2")]
+    ordered = _apply_entity_order(entities, ["A1", "A2", "A1"])
+    assert [e.entity_id for e in ordered] == ["A1", "A2"]
+
+
+def test_path_manager_entity_order_round_trip(tmp_path):
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+    mgr = PathManager(str(tmp_path))
+
+    # Mock parse_dxf to return known entities
+    mgr.parse_dxf = lambda *args, **kwargs: [
+        _make_line_entity("A1"),
+        _make_line_entity("A2"),
+        _make_line_entity("A3"),
+    ]
+
+    # No saved order yet
+    assert mgr.load_entity_order("field.dxf") == []
+
+    # Save order
+    mgr.save_entity_order("field.dxf", ["A3", "A1", "A2"])
+    loaded = mgr.load_entity_order("field.dxf")
+    assert loaded == ["A3", "A1", "A2"]
+
+    # Overwrite
+    mgr.save_entity_order("field.dxf", ["A2", "A3", "A1"])
+    loaded = mgr.load_entity_order("field.dxf")
+    assert loaded == ["A2", "A3", "A1"]
+
+
+def test_path_manager_entity_order_cleared_on_delete(tmp_path):
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+    mgr = PathManager(str(tmp_path))
+    mgr.parse_dxf = lambda *args, **kwargs: [_make_line_entity("A1")]
+
+    mgr.save_entity_order("field.dxf", ["A1"])
+    assert mgr.load_entity_order("field.dxf") == ["A1"]
+
+    mgr.delete_file("field.dxf")
+    assert mgr.load_entity_order("field.dxf") == []
+
+
+def test_path_manager_entity_order_cleared_on_upload(tmp_path):
+    from path_manager import validate_upload
+
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+    mgr = PathManager(str(tmp_path))
+    mgr.parse_dxf = lambda *args, **kwargs: [_make_line_entity("A1")]
+
+    mgr.save_entity_order("field.dxf", ["A1"])
+    assert mgr.load_entity_order("field.dxf") == ["A1"]
+
+    # Upload a new version of the same file (via save_uploaded)
+    mgr.save_uploaded("field.dxf", b"0\nEOF\n")
+    assert mgr.load_entity_order("field.dxf") == []
+
+
+def test_path_manager_load_entity_order_handles_malformed_json(tmp_path):
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+    mgr = PathManager(str(tmp_path))
+
+    # Write malformed sidecar
+    sidecar = tmp_path / ".field.dxf.entity_order.json"
+    sidecar.write_text("not valid json", encoding="utf-8")
+
+    assert mgr.load_entity_order("field.dxf") == []
+
+
+def test_path_manager_load_entity_order_handles_invalid_structure(tmp_path):
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+    mgr = PathManager(str(tmp_path))
+
+    sidecar = tmp_path / ".field.dxf.entity_order.json"
+    sidecar.write_text('{"entity_order": {"A1": 1}}', encoding="utf-8")
+
+    assert mgr.load_entity_order("field.dxf") == []
+
+
+@pytest.mark.anyio
+async def test_entities_api_get_returns_parser_order_with_order_index(tmp_path, monkeypatch):
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            return [
+                _make_line_entity("A1"),
+                _make_line_entity("A2"),
+                _make_line_entity("A3"),
+            ]
+
+        def load_entity_overrides(self, filename):
+            return {}
+
+        def load_extension_config(self, filename):
+            return {"enabled": False, "pre_extension_m": 0.5, "aft_extension_m": 0.5}
+
+        def load_entity_order(self, filename):
+            return []
+
+    import routes.path as path_route
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    data = await path_entities("field.dxf")
+
+    assert data.num_entities == 3
+    assert [e.entity_id for e in data.entities] == ["A1", "A2", "A3"]
+    assert [e.order_index for e in data.entities] == [0, 1, 2]
+
+
+@pytest.mark.anyio
+async def test_entities_api_get_returns_saved_order(tmp_path, monkeypatch):
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            return [
+                _make_line_entity("A1"),
+                _make_line_entity("A2"),
+                _make_line_entity("A3"),
+            ]
+
+        def load_entity_overrides(self, filename):
+            return {}
+
+        def load_extension_config(self, filename):
+            return {"enabled": False, "pre_extension_m": 0.5, "aft_extension_m": 0.5}
+
+        def load_entity_order(self, filename):
+            return ["A3", "A1", "A2"]
+
+    import routes.path as path_route
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    data = await path_entities("field.dxf")
+
+    assert [e.entity_id for e in data.entities] == ["A3", "A1", "A2"]
+    assert [e.order_index for e in data.entities] == [0, 1, 2]
+
+
+@pytest.mark.anyio
+async def test_entities_api_transit_follows_reordered_mark_entities(tmp_path, monkeypatch):
+    """Transit preview must connect MARK entities in reordered sequence."""
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+
+    def line(entity_id, start, end):
+        return SimpleNamespace(
+            entity_id=entity_id,
+            entity_type="LINE",
+            layer="MARKINGS",
+            color=7,
+            geometry={"start": start, "end": end},
+            is_mark=lambda: True,
+        )
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            return [
+                line("A", (0.0, 0.0), (1.0, 0.0)),   # first in parser order
+                line("B", (2.0, 0.0), (3.0, 0.0)),   # second
+                line("C", (4.0, 0.0), (5.0, 0.0)),   # third
+            ]
+
+        def load_entity_overrides(self, filename):
+            return {}
+
+        def load_extension_config(self, filename):
+            return {"enabled": False, "pre_extension_m": 0.5, "aft_extension_m": 0.5}
+
+        def load_entity_order(self, filename):
+            return ["C", "A", "B"]  # saved order: C first
+
+    import routes.path as path_route
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    data = await path_entities("field.dxf")
+
+    # Entity order must be C, A, B
+    assert [e.entity_id for e in data.entities] == ["C", "A", "B"]
+
+    # Transit must connect C→A and A→B (the consecutively ordered MARK entities)
+    assert len(data.transit_preview) == 2
+    assert data.transit_preview[0].from_entity_id == "C"
+    assert data.transit_preview[0].to_entity_id == "A"
+    assert data.transit_preview[1].from_entity_id == "A"
+    assert data.transit_preview[1].to_entity_id == "B"
+
+
+@pytest.mark.anyio
+async def test_entities_api_new_entities_appended_after_saved_order(tmp_path, monkeypatch):
+    """DXF changes: saved order has old ID, DXF has extra entity not in saved order."""
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            return [
+                _make_line_entity("B"),  # new entity not in saved order
+                _make_line_entity("A"),  # in saved order
+                _make_line_entity("C"),  # new entity not in saved order
+            ]
+
+        def load_entity_overrides(self, filename):
+            return {}
+
+        def load_extension_config(self, filename):
+            return {"enabled": False, "pre_extension_m": 0.5, "aft_extension_m": 0.5}
+
+        def load_entity_order(self, filename):
+            return ["A", "OLD"]  # OLD no longer exists
+
+    import routes.path as path_route
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    data = await path_entities("field.dxf")
+
+    # A first (from saved order), then B, C appended in parser order
+    assert [e.entity_id for e in data.entities] == ["A", "B", "C"]
+
+
+@pytest.mark.anyio
+async def test_update_entity_order_endpoint_saves_full_order(tmp_path, monkeypatch):
+    from models import EntityOrderUpdateRequest, EntityOrderUpdateResponse
+
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+
+    saved = None
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            return [_make_line_entity("A1"), _make_line_entity("A2")]
+
+        def save_entity_order(self, filename, entity_order):
+            nonlocal saved
+            saved = (filename, entity_order)
+
+    import routes.path as path_route
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    from routes.path import update_entity_order
+
+    req = EntityOrderUpdateRequest(entity_order=["A2", "A1"])
+    resp = await update_entity_order("field.dxf", req)
+
+    assert saved == ("field.dxf", ["A2", "A1"])
+    assert resp.name == "field.dxf"
+    assert resp.num_entities == 2
+    assert resp.entity_order == ["A2", "A1"]
+
+
+@pytest.mark.anyio
+async def test_update_entity_order_rejects_duplicate_ids(tmp_path, monkeypatch):
+    from models import EntityOrderUpdateRequest
+
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            return [_make_line_entity("A1"), _make_line_entity("A2")]
+
+    import routes.path as path_route
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    from routes.path import update_entity_order
+
+    req = EntityOrderUpdateRequest(entity_order=["A1", "A2", "A1"])
+    with pytest.raises(HTTPException) as exc:
+        await update_entity_order("field.dxf", req)
+    assert exc.value.status_code == 422
+    assert "Duplicate" in exc.value.detail
+
+
+@pytest.mark.anyio
+async def test_update_entity_order_rejects_unknown_ids(tmp_path, monkeypatch):
+    from models import EntityOrderUpdateRequest
+
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            return [_make_line_entity("A1"), _make_line_entity("A2")]
+
+    import routes.path as path_route
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    from routes.path import update_entity_order
+
+    req = EntityOrderUpdateRequest(entity_order=["A1", "UNKNOWN"])
+    with pytest.raises(HTTPException) as exc:
+        await update_entity_order("field.dxf", req)
+    assert exc.value.status_code == 422
+    assert "Unknown" in exc.value.detail
+
+
+@pytest.mark.anyio
+async def test_update_entity_order_rejects_missing_ids(tmp_path, monkeypatch):
+    from models import EntityOrderUpdateRequest
+
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            return [_make_line_entity("A1"), _make_line_entity("A2")]
+
+    import routes.path as path_route
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    from routes.path import update_entity_order
+
+    req = EntityOrderUpdateRequest(entity_order=["A1"])
+    with pytest.raises(HTTPException) as exc:
+        await update_entity_order("field.dxf", req)
+    assert exc.value.status_code == 422
+    assert "Missing" in exc.value.detail
+
+
+@pytest.mark.anyio
+async def test_update_entity_order_rejects_non_dxf(tmp_path, monkeypatch):
+    from models import EntityOrderUpdateRequest
+
+    csv_file = tmp_path / "field.csv"
+    csv_file.write_text("0,0\n", encoding="utf-8")
+
+    import routes.path as path_route
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+
+    from routes.path import update_entity_order
+
+    req = EntityOrderUpdateRequest(entity_order=["A1"])
+    with pytest.raises(HTTPException) as exc:
+        await update_entity_order("field.csv", req)
+    assert exc.value.status_code == 415
+
+
+@pytest.mark.anyio
+async def test_update_entity_order_rejects_missing_path(tmp_path, monkeypatch):
+    from models import EntityOrderUpdateRequest
+
+    import routes.path as path_route
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+
+    from routes.path import update_entity_order
+
+    req = EntityOrderUpdateRequest(entity_order=["A1"])
+    with pytest.raises(HTTPException) as exc:
+        await update_entity_order("nonexistent.dxf", req)
+    assert exc.value.status_code == 404
 
 
 def test_preview_spray_flags_match_executed_path_with_extensions(tmp_path):

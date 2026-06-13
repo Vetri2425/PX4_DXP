@@ -43,6 +43,8 @@ from models import (
     DXFEntityInfo,
     DXFParseResponse,
     EntityExtensionPreview,
+    EntityOrderUpdateRequest,
+    EntityOrderUpdateResponse,
     EntityTransitPreview,
     LoadMissionRequest,
     MissionSummary,
@@ -320,6 +322,36 @@ async def _sidecar_call(fn, *args, what: str, timeout: float = 5.0):
         raise HTTPException(500, f"{what} failed: {exc}")
 
 
+def _apply_entity_order(entities: list, saved_order: list[str]) -> list:
+    """Reorder entities according to saved entity order.
+
+    If *saved_order* is empty, return parser order unchanged.
+    Entities present in *saved_order* appear in that order.
+    Any entities not in *saved_order* are appended at the end
+    in parser order. Saved IDs that no longer exist in the DXF
+    are silently ignored. No duplicates.
+    """
+    if not saved_order:
+        return list(entities)
+
+    by_id = {ent.entity_id: ent for ent in entities}
+    used: set[str] = set()
+    ordered: list = []
+
+    for entity_id in saved_order:
+        ent = by_id.get(entity_id)
+        if ent is not None and entity_id not in used:
+            ordered.append(ent)
+            used.add(entity_id)
+
+    for ent in entities:
+        if ent.entity_id not in used:
+            ordered.append(ent)
+            used.add(ent.entity_id)
+
+    return ordered
+
+
 @path_router.get("/{name}/entities", response_model=DXFEntitiesResponse)
 async def path_entities(name: str):
     """Return per-entity DXF preview geometry without full path planning."""
@@ -344,6 +376,10 @@ async def path_entities(name: str):
     except Exception as exc:
         raise HTTPException(422, f"DXF entity preview failed: {exc}")
 
+    # Apply saved entity ordering
+    saved_order = await asyncio.to_thread(path_mgr.load_entity_order, safe)
+    entities = _apply_entity_order(entities, saved_order)
+
     previews = []
     all_pts: list[tuple[float, float]] = []
     # Sidecar reads are tiny, but keep ALL filesystem work off the event loop
@@ -354,7 +390,7 @@ async def path_entities(name: str):
     # (entity_id, first_pt, last_pt) per drawable MARK entity — endpoints
     # only, so large per-entity point lists aren't retained past the loop.
     mark_endpoints: list[tuple[str, tuple[float, float], tuple[float, float]]] = []
-    for ent in entities:
+    for order_index, ent in enumerate(entities):
         pts = _entity_preview_tuples(ent)
         all_pts.extend(pts)
         default_is_mark = ent.is_mark()
@@ -384,6 +420,7 @@ async def path_entities(name: str):
             color=ent.color,
             default_is_mark=default_is_mark,
             is_mark=is_mark,
+            order_index=order_index,
             length_m=round(_entity_length_m(ent), 3),
             geometry=_jsonable_geometry(geometry),
             preview_points=[_ned_point(pt) for pt in pts],
@@ -412,6 +449,49 @@ async def path_entities(name: str):
         extension_config=extension_config,
         transit_preview=transit_preview,
         entities=previews,
+    )
+
+
+@path_router.post("/{name}/entities/order", response_model=EntityOrderUpdateResponse)
+async def update_entity_order(name: str, req: EntityOrderUpdateRequest):
+    """Persist entity execution order for a DXF file."""
+    from main import path_mgr
+
+    safe = os.path.basename(name)
+    fpath = os.path.join(MISSION_DIR, safe)
+    if not os.path.isfile(fpath):
+        raise HTTPException(404, f"Path not found: {name!r}")
+    if os.path.splitext(fpath)[1].lower() != ".dxf":
+        raise HTTPException(415, "Entity ordering is only available for DXF files")
+
+    # Parse DXF to get valid entity IDs
+    entities = await _sidecar_call(
+        path_mgr.parse_dxf, fpath,
+        what="Parsing DXF for entity order validation",
+    )
+    valid_ids = [ent.entity_id for ent in entities]
+    valid_set = set(valid_ids)
+    posted = req.entity_order
+    posted_set = set(posted)
+
+    # Full-order contract: must contain exactly the current entity ID set.
+    if len(posted) != len(posted_set):
+        raise HTTPException(422, "Duplicate entity IDs in entity_order")
+
+    unknown = posted_set - valid_set
+    missing = valid_set - posted_set
+
+    if unknown:
+        raise HTTPException(422, f"Unknown entity IDs: {sorted(unknown)}")
+    if missing:
+        raise HTTPException(422, f"Missing entity IDs: {sorted(missing)}")
+
+    await asyncio.to_thread(path_mgr.save_entity_order, safe, posted)
+
+    return EntityOrderUpdateResponse(
+        name=safe,
+        num_entities=len(posted),
+        entity_order=list(posted),
     )
 
 
@@ -578,6 +658,7 @@ async def parse_dxf_file(file: UploadFile = File(...)):
         os.replace(fpath, final_path)
         path_mgr.clear_entity_overrides(safe)
         path_mgr.clear_extension_config(safe)
+        path_mgr.clear_entity_order(safe)
 
         return DXFParseResponse(
             filename=safe,

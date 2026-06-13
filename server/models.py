@@ -255,6 +255,7 @@ class DXFEntityPreview(BaseModel):
     color: int = 7
     default_is_mark: bool = True
     is_mark: bool = True
+    order_index: int = 0
     length_m: float = 0.0
     geometry: dict[str, Any] = Field(default_factory=dict)
     preview_points: list[EntityPreviewPoint]
@@ -311,6 +312,20 @@ class DXFEntityOverridesResponse(BaseModel):
     name: str
     saved: bool = True
     num_overrides: int
+
+
+class EntityOrderUpdateRequest(BaseModel):
+    """Persist entity execution order for a DXF file."""
+
+    entity_order: list[str]
+
+
+class EntityOrderUpdateResponse(BaseModel):
+    """Response from POST /api/path/{name}/entities/order."""
+
+    name: str
+    num_entities: int
+    entity_order: list[str]
 
 
 class PathExtensionConfig(BaseModel):

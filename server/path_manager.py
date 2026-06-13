@@ -282,6 +282,61 @@ class PathManager:
         basename = os.path.basename(fpath)
         return os.path.join(dirname, f".{basename}.extensions.json")
 
+    @staticmethod
+    def _entity_order_path(fpath: str) -> str:
+        """Hidden sidecar path for per-file entity execution order."""
+        dirname = os.path.dirname(fpath)
+        basename = os.path.basename(fpath)
+        return os.path.join(dirname, f".{basename}.entity_order.json")
+
+    def load_entity_order(self, filename: str) -> list[str]:
+        """Load saved entity execution order for a mission file.
+
+        Returns the saved ID order, or [] if no sidecar exists.
+        Malformed JSON is logged and treated as missing ([]).
+        """
+        fpath = os.path.join(self._dir, os.path.basename(filename))
+        sidecar = self._entity_order_path(fpath)
+        try:
+            with open(sidecar, encoding="utf-8") as f:
+                payload = json.load(f)
+        except FileNotFoundError:
+            return []
+        except (OSError, ValueError) as exc:
+            log.warning("ignoring invalid entity order sidecar %s: %s", sidecar, exc)
+            return []
+
+        raw = payload.get("entity_order", [])
+        if not isinstance(raw, list) or not all(isinstance(v, str) for v in raw):
+            log.warning("ignoring malformed entity_order in %s", sidecar)
+            return []
+        return raw
+
+    def save_entity_order(self, filename: str, entity_order: list[str]) -> None:
+        """Persist entity execution order for a DXF mission file.
+
+        Args:
+            filename: DXF filename in the missions directory.
+            entity_order: Ordered list of entity IDs.
+
+        Raises FileNotFoundError if the DXF does not exist.
+        """
+        safe, fpath = self._require_dxf(filename, "Entity ordering is")
+        self._write_sidecar(
+            self._entity_order_path(fpath),
+            {"source": safe, "entity_order": list(entity_order)},
+        )
+        self._preview_cache.pop(fpath, None)
+
+    def clear_entity_order(self, filename: str) -> None:
+        """Remove saved entity execution order for a mission file, if present."""
+        fpath = os.path.join(self._dir, os.path.basename(filename))
+        sidecar = self._entity_order_path(fpath)
+        try:
+            os.remove(sidecar)
+        except FileNotFoundError:
+            pass
+
     def load_extension_config(self, filename: str) -> dict[str, float | bool]:
         """Load saved path extension config for a mission file."""
         default = {
@@ -654,6 +709,7 @@ class PathManager:
         self._entity_cache.pop(fpath, None)
         self.clear_entity_overrides(safe)
         self.clear_extension_config(safe)
+        self.clear_entity_order(safe)
         log.info("uploaded mission file: %s (%d bytes)", safe, len(content))
         return safe
 
@@ -666,6 +722,7 @@ class PathManager:
             self._entity_cache.pop(fpath, None)
             self.clear_entity_overrides(filename)
             self.clear_extension_config(filename)
+            self.clear_entity_order(filename)
             log.info("deleted mission file: %s", filename)
             return True
         return False
