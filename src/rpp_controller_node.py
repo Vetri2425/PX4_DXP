@@ -1962,6 +1962,10 @@ class RPPControllerNode(Node):
         unit_e = de / l_actual
         v_n = speed * unit_n
         v_e = speed * unit_e
+        # BUG-T3 fix: clamp velocity bearing into forward cone so PX4
+        # reverse-detection never flips the turn, even on the first segment
+        # (idx==0) where _run_alignment_hold is skipped.
+        v_n, v_e = self._clamp_velocity_to_forward_cone(v_n, v_e, yaw_ned, speed)
         speed_mag = math.hypot(v_n, v_e)
         if speed_mag > 0.01:
             self._last_yaw_cmd = math.atan2(v_e, v_n)
@@ -2351,7 +2355,11 @@ class RPPControllerNode(Node):
         unit_e = de / l_actual if l_actual > 1e-9 else 0.0
         v_n = speed * unit_n
         v_e = speed * unit_e
-        
+        # BUG-T3 fix: clamp velocity bearing into forward cone so PX4
+        # reverse-detection never flips the turn, even on the first run
+        # (idx==0) where _run_alignment_hold is skipped.
+        v_n, v_e = self._clamp_velocity_to_forward_cone(v_n, v_e, yaw_ned, speed)
+
         # P0.5: compute target yaw (NED: 0=North, CW+).
         # When |v| < 1 cm/s, freeze at last commanded yaw to avoid snapping
         # to North on stop (matches PX4 P4 patch behavior).
@@ -2475,6 +2483,49 @@ class RPPControllerNode(Node):
         )
         cmd_bearing = yaw_ned + step
         return corner_speed * math.cos(cmd_bearing), corner_speed * math.sin(cmd_bearing)
+
+    def _clamp_velocity_to_forward_cone(
+        self,
+        v_n: float,
+        v_e: float,
+        yaw_ned: float,
+        speed: float,
+    ) -> tuple[float, float]:
+        """Prevent PX4 rover reverse-flip by keeping velocity bearing in forward cone.
+
+        PX4 DifferentialVelControl derives desired heading from the velocity
+        vector bearing = atan2(vE, vN). If the velocity vector is >90° from the
+        rover nose, the forward projection fwd_component = v_n*cos(yaw) +
+        v_e*sin(yaw) goes negative, and PX4 may choose reverse + 180° heading —
+        spot-turning the rover the WRONG way (BUG-T3).
+
+        This helper clamps the commanded velocity bearing into the same ±75°
+        forward cone used by corner pivots (_corner_pivot_velocity), keeping
+        fwd_component > 0 so the firmware spot-turns the short way, forward.
+
+        No-op (returns (v_n, v_e) unchanged) when:
+          - speed is zero
+          - velocity magnitude is near-zero
+          - the raw bearing is already inside the ±75° cone
+        """
+        if speed <= 1e-6:
+            return v_n, v_e
+        mag = math.hypot(v_n, v_e)
+        if mag <= 1e-9:
+            return v_n, v_e
+        bearing = math.atan2(v_e, v_n)  # NED bearing: atan2(E, N); 0=North, CW+
+        heading_err = self._angle_wrap(bearing - yaw_ned)
+        if abs(heading_err) <= self._CORNER_MAX_BEARING_OFFSET_RAD:
+            return v_n, v_e
+        step = self._clamp(
+            heading_err,
+            -self._CORNER_MAX_BEARING_OFFSET_RAD,
+            self._CORNER_MAX_BEARING_OFFSET_RAD,
+        )
+        cmd_bearing = yaw_ned + step
+        # Preserve requested speed (the intended command magnitude).
+        cmd_speed = speed
+        return cmd_speed * math.cos(cmd_bearing), cmd_speed * math.sin(cmd_bearing)
 
     # Hard cap on how long CORNER_STOP may hold before proceeding to the
     # pivot anyway — guards against a missing/noisy velocity_local topic
