@@ -71,9 +71,17 @@ _deploy_service "${SCRIPT_DIR}/rpp-pipeline.service" \
 _deploy_service "${SCRIPT_DIR}/rover-server.service" \
     "/etc/systemd/system/rover-server.service" "rover-server"
 
+_deploy_service "${SCRIPT_DIR}/bag-autorecord.service" \
+    "/etc/systemd/system/bag-autorecord.service" "bag-autorecord"
+
+# Auto-bag output folder (pulled from the Mac; outside the read-only repo)
+mkdir -p "${HOME}/bags_jet"
+log "bags: ${HOME}/bags_jet ready"
+
 # Make startup scripts executable
 chmod +x "${SCRIPT_DIR}/rpp_start.sh" 2>/dev/null || true
 chmod +x "${SCRIPT_DIR}/server/run.sh" 2>/dev/null || true
+chmod +x "${SCRIPT_DIR}/tools/bag_autorecord.sh" 2>/dev/null || true
 
 # ── 2. Keep manual ROS shells on the same Fast DDS profile ─────────
 DDS_PROFILE_EXPORT="export FASTRTPS_DEFAULT_PROFILES_FILE=${SCRIPT_DIR}/config/fastdds_no_shm.xml"
@@ -123,6 +131,13 @@ if systemctl is-enabled rover-server.service >/dev/null 2>&1; then
 else
     sudo systemctl enable rover-server.service
     log "systemd: rover-server enabled"
+fi
+
+if systemctl is-enabled bag-autorecord.service >/dev/null 2>&1; then
+    log "systemd: bag-autorecord already enabled"
+else
+    sudo systemctl enable bag-autorecord.service
+    log "systemd: bag-autorecord enabled"
 fi
 
 # ── 8. Restart (optional) ──────────────────────────────────────────

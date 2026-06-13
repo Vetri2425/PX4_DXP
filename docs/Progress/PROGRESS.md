@@ -4,6 +4,44 @@ Running log of all work. Each entry: what built, what fixed, what's next, time s
 
 ---
 
+## 2026-06-12 — Controller + Tuning Phase CLOSED; pivot to path/spray/pipeline
+
+### Milestone: tracking validated, controller work frozen
+- **Square (segment / stop-pivot profile) — FIELD VALIDATED.** Bag `square_cornerfix_20260612_201142` (~2m sides, full loop, 55.9s):
+  - RPP cross-track (TRACKING): **mean 0.34 / RMS 0.52 / p95 1.11 / max 1.45 cm**
+  - Independent geometric x-track (point-to-polyline): **mean 0.66 / RMS 0.82 / p95 1.58 / max 2.17 cm** (max = corner cusp, not straights)
+  - Stop-pivot corner FSM exercised all states (TRACK_SEGMENT→PRE_CORNER_SLOWDOWN→CORNER_ALIGN→CORNER_STOP→TRACK). Heading tracks target cleanly after each pivot.
+  - **Corner-xtrack goal ≤5cm: MET (~2cm).** Lines run ~0.5cm; corners handled by stop-and-pivot, so no curvature-following error.
+- **Arc (smooth RPP) — at structural floor, DEFERRED (not on critical path).**
+  - Best run `arc_fix_01_20260609_173519`: RMS 2.09 / max 3.47 cm. `arc_fix_02_173805`: RMS 2.76 cm. 06-08 ref `arc_fix_01`: 2.57cm median / 6.3cm peak.
+  - NOT robust: `arc_fix_03_173922` (12.6cm RMS) and `arc_fix_04_174210` (15.7cm RMS, didn't finish) diverged/oscillated when gains were pushed. `arc_fix_01_173313` was an aborted run (no `/path`, state stayed RTK_WAIT=4).
+  - Summary verdict: smooth arcs are under 3cm RMS in the validated config but peak >3cm and aren't reliable; the segment profile is the production path.
+
+### Root cause analysis (ulog `log_42` + fork source) — why smooth arcs floor at ~2-3cm
+- OFFBOARD runs in **velocity mode**. `DifferentialOffboardMode::offboardControl()` velocity branch sets `speed = |vel|`, `yaw_setpoint = atan2f(vE,vN)`, and **discards `trajectory_setpoint.yawspeed`** (RPP's `/rpp/yaw_rate_body` FF). yawspeed is only piped through in `body_rate` mode.
+- Attitude loop (`DifferentialAttControl` → `RoverControl::attitudeControl`) is **pure-P**: `pid_yaw.setGains(RO_YAW_P, 0, 0)`, no feedforward. On a curve the yaw setpoint ramps at ω, so steady following error = `ω/RO_YAW_P = 0.23/1.0 = 13°`. Measured heading lag = **12.0° ± 2.2°** (matches), pinned across all 06-09 runs regardless of companion-side changes.
+- **No saturation/clipping anywhere** (ulog): actuator_motors peak 0.40/1.0, normalized_speed_diff 0.08/0.95, yaw-accel slew not active, rate-loop meas/cmd ≈ 1.04, integrals ~0. Error is a heading-loop gain/architecture issue, not headroom.
+- Speed loop overshoots (~0.42 vs 0.35 cmd) + decel lag from soft `RO_SPEED_P=0.18/I=0.02`; absorbed by CORNER_STOP dwell on the square.
+- **Correction to prior session's claim:** the earlier "PX4 under-delivers yaw rate / use `yaw_rate_feedback_gain`" idea is wrong — in velocity mode PX4 ignores RPP's body yaw rate entirely. To beat 2cm on smooth curves: raise `RO_YAW_P` (QGC, source of truth) OR switch offboard to `body_rate` mode so RPP's yaw rate drives the rate loop directly. Deferred — segment profile already meets the target.
+
+### Tooling
+- Bag analyser confirmed: `tools/analysis/analyze_arc_bag.py <bagdir>` (reads `/rpp/debug` idx 0/1/3/4/7, TRACKING-only metrics + PNG).
+- New: `bags/12-06-2026/square_cornerfix_20260612_201142/analyze_square.py` — commanded-vs-actual figures (path, yaw heading+rate, speed w/ corner-phase shading, error+state timeline) + independent geometric cross-track. Outputs `fig1_path / fig2_yaw / fig3_speed / fig4_error`.
+
+### Next (Phase 3 — controller done, focus shifts)
+1. **Path engine + trajectory planning** — mission/path generation, per-entity segment splitting, corner handling, resample/smooth
+2. **CRS / coordinate handling** — coordinate reference system + geodesic conversion for path import (DXF/QGC → local NED)
+3. **Spray control logic** — validate flag conditioning, timing, safety gates end-to-end (still pending hw: AUX 301, solenoid wiring, cmd 187 bench, latency)
+4. **Full-pipeline validation** — CAD/DXF → path → mission → drive → spray, on hardware
+
+### Status audit vs codebase (2026-06-12) — closed stale "pending" tasks
+- **Spray software is BUILT + tested**, not pending: z-channel flag transport (`ros_node.py`, `path_publisher_node.py`, RPP `:555`), flag carry-through in `_smooth_corners`/`_resample_path`/`_simplify_path_for_profile` with boundary AND-rule (test: `test_spray_flag_conditioning.py`), `spray_controller` wired in prod launcher `rpp_start.sh` + dead `rpp_pipeline.launch.py`, server `marking_state` (models/main/telemetry), and `test_spray_manual_override.py` (9 tests: debounce, disarm/not-OFFBOARD reject, watchdog, staleness, failsafe precedence, shutdown→OFF). Tracker P3-T3/T4/T5/T6/T9/T10 → **Done**. Remaining spray = hardware/bench/QGC only (P3-T1/T2/T8/T11/T12) + frontend pill (P3-T7).
+- **Encoder fusion DONE via EKF2 wheel-encoder fusion** (validated log_150). robot_localization sprint **superseded** — no STM32 bridge, no ROS2 EKF node. Tracker S2-T7/T8 → Superseded, S2-T9 → Done, I-T1 → Superseded.
+- ⚠ **Open caveat:** 12-06 param snapshot `init.params` still shows `EKF2_WENC_CTRL=0` / `RBCLW_COUNTS_REV=1200` (pre-fix). Confirm the live FCU carries the validated `CTRL=1` / `COUNTS_REV=148000` before relying on fusion.
+- `rpp_pipeline.launch.py` confirmed **dead code** (services use `rpp_start.sh`) — I-T2 cleanup still valid.
+
+---
+
 ## 2026-06-11 — Codebase/Tracker Audit
 
 ### Current source-of-truth updates

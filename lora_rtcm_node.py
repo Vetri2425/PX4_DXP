@@ -3,11 +3,13 @@
 
 Reads RTCM3 frames from a local serial LoRa module, validates CRC-24Q,
 and publishes them to /mavros/gps_rtk/send_rtcm.
+Auto-reconnects with exponential backoff on serial errors.
 """
 
 import argparse
 import json
 import os
+import signal
 import threading
 import time
 from pathlib import Path
@@ -41,7 +43,10 @@ def _rtcm3_crc(data: bytes, length: int) -> int:
 
 
 class LoraRtcmNode(Node):
-    """ROS2 node that streams RTCM3 corrections from serial LoRa to MAVROS."""
+    """ROS2 node that streams RTCM3 corrections from serial LoRa to MAVROS.
+
+    Reconnects automatically with exponential backoff on serial errors.
+    """
 
     def __init__(self, serial_port: str, baudrate: int, status_file: str | None = None):
         super().__init__("lora_rtcm_node")
@@ -64,12 +69,21 @@ class LoraRtcmNode(Node):
         self._bytes = 0
         self._last_frame_wall_time = None
         self._last_error = None
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        self.create_timer(1.0, lambda: self._write_status("connected" if self._connected else "starting"))
+        self._reconnect_count = 0
+        self._window_frames = 0
+        self._window_bytes = 0
+
+        self.create_timer(1.0, lambda: self._write_status("connected" if self._connected else "connecting"))
+        self.create_timer(30.0, self._check_health)
 
         self.get_logger().info(f"Starting LoRa RTK on {serial_port} @ {baudrate} baud")
         self._write_status("starting")
+
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def request_stop(self):
+        self._stop_event.set()
 
     def _write_status(self, state: str):
         if self._status_file is None:
@@ -91,6 +105,26 @@ class LoraRtcmNode(Node):
             os.replace(tmp_path, self._status_file)
         except Exception as exc:
             self.get_logger().debug(f"Failed to write status file: {exc}")
+
+    def _check_health(self):
+        with self._stats_lock:
+            frames = self._window_frames
+            bytess = self._window_bytes
+            self._window_frames = 0
+            self._window_bytes = 0
+            last = self._last_frame_wall_time
+
+        age = time.time() - last if last is not None else None
+        if age is None or age > 30.0:
+            self.get_logger().warn(
+                f"No LoRa RTCM data for {age:.0f}s" if age is not None else "No LoRa RTCM data yet"
+                f" (reconnects: {self._reconnect_count})"
+            )
+        else:
+            self.get_logger().info(
+                f"LoRa RTCM: {frames} frames, {bytess} bytes in last 30s"
+                f" (reconnects: {self._reconnect_count})"
+            )
 
     @staticmethod
     def _parse_rtcm_frames(buf: bytes, logger=None):
@@ -135,44 +169,81 @@ class LoraRtcmNode(Node):
         return frames, buf[i:]
 
     def _run(self):
-        buf = b""
-        try:
-            with serial.Serial(self.serial_port, self.baudrate, timeout=1.0) as ser:
-                with self._stats_lock:
-                    self._connected = True
-                    self._last_error = None
-                self._write_status("connected")
-                while not self._stop_event.is_set():
-                    chunk = ser.read(1024)
-                    if not chunk:
-                        continue
+        attempt = 0
 
-                    buf += chunk
-                    frames, buf = self._parse_rtcm_frames(buf, self.get_logger())
-                    for frame in frames:
-                        msg = RTCM()
-                        msg.header.stamp = self.get_clock().now().to_msg()
-                        msg.data = list(frame)
-                        self.pub.publish(msg)
-                        with self._stats_lock:
-                            self._frames += 1
-                            self._bytes += len(frame)
-                            self._last_frame_wall_time = time.time()
-                            self._last_error = None
-                        self._write_status("streaming")
-        except serial.SerialException as exc:
-            with self._stats_lock:
-                self._connected = False
-                self._last_error = str(exc)
-            self._write_status("error")
-            self.get_logger().error(f"LoRa serial error: {exc}")
-            self._stop_event.set()
-            rclpy.try_shutdown()
+        while not self._stop_event.is_set():
+            buf = b""
+            try:
+                self.get_logger().info(
+                    f"Opening {self.serial_port} @ {self.baudrate} baud"
+                    + (f" (reconnect #{self._reconnect_count})" if self._reconnect_count else "")
+                )
+                with serial.Serial(self.serial_port, self.baudrate, timeout=1.0) as ser:
+                    with self._stats_lock:
+                        self._connected = True
+                        self._last_error = None
+                    self._write_status("connected")
+                    attempt = 0  # reset backoff on successful open
+
+                    while not self._stop_event.is_set():
+                        chunk = ser.read(1024)
+                        if not chunk:
+                            continue
+
+                        buf += chunk
+                        frames, buf = self._parse_rtcm_frames(buf, self.get_logger())
+                        for frame in frames:
+                            msg = RTCM()
+                            msg.header.stamp = self.get_clock().now().to_msg()
+                            msg.data = list(frame)
+                            self.pub.publish(msg)
+                            with self._stats_lock:
+                                self._frames += 1
+                                self._bytes += len(frame)
+                                self._window_frames += 1
+                                self._window_bytes += len(frame)
+                                self._last_frame_wall_time = time.time()
+                                self._last_error = None
+                            self._write_status("streaming")
+
+            except serial.SerialException as exc:
+                with self._stats_lock:
+                    self._connected = False
+                    self._last_error = str(exc)
+                    self._reconnect_count += 1
+                self.get_logger().error(
+                    f"LoRa serial error: {exc} — reconnect #{self._reconnect_count}"
+                )
+                self._write_status("error")
+            except Exception as exc:
+                with self._stats_lock:
+                    self._connected = False
+                    self._last_error = str(exc)
+                    self._reconnect_count += 1
+                self.get_logger().error(
+                    f"LoRa unexpected error: {exc} — reconnect #{self._reconnect_count}"
+                )
+                self._write_status("error")
+            else:
+                # Clean exit from inner loop — stop was requested
+                with self._stats_lock:
+                    self._connected = False
+                break
+
+            if self._stop_event.is_set():
+                break
+
+            # Exponential backoff: min(5 * 2^attempt, 60) seconds
+            backoff = min(5 * (2 ** attempt), 60)
+            attempt += 1
+            self.get_logger().info(f"Reconnecting LoRa in {backoff}s...")
+            self._write_status("reconnecting")
+            self._stop_event.wait(backoff)
 
     def destroy_node(self):
         self.get_logger().info("Shutting down LoRa RTK node...")
         self._write_status("stopping")
-        self._stop_event.set()
+        self.request_stop()
         if self._thread.is_alive():
             self._thread.join(timeout=2)
         super().destroy_node()
@@ -194,6 +265,15 @@ def main(argv=None):
 
     rclpy.init()
     node = LoraRtcmNode(args.serial_port, args.baudrate, status_file=args.status_file)
+
+    def _handle_signal(signum, _frame):
+        node.get_logger().info(f"Received signal {signum}; stopping LoRa node")
+        node.request_stop()
+        rclpy.try_shutdown()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

@@ -1,5 +1,19 @@
 # Corner Xtrack Reduction — RPP Upgrade Path Plan
 
+> ## ✅ CLOSED — 2026-06-12 (Sprint 1 goal MET)
+>
+> **Outcome:** Corner xtrack ≤5cm goal **achieved (~2cm)**. Validation bag `square_cornerfix_20260612_201142`: RPP xtrack **0.52cm RMS / 1.45cm max**; independent geometric **0.82cm RMS / 2.17cm max** (peak = corner cusp). Controller + tuning phase is now **frozen**; focus moved to path engine / CRS / spray / full-pipeline.
+>
+> **How it was actually solved — and the key correction to this plan:** NOT by the `yaw_rate_feedback_gain` sweep (Task 3 / Kill-Priority #1) this plan was built around. That mechanism is a **no-op in velocity OFFBOARD mode**: PX4 `DifferentialOffboardMode` sets `yaw_setpoint = atan2(vE,vN)` and **discards `trajectory_setpoint.yawspeed`**, so the companion-side `yaw_rate_feedback_gain` / FF yaw rate never reaches the PX4 rate loop. The corner goal was met instead by the **segment / stop-pivot tracking profile** (drive straight segments → stop → pivot in place at corners), which sidesteps continuous-curvature tracking entirely.
+>
+> **Smooth-arc note:** smooth RPP arcs sit at a **structural floor ~2–3cm** due to the pure-P attitude loop following-error `≈ ω/RO_YAW_P ≈ 12°` (`RO_YAW_P=1.0`, no FF). No clipping anywhere (motors 40%, steering 8%, rate loop tracks ~1.0). To beat 2cm on smooth curves later: raise `RO_YAW_P` (QGC) OR switch offboard to `body_rate`. DEFERRED — not on critical path.
+>
+> **Sprint 2 (robot_localization fusion):** still valid as written and still **blocked** on the STM32 encoder bridge.
+>
+> _Remainder of this document is retained for history; Sprint 1 tasks 1–6 and the Xtrack-Kill-Priority table below are superseded by the outcome above._
+
+---
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Reduce corner cross-track error from the validated baseline of 9.4cm (log 59) to ≤5cm using mechanisms already present in the codebase, then build the robot_localization fusion upgrade path as Phase 2.

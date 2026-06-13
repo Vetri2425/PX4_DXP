@@ -51,15 +51,26 @@ Not your job: PX4 firmware, waypoint gen, log analysis — those live on Mac GCS
 | SSH to Jetson | `ssh flash@192.168.1.102` |
 | QGC | QGroundControl on macOS |
 
-## Current status (2026-06-11)
+## Current status (2026-06-12)
 
 - Phase 2 OFFBOARD stack running; FastAPI + mobile frontend built
-- Arc tuning at arc_fix_28; arc_fix_16 validated 1.5m arc at **2.57cm median xtrack**
-- Active goal: corner xtrack **≤5cm** (plan: `docs/superpowers/plans/2026-06-02-corner-xtrack-reduction.md`)
+- **Controller + tuning phase CLOSED** — frozen at validated config. Production tracking = **segment / stop-pivot profile**. Do not re-open arc PID/lookahead tuning unless a regression appears.
+- **Square (segment profile) — FIELD VALIDATED** (`square_cornerfix_20260612_201142`): RPP xtrack **0.52cm RMS / 1.45cm max**; independent geometric **0.82cm RMS / 2.17cm max** (peak is the corner cusp). Corner ≤5cm goal **MET (~2cm)**. Stop-and-pivot corner FSM (TRACK→SLOWDOWN→ALIGN→STOP→TRACK) all states exercised, clean.
+- **Arc (smooth RPP) — at structural floor, DEFERRED.** Best run `arc_fix_01_20260609_173519` = **2.1cm RMS / 3.5cm max**; 06-08 ref 2.57cm median / 6.3cm peak. NOT robust — 2/4 runs on 06-09 diverged to 12–15cm when gains pushed.
+  - Root cause (firmware-confirmed): velocity OFFBOARD mode → `DifferentialOffboardMode` sets `yaw_setpoint = atan2(vE,vN)` and **discards `trajectory_setpoint.yawspeed`** (RPP's FF). Attitude loop is pure-P (no FF) → structural heading following-error `≈ ω/RO_YAW_P` on curves → outside bulge. NO clipping anywhere (motors 40%, steering 8%, rate loop tracks ~1.0).
+  - **`RO_YAW_P` raised 1.0 → 1.5** (live as of `log_183` 2026-06-12 20:00; square validated at 1.5): cuts lag ~12° → ~9°. Further raise (or body_rate offboard) needed to chase <2cm on smooth curves.
+  - To beat 2cm on smooth curves (NOT on critical path): raise `RO_YAW_P` (QGC) OR switch offboard to `body_rate` so RPP yaw rate drives the rate loop directly. Companion-side `yaw_rate_feedback_gain` does NOTHING in velocity mode.
 - Validated RPP params: `max_yaw_rate_body=0.45`, `a_lat_max=0.3`, `corner_smooth_radius_m=0.5`
-- Tracking profiles live: `tracking_profile=auto|segment|smooth` — auto splits missions into per-entity runs (spray-flag + hard-corner splits), lines→segment (stop-and-pivot corners), arcs/circles→smooth RPP; pivot-align at run transitions. Bench-verified, not yet field-tested
+- Known minor: speed loop overshoots (~0.42 vs 0.35 cmd) + decel lag; absorbed by CORNER_STOP dwell. Tighten `RO_SPEED_P/I` / `RO_DECEL_LIM` if/when needed.
+- Tracking profiles live: `tracking_profile=auto|segment|smooth` — auto splits missions per-entity (spray-flag + hard-corner splits), lines→segment, arcs/circles→smooth, pivot-align at transitions.
 - Phase 3 spray: **built & live** — `spray_controller_node.py` drives PX4 AUX via `MAV_CMD_DO_SET_ACTUATOR` (MAVROS), safety-gated (armed+OFFBOARD, staleness watchdog, debounce); manual test via `POST /api/spray/test`. QGC owns AUX pin/PWM config
 - robot_localization fusion: not yet built
+
+### Active focus (Phase 3 — moved on from controller)
+1. **Path engine + trajectory planning** — mission/path generation, segment splitting, corner handling
+2. **CRS / coordinate handling** — coordinate reference system + geodesic conversion for path import
+3. **Spray control logic** — validate flag conditioning, timing, safety gates end-to-end
+4. **Full-pipeline validation** — CAD/DXF → path → mission → drive → spray, on hardware
 
 ## Hard rules
 
