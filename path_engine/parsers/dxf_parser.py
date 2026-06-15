@@ -9,6 +9,7 @@ Supported entities:
   - CIRCLE: full circle (discretized via chord-error method)
   - ARC: partial arc (discretized via chord-error method)
   - LWPOLYLINE: with bulge values (mixed line+arc segments)
+  - POLYLINE: legacy heavyweight 2D/3D vertex chains (older CAD exports)
   - SPLINE/HELIX: flattened via ezdxf make_path + flattening
   - ELLIPSE: elliptical arcs (flattened via ezdxf make_path)
   - INSERT: block references (decomposed recursively)
@@ -226,6 +227,38 @@ def parse_dxf(
                 },
                 unit_scale=unit_scale,
             ))
+
+        elif etype == "POLYLINE":
+            # Legacy heavyweight POLYLINE (older CAD exports, pre-LWPOLYLINE).
+            # 2D/3D vertex chains are folded into the same vertices+bulges shape
+            # as LWPOLYLINE so they ride the proven bulge-aware densifier
+            # downstream. Polygon/polyface MESH variants have no single drivable
+            # vertex chain — skip them (logged) rather than emit garbage geometry.
+            mode = entity.get_mode()
+            if mode in ("AcDb2dPolyline", "AcDb3dPolyline"):
+                verts = list(entity.vertices)
+                pts = [(v.dxf.location.y * s, v.dxf.location.x * s) for v in verts]
+                # 3D polylines carry no bulge; .get falls back to 0.0 → straight.
+                bulges = [float(v.dxf.get("bulge", 0.0)) for v in verts]
+                if len(pts) >= 2:
+                    entities.append(DXFEntity(
+                        entity_type="LWPOLYLINE",
+                        layer=layer,
+                        color=color,
+                        entity_id=handle,
+                        geometry={
+                            "vertices": pts,
+                            "bulges": bulges,
+                            "closed": bool(entity.is_closed),
+                        },
+                        unit_scale=unit_scale,
+                    ))
+                else:
+                    log.warning("POLYLINE %s on layer %s: <2 vertices — skipped",
+                                handle, layer)
+            else:
+                log.warning("Skipping unsupported POLYLINE mode %s "
+                            "(layer=%s, handle=%s)", mode, layer, handle)
 
         elif etype in ("SPLINE", "HELIX"):
             # SPLINE — use ezdxf's make_path + flattening for accurate discretization

@@ -308,6 +308,60 @@ def test_dxf_arc_parsing():
     assert len(segments[0].points) >= 3
 
 
+def test_dxf_legacy_polyline_2d_parsing():
+    """Legacy heavyweight 2D POLYLINE folds into a drivable LWPOLYLINE path."""
+    if not _HAS_EZDXF:
+        return
+
+    import ezdxf
+    doc = ezdxf.new("R2010")
+    doc.header["$INSUNITS"] = 6  # metres
+    msp = doc.modelspace()
+    msp.add_polyline2d([(0, 0), (2, 0), (2, 2), (0, 2)], close=True,
+                       dxfattribs={"layer": "MARK"})
+
+    fpath = _write_dxf(doc)
+    try:
+        entities = parse_dxf(fpath, unit_scale=1.0)
+    finally:
+        os.unlink(fpath)
+
+    assert len(entities) == 1
+    ent = entities[0]
+    assert ent.entity_type == "LWPOLYLINE"
+    assert ent.geometry["closed"] is True
+    assert len(ent.geometry["vertices"]) == 4
+    segments = entities_to_segments(entities)
+    assert len(segments) == 1
+    # Closed square: 4 corners + closing point back to start.
+    assert len(segments[0].points) >= 4
+
+
+def test_dxf_legacy_polyline_3d_parsing():
+    """Legacy 3D POLYLINE (no bulges) parses as a straight drivable chain."""
+    if not _HAS_EZDXF:
+        return
+
+    import ezdxf
+    doc = ezdxf.new("R2010")
+    doc.header["$INSUNITS"] = 6
+    msp = doc.modelspace()
+    msp.add_polyline3d([(0, 0, 0), (1, 0, 0), (1, 1, 0)],
+                       dxfattribs={"layer": "DRAW"})
+
+    fpath = _write_dxf(doc)
+    try:
+        entities = parse_dxf(fpath, unit_scale=1.0)
+    finally:
+        os.unlink(fpath)
+
+    assert len(entities) == 1
+    assert entities[0].entity_type == "LWPOLYLINE"
+    assert len(entities[0].geometry["vertices"]) == 3
+    segments = entities_to_segments(entities)
+    assert len(segments) == 1
+
+
 def test_dxf_corrupt_file_raises_value_error():
     """Verify that corrupt DXF files raise a clean ValueError instead of unhandled exception."""
     with tempfile.NamedTemporaryFile(mode="w", suffix=".dxf", delete=False) as f:
