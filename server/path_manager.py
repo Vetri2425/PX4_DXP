@@ -875,15 +875,17 @@ class PathManager:
                 self.resolve_extension_settings(name)
             )
 
-        # Extension-aware auto-origin: when the rover is anchoring the mission to
-        # its current pose AND drive extensions are active, anchor the first
-        # driven waypoint (the PRE run-up point) at the rover instead of the DXF
-        # drawing origin, so the rover drives forward through the run-up rather
-        # than starting with the run-up point behind it. Builtins never run
-        # through the extension stage, so they always keep drawing-origin.
+        # Auto-origin anchoring: when the rover is anchoring the mission to its
+        # current pose, place the first driven waypoint at the rover position.
+        # With extensions active this is the PRE run-up point; without extensions
+        # it is the first marking waypoint of the first entity. Either way the
+        # rover starts driving forward from where it stands.
+        # drawing_origin (DXF 0,0 → rover) was the prior default but caused RPP
+        # to skip the first segment when the first entity's endpoint happened to
+        # coincide with the DXF origin. Builtins are pre-shifted and exempt.
         anchor = (
             "first_waypoint"
-            if (auto_origin and enable_path_extensions and name not in BUILTIN_PATHS)
+            if (auto_origin and name not in BUILTIN_PATHS)
             else "drawing_origin"
         )
 
