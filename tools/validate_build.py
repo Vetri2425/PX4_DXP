@@ -135,10 +135,14 @@ def check_bugs(b: dict) -> dict:
         piv = np.isin(seg["st"], (3, 5))
         yr = seg["yr9"][piv]
         yr = yr[np.isfinite(yr)]
-        reversals = int(np.sum(np.diff(np.sign(yr[np.abs(yr) > 0.02])) != 0)) if yr.size else 0
+        # Count only SIGNIFICANT sign reversals (>0.10 rad/s) — sub-0.10 wiggle is
+        # settle-noise, not oscillation (calibrated on 06-15 clean vs 06-13 ringing).
+        sig = yr[np.abs(yr) > 0.10]
+        reversals = int(np.sum(np.diff(np.sign(sig)) != 0)) if sig.size else 0
+        big = int(np.sum(np.abs(yr) > 0.20))
         peak = float(np.max(np.abs(yr))) if yr.size else 0.0
-        out["BUG-T1"] = ("PASS" if reversals <= 4 else "WARN" if reversals <= 8 else "FAIL",
-                         f"pivot yaw-rate reversals={reversals}, peak={peak:.2f} rad/s")
+        out["BUG-T1"] = ("PASS" if reversals <= 2 else "WARN" if reversals <= 5 else "FAIL",
+                         f"significant pivot reversals(>0.1)={reversals} (large>0.2:{big}), peak={peak:.2f} rad/s")
     else:
         out["BUG-T1"] = ("N/A", "no segment_debug[9] (pre-fix bag or no corners)")
 

@@ -336,6 +336,7 @@ class PathManager:
             os.remove(sidecar)
         except FileNotFoundError:
             pass
+        self._preview_cache.pop(fpath, None)
 
     def load_extension_config(self, filename: str) -> dict[str, float | bool]:
         """Load saved path extension config for a mission file."""
@@ -948,15 +949,15 @@ class PathManager:
         from path_engine.engine import PathEngine
         from path_engine.validator import PathValidator
 
-        # Peek at the saved order before constructing the engine so we can
-        # suppress the optimizer.  We'll load the full order below after
-        # constructing the entity list; this early peek is only used to decide
-        # the engine flag.  It's cheap (tiny JSON file read).
-        is_dxf_peek = os.path.splitext(fpath)[1].lower() == ".dxf"
-        _saved_order_peek = self.load_entity_order(name) if is_dxf_peek else []
+        # Load all sidecar state before constructing the engine so the
+        # optimizer flag, entity overrides, and saved order all come from a
+        # single consistent read of the filesystem.
+        is_dxf = os.path.splitext(fpath)[1].lower() == ".dxf"
+        overrides = self.load_entity_overrides(name) if is_dxf else {}
+        saved_order: list[str] = self.load_entity_order(name) if is_dxf else []
         # When the user has committed a manual entity order, the optimizer would
         # silently re-arrange that order — disable it.
-        effective_optimize = optimize and not bool(_saved_order_peek)
+        effective_optimize = optimize and not bool(saved_order)
 
         engine = PathEngine(
             mark_spacing=line_spacing,
@@ -973,15 +974,6 @@ class PathManager:
             use_two_opt=use_two_opt,
             max_two_opt_segments=max_two_opt_segments,
         )
-
-        is_dxf = os.path.splitext(fpath)[1].lower() == ".dxf"
-        overrides = self.load_entity_overrides(name) if is_dxf else {}
-
-        # Load saved entity execution order.  An non-empty sidecar means the
-        # user has deliberately arranged entities in the UI and the optimizer
-        # must NOT overrule that decision.  We also need to pre-parse the DXF
-        # so we can reorder the entity list before converting to segments.
-        saved_order: list[str] = self.load_entity_order(name) if is_dxf else []
 
         plan_metadata: dict = {}
 
