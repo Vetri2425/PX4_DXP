@@ -1122,11 +1122,34 @@ async def plan_and_stage(name: str, req: PathPlanRequest):
     Same pipeline as POST /api/path/plan, but ``name`` comes from the path and
     the staged artifact is always written when waypoints exist, so the result
     can be inspected via GET /api/path/staged/{mission_id} and committed with
-    /load-to-controller. ``source`` in the body is ignored.
+    /load-to-controller. ``source`` in the body must match ``name`` (or be
+    omitted) — the path name is authoritative.
     """
     from main import path_mgr
 
     safe = os.path.basename(name)
+
+    # Parity with /api/path/plan: reject preview fields that aren't wired up,
+    # so a caller can't unknowingly stage a broader mission than requested.
+    unsupported = [
+        field for field, val in (
+            ("selected_entities", req.selected_entities),
+            ("overrides", req.overrides),
+            ("order", req.order),
+        ) if val is not None
+    ]
+    if unsupported:
+        raise HTTPException(
+            422, "Preview fields not implemented yet: " + ", ".join(unsupported),
+        )
+
+    # The path name is authoritative; a mismatched body.source is almost always
+    # a client bug, so surface it instead of silently planning a different file.
+    if req.source and os.path.basename(req.source) != safe:
+        raise HTTPException(
+            422, f"source {req.source!r} does not match path name {safe!r}",
+        )
+
     origin = tuple(req.origin) if req.origin else (0.0, 0.0)
     start_position = tuple(req.start_position) if req.start_position else None
     origin_gps = tuple(req.origin_gps) if req.origin_gps else None
@@ -1182,6 +1205,16 @@ async def plan_and_stage(name: str, req: PathPlanRequest):
     if result.get("merged_waypoints"):
         mission_summary = _stage_mission(req, result, alignment_meta, rmse)
 
+    # Parity with /api/path/plan: the extension trio is sidecar-driven now.
+    warnings = list(result.get("warnings") or [])
+    deprecated = {"enable_path_extensions", "pre_extension_m", "aft_extension_m"} & req.model_fields_set
+    if deprecated:
+        warnings.append(
+            "Ignored deprecated field(s) " + ", ".join(sorted(deprecated))
+            + ": path extensions are configured per DXF via "
+            "GET/POST /api/path/{name}/extensions."
+        )
+
     return PathPlanResponse(
         source=result["source"],
         num_waypoints=result["num_waypoints"],
@@ -1194,7 +1227,7 @@ async def plan_and_stage(name: str, req: PathPlanRequest):
         spray_flags=result.get("spray_flags", []),
         alignment_metadata=alignment_meta or None,
         planning_metadata=result.get("planning_metadata"),
-        warnings=result.get("warnings"),
+        warnings=warnings or None,
         mission_summary=mission_summary,
     )
 
@@ -1206,21 +1239,39 @@ async def get_staged_mission(mission_id: str):
     staging_file = os.path.join(STAGING_DIR, f"{safe_id}.json")
     if not os.path.isfile(staging_file):
         raise HTTPException(404, "Staged mission not found or expired.")
+
+    # Enforce the same TTL the loader and pruner use: an expired artifact is
+    # treated as missing (and pruned) rather than handed back as if still valid.
+    try:
+        age = time.time() - os.path.getmtime(staging_file)
+    except OSError:
+        raise HTTPException(404, "Staged mission not found or expired.")
+    if age > STAGING_TTL_S:
+        _prune_staging()
+        raise HTTPException(404, "Staged mission expired.")
+
     try:
         staged = await asyncio.to_thread(_read_json, staging_file)
     except (OSError, ValueError) as exc:
         raise HTTPException(422, f"Could not read staged mission: {exc}")
+    if not isinstance(staged, dict):
+        raise HTTPException(422, "Malformed staged mission (not an object).")
 
     waypoints = staged.get("waypoints", []) or []
     spray_flags = staged.get("spray_flags", []) or []
+    try:
+        wp_out = [[float(p[0]), float(p[1])] for p in waypoints]
+    except (TypeError, ValueError, IndexError, KeyError) as exc:
+        raise HTTPException(422, f"Malformed staged waypoints: {exc}")
+
     return StagedMissionResponse(
         mission_id=staged.get("mission_id", safe_id),
         created_at=staged.get("created_at"),
         anchor=staged.get("anchor"),
-        num_waypoints=len(waypoints),
-        waypoints=[list(p) for p in waypoints],
+        num_waypoints=len(wp_out),
+        waypoints=wp_out,
         spray_flags=[bool(f) for f in spray_flags],
-        segment_runs=_spray_runs(waypoints, spray_flags),
+        segment_runs=_spray_runs(wp_out, spray_flags),
         alignment_metadata=staged.get("alignment_metadata"),
         metadata=staged.get("metadata"),
     )

@@ -7,7 +7,9 @@ main.path_mgr and the route-module MISSION_DIR / STAGING_DIR globals.
 """
 import os
 import asyncio
+import json
 import sys
+import time
 from collections import deque
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -203,6 +205,123 @@ async def test_loaded_path_empty_controller(monkeypatch):
     resp = await mission_route.loaded_path()
     assert resp.loaded is False
     assert resp.num_waypoints == 0
+
+
+# ── /segments reuses sidecars (order + overrides) ──────────────────────────────
+
+def _two_separated_lines_dxf(path):
+    """Two non-connected LINE entities (won't be shape-grouped)."""
+    doc = ezdxf.new("R2010"); doc.header["$INSUNITS"] = 6
+    m = doc.modelspace()
+    m.add_line((0, 0, 0), (1, 0, 0), dxfattribs={"layer": "0"})
+    m.add_line((10, 0, 0), (11, 0, 0), dxfattribs={"layer": "0"})
+    doc.saveas(str(path))
+
+
+async def test_segments_respects_spray_override(tmp_path, monkeypatch):
+    mgr, _ = _setup(tmp_path, monkeypatch, name="two.dxf")
+    _two_separated_lines_dxf(tmp_path / "two.dxf")
+    ids = [e.entity_id for e in mgr.parse_dxf(str(tmp_path / "two.dxf"))]
+    mgr.save_entity_overrides("two.dxf", {ids[0]: False})  # entity 0 → TRANSIT
+
+    resp = await path_route.path_segments("two.dxf")
+
+    # Exactly one MARK survives (entity 1); the overridden entity is not MARK.
+    marks = [s for s in resp.segments if s.type == "MARK"]
+    assert len(marks) == 1
+
+
+async def test_segments_respects_saved_order(tmp_path, monkeypatch):
+    mgr, _ = _setup(tmp_path, monkeypatch, name="two.dxf")
+    _two_separated_lines_dxf(tmp_path / "two.dxf")
+    ids = [e.entity_id for e in mgr.parse_dxf(str(tmp_path / "two.dxf"))]
+    mgr.save_entity_order("two.dxf", [ids[1], ids[0]])  # reversed
+
+    resp = await path_route.path_segments("two.dxf")
+
+    first_mark = next(s for s in resp.segments if s.type == "MARK")
+    assert ids[1] in first_mark.source_entity
+
+
+# ── plan-and-stage guards ──────────────────────────────────────────────────────
+
+async def test_plan_and_stage_rejects_unsupported_fields(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    with pytest.raises(Exception) as ei:
+        await path_route.plan_and_stage(
+            "square.dxf", PathPlanRequest(source="square.dxf", order=["A1"]),
+        )
+    assert getattr(ei.value, "status_code", None) == 422
+
+
+async def test_plan_and_stage_source_mismatch_422(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    with pytest.raises(Exception) as ei:
+        await path_route.plan_and_stage(
+            "square.dxf", PathPlanRequest(source="other.dxf"),
+        )
+    assert getattr(ei.value, "status_code", None) == 422
+
+
+async def test_plan_and_stage_missing_file_404(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    with pytest.raises(Exception) as ei:
+        await path_route.plan_and_stage(
+            "nope.dxf", PathPlanRequest(source="nope.dxf"),
+        )
+    assert getattr(ei.value, "status_code", None) == 404
+
+
+# ── staged: TTL + malformed ────────────────────────────────────────────────────
+
+async def test_get_staged_expired_404(tmp_path, monkeypatch):
+    _, staging = _setup(tmp_path, monkeypatch)
+    plan = await path_route.plan_and_stage(
+        "square.dxf", PathPlanRequest(source="square.dxf", origin_gps=[37.0, -122.0]),
+    )
+    mid = plan.mission_summary.mission_id
+    f = os.path.join(staging, f"{mid}.json")
+    old = time.time() - (path_route.STAGING_TTL_S + 100)
+    os.utime(f, (old, old))
+    with pytest.raises(Exception) as ei:
+        await path_route.get_staged_mission(mid)
+    assert getattr(ei.value, "status_code", None) == 404
+
+
+async def test_get_staged_malformed_waypoints_422(tmp_path, monkeypatch):
+    _, staging = _setup(tmp_path, monkeypatch)
+    bad = os.path.join(staging, "stg_bad.json")
+    with open(bad, "w") as fh:
+        json.dump({"mission_id": "stg_bad", "waypoints": [[1.0]], "spray_flags": []}, fh)
+    with pytest.raises(Exception) as ei:
+        await path_route.get_staged_mission("stg_bad")
+    assert getattr(ei.value, "status_code", None) == 422
+
+
+# ── loaded-path edge cases ─────────────────────────────────────────────────────
+
+async def test_loaded_path_no_spray_flags(monkeypatch):
+    ctrl = OffboardController(None, deque())
+    ctrl.load_path([(0.0, 0.0), (1.0, 0.0)], name="noflags")
+    monkeypatch.setattr(main, "offboard_ctrl", ctrl)
+
+    resp = await mission_route.loaded_path()
+    assert resp.loaded is True
+    assert resp.has_spray_flags is False
+    assert resp.num_mark == 0 and resp.num_transit == 0
+    assert resp.num_waypoints == 2
+
+
+async def test_loaded_path_sample_truncation(monkeypatch):
+    ctrl = OffboardController(None, deque())
+    pts = [(float(i), 0.0) for i in range(100)]
+    ctrl.load_path(pts, name="big", spray_flags=[True] * 100)
+    monkeypatch.setattr(main, "offboard_ctrl", ctrl)
+
+    resp = await mission_route.loaded_path()
+    assert resp.num_waypoints == 100
+    assert resp.sample_truncated is True
+    assert len(resp.sample_coords) == 40   # head 20 + tail 20
 
 
 # ── regression: /plan stays light (no per-segment points by default) ────────────
