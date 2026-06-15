@@ -432,7 +432,8 @@ class RPPControllerNode(Node):
         self._pose: PoseStamped | None = None
         self._pose_recv_time: RclTime | None = None
         self._path_done = False
-        self._path_travel_m: float = 0.0   # cumulative distance traveled along path
+        self._path_travel_m: float = 0.0   # monotonic along-path progress on active run
+        self._path_s: list[float] = []     # cumulative arc length for active run
 
         # P1.4 — segment search hint: start projection from previous best seg
         self._closest_seg_hint: int = 0
@@ -627,6 +628,7 @@ class RPPControllerNode(Node):
                 "flags": list(c_flags),
                 "profile": profile,
                 "length": self._pts_length(c_pts),
+                "cum_s": self._pts_cumulative_lengths(c_pts),
                 "closed": self._is_closed_run(c_pts),
             })
 
@@ -938,6 +940,14 @@ class RPPControllerNode(Node):
             for a, b in zip(pts[:-1], pts[1:])
         )
 
+    @classmethod
+    def _pts_cumulative_lengths(cls, pts: list[tuple[float, float]]) -> list[float]:
+        """Cumulative arc length at each waypoint."""
+        out = [0.0]
+        for a, b in zip(pts[:-1], pts[1:]):
+            out.append(out[-1] + math.hypot(b[0] - a[0], b[1] - a[1]))
+        return out
+
     @staticmethod
     def _split_runs_by_flag(
         pts: list[tuple[float, float]], flags: list[bool]
@@ -1053,6 +1063,7 @@ class RPPControllerNode(Node):
         self._reset_corner_pivot_state()
         self._run_idx = idx
         self._path = run["poses"]
+        self._path_s = list(run.get("cum_s", []))
         self._spray_flags = list(run["flags"])
         self._active_tracking_profile = run["profile"]
         self._segment_idx = 0
@@ -1062,10 +1073,14 @@ class RPPControllerNode(Node):
             else SegmentStateCode.INACTIVE
         )
         self._path_done = False
-        self._path_travel_m = 0.0   # reset travel distance per run
+        self._path_travel_m = 0.0   # reset along-path progress per run
         # P1.4 — reset hint so search starts from beginning of the run
         self._closest_seg_hint = 0
-        self._hint_valid = False
+        # Closed loops have first ≈ last. A full nearest-segment scan at the loop
+        # seam can snap to the final segment and collapse lookahead/progress
+        # before the circle is traced. New runs start at waypoint 0, so seed
+        # closed loops there and let the normal projection window advance.
+        self._hint_valid = bool(run.get("closed"))
         self._last_segment_debug = (
             self._profile_code(run["profile"]),
             float(self._segment_state.value),
@@ -1129,6 +1144,20 @@ class RPPControllerNode(Node):
             frac = float(self.get_parameter("closed_loop_min_travel_frac").value)
             return frac * length
         return min(min_travel, 0.5 * length)
+
+    def _path_progress_at(self, seg_idx: int, t: float) -> float:
+        """Return along-run arc length for a segment projection."""
+        if not self._path_s or len(self._path_s) != len(self._path):
+            return 0.0
+        if len(self._path_s) == 1:
+            return 0.0
+        i = max(0, min(int(seg_idx), len(self._path_s) - 2))
+        alpha = self._clamp(float(t), 0.0, 1.0)
+        return self._path_s[i] + alpha * (self._path_s[i + 1] - self._path_s[i])
+
+    def _update_path_progress(self, seg_idx: int, t: float) -> None:
+        """Advance monotonic along-path progress; never count local spin as travel."""
+        self._path_travel_m = max(self._path_travel_m, self._path_progress_at(seg_idx, t))
 
     def _run_alignment_hold(
         self, pos_n: float, pos_e: float, yaw_ned: float, pose_age_s: float
@@ -1808,6 +1837,7 @@ class RPPControllerNode(Node):
         t, foot_n, foot_e, signed_xtrack, dist_to_end_along = self._project_onto_segment(
             pos_n, pos_e, seg_idx
         )
+        self._update_path_progress(seg_idx, t)
         dist_to_corner = self._dist(pos_n, pos_e, b.x, b.y)
         corner_angle = self._segment_angle_deg(seg_idx)
         spray_active = self._segment_spray_active(seg_idx)
@@ -2243,13 +2273,6 @@ class RPPControllerNode(Node):
                 # as STALE (RPP_UNHEALTHY_CODES) — same response, more info.
                 self._publish_zero(StateCode.JUMP_SKIP, pose_age_ms=pose_age_s * 1000)
                 return
-        # Accumulate path travel distance for min_goal_travel_m gate.
-        # Must happen BEFORE _last_pos update so delta is non-zero.
-        if self._last_pos is not None:
-            dx = pos_n - self._last_pos[0]
-            dy = pos_e - self._last_pos[1]
-            self._path_travel_m += math.hypot(dx, dy)
-
         self._last_pos = (pos_n, pos_e)
 
         # ---- Run-transition alignment (per-entity profile switching) ----
@@ -2257,6 +2280,11 @@ class RPPControllerNode(Node):
         # before tracking it. No-op when already aligned.
         if self._run_alignment_hold(pos_n, pos_e, yaw_ned, pose_age_s):
             return
+
+        smooth_projection = None
+        if self._active_tracking_profile != "segment":
+            smooth_projection = self._project_onto_path(pos_n, pos_e)
+            self._update_path_progress(smooth_projection[0], smooth_projection[1])
 
         # ---- Goal check ----
         # Skip until the rover has traveled min_goal_travel_m along the path.
@@ -2291,9 +2319,13 @@ class RPPControllerNode(Node):
 
         # ---- Step 1: Closest-point projection (segment, not vertex) ----
         # P1.4: _project_onto_path uses _closest_seg_hint internally.
-        seg_idx, t, foot_n, foot_e, signed_xtrack = self._project_onto_path(
-            pos_n, pos_e
-        )
+        if smooth_projection is None:
+            seg_idx, t, foot_n, foot_e, signed_xtrack = self._project_onto_path(
+                pos_n, pos_e
+            )
+            self._update_path_progress(seg_idx, t)
+        else:
+            seg_idx, t, foot_n, foot_e, signed_xtrack = smooth_projection
         spray_active = self._segment_spray_active(seg_idx)
 
         # ---- Step 2: P0.1 + P1.2 — Closed-loop, xtrack-adaptive lookahead ----
