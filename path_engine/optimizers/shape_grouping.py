@@ -171,11 +171,13 @@ def _merge_chain(chain: list[PathSegment], tol: float) -> PathSegment:
     meta = {
         k: v for k, v in head.metadata.items()
         # Tangents/geometry belonged to the first primitive only — dropping them
-        # leaves the composite a plain line run (segment profile in RPP).
+        # lets the composite be re-tagged below as a whole line chain.
         if k not in ("start_tangent", "end_tangent", "geometry_type",
                      "direction", "reversed")
     }
     meta["grouped_from"] = sources
+    meta["geometry_type"] = "LINE_CHAIN"
+    meta["line_like"] = True
     label = sources[0] if sources else head.source_entity
     return PathSegment(
         segment_type=SegmentType.MARK,

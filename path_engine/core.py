@@ -38,6 +38,9 @@ class PathSegment:
         source_entity: Human-readable label (e.g. "LINE_E042", "ARC_circle_1").
         metadata: Optional geometry metadata dict.  Keys injected by parsers:
             "geometry_type"  : "ARC" | "CIRCLE" (set by dxf_parser)
+                               or "LINE_CHAIN" (set by shape grouping)
+            "line_like"      : True for grouped straight line chains
+            "grouped_from"   : source_entity labels merged into a line chain
             "start_tangent"  : (north, east) unit vector at segment start
             "end_tangent"    : (north, east) unit vector at segment end
             "direction"      : "CCW" | "CW" (arc traversal direction)

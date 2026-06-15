@@ -20,6 +20,7 @@ from path_engine.planners.extensions import (
     _unit_vector,
     split_mark_segment_with_extensions,
 )
+from path_engine.optimizers.shape_grouping import group_connected_segments
 from path_engine.engine import PathEngine
 
 
@@ -97,6 +98,81 @@ class TestIsLineLike:
     def test_empty_source_excluded(self):
         seg = PathSegment(SegmentType.MARK, [(0, 0), (1, 0)], source_entity="")
         assert _is_line_like_segment(seg) is False
+
+    def test_line_chain_metadata(self):
+        seg = PathSegment(
+            SegmentType.MARK,
+            [(0, 0), (1, 0)],
+            source_entity="group:anything",
+            metadata={"geometry_type": "LINE_CHAIN", "grouped_from": ["LINE_E001"]},
+        )
+        assert _is_line_like_segment(seg) is True
+
+    def test_grouped_line_sources(self):
+        seg = PathSegment(
+            SegmentType.MARK,
+            [(0, 0), (1, 0)],
+            source_entity="group:LINE_E001+LINE_E002",
+        )
+        assert _is_line_like_segment(seg) is True
+
+    def test_grouped_line_source_with_count_suffix(self):
+        seg = PathSegment(
+            SegmentType.MARK,
+            [(0, 0), (1, 0)],
+            source_entity="group:LINE_E001+1",
+        )
+        assert _is_line_like_segment(seg) is True
+
+    def test_grouped_arc_sources_excluded(self):
+        seg = PathSegment(
+            SegmentType.MARK,
+            [(0, 0), (1, 0)],
+            source_entity="group:ARC_A1+ARC_A2",
+        )
+        assert _is_line_like_segment(seg) is False
+
+
+class TestGroupedLineLikeExtensions:
+    @pytest.mark.parametrize("prefix", ["LINE", "LWPOLYLINE", "POLYLINE"])
+    def test_grouped_line_like_chain_gets_pre_mark_aft(self, prefix):
+        segs = [
+            PathSegment(
+                segment_type=SegmentType.MARK,
+                points=[(0.0, 0.0), (1.0, 0.0)],
+                speed=0.35,
+                source_entity=f"{prefix}_E001",
+            ),
+            PathSegment(
+                segment_type=SegmentType.MARK,
+                points=[(1.0, 0.0), (2.0, 0.0)],
+                speed=0.35,
+                source_entity=f"{prefix}_E002",
+            ),
+        ]
+
+        grouped = group_connected_segments(segs)
+        assert len(grouped) == 1
+        assert grouped[0].source_entity.startswith(f"group:{prefix}_E001+")
+        assert grouped[0].metadata["grouped_from"] == [
+            f"{prefix}_E001",
+            f"{prefix}_E002",
+        ]
+
+        result = split_mark_segment_with_extensions(
+            grouped[0], pre_extension_m=0.5, aft_extension_m=0.5, transit_speed=0.50
+        )
+
+        assert [s.segment_type for s in result] == [
+            SegmentType.TRANSIT,
+            SegmentType.MARK,
+            SegmentType.TRANSIT,
+        ]
+        assert result[0].points == [(-0.5, 0.0), (0.0, 0.0)]
+        assert result[1].points == [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)]
+        assert result[2].points == [(2.0, 0.0), (2.5, 0.0)]
+        assert result[0].metadata["parent_source_entity"] == grouped[0].source_entity
+        assert result[2].metadata["parent_source_entity"] == grouped[0].source_entity
 
 
 # ---------------------------------------------------------------------------

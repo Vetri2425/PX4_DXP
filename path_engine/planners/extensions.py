@@ -7,8 +7,9 @@ geometry; the PRE/AFT extensions are TRANSIT (spray OFF).
 Extension direction priority (evaluated in order):
   1. ``metadata["start_tangent"]`` / ``metadata["end_tangent"]`` — exact analytic
      tangent vectors injected by ``dxf_parser`` for ARC and CIRCLE entities.
-  2. ``_is_line_like_segment()`` — ``LINE_``, ``LWPOLYLINE_``, ``POLYLINE_``
-     prefixes: infer direction from first/last adjacent densified points.
+  2. ``_is_line_like_segment()`` — line-like metadata or ``LINE_``,
+     ``LWPOLYLINE_``, ``POLYLINE_`` source prefixes: infer direction from
+     first/last adjacent densified points.
   3. No match → return unchanged copy (unknown geometry, no metadata).
 
 Tangent formula (Stage 7A audit, verified against ``arc_waypoints()``):
@@ -96,20 +97,62 @@ def _copy_segment(segment: PathSegment) -> PathSegment:
 # Geometry classification
 # ---------------------------------------------------------------------------
 
+_LINE_LIKE_GEOMETRY_TYPES = {
+    "LINE",
+    "LWPOLYLINE",
+    "POLYLINE",
+    "LINE_CHAIN",
+}
+
+_LINE_LIKE_PREFIXES = ("LINE_", "LWPOLYLINE_", "POLYLINE_")
+
+
+def _is_line_like_source(source_entity: str) -> bool:
+    """Return True when a source_entity label names line-like geometry."""
+    src = (source_entity or "").upper()
+    if src.startswith(_LINE_LIKE_PREFIXES):
+        return True
+
+    if not src.startswith("GROUP:"):
+        return False
+
+    # Grouped labels are synthetic. Current grouping writes
+    # ``group:<first_source>+<extra_count>``; older/audit examples may carry
+    # ``group:LINE_A+LINE_B``. Accept only when every explicit geometry token is
+    # line-like. Numeric count suffixes are bookkeeping, not geometry tokens.
+    body = src.split(":", 1)[1]
+    geometry_tokens = [
+        token for token in body.split("+")
+        if token and not token.isdigit()
+    ]
+    return bool(geometry_tokens) and all(
+        token.startswith(_LINE_LIKE_PREFIXES) for token in geometry_tokens
+    )
+
+
 def _is_line_like_segment(segment: PathSegment) -> bool:
     """Return True for geometry profiles whose direction can be inferred from
     adjacent densified points (LINE / LWPOLYLINE / POLYLINE).
 
-    ARC / CIRCLE / SPLINE / ELLIPSE / POINT are excluded; they need analytic
-    tangent metadata (Stage 7) or dedicated curve handling.  An empty or
-    unrecognised source_entity also returns False.
+    ARC / CIRCLE / SPLINE / ELLIPSE / POINT are excluded unless they carry
+    explicit tangent metadata, which is handled before this classifier.  An
+    empty or unrecognised source_entity also returns False.
     """
-    src = (segment.source_entity or "").upper()
-    return (
-        src.startswith("LINE_")
-        or src.startswith("LWPOLYLINE_")
-        or src.startswith("POLYLINE_")
-    )
+    meta = segment.metadata or {}
+    if meta.get("line_like") is True:
+        return True
+
+    geom = str(meta.get("geometry_type", "")).upper()
+    if geom in _LINE_LIKE_GEOMETRY_TYPES:
+        return True
+
+    grouped_from = meta.get("grouped_from")
+    if isinstance(grouped_from, (list, tuple)):
+        sources = [str(src) for src in grouped_from if src]
+        if sources and all(_is_line_like_source(src) for src in sources):
+            return True
+
+    return _is_line_like_source(segment.source_entity)
 
 
 def _normalise(v: tuple[float, float]) -> tuple[float, float] | None:
