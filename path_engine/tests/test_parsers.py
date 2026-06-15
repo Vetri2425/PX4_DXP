@@ -199,6 +199,11 @@ def test_entities_to_segments_line():
     assert segments[1].points == [(5.0, 0.0), (5.0, 3.0)]
     assert segments[1].speed == 0.50  # default transit speed
 
+    # LINE segments carry explicit geometry metadata so line-likeness is decided
+    # by metadata (the production signal), not by the source_entity label.
+    assert segments[0].metadata.get("geometry_type") == "LINE"
+    assert segments[1].metadata.get("geometry_type") == "LINE"
+
 
 def test_entities_to_segments_circle():
     """CIRCLE entity is discretized into waypoints (not placeholder)."""

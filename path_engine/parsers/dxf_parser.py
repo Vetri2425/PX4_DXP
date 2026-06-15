@@ -530,6 +530,9 @@ def entities_to_segments(
                 speed=speed,
                 segment_id=seg_id,
                 source_entity=f"LINE_{ent.entity_id}",
+                # Tag geometry explicitly so line-likeness is decided by metadata
+                # (the production signal) rather than by the source_entity label.
+                metadata={"geometry_type": "LINE"},
             ))
             seg_id += 1
             total_waypoints += len(pts)

@@ -132,6 +132,37 @@ class TestIsLineLike:
         )
         assert _is_line_like_segment(seg) is False
 
+    def test_line_geometry_metadata(self):
+        # dxf_parser now tags every LINE with geometry_type — classification is
+        # by metadata, independent of the label.
+        seg = PathSegment(
+            SegmentType.MARK,
+            [(0, 0), (1, 0)],
+            source_entity="anything_at_all",
+            metadata={"geometry_type": "LINE"},
+        )
+        assert _is_line_like_segment(seg) is True
+
+    def test_curved_metadata_hard_excludes_line_like_label(self):
+        # A curved geometry_type must win even when the label looks line-like —
+        # this is the guard that keeps the smooth/segment profile split intact.
+        seg = PathSegment(
+            SegmentType.MARK,
+            [(0, 0), (1, 0)],
+            source_entity="LINE_DECOY",
+            metadata={"geometry_type": "ARC"},
+        )
+        assert _is_line_like_segment(seg) is False
+
+    def test_bulge_polyline_metadata_excluded(self):
+        seg = PathSegment(
+            SegmentType.MARK,
+            [(0, 0), (1, 0)],
+            source_entity="LWPOLYLINE_7",
+            metadata={"geometry_type": "LWPOLYLINE_BULGE"},
+        )
+        assert _is_line_like_segment(seg) is False
+
 
 class TestGroupedLineLikeExtensions:
     @pytest.mark.parametrize("prefix", ["LINE", "LWPOLYLINE", "POLYLINE"])

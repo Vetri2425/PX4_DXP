@@ -35,7 +35,14 @@ from __future__ import annotations
 import logging
 import math
 
-from ..core import DXFEntity, PathSegment, SegmentType, dxf_arc_tangent
+from ..core import (
+    CURVED_GEOMETRY_TYPES,
+    LINE_LIKE_GEOMETRY_TYPES,
+    DXFEntity,
+    PathSegment,
+    SegmentType,
+    dxf_arc_tangent,
+)
 
 log = logging.getLogger("path_engine.extensions")
 
@@ -97,13 +104,6 @@ def _copy_segment(segment: PathSegment) -> PathSegment:
 # Geometry classification
 # ---------------------------------------------------------------------------
 
-_LINE_LIKE_GEOMETRY_TYPES = {
-    "LINE",
-    "LWPOLYLINE",
-    "POLYLINE",
-    "LINE_CHAIN",
-}
-
 _LINE_LIKE_PREFIXES = ("LINE_", "LWPOLYLINE_", "POLYLINE_")
 
 
@@ -132,26 +132,41 @@ def _is_line_like_source(source_entity: str) -> bool:
 
 def _is_line_like_segment(segment: PathSegment) -> bool:
     """Return True for geometry profiles whose direction can be inferred from
-    adjacent densified points (LINE / LWPOLYLINE / POLYLINE).
+    adjacent densified points (LINE / LWPOLYLINE / POLYLINE / LINE_CHAIN).
 
-    ARC / CIRCLE / SPLINE / ELLIPSE / POINT are excluded unless they carry
-    explicit tangent metadata, which is handled before this classifier.  An
-    empty or unrecognised source_entity also returns False.
+    Classification is by geometry metadata, not by entity label: every primitive
+    is tagged ``geometry_type`` by ``dxf_parser`` and every composite by
+    ``shape_grouping``.  Curved geometry (ARC / CIRCLE / SPLINE / ELLIPSE /
+    bulge polyline) is excluded here — it uses analytic tangent metadata handled
+    before this classifier.  The source_entity string is consulted only as a
+    legacy fallback for segments built without geometry metadata.
     """
     meta = segment.metadata or {}
+
+    # Primary signal: explicit geometry metadata (the production path).
     if meta.get("line_like") is True:
         return True
 
     geom = str(meta.get("geometry_type", "")).upper()
-    if geom in _LINE_LIKE_GEOMETRY_TYPES:
+    if geom in CURVED_GEOMETRY_TYPES:
+        # Hard exclude: a curve never qualifies as line-like, even if some
+        # stray label looks line-like. This is what keeps the smooth/segment
+        # profile split intact.
+        return False
+    if geom in LINE_LIKE_GEOMETRY_TYPES:
         return True
 
+    # Composite lacking an explicit line_like flag: line-like iff every merged
+    # source is line-like.
     grouped_from = meta.get("grouped_from")
     if isinstance(grouped_from, (list, tuple)):
         sources = [str(src) for src in grouped_from if src]
         if sources and all(_is_line_like_source(src) for src in sources):
             return True
 
+    # Legacy fallback: segments constructed without geometry_type metadata
+    # (hand-built PathSegments, older callers). Dead once every producer tags
+    # geometry, but keeps untagged inputs working.
     return _is_line_like_source(segment.source_entity)
 
 

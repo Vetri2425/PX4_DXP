@@ -27,9 +27,10 @@ from __future__ import annotations
 
 import math
 
-from ..core import PathSegment, SegmentType
+from ..core import CURVED_GEOMETRY_TYPES, PathSegment, SegmentType
 
-_CURVED_GEOMETRY = {"ARC", "CIRCLE", "ELLIPSE", "SPLINE", "LWPOLYLINE_BULGE"}
+# Shared taxonomy (core.py) — a curve is never absorbed into a line chain.
+_CURVED_GEOMETRY = CURVED_GEOMETRY_TYPES
 _CURVED_PREFIXES = ("ARC_", "CIRCLE_", "ELLIPSE_", "SPLINE_")
 
 

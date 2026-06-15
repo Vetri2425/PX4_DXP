@@ -15,7 +15,13 @@ import math
 import os
 import time
 
-from .core import PlannedPath, PathSegment, SegmentType, DXFEntity
+from .core import (
+    CURVED_GEOMETRY_TYPES,
+    PlannedPath,
+    PathSegment,
+    SegmentType,
+    DXFEntity,
+)
 from .parsers import load_mission_file, load_mission_segments, parse_dxf, entities_to_segments
 from .parsers.csv_parser import read_ned_csv_enhanced
 from .parsers.waypoints_parser import read_qgc_waypoints_as_segment
@@ -29,13 +35,11 @@ from .ned import latlon_to_ned, dxf_to_ned_affine, apply_affine_transform
 
 log = logging.getLogger(__name__)
 
-_SMOOTH_SKIP_GEOMETRY_TYPES = {
-    "ARC",
-    "CIRCLE",
-    "ELLIPSE",
-    "SPLINE",
-    "LWPOLYLINE_BULGE",
-}
+# Curved geometry is already smoothly discretised by the parser — re-running the
+# corner rounder on it would distort the curve. Sourced from the shared taxonomy
+# so "what counts as a curve" stays defined in exactly one place (core.py).
+# LINE_CHAIN is deliberately absent: a grouped polygon still rounds its corners.
+_SMOOTH_SKIP_GEOMETRY_TYPES = CURVED_GEOMETRY_TYPES
 
 
 class PathEngine:

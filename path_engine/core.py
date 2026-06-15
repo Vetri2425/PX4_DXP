@@ -26,6 +26,37 @@ class SegmentType(IntEnum):
     TRANSIT = 1   # Spray OFF — fast travel between marks
 
 
+# ---------------------------------------------------------------------------
+# Geometry taxonomy — single source of truth for "straight vs curved".
+#
+# Stored on ``PathSegment.metadata["geometry_type"]`` by ``dxf_parser`` (one tag
+# per primitive) and by ``shape_grouping`` (the composite ``"LINE_CHAIN"``).
+# Consumed by:
+#   - extensions._is_line_like_segment  → line-like geometry gets finite-
+#     difference PRE/AFT run-up; curved geometry uses analytic tangents instead.
+#   - shape_grouping._is_chainable      → curved MARK is never absorbed into a
+#     line chain (keeps its smooth profile + closed-loop guard downstream).
+#   - engine corner-smoothing           → curved geometry skips re-smoothing.
+#
+# Classification is by geometry, never by entity label.  Defining the sets here
+# keeps "what counts as a curve" in exactly one place across all four callers.
+# ---------------------------------------------------------------------------
+LINE_LIKE_GEOMETRY_TYPES = frozenset({
+    "LINE",
+    "LWPOLYLINE",      # bulge-free straight polyline
+    "POLYLINE",
+    "LINE_CHAIN",      # composite emitted by shape grouping
+})
+
+CURVED_GEOMETRY_TYPES = frozenset({
+    "ARC",
+    "CIRCLE",
+    "ELLIPSE",
+    "SPLINE",
+    "LWPOLYLINE_BULGE",  # polyline carrying arc bulges
+})
+
+
 @dataclass
 class PathSegment:
     """One continuous geometry segment with spray state and speed.
@@ -37,8 +68,11 @@ class PathSegment:
         segment_id: Integer ID matching DXF entity or CSV row group.
         source_entity: Human-readable label (e.g. "LINE_E042", "ARC_circle_1").
         metadata: Optional geometry metadata dict.  Keys injected by parsers:
-            "geometry_type"  : "ARC" | "CIRCLE" (set by dxf_parser)
-                               or "LINE_CHAIN" (set by shape grouping)
+            "geometry_type"  : "LINE" | "ARC" | "CIRCLE" | "LWPOLYLINE" |
+                               "LWPOLYLINE_BULGE" | "SPLINE" | "ELLIPSE"
+                               (set by dxf_parser, one per primitive) or
+                               "LINE_CHAIN" (set by shape grouping).  See the
+                               LINE_LIKE_/CURVED_GEOMETRY_TYPES taxonomy below.
             "line_like"      : True for grouped straight line chains
             "grouped_from"   : source_entity labels merged into a line chain
             "start_tangent"  : (north, east) unit vector at segment start
