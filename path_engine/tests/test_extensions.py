@@ -15,6 +15,7 @@ import pytest
 from path_engine.core import PathSegment, SegmentType
 from path_engine.planners.extensions import (
     _distance,
+    _is_closed_run,
     _is_line_like_segment,
     _offset_point,
     _unit_vector,
@@ -204,6 +205,71 @@ class TestGroupedLineLikeExtensions:
         assert result[2].points == [(2.0, 0.0), (2.5, 0.0)]
         assert result[0].metadata["parent_source_entity"] == grouped[0].source_entity
         assert result[2].metadata["parent_source_entity"] == grouped[0].source_entity
+
+
+class TestClosedRunExtensions:
+    """Closed loops (square / triangle / closed polyline) get no linear
+    PRE/AFT run-up — endpoints coincide, so an extension would stub into the
+    shape. Open runs are unaffected."""
+
+    def _square_chain(self):
+        # Four connected lines forming a closed 2x2 square loop.
+        edges = [
+            ((0.0, 0.0), (2.0, 0.0)),
+            ((2.0, 0.0), (2.0, 2.0)),
+            ((2.0, 2.0), (0.0, 2.0)),
+            ((0.0, 2.0), (0.0, 0.0)),
+        ]
+        segs = [
+            PathSegment(
+                segment_type=SegmentType.MARK,
+                points=[a, b],
+                speed=0.35,
+                source_entity=f"LINE_E{i:03d}",
+            )
+            for i, (a, b) in enumerate(edges)
+        ]
+        grouped = group_connected_segments(segs)
+        assert len(grouped) == 1
+        return grouped[0]
+
+    def test_is_closed_run_detects_loop(self):
+        chain = self._square_chain()
+        assert _is_closed_run(chain.points) is True
+
+    def test_is_closed_run_rejects_open_line(self):
+        assert _is_closed_run([(0.0, 0.0), (2.0, 0.0)]) is False
+
+    def test_is_closed_run_rejects_tiny_loop(self):
+        # Endpoints coincide but perimeter < 1.0 m → not a real shape.
+        tiny = [(0.0, 0.0), (0.1, 0.0), (0.1, 0.1), (0.0, 0.0)]
+        assert _is_closed_run(tiny) is False
+
+    def test_closed_square_gets_no_extensions(self):
+        chain = self._square_chain()
+        result = split_mark_segment_with_extensions(
+            chain, pre_extension_m=0.5, aft_extension_m=0.5, transit_speed=0.50
+        )
+        # Suppressed: a single MARK, no TRANSIT lead-in/out.
+        assert len(result) == 1
+        assert result[0].segment_type == SegmentType.MARK
+        assert result[0].points == chain.points
+
+    def test_open_chain_still_gets_extensions(self):
+        # Control: an OPEN line-like chain still receives the full triplet.
+        segs = [
+            PathSegment(SegmentType.MARK, [(0.0, 0.0), (1.0, 0.0)],
+                        speed=0.35, source_entity="LINE_E001"),
+            PathSegment(SegmentType.MARK, [(1.0, 0.0), (2.0, 0.0)],
+                        speed=0.35, source_entity="LINE_E002"),
+        ]
+        grouped = group_connected_segments(segs)
+        result = split_mark_segment_with_extensions(
+            grouped[0], pre_extension_m=0.5, aft_extension_m=0.5, transit_speed=0.50
+        )
+        assert [s.segment_type for s in result] == [
+            SegmentType.TRANSIT, SegmentType.MARK, SegmentType.TRANSIT,
+        ]
 
 
 # ---------------------------------------------------------------------------

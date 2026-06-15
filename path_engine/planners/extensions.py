@@ -56,6 +56,32 @@ def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.hypot(b[0] - a[0], b[1] - a[1])
 
 
+# Closed-run detection — thresholds match the RPP `_is_closed_run` guard
+# (commit 5677d48) so planner and controller agree on what a closed loop is.
+_CLOSED_RUN_GAP_TOL_M = 0.15   # endpoints within this distance ⇒ coincident
+_CLOSED_RUN_MIN_LEN_M = 1.0    # ignore tiny loops (degenerate stubs)
+
+
+def _path_length(points: list[tuple[float, float]]) -> float:
+    """Total polyline arc length in metres."""
+    return sum(_distance(points[i - 1], points[i]) for i in range(1, len(points)))
+
+
+def _is_closed_run(points: list[tuple[float, float]]) -> bool:
+    """True when *points* form a closed loop (square / triangle / closed
+    polyline): first and last points coincide within tolerance and the loop is
+    long enough to be a real shape rather than a degenerate stub.
+
+    A closed loop has no free end to run off, so a linear PRE/AFT extension
+    would stub into or across the shape — extensions are suppressed for these.
+    """
+    if len(points) < 4:
+        return False
+    if _distance(points[0], points[-1]) > _CLOSED_RUN_GAP_TOL_M:
+        return False
+    return _path_length(points) >= _CLOSED_RUN_MIN_LEN_M
+
+
 def _unit_vector(
     a: tuple[float, float],
     b: tuple[float, float],
@@ -259,6 +285,8 @@ def split_mark_segment_with_extensions(
       - segment is not MARK
       - segment has fewer than 2 points
       - no metadata tangents AND not line-like
+      - line-like segment is a closed loop (square / triangle / closed
+        polyline) — a linear run-up/run-out would stub into the shape
       - direction vectors are degenerate (coincident points or zero-length)
 
     Original ``segment.points`` is **never mutated**.
@@ -304,6 +332,20 @@ def split_mark_segment_with_extensions(
             return [_copy_segment(segment)]
 
     elif _is_line_like_segment(segment):
+        # Closed loop (square / triangle / closed polyline): endpoints coincide,
+        # so there is no free end to run off. A linear PRE/AFT would stub into or
+        # across the shape — suppress extensions and mark the run unchanged. The
+        # closed-loop completion guard in RPP already drives the rover through the
+        # start point at speed, so no separate run-up is needed. Curves keep their
+        # analytic-tangent extensions (handled in the branch above).
+        if _is_closed_run(segment.points):
+            log.debug(
+                "Path extensions suppressed for closed run %s (id=%s): "
+                "endpoints coincide — no linear run-up/run-out added.",
+                segment.source_entity, segment.segment_id,
+            )
+            return [_copy_segment(segment)]
+
         # Priority 2: infer from adjacent densified points (LINE / LWPOLYLINE)
         start_dir = _unit_vector(segment.points[0], segment.points[1])
         end_dir   = _unit_vector(segment.points[-2], segment.points[-1])
