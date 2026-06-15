@@ -18,10 +18,24 @@ from mission_loading import (
     pose_origin_or_error,
     spray_flags_for_path,
 )
-from models import MissionLoadRequest, MissionStartRequest, MissionStatus
+from models import (
+    LoadedPathResponse,
+    MissionLoadRequest,
+    MissionStartRequest,
+    MissionStatus,
+)
 
 router = APIRouter(prefix="/mission", tags=["mission"],
                    dependencies=[Depends(require_token)])
+
+
+@router.get("/loaded-path", response_model=LoadedPathResponse)
+async def loaded_path():
+    """Stage 10 — confirm the coordinates currently resident in the controller."""
+    from main import offboard_ctrl
+    if offboard_ctrl is None:
+        return LoadedPathResponse(loaded=False, state="idle")
+    return LoadedPathResponse(**offboard_ctrl.loaded_path_summary())
 
 
 @router.post("/load")

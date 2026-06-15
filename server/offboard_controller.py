@@ -76,6 +76,37 @@ class OffboardController:
     def loaded_path_name(self) -> Optional[str]:
         return self._path_name
 
+    def loaded_path_summary(self, sample: int = 20) -> dict:
+        """Read-only snapshot of the path currently resident in the controller.
+
+        Used by GET /api/mission/loaded-path to confirm what coordinates were
+        actually committed (stage 10). Returns counts + a head/tail coordinate
+        sample so the operator can verify without shipping the full array.
+        """
+        pts = self._loaded_pts or []
+        flags = self._loaded_spray_flags
+        num_mark = sum(1 for f in flags) if flags else 0
+        if flags is not None:
+            num_mark = sum(1 for f in flags if f)
+        sample = max(0, int(sample))
+        if sample and len(pts) > 2 * sample:
+            sample_coords = [list(p) for p in pts[:sample]] + [list(p) for p in pts[-sample:]]
+            sample_truncated = True
+        else:
+            sample_coords = [list(p) for p in pts]
+            sample_truncated = False
+        return {
+            "loaded": bool(pts),
+            "name": self._path_name,
+            "state": self._state.value,
+            "num_waypoints": len(pts),
+            "num_mark": num_mark,
+            "num_transit": (len(flags) - num_mark) if flags else 0,
+            "has_spray_flags": flags is not None,
+            "sample_coords": sample_coords,
+            "sample_truncated": sample_truncated,
+        }
+
     # ── Path management ───────────────────────────────────────────────────────
 
     def load_path(

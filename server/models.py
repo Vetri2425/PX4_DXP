@@ -445,6 +445,105 @@ class MissionSummary(BaseModel):
     rmse_m: float
 
 
+# ── Staged workflow: stage-specific endpoints ─────────────────────────────────
+# These split the monolithic /api/path/plan into composable stages. /plan stays
+# unchanged; each stage below is additive.
+
+class AlignRequest(BaseModel):
+    """Stage 6/7 — alignment only. No optimize / extend / stage / load."""
+
+    ref_points: Optional[list[RefPoint]] = None       # DXF→NED affine fit
+    origin_gps: Optional[list[float]] = None          # [lat, lon]
+    rotation_deg: float = 0.0
+    origin: Optional[list[float]] = None              # [north, east] NED offset
+    auto_origin: bool = False
+    sample_points: int = Field(20, ge=0, le=2000)     # transformed coords to return
+
+
+class RefPointResidual(BaseModel):
+    """Per-reference-point alignment residual (least-squares mode only)."""
+
+    dxf_x: float
+    dxf_y: float
+    lat: float
+    lon: float
+    residual_m: float
+
+
+class AlignResponse(BaseModel):
+    """Response for POST /api/path/{name}/align."""
+
+    source: str
+    method: Optional[str] = None          # least_squares | single_point_heading | gps_origin
+    rmse_m: float = 0.0
+    scale: float = 1.0
+    rotation_deg: float = 0.0
+    offset_n: float = 0.0
+    offset_e: float = 0.0
+    origin_gps: Optional[list[float]] = None
+    num_waypoints: int = 0
+    sample_coords: list[list[float]] = Field(default_factory=list)   # [[n, e], ...]
+    residuals: list[RefPointResidual] = Field(default_factory=list)
+    warnings: Optional[list[str]] = None
+
+
+class SegmentInfo(BaseModel):
+    """One verification segment (stage 8)."""
+
+    index: int
+    sequence: int
+    type: str                       # MARK | TRANSIT
+    segment_role: Optional[str] = None   # mark | pre_transit | aft_transit | transit
+    source_entity: str = ""
+    is_extension: bool = False
+    spray_on: bool = False
+    speed: float = 0.0
+    length_m: float = 0.0
+    points: list[list[float]] = Field(default_factory=list)   # [[n, e], ...]
+
+
+class PathSegmentsResponse(BaseModel):
+    """Response for GET /api/path/{name}/segments."""
+
+    name: str
+    num_segments: int
+    num_waypoints: int
+    mark_length_m: float
+    transit_length_m: float
+    total_length_m: float
+    extension_config: Optional["PathExtensionConfig"] = None
+    segments: list[SegmentInfo] = Field(default_factory=list)
+    warnings: Optional[list[str]] = None
+
+
+class StagedMissionResponse(BaseModel):
+    """Response for GET /api/path/staged/{mission_id}. Exact staged content."""
+
+    mission_id: str
+    created_at: Optional[float] = None
+    anchor: Optional[dict] = None
+    num_waypoints: int = 0
+    waypoints: list[list[float]] = Field(default_factory=list)
+    spray_flags: list[bool] = Field(default_factory=list)
+    segment_runs: list[dict] = Field(default_factory=list)  # derived spray on/off runs
+    alignment_metadata: Optional[dict] = None
+    metadata: Optional[dict] = None
+
+
+class LoadedPathResponse(BaseModel):
+    """Response for GET /api/mission/loaded-path (stage 10)."""
+
+    loaded: bool = False
+    name: Optional[str] = None
+    state: str = "idle"
+    num_waypoints: int = 0
+    num_mark: int = 0
+    num_transit: int = 0
+    has_spray_flags: bool = False
+    sample_coords: list[list[float]] = Field(default_factory=list)
+    sample_truncated: bool = False
+
+
 class LoadMissionRequest(BaseModel):
     """Payload for committing a staged mission to the controller."""
 

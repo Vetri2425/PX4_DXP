@@ -10,6 +10,10 @@ POST   /api/path/upload        — upload .waypoints, .csv, or .dxf
 POST   /api/path/publish       — publish named path to /path topic
 POST   /api/path/parse-dxf     — parse DXF file, return entity list
 POST   /api/path/plan          — run full planning pipeline, return PlannedPath
+POST   /api/path/{name}/align          — alignment only (coords + residuals)
+GET    /api/path/{name}/segments       — verification segments (MARK/TRANSIT/ext)
+POST   /api/path/{name}/plan-and-stage — heavy final plan + stage
+GET    /api/path/staged/{mission_id}   — read a staged mission artifact
 DELETE /api/path/{filename}    — delete uploaded file
 """
 from __future__ import annotations
@@ -36,6 +40,8 @@ from config import (
     STAGING_TTL_S,
 )
 from models import (
+    AlignRequest,
+    AlignResponse,
     DXFEntitiesResponse,
     DXFEntityOverridesRequest,
     DXFEntityOverridesResponse,
@@ -47,6 +53,7 @@ from models import (
     EntityOrderUpdateResponse,
     EntityTransitPreview,
     LoadMissionRequest,
+    LoadedPathResponse,
     MissionSummary,
     PathExtensionConfig,
     PathExtensionConfigResponse,
@@ -55,6 +62,10 @@ from models import (
     PathPreviewBounds,
     PathPreviewResponse,
     PathPublishRequest,
+    PathSegmentsResponse,
+    RefPointResidual,
+    SegmentInfo,
+    StagedMissionResponse,
 )
 from path_manager import UploadValidationError
 from path_engine.entity_order import apply_entity_order as _apply_entity_order_shared
@@ -927,6 +938,292 @@ async def load_mission_to_controller(req: LoadMissionRequest):
         "num_waypoints": len(waypoints),
         "anchor_loaded": anchor is not None,
     }
+
+
+# ── Staged workflow: stage-specific endpoints ──────────────────────────────────
+# These split the monolithic POST /api/path/plan into composable stages.
+# /plan stays untouched; everything below is additive.
+
+def _require_dxf(name: str) -> str:
+    """Resolve a DXF in MISSION_DIR or raise 404/415. Returns the safe basename."""
+    safe = os.path.basename(name)
+    fpath = os.path.join(MISSION_DIR, safe)
+    if not os.path.isfile(fpath):
+        raise HTTPException(404, f"Path not found: {name!r}")
+    if os.path.splitext(fpath)[1].lower() != ".dxf":
+        raise HTTPException(415, "This stage is only available for DXF files")
+    return safe
+
+
+def _read_json(path: str) -> dict:
+    with open(path) as f:
+        return json.load(f)
+
+
+def _spray_runs(waypoints: list, spray_flags: list) -> list[dict]:
+    """Derive contiguous spray-ON/OFF runs from a parallel flag list."""
+    if not spray_flags or len(spray_flags) != len(waypoints):
+        return []
+    runs: list[dict] = []
+    start = 0
+    for i in range(1, len(spray_flags) + 1):
+        if i == len(spray_flags) or bool(spray_flags[i]) != bool(spray_flags[start]):
+            runs.append({
+                "type": "MARK" if spray_flags[start] else "TRANSIT",
+                "spray_on": bool(spray_flags[start]),
+                "start_index": start,
+                "end_index": i - 1,
+                "num_points": i - start,
+            })
+            start = i
+    return runs
+
+
+@path_router.post("/{name}/align", response_model=AlignResponse)
+async def align_path(name: str, req: AlignRequest):
+    """Stage 6/7 — alignment ONLY: transformed coords + per-refpoint residuals.
+
+    Reuses path_manager.plan_path's alignment path but forces optimize/extend/
+    smoothing OFF and never stages or loads the controller.
+    """
+    from main import path_mgr
+
+    safe = _require_dxf(name)
+    if not req.ref_points and not req.origin_gps:
+        raise HTTPException(422, "Provide ref_points or origin_gps to align.")
+
+    origin = tuple(req.origin) if req.origin else (0.0, 0.0)
+    ref_points_dxf = [(pt.dxf_y, pt.dxf_x) for pt in req.ref_points] if req.ref_points else None
+    ref_points_gps = [(pt.lat, pt.lon) for pt in req.ref_points] if req.ref_points else None
+    origin_gps = tuple(req.origin_gps) if req.origin_gps else None
+
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                path_mgr.plan_path,
+                safe,
+                summary_only=False,
+                optimize=False,             # alignment only — no reordering
+                enable_path_extensions=False,
+                compensate_spray=False,
+                corner_smooth_radius_m=0.0,
+                origin=origin,
+                auto_origin=req.auto_origin,
+                origin_gps=origin_gps,
+                rotation_deg=req.rotation_deg,
+                ref_points_dxf=ref_points_dxf,
+                ref_points_gps=ref_points_gps,
+            ),
+            timeout=15.0,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc))
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "Alignment timed out (15s limit)")
+    except Exception as exc:
+        raise HTTPException(422, f"Alignment error: {exc}")
+
+    meta = result.get("alignment_metadata") or {}
+    if not meta.get("method"):
+        raise HTTPException(422, "No alignment produced — check ref_points / origin_gps.")
+
+    waypoints = result.get("merged_waypoints", [])
+    sample = [list(p) for p in waypoints[:req.sample_points]] if req.sample_points else []
+
+    residuals_out: list[RefPointResidual] = []
+    res_list = meta.get("residuals") or []
+    if req.ref_points and len(res_list) == len(req.ref_points):
+        residuals_out = [
+            RefPointResidual(
+                dxf_x=pt.dxf_x, dxf_y=pt.dxf_y, lat=pt.lat, lon=pt.lon,
+                residual_m=round(float(r), 4),
+            )
+            for pt, r in zip(req.ref_points, res_list)
+        ]
+
+    return AlignResponse(
+        source=result["source"],
+        method=meta.get("method"),
+        rmse_m=round(float(meta.get("rmse", 0.0)), 4),
+        scale=float(meta.get("scale", 1.0)),
+        rotation_deg=float(meta.get("rotation_deg", 0.0)),
+        offset_n=float(meta.get("offset_n", 0.0)),
+        offset_e=float(meta.get("offset_e", 0.0)),
+        origin_gps=list(meta["origin_gps"]) if meta.get("origin_gps") else None,
+        num_waypoints=result["num_waypoints"],
+        sample_coords=sample,
+        residuals=residuals_out,
+        warnings=result.get("warnings") or None,
+    )
+
+
+@path_router.get("/{name}/segments", response_model=PathSegmentsResponse)
+async def path_segments(name: str):
+    """Stage 8 — verification segments: MARK/TRANSIT, PRE/AFT roles, spray flags.
+
+    Reuses saved entity order / overrides / extension config. No staging, no
+    controller load, no GPS alignment (local NED).
+    """
+    from main import path_mgr
+
+    safe = _require_dxf(name)
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                path_mgr.plan_path,
+                safe,
+                summary_only=False,
+                include_segment_points=True,
+            ),
+            timeout=15.0,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc))
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "Segment build timed out (15s limit)")
+    except Exception as exc:
+        raise HTTPException(422, f"Segment build error: {exc}")
+
+    seg_models = [
+        SegmentInfo(
+            index=s["runtime_segment_index"],
+            sequence=s["runtime_sequence"],
+            type=s["type"],
+            segment_role=s.get("segment_role"),
+            source_entity=s.get("source", ""),
+            is_extension=s.get("is_extension", False),
+            spray_on=s.get("spray_on", s["type"] == "MARK"),
+            speed=s.get("speed", 0.0),
+            length_m=s.get("length_m", 0.0),
+            points=s.get("points", []),
+        )
+        for s in result["segments"]
+    ]
+
+    ext_cfg = await asyncio.to_thread(path_mgr.load_extension_config, safe)
+
+    return PathSegmentsResponse(
+        name=safe,
+        num_segments=result["num_segments"],
+        num_waypoints=result["num_waypoints"],
+        mark_length_m=result["mark_length_m"],
+        transit_length_m=result["transit_length_m"],
+        total_length_m=result["total_length_m"],
+        extension_config=PathExtensionConfig(**ext_cfg),
+        segments=seg_models,
+        warnings=result.get("warnings") or None,
+    )
+
+
+@path_router.post("/{name}/plan-and-stage", response_model=PathPlanResponse)
+async def plan_and_stage(name: str, req: PathPlanRequest):
+    """Stage 9 — heavy final planning + staging only.
+
+    Same pipeline as POST /api/path/plan, but ``name`` comes from the path and
+    the staged artifact is always written when waypoints exist, so the result
+    can be inspected via GET /api/path/staged/{mission_id} and committed with
+    /load-to-controller. ``source`` in the body is ignored.
+    """
+    from main import path_mgr
+
+    safe = os.path.basename(name)
+    origin = tuple(req.origin) if req.origin else (0.0, 0.0)
+    start_position = tuple(req.start_position) if req.start_position else None
+    origin_gps = tuple(req.origin_gps) if req.origin_gps else None
+    ref_points_dxf = [(pt.dxf_y, pt.dxf_x) for pt in req.ref_points] if req.ref_points is not None else None
+    ref_points_gps = [(pt.lat, pt.lon) for pt in req.ref_points] if req.ref_points is not None else None
+
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                path_mgr.plan_path,
+                safe,
+                summary_only=False,
+                line_spacing=req.line_spacing,
+                transit_spacing=req.transit_spacing,
+                marking_speed=req.marking_speed,
+                transit_speed=req.transit_speed,
+                layer_mapping=req.layer_mapping,
+                optimize=req.optimize,
+                compensate_spray=req.compensate_spray,
+                corner_smooth_radius_m=req.corner_smooth_radius_m,
+                corner_smooth_arc_pts=req.corner_smooth_arc_pts,
+                use_two_opt=req.use_two_opt,
+                max_two_opt_segments=req.max_two_opt_segments,
+                max_waypoints=req.max_waypoints,
+                max_segments=req.max_segments,
+                origin=origin,
+                start_position=start_position,
+                origin_gps=origin_gps,
+                rotation_deg=req.rotation_deg,
+                ref_points_dxf=ref_points_dxf,
+                ref_points_gps=ref_points_gps,
+                close_loop=req.close_loop,
+            ),
+            timeout=15.0,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc))
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "Planning timed out (15s limit)")
+    except Exception as exc:
+        raise HTTPException(422, f"Planning error: {exc}")
+
+    alignment_meta = result.get("alignment_metadata") or {}
+    rmse = alignment_meta.get("rmse", 0.0)
+    if rmse > RMSE_MAX:
+        raise HTTPException(
+            422,
+            f"Alignment error too high (rmse={rmse:.3f} m, max {RMSE_MAX:.3f} m). "
+            "Re-verify the reference points.",
+        )
+
+    mission_summary = None
+    if result.get("merged_waypoints"):
+        mission_summary = _stage_mission(req, result, alignment_meta, rmse)
+
+    return PathPlanResponse(
+        source=result["source"],
+        num_waypoints=result["num_waypoints"],
+        num_segments=result["num_segments"],
+        mark_length_m=result["mark_length_m"],
+        transit_length_m=result["transit_length_m"],
+        total_length_m=result["total_length_m"],
+        segments=result["segments"],
+        merged_waypoints=result.get("merged_waypoints", []),
+        spray_flags=result.get("spray_flags", []),
+        alignment_metadata=alignment_meta or None,
+        planning_metadata=result.get("planning_metadata"),
+        warnings=result.get("warnings"),
+        mission_summary=mission_summary,
+    )
+
+
+@path_router.get("/staged/{mission_id}", response_model=StagedMissionResponse)
+async def get_staged_mission(mission_id: str):
+    """Stage 9 verify — return the exact staged mission artifact."""
+    safe_id = os.path.basename(mission_id)
+    staging_file = os.path.join(STAGING_DIR, f"{safe_id}.json")
+    if not os.path.isfile(staging_file):
+        raise HTTPException(404, "Staged mission not found or expired.")
+    try:
+        staged = await asyncio.to_thread(_read_json, staging_file)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(422, f"Could not read staged mission: {exc}")
+
+    waypoints = staged.get("waypoints", []) or []
+    spray_flags = staged.get("spray_flags", []) or []
+    return StagedMissionResponse(
+        mission_id=staged.get("mission_id", safe_id),
+        created_at=staged.get("created_at"),
+        anchor=staged.get("anchor"),
+        num_waypoints=len(waypoints),
+        waypoints=[list(p) for p in waypoints],
+        spray_flags=[bool(f) for f in spray_flags],
+        segment_runs=_spray_runs(waypoints, spray_flags),
+        alignment_metadata=staged.get("alignment_metadata"),
+        metadata=staged.get("metadata"),
+    )
 
 
 # ── Delete ─────────────────────────────────────────────────────────────────────

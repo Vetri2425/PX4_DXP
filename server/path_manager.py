@@ -858,6 +858,10 @@ class PathManager:
         ref_points_dxf = kwargs.pop("ref_points_dxf", None)
         ref_points_gps = kwargs.pop("ref_points_gps", None)
         close_loop = kwargs.pop("close_loop", False)
+        # Additive: when True, each segment dict carries its full point list and
+        # an explicit spray_on flag (used by GET /api/path/{name}/segments for
+        # spray verification). Default False keeps /api/path/plan byte-identical.
+        include_segment_points = bool(kwargs.pop("include_segment_points", False))
 
         # Resolve extension settings once, for every branch below. Explicit
         # kwargs (legacy callers/tests) win; otherwise the per-DXF sidecar
@@ -920,6 +924,8 @@ class PathManager:
                     "is_extension": False,
                     "speed": marking_speed,
                     "length_m": round(mark_length, 3),
+                    **({"points": [list(p) for p in shifted], "spray_on": True}
+                       if include_segment_points else {}),
                 }] if shifted else [],
                 "alignment_metadata": {},
                 "planning_metadata": {
@@ -1073,6 +1079,9 @@ class PathManager:
                     "is_extension": s.metadata.get("extension_role") is not None,
                     "speed": s.speed,
                     "length_m": round(s.length, 3),
+                    **({"points": [list(p) for p in s.points],
+                        "spray_on": s.segment_type == 0}
+                       if include_segment_points else {}),
                 }
                 for idx, s in enumerate(plan.segments)
             ],
