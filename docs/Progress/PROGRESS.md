@@ -4,6 +4,18 @@ Running log of all work. Each entry: what built, what fixed, what's next, time s
 
 ---
 
+## 2026-06-15 — All 3 bug fixes VALIDATED; build stable
+
+- **11-bag campaign (13-06)** via `tools/validate_build.py`: tracking excellent all shapes — arc 1.46 / lshape 0.90 / square 0.87 / U-turn 1.06 cm RMS (TRACKING). ulogs clean, no clipping, params consistent (RO_YAW_P=1.5, YAW_RATE_LIM=30, WENC=1).
+- **BUG-T3 VALIDATED** — PASS on all 11 incl. ~90° mis-headed starts (init err +93/+87/+92°): correct turn, no reverse.
+- **BUG-T2 VALIDATED** — U-turn flows continuously through tangent junction (0 stops, 0.97cm RMS).
+- **BUG-T1 VALIDATED** — `square_2x2_20260615_144019`: pivots now clean single-direction spins, **1 significant yaw-rate reversal (>0.1) / 0 large** across 3 corners (was 8/2 on 06-13). xtrack 0.53cm RMS. Oscillation eliminated.
+- Validator BUG-T1 heuristic recalibrated: count reversals >0.10 rad/s (sub-0.10 is settle-noise) — was over-counting (49 vs 8 real).
+- Minor follow-up (optional): pivots ~6s (near 5s watchdog), 2/3 exit ~0.17 rad/s residual yaw — not blocking.
+- **All 3 priority bugs CLOSED. Focus → path engine / CRS / spray (PE-T1..T5).**
+
+---
+
 ## 2026-06-13 — BUG-T1/T2/T3 fixes committed
 
 - **`1af51ac` `fix(rpp): BUG-T2 hard stops at smooth run/segment boundaries`** — eliminates stop-and-go at tangent junctions. Root cause = two forced stop-and-pivots: (1) `_apply_run` pivoted at every run boundary (`idx>0`) ignoring heading; (2) `_control_segment_profile` corner gate keyed off vehicle `heading_err` vs global frame → tracking noise on a straight junction tripped CORNER_STOP/ALIGN. Fix: `_apply_run` pivots only if prev-exit→new-entry heading Δ ≥ `segment_corner_threshold_deg`; transition gate now uses path-intrinsic `_segment_angle_deg` (below threshold → advance without dropping velocity). Hard corners unchanged. Pending live RTK validation (U-turn).

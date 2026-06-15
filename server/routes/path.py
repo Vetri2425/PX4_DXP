@@ -57,6 +57,7 @@ from models import (
     PathPublishRequest,
 )
 from path_manager import UploadValidationError
+from path_engine.entity_order import apply_entity_order as _apply_entity_order_shared
 
 log = logging.getLogger("server.routes.path")
 
@@ -323,33 +324,12 @@ async def _sidecar_call(fn, *args, what: str, timeout: float = 5.0):
 
 
 def _apply_entity_order(entities: list, saved_order: list[str]) -> list:
-    """Reorder entities according to saved entity order.
+    """Delegate to the shared helper in path_engine.entity_order.
 
-    If *saved_order* is empty, return parser order unchanged.
-    Entities present in *saved_order* appear in that order.
-    Any entities not in *saved_order* are appended at the end
-    in parser order. Saved IDs that no longer exist in the DXF
-    are silently ignored. No duplicates.
+    Kept as a thin wrapper so existing internal call sites in this module
+    are undisturbed.  The shared helper is the single source of truth.
     """
-    if not saved_order:
-        return list(entities)
-
-    by_id = {ent.entity_id: ent for ent in entities}
-    used: set[str] = set()
-    ordered: list = []
-
-    for entity_id in saved_order:
-        ent = by_id.get(entity_id)
-        if ent is not None and entity_id not in used:
-            ordered.append(ent)
-            used.add(entity_id)
-
-    for ent in entities:
-        if ent.entity_id not in used:
-            ordered.append(ent)
-            used.add(ent.entity_id)
-
-    return ordered
+    return _apply_entity_order_shared(entities, saved_order)
 
 
 @path_router.get("/{name}/entities", response_model=DXFEntitiesResponse)

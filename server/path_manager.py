@@ -634,21 +634,30 @@ class PathManager:
                 return cached[2]
             if os.path.splitext(fpath)[1].lower() == ".dxf":
                 from path_engine import PathEngine
+                from path_engine.entity_order import apply_entity_order
                 # Honor the saved extension config so the preview, its spray
                 # schedule, and the executed mission (load_path → plan_path)
                 # all share the same waypoint count and spray flags. A bare
                 # PathEngine() here would drop PRE/AFT legs and desync the
                 # spray-flag length from the executed path.
                 enabled, pre_m, aft_m = self.resolve_extension_settings(name)
+                overrides = self.load_entity_overrides(name)
+                saved_order = self.load_entity_order(name)
+                # Suppress optimizer when saved entity order is present so
+                # preview matches planned execution.
+                effective_optimize = not bool(saved_order)
                 engine = PathEngine(
                     enable_path_extensions=enabled,
                     pre_extension_m=pre_m,
                     aft_extension_m=aft_m,
+                    optimize_order=effective_optimize,
                 )
-                overrides = self.load_entity_overrides(name)
-                if overrides:
+                if overrides or saved_order:
                     entities = self.parse_dxf(fpath)
-                    self.apply_entity_overrides(entities, overrides)
+                    if overrides:
+                        self.apply_entity_overrides(entities, overrides)
+                    if saved_order:
+                        entities = apply_entity_order(entities, saved_order)
                     plan = engine.plan_dxf_entities(entities)
                 else:
                     plan = engine.plan_file(fpath)
@@ -756,6 +765,54 @@ class PathManager:
         # which must never leak into the pristine cached entities.
         return [copy.copy(ent) for ent in entities]
 
+    # ── Segment serialization helpers ────────────────────────────────────────
+
+    @staticmethod
+    def _segment_role(segment) -> str:
+        """Human-readable role for a planned segment.
+
+        Returns one of: "pre_transit" | "aft_transit" | "mark" | "transit".
+        """
+        role = segment.metadata.get("extension_role")
+        if role == "pre":
+            return "pre_transit"
+        if role == "aft":
+            return "aft_transit"
+        if segment.segment_type == 0:  # SegmentType.MARK == 0
+            return "mark"
+        return "transit"
+
+    @staticmethod
+    def _parent_source_entity(segment) -> str | None:
+        """Clean parent source_entity name (strips :pre/:aft suffix).
+
+        Returns the ``parent_source_entity`` from metadata when present
+        (injected by extensions.py), otherwise strips any trailing colon-suffix
+        from source_entity itself.
+        """
+        parent = segment.metadata.get("parent_source_entity")
+        if parent:
+            return parent
+        source = segment.source_entity or ""
+        return source.split(":")[0] if source else None
+
+    @staticmethod
+    def _extract_entity_id(parent_source: str | None) -> str | None:
+        """Extract the raw DXF ezdxf handle from a source_entity name.
+
+        Format: ``{TYPE}_{handle}``  e.g. ``LINE_1A3`` → ``"1A3"``.
+        Synthetic sources (``transit:N``, ``group:...``, ``builtin:...``)
+        return ``None``.
+        """
+        if not parent_source:
+            return None
+        if ":" in parent_source:
+            # Any colon-prefixed synthetic source: transit:N, group:..., builtin:...
+            return None
+        if "_" not in parent_source:
+            return None
+        return parent_source.split("_", 1)[1]
+
     def plan_path(self, name: str, summary_only: bool = False, **kwargs) -> dict:
         """Run the full planning pipeline on a file and return PlannedPath info.
 
@@ -849,9 +906,16 @@ class PathManager:
                 "transit_length_m": 0.0,
                 "total_length_m": round(mark_length, 3),
                 "segments": [{
+                    "runtime_segment_index": 0,
+                    "runtime_sequence": 1,
                     "type": "MARK",
-                    "speed": marking_speed,
+                    "segment_role": "mark",
                     "source": f"builtin:{name}",
+                    "parent_source_entity": f"builtin:{name}",
+                    "parent_entity_id": None,
+                    "order_source": "parser_order",
+                    "is_extension": False,
+                    "speed": marking_speed,
                     "length_m": round(mark_length, 3),
                 }] if shifted else [],
                 "alignment_metadata": {},
@@ -883,12 +947,23 @@ class PathManager:
 
         from path_engine.engine import PathEngine
         from path_engine.validator import PathValidator
+
+        # Peek at the saved order before constructing the engine so we can
+        # suppress the optimizer.  We'll load the full order below after
+        # constructing the entity list; this early peek is only used to decide
+        # the engine flag.  It's cheap (tiny JSON file read).
+        is_dxf_peek = os.path.splitext(fpath)[1].lower() == ".dxf"
+        _saved_order_peek = self.load_entity_order(name) if is_dxf_peek else []
+        # When the user has committed a manual entity order, the optimizer would
+        # silently re-arrange that order — disable it.
+        effective_optimize = optimize and not bool(_saved_order_peek)
+
         engine = PathEngine(
             mark_spacing=line_spacing,
             transit_spacing=transit_spacing,
             marking_speed=marking_speed,
             transit_speed=transit_speed,
-            optimize_order=optimize,
+            optimize_order=effective_optimize,
             compensate_spray=compensate_spray,
             enable_path_extensions=enable_path_extensions,
             pre_extension_m=pre_extension_m,
@@ -899,15 +974,30 @@ class PathManager:
             max_two_opt_segments=max_two_opt_segments,
         )
 
-        overrides = (
-            self.load_entity_overrides(name)
-            if os.path.splitext(fpath)[1].lower() == ".dxf"
-            else {}
-        )
+        is_dxf = os.path.splitext(fpath)[1].lower() == ".dxf"
+        overrides = self.load_entity_overrides(name) if is_dxf else {}
+
+        # Load saved entity execution order.  An non-empty sidecar means the
+        # user has deliberately arranged entities in the UI and the optimizer
+        # must NOT overrule that decision.  We also need to pre-parse the DXF
+        # so we can reorder the entity list before converting to segments.
+        saved_order: list[str] = self.load_entity_order(name) if is_dxf else []
+
         plan_metadata: dict = {}
-        if overrides:
+
+        # When either overrides or a saved order exist we must pass entities
+        # explicitly so we can mutate / reorder them before planning.
+        if overrides or saved_order:
             entities = self.parse_dxf(fpath)
-            self.apply_entity_overrides(entities, overrides)
+            if overrides:
+                self.apply_entity_overrides(entities, overrides)
+            if saved_order:
+                from path_engine.entity_order import apply_entity_order
+                entities = apply_entity_order(entities, saved_order)
+                log.debug(
+                    "plan_path(%s): applying saved entity order (%d ids)",
+                    name, len(saved_order),
+                )
             plan = engine.plan_dxf_entities(
                 entities,
                 layer_mapping=layer_mapping,
@@ -920,10 +1010,16 @@ class PathManager:
                 close_loop=close_loop,
                 anchor=anchor,
             )
-            plan_metadata["entity_overrides"] = {
-                "num_overrides": len(overrides),
-                "entity_ids": sorted(overrides),
-            }
+            if overrides:
+                plan_metadata["entity_overrides"] = {
+                    "num_overrides": len(overrides),
+                    "entity_ids": sorted(overrides),
+                }
+            if saved_order:
+                plan_metadata["entity_order"] = {
+                    "num_ids": len(saved_order),
+                    "optimizer_skipped": True,
+                }
         else:
             plan = engine.plan_file(
                 fpath,
@@ -953,6 +1049,14 @@ class PathManager:
         validator = PathValidator(max_waypoints=max_waypoints, max_segments=max_segments)
         warnings = validator.validate_or_raise(plan)
 
+        # Determine order_source once — same value for every segment in this plan.
+        if saved_order:
+            _order_source = "saved_entity_order"
+        elif effective_optimize:
+            _order_source = "optimizer"
+        else:
+            _order_source = "parser_order"
+
         result = {
             "source": source_name,
             "num_waypoints": plan.num_waypoints,
@@ -962,12 +1066,21 @@ class PathManager:
             "total_length_m": round(plan.total_length, 3),
             "segments": [
                 {
+                    "runtime_segment_index": idx,
+                    "runtime_sequence": idx + 1,
                     "type": "MARK" if s.segment_type == 0 else "TRANSIT",
-                    "speed": s.speed,
+                    "segment_role": self._segment_role(s),
                     "source": s.source_entity,
+                    "parent_source_entity": self._parent_source_entity(s),
+                    "parent_entity_id": self._extract_entity_id(
+                        self._parent_source_entity(s)
+                    ),
+                    "order_source": _order_source,
+                    "is_extension": s.metadata.get("extension_role") is not None,
+                    "speed": s.speed,
                     "length_m": round(s.length, 3),
                 }
-                for s in plan.segments
+                for idx, s in enumerate(plan.segments)
             ],
             "alignment_metadata": getattr(plan, "alignment_metadata", {}),
             "planning_metadata": getattr(plan, "planning_metadata", {}),
