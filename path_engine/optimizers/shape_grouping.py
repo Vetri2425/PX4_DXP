@@ -27,11 +27,27 @@ from __future__ import annotations
 
 import math
 
-from ..core import CURVED_GEOMETRY_TYPES, PathSegment, SegmentType
+from ..core import (
+    CURVED_GEOMETRY_TYPES,
+    LINE_LIKE_GEOMETRY_TYPES,
+    PathSegment,
+    SegmentType,
+)
 
 # Shared taxonomy (core.py) — a curve is never absorbed into a line chain.
 _CURVED_GEOMETRY = CURVED_GEOMETRY_TYPES
 _CURVED_PREFIXES = ("ARC_", "CIRCLE_", "ELLIPSE_", "SPLINE_")
+_LINE_LIKE_PREFIXES = ("LINE_", "LWPOLYLINE_", "POLYLINE_")
+
+
+def _is_known_line_like(seg: PathSegment) -> bool:
+    """True when segment provenance explicitly identifies straight geometry."""
+    geom = str(seg.metadata.get("geometry_type", "")).upper()
+    if geom in CURVED_GEOMETRY_TYPES:
+        return False
+    if geom in LINE_LIKE_GEOMETRY_TYPES:
+        return True
+    return seg.source_entity.upper().startswith(_LINE_LIKE_PREFIXES)
 
 
 def _is_chainable(seg: PathSegment) -> bool:
@@ -177,8 +193,9 @@ def _merge_chain(chain: list[PathSegment], tol: float) -> PathSegment:
                      "direction", "reversed")
     }
     meta["grouped_from"] = sources
-    meta["geometry_type"] = "LINE_CHAIN"
-    meta["line_like"] = True
+    if all(_is_known_line_like(seg) for seg in chain):
+        meta["geometry_type"] = "LINE_CHAIN"
+        meta["line_like"] = True
     label = sources[0] if sources else head.source_entity
     return PathSegment(
         segment_type=SegmentType.MARK,

@@ -206,6 +206,34 @@ class TestGroupedLineLikeExtensions:
         assert result[0].metadata["parent_source_entity"] == grouped[0].source_entity
         assert result[2].metadata["parent_source_entity"] == grouped[0].source_entity
 
+    def test_grouped_unknown_mark_chain_does_not_become_extendable(self):
+        segs = [
+            PathSegment(
+                segment_type=SegmentType.MARK,
+                points=[(0.0, 0.0), (1.0, 0.0)],
+                source_entity="A",
+            ),
+            PathSegment(
+                segment_type=SegmentType.MARK,
+                points=[(1.0, 0.0), (2.0, 0.0)],
+                source_entity="B",
+            ),
+        ]
+
+        grouped = group_connected_segments(segs)
+        assert len(grouped) == 1
+        assert grouped[0].metadata["grouped_from"] == ["A", "B"]
+        assert "line_like" not in grouped[0].metadata
+        assert "geometry_type" not in grouped[0].metadata
+
+        result = split_mark_segment_with_extensions(
+            grouped[0], pre_extension_m=0.5, aft_extension_m=0.5, transit_speed=0.50
+        )
+
+        assert len(result) == 1
+        assert result[0].segment_type == SegmentType.MARK
+        assert result[0].points == [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)]
+
 
 class TestClosedRunExtensions:
     """Closed loops (square / triangle / closed polyline) get no linear
