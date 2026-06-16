@@ -577,15 +577,26 @@ class PathEngine:
             }
 
         # Step 4: Apply drive extensions to line-like MARK segments.
+        # A composite line-chain (square/triangle/rectangle perimeter from
+        # connected LINE primitives) is expanded back into its constituent edges
+        # via `chain_members` so EACH edge gets its own PRE/AFT run-up — each edge
+        # is open (distinct endpoints), so the closed-loop suppression that applies
+        # to the whole chain no longer hides them. Curves and lone lines have no
+        # members and are extended as a single segment (unchanged behavior).
         if self.enable_path_extensions:
             extended: list[PathSegment] = []
             for seg in ordered:
-                extended.extend(split_mark_segment_with_extensions(
-                    seg,
-                    pre_extension_m=self.pre_extension_m,
-                    aft_extension_m=self.aft_extension_m,
-                    transit_speed=self.transit_speed,
-                ))
+                members = (
+                    seg.metadata.get("chain_members")
+                    if seg.segment_type == SegmentType.MARK else None
+                )
+                for target in (members or [seg]):
+                    extended.extend(split_mark_segment_with_extensions(
+                        target,
+                        pre_extension_m=self.pre_extension_m,
+                        aft_extension_m=self.aft_extension_m,
+                        transit_speed=self.transit_speed,
+                    ))
             ordered = extended
 
         # Step 4b: Densify TRANSIT connectors created during ordering/extension.

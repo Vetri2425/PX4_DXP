@@ -28,6 +28,14 @@ def _reverse_segment(seg: PathSegment) -> PathSegment:
         new_meta["start_tangent"] = (-et[0], -et[1])
         new_meta["end_tangent"] = (-st[0], -st[1])
     new_meta["reversed"] = not bool(seg.metadata.get("reversed", False))
+    # Composite line-chains carry their constituent edges in `chain_members` so
+    # per-edge extensions can be applied downstream. Reversing the chain must
+    # reverse the member list and each member's orientation, or the members would
+    # no longer match the reversed composite. Members are line-like (no tangents),
+    # so the recursive call only flips their point order.
+    members = seg.metadata.get("chain_members")
+    if members:
+        new_meta["chain_members"] = [_reverse_segment(m) for m in reversed(members)]
     return PathSegment(
         segment_type=seg.segment_type,
         points=list(reversed(seg.points)),

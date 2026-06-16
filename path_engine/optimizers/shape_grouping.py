@@ -193,6 +193,21 @@ def _merge_chain(chain: list[PathSegment], tol: float) -> PathSegment:
                      "direction", "reversed")
     }
     meta["grouped_from"] = sources
+    # Preserve the oriented constituent edges so per-edge PRE/AFT extensions can be
+    # applied downstream (engine Step 4). The composite's flattened `points` are
+    # still what drives the rover when extensions are OFF; `chain_members` is only
+    # read by the extension step. Each member keeps its own geometry metadata.
+    meta["chain_members"] = [
+        PathSegment(
+            segment_type=seg.segment_type,
+            points=list(seg.points),
+            speed=seg.speed,
+            segment_id=seg.segment_id,
+            source_entity=seg.source_entity,
+            metadata=dict(seg.metadata),
+        )
+        for seg in chain
+    ]
     if all(_is_known_line_like(seg) for seg in chain):
         meta["geometry_type"] = "LINE_CHAIN"
         meta["line_like"] = True
