@@ -905,3 +905,44 @@ def test_anchor_metadata_recorded():
     anchor_meta = plan.planning_metadata["anchor"]
     assert anchor_meta["mode"] == "first_waypoint"
     assert anchor_meta["requested_origin"] == (1.0, 2.0)
+
+
+def _sq_edge(a, b, sid, src):
+    return PathSegment(
+        segment_type=SegmentType.MARK, points=[a, b], speed=0.35,
+        segment_id=sid, source_entity=src, metadata={"geometry_type": "LINE"},
+    )
+
+
+def test_extensions_suppressed_on_closed_chain():
+    """A closed perimeter (square) built from connected edges must NOT get
+    per-edge PRE/AFT tabs: the closed-loop suppression keeps corners clean.
+    Regression for the triangular corner-tab tracking failure."""
+    engine = PathEngine(
+        enable_path_extensions=True, pre_extension_m=0.5, aft_extension_m=0.5,
+        group_shapes=True, optimize_order=True, compensate_spray=False,
+    )
+    edges = [
+        _sq_edge((0.0, 0.0), (2.0, 0.0), 0, "LINE_A"),
+        _sq_edge((2.0, 0.0), (2.0, 2.0), 1, "LINE_B"),
+        _sq_edge((2.0, 2.0), (0.0, 2.0), 2, "LINE_C"),
+        _sq_edge((0.0, 2.0), (0.0, 0.0), 3, "LINE_D"),
+    ]
+    plan = engine.plan_segments(edges)
+    # No spray-OFF run-up tabs anywhere on a closed loop.
+    assert all(plan.spray_flags), "closed loop must have no transit extension tabs"
+
+
+def test_extensions_kept_on_open_chain():
+    """An OPEN chain (L-shape, free ends) must still receive PRE/AFT extensions."""
+    engine = PathEngine(
+        enable_path_extensions=True, pre_extension_m=0.5, aft_extension_m=0.5,
+        group_shapes=True, optimize_order=True, compensate_spray=False,
+    )
+    edges = [
+        _sq_edge((0.0, 0.0), (0.0, 2.0), 0, "LINE_A"),
+        _sq_edge((0.0, 2.0), (2.0, 2.0), 1, "LINE_B"),
+    ]
+    plan = engine.plan_segments(edges)
+    # Free ends → at least one spray-OFF extension waypoint present.
+    assert not all(plan.spray_flags), "open chain must keep PRE/AFT extensions"
