@@ -26,10 +26,7 @@ from .parsers import load_mission_file, load_mission_segments, parse_dxf, entiti
 from .parsers.csv_parser import read_ned_csv_enhanced
 from .parsers.waypoints_parser import read_qgc_waypoints_as_segment
 from .planners.straight_line import densify_segment
-from .planners.extensions import (
-    _is_closed_run as is_closed_run,
-    split_mark_segment_with_extensions,
-)
+from .planners.extensions import split_mark_segment_with_extensions
 from .planners.smooth import smooth_corners
 from .optimizers.segment_order import optimize_segment_order
 from .optimizers.shape_grouping import group_connected_segments
@@ -580,21 +577,12 @@ class PathEngine:
             }
 
         # Step 4: Apply drive extensions to line-like MARK segments.
-        # An OPEN composite line-chain (e.g. an L-shape or polyline stroke with
-        # distinct free ends) is expanded back into its constituent edges via
-        # `chain_members` so EACH edge gets its own PRE/AFT run-up — each edge is
-        # open, so the per-edge run-up is meaningful.
-        #
-        # A CLOSED composite chain (square/triangle/rectangle/closed polyline
-        # perimeter) has NO free end: every corner is a shared interior junction
-        # already painted by the two edges meeting there. Expanding it and
-        # extending each edge stubs a triangular out-and-back tab across every
-        # corner (0.5 m past the vertex + a ~0.707 m diagonal back) — zero added
-        # paint coverage and not cleanly trackable (the rover rounds each tab into
-        # a wide loop). So for a closed chain we keep the composite WHOLE and let
-        # split_mark_segment_with_extensions' closed-loop suppression drop the
-        # extensions, leaving clean 90°/120° corners the segment profile tracks.
-        # Curves and lone lines have no members and extend as a single segment.
+        # A composite line-chain (square/triangle/rectangle perimeter from
+        # connected LINE primitives) is expanded back into its constituent edges
+        # via `chain_members` so EACH edge gets its own PRE/AFT run-up — each edge
+        # is open (distinct endpoints), so the closed-loop suppression that applies
+        # to the whole chain no longer hides them. Curves and lone lines have no
+        # members and are extended as a single segment (unchanged behavior).
         if self.enable_path_extensions:
             extended: list[PathSegment] = []
             for seg in ordered:
@@ -602,8 +590,6 @@ class PathEngine:
                     seg.metadata.get("chain_members")
                     if seg.segment_type == SegmentType.MARK else None
                 )
-                if members and is_closed_run(seg.points):
-                    members = None
                 for target in (members or [seg]):
                     extended.extend(split_mark_segment_with_extensions(
                         target,
