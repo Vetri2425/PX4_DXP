@@ -605,6 +605,113 @@ class TestSprayFlagsThroughEngine:
         assert abs(plan.total_mark_length - 10.0) < 0.01
 
 
+class TestExtensionStitchingThroughEngine:
+    """Regression coverage for CAD line chains split into per-edge extensions."""
+
+    def _square_edges(self):
+        corners = [
+            (0.0, 0.0),
+            (2.0, 0.0),
+            (2.0, 2.0),
+            (0.0, 2.0),
+            (0.0, 0.0),
+        ]
+        return [
+            PathSegment(
+                segment_type=SegmentType.MARK,
+                points=[corners[i], corners[i + 1]],
+                speed=0.35,
+                source_entity=f"LINE_E{i}",
+                metadata={"geometry_type": "LINE"},
+            )
+            for i in range(4)
+        ]
+
+    def test_square_without_extensions_preserves_cad_topology(self):
+        engine = PathEngine(
+            enable_path_extensions=False,
+            optimize_order=False,
+            compensate_spray=False,
+            mark_spacing=2.0,
+        )
+        plan = engine.plan_segments(self._square_edges())
+
+        assert [s.segment_type for s in plan.segments] == [SegmentType.MARK]
+        assert plan.merged_waypoints == [
+            (0.0, 0.0),
+            (2.0, 0.0),
+            (2.0, 2.0),
+            (0.0, 2.0),
+            (0.0, 0.0),
+        ]
+
+    def test_square_extensions_add_explicit_aft_to_pre_connectors(self):
+        engine = PathEngine(
+            enable_path_extensions=True,
+            pre_extension_m=0.5,
+            aft_extension_m=0.5,
+            optimize_order=False,
+            compensate_spray=False,
+            mark_spacing=2.0,
+            transit_spacing=0.25,
+        )
+        plan = engine.plan_segments(self._square_edges())
+
+        connectors = [
+            s for s in plan.segments
+            if s.metadata.get("extension_connector") is True
+        ]
+        assert len(connectors) == 3
+        assert all(s.segment_type == SegmentType.TRANSIT for s in connectors)
+
+        # No hidden /path jumps remain between planned segments.
+        for prev, curr in zip(plan.segments, plan.segments[1:]):
+            assert _distance(prev.points[-1], curr.points[0]) < 1e-9
+
+        assert plan.segments[0].points[0] == (-0.5, 0.0)  # pre(A)
+        assert plan.segments[1].points == [(0.0, 0.0), (2.0, 0.0)]  # A->B
+        assert plan.segments[2].points[-1] == (2.5, 0.0)  # aft(B)
+        assert connectors[0].points[0] == (2.5, 0.0)
+        assert connectors[0].points[-1] == (2.0, -0.5)  # connector to pre(B)
+        assert plan.segments[4].points[0] == (2.0, -0.5)
+        assert plan.segments[4].points[-1] == (2.0, 0.0)
+
+    def test_spray_compensation_keeps_extensions_continuous(self):
+        engine = PathEngine(
+            enable_path_extensions=True,
+            pre_extension_m=0.5,
+            aft_extension_m=0.5,
+            optimize_order=False,
+            compensate_spray=True,
+            mark_spacing=0.5,
+            transit_spacing=0.25,
+        )
+        plan = engine.plan_segments([
+            PathSegment(
+                segment_type=SegmentType.MARK,
+                points=[(0.0, 0.0), (2.0, 0.0)],
+                speed=0.35,
+                source_entity="LINE_E0",
+                metadata={"geometry_type": "LINE"},
+            )
+        ])
+
+        for prev, curr in zip(plan.segments, plan.segments[1:]):
+            assert _distance(prev.points[-1], curr.points[0]) < 1e-9
+
+        # Coincident boundary waypoints must survive when their spray state
+        # changes, otherwise lead-in/lead-out compensation is lost at flattening.
+        boundary_pairs = [
+            (a, fa, b, fb)
+            for (a, fa), (b, fb) in zip(
+                zip(plan.merged_waypoints, plan.spray_flags),
+                zip(plan.merged_waypoints[1:], plan.spray_flags[1:]),
+            )
+            if _distance(a, b) < 1e-9 and fa != fb
+        ]
+        assert len(boundary_pairs) == 2
+
+
 # ---------------------------------------------------------------------------
 # Stage 3 Test 7 — Disabled mode: behavior identical to pre-extension code
 # ---------------------------------------------------------------------------

@@ -42,6 +42,171 @@ log = logging.getLogger(__name__)
 _SMOOTH_SKIP_GEOMETRY_TYPES = CURVED_GEOMETRY_TYPES
 
 
+_SEGMENT_JOIN_TOL_M = 0.01
+_CHAIN_STRAIGHT_DOT_MIN = math.cos(math.radians(5.0))
+
+
+def _point_distance(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return math.hypot(b[0] - a[0], b[1] - a[1])
+
+
+def _insert_transit_connectors_between_segments(
+    segments: list[PathSegment],
+    transit_speed: float,
+    gap_tol_m: float = _SEGMENT_JOIN_TOL_M,
+) -> list[PathSegment]:
+    """Make all inter-segment travel explicit.
+
+    The final /path topic is a flat polyline, so adjacent segment endpoints that
+    do not touch become real rover motion even if no PathSegment represents the
+    connector.  After extension expansion, those gaps can occur between
+    aft-extension and pre-extension chunks.  Insert explicit TRANSIT segments so
+    the geometry, spray flags, segment metadata, and transit length all describe
+    the same trajectory.
+    """
+    if len(segments) < 2:
+        return list(segments)
+
+    stitched: list[PathSegment] = []
+    connector_count = 0
+    previous: PathSegment | None = None
+    for seg in segments:
+        if (
+            previous is not None
+            and previous.points
+            and seg.points
+            and _point_distance(previous.points[-1], seg.points[0]) > gap_tol_m
+        ):
+            connector_count += 1
+            stitched.append(PathSegment(
+                segment_type=SegmentType.TRANSIT,
+                points=[previous.points[-1], seg.points[0]],
+                speed=transit_speed,
+                source_entity=f"transit:extension_join:{connector_count}",
+                metadata={
+                    "extension_connector": True,
+                    "from_source_entity": previous.source_entity,
+                    "to_source_entity": seg.source_entity,
+                },
+            ))
+        stitched.append(seg)
+        previous = seg
+    return stitched
+
+
+def _align_extension_boundaries_to_compensated_marks(
+    segments: list[PathSegment],
+) -> list[PathSegment]:
+    """Keep PRE/MARK/AFT continuous after spray compensation shifts MARK ends."""
+    aligned = list(segments)
+    for i in range(len(aligned) - 1):
+        prev = aligned[i]
+        curr = aligned[i + 1]
+
+        if (
+            prev.segment_type == SegmentType.TRANSIT
+            and curr.segment_type == SegmentType.MARK
+            and prev.metadata.get("extension_role") == "pre"
+            and prev.metadata.get("parent_source_entity") == curr.source_entity
+            and prev.points
+            and curr.points
+        ):
+            prev.points[-1] = curr.points[0]
+
+        if (
+            prev.segment_type == SegmentType.MARK
+            and curr.segment_type == SegmentType.TRANSIT
+            and curr.metadata.get("extension_role") == "aft"
+            and curr.metadata.get("parent_source_entity") == prev.source_entity
+            and prev.points
+            and curr.points
+        ):
+            curr.points[0] = prev.points[-1]
+
+    return aligned
+
+
+def _segment_start_tangent(seg: PathSegment) -> tuple[float, float] | None:
+    for i in range(1, len(seg.points)):
+        d = _point_distance(seg.points[0], seg.points[i])
+        if d > 1e-9:
+            return (
+                (seg.points[i][0] - seg.points[0][0]) / d,
+                (seg.points[i][1] - seg.points[0][1]) / d,
+            )
+    return None
+
+
+def _segment_end_tangent(seg: PathSegment) -> tuple[float, float] | None:
+    for i in range(len(seg.points) - 2, -1, -1):
+        d = _point_distance(seg.points[i], seg.points[-1])
+        if d > 1e-9:
+            return (
+                (seg.points[-1][0] - seg.points[i][0]) / d,
+                (seg.points[-1][1] - seg.points[i][1]) / d,
+            )
+    return None
+
+
+def _merge_extension_target_run(run: list[PathSegment]) -> PathSegment:
+    if len(run) == 1:
+        return run[0]
+
+    points: list[tuple[float, float]] = []
+    sources: list[str] = []
+    for seg in run:
+        if seg.source_entity:
+            sources.append(seg.source_entity)
+        for pt in seg.points:
+            if points and _point_distance(points[-1], pt) <= _SEGMENT_JOIN_TOL_M:
+                continue
+            points.append(pt)
+
+    head = run[0]
+    metadata = {
+        "geometry_type": "LINE_CHAIN",
+        "line_like": True,
+        "grouped_from": sources,
+    }
+    return PathSegment(
+        segment_type=SegmentType.MARK,
+        points=points,
+        speed=head.speed,
+        segment_id=head.segment_id,
+        source_entity=f"group:{sources[0]}+{len(run) - 1}" if sources else head.source_entity,
+        metadata=metadata,
+    )
+
+
+def _extension_targets_for_segment(seg: PathSegment) -> list[PathSegment]:
+    """Return extension targets, splitting grouped chains only at real corners."""
+    if seg.segment_type != SegmentType.MARK:
+        return [seg]
+
+    members = seg.metadata.get("chain_members")
+    if not members:
+        return [seg]
+
+    runs: list[list[PathSegment]] = []
+    current: list[PathSegment] = []
+    previous_tangent: tuple[float, float] | None = None
+
+    for member in members:
+        start_tangent = _segment_start_tangent(member)
+        if current and previous_tangent is not None and start_tangent is not None:
+            dot = previous_tangent[0] * start_tangent[0] + previous_tangent[1] * start_tangent[1]
+            if dot < _CHAIN_STRAIGHT_DOT_MIN:
+                runs.append(current)
+                current = []
+        current.append(member)
+        previous_tangent = _segment_end_tangent(member)
+
+    if current:
+        runs.append(current)
+
+    return [_merge_extension_target_run(run) for run in runs]
+
+
 class PathEngine:
     """Main orchestrator for the path planning pipeline.
 
@@ -578,45 +743,24 @@ class PathEngine:
 
         # Step 4: Apply drive extensions to line-like MARK segments.
         # A composite line-chain (square/triangle/rectangle perimeter from
-        # connected LINE primitives) is expanded back into its constituent edges
-        # via `chain_members` so EACH edge gets its own PRE/AFT run-up — each edge
-        # is open (distinct endpoints), so the closed-loop suppression that applies
-        # to the whole chain no longer hides them. Curves and lone lines have no
-        # members and are extended as a single segment (unchanged behavior).
+        # connected LINE primitives) is split at real corners before extension.
+        # Straight-through CAD primitives stay one run, while each square corner
+        # gets tangent-aligned AFT/connector/PRE geometry. Curves and lone lines
+        # have no members and are extended as a single segment.
         if self.enable_path_extensions:
             extended: list[PathSegment] = []
             for seg in ordered:
-                members = (
-                    seg.metadata.get("chain_members")
-                    if seg.segment_type == SegmentType.MARK else None
-                )
-                for target in (members or [seg]):
+                for target in _extension_targets_for_segment(seg):
                     extended.extend(split_mark_segment_with_extensions(
                         target,
                         pre_extension_m=self.pre_extension_m,
                         aft_extension_m=self.aft_extension_m,
                         transit_speed=self.transit_speed,
                     ))
-            ordered = extended
-
-        # Step 4b: Densify TRANSIT connectors created during ordering/extension.
-        # Densification (Step 2) runs BEFORE ordering, so the TRANSIT links the
-        # optimizer inserts between shapes (and any extension run-ups) reach this
-        # point with only their two endpoints. Left sparse, each collapses to a
-        # SINGLE spray=False waypoint in the merge — the start point coincides
-        # with the previous MARK endpoint and is de-duplicated — which gives RPP
-        # no real transit run to split on and makes spray ON/OFF timing brittle.
-        # Re-densify so every transit longer than transit_spacing carries
-        # multiple spray=False samples (≥2 after junction de-dup).
-        redensified: list[PathSegment] = []
-        for seg in ordered:
-            if seg.segment_type == SegmentType.TRANSIT and len(seg.points) >= 2:
-                redensified.append(
-                    densify_segment(seg, self.mark_spacing, self.transit_spacing)
-                )
-            else:
-                redensified.append(seg)
-        ordered = redensified
+            ordered = _insert_transit_connectors_between_segments(
+                extended,
+                transit_speed=self.transit_speed,
+            )
 
         # Step 5: Apply spray latency compensation to MARK segments
         if self.compensate_spray:
@@ -628,6 +772,28 @@ class PathEngine:
                     spray_off_latency_s=self.spray_off_latency,
                 ))
             ordered = compensated
+            if self.enable_path_extensions:
+                ordered = _align_extension_boundaries_to_compensated_marks(ordered)
+                ordered = _insert_transit_connectors_between_segments(
+                    ordered,
+                    transit_speed=self.transit_speed,
+                )
+
+        # Step 5b: Densify TRANSIT connectors created during ordering/extension.
+        # Densification (Step 2) runs BEFORE ordering, so TRANSIT links inserted
+        # by the optimizer, extension run-ups, and explicit extension-join
+        # connectors can reach this point with only their two endpoints. Do this
+        # after spray compensation so PRE/AFT segments are sampled from their
+        # final, compensation-aligned endpoints.
+        redensified: list[PathSegment] = []
+        for seg in ordered:
+            if seg.segment_type == SegmentType.TRANSIT and len(seg.points) >= 2:
+                redensified.append(
+                    densify_segment(seg, self.mark_spacing, self.transit_spacing)
+                )
+            else:
+                redensified.append(seg)
+        ordered = redensified
 
         # Step 6: Merge into single polyline with spray flags (and de-duplicate junctions)
         merged_waypoints: list[tuple[float, float]] = []
@@ -667,7 +833,7 @@ class PathEngine:
                 # Junction de-duplication: skip adjacent duplicate points within 1 cm
                 if merged_waypoints:
                     d = math.hypot(offset_pt[0] - merged_waypoints[-1][0], offset_pt[1] - merged_waypoints[-1][1])
-                    if d < 0.01:
+                    if d < 0.01 and spray_flags[-1] == is_mark:
                         continue
 
                 merged_waypoints.append(offset_pt)
