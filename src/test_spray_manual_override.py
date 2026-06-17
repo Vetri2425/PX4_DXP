@@ -154,6 +154,9 @@ class _Logger:
     def debug(self, *a, **k):
         self.records.append(("debug", a, k))
 
+    def error(self, *a, **k):
+        self.records.append(("error", a, k))
+
 
 class _Pub:
     def __init__(self):
@@ -246,6 +249,10 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "velocity_timeout_s": _Param(0.5),
         "path_clear_disarm_s": _Param(2.0),
         "allow_legacy_spray_active_fallback": _Param(True),
+        "actuator_backend": _Param("mavlink_actuator"),
+        "servo_instance": _Param(1),
+        "off_pwm_us": _Param(0),
+        "on_pwm_us": _Param(1800),
     }
     node.get_parameter = lambda name: node._params[name]
     node._clock = _Clock()

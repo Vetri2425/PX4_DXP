@@ -37,6 +37,8 @@ from std_msgs.msg import Bool, Float32MultiArray
 
 
 MAV_CMD_DO_SET_ACTUATOR = 187
+MAV_CMD_DO_SET_SERVO = 183
+_SERVO_PWM_MAX_US = 2200
 TRANSIT_TO_MARK = "TRANSIT_TO_MARK"
 MARK_TO_TRANSIT = "MARK_TO_TRANSIT"
 
@@ -354,6 +356,14 @@ class SprayControllerNode(Node):
         # armed=False message must not wipe the path).
         self.declare_parameter("path_clear_disarm_s", 2.0)
         self.declare_parameter("allow_legacy_spray_active_fallback", True)
+        # Backend selector: "mavlink_actuator" (cmd 187, normalized) or
+        # "mavlink_servo_pwm" (cmd 183, absolute PWM µs).
+        self.declare_parameter("actuator_backend", "mavlink_actuator")
+        # servo_instance: MUST validate in QGC Actuator Outputs which instance
+        # number maps to the physical AUX pin driving the spray driver.
+        self.declare_parameter("servo_instance", 1)
+        self.declare_parameter("off_pwm_us", 0)
+        self.declare_parameter("on_pwm_us", 1800)
 
         self._group = ReentrantCallbackGroup()
         self._desired_raw = False
@@ -472,6 +482,17 @@ class SprayControllerNode(Node):
                 f"{command_service} not ready; spray commands idle until service appears"
             )
             self.create_timer(1.0, self._service_probe_tick)
+
+        backend = str(self.get_parameter("actuator_backend").value)
+        if backend == "mavlink_servo_pwm":
+            self.get_logger().warn(
+                f"Spray backend=mavlink_servo_pwm "
+                f"servo_instance={self.get_parameter('servo_instance').value} "
+                f"off_pwm_us={self.get_parameter('off_pwm_us').value} "
+                f"on_pwm_us={self.get_parameter('on_pwm_us').value}"
+            )
+        else:
+            self.get_logger().info("Spray backend=mavlink_actuator (normalized -1/+1)")
 
         self._publish_state(False)
         self.get_logger().info("spray_controller started")
@@ -872,6 +893,22 @@ class SprayControllerNode(Node):
             self._publish_state(True)
 
     def _build_command_request(self, on: bool) -> CommandLong.Request:
+        req = CommandLong.Request()
+        req.broadcast = False
+        req.confirmation = 0
+        backend = str(self.get_parameter("actuator_backend").value)
+        if backend == "mavlink_servo_pwm":
+            return self._build_servo_pwm_request(req, on)
+        elif backend == "mavlink_actuator":
+            return self._build_actuator_request(req, on)
+        else:
+            self.get_logger().error(
+                f"Unknown actuator_backend={backend!r}; sending OFF via mavlink_servo_pwm",
+                throttle_duration_sec=5.0,
+            )
+            return self._build_servo_pwm_request(req, False)
+
+    def _build_actuator_request(self, req: CommandLong.Request, on: bool) -> CommandLong.Request:
         set_index = int(self.get_parameter("actuator_set_index").value)
         if set_index < 1 or set_index > 6:
             self.get_logger().warn(
@@ -884,16 +921,29 @@ class SprayControllerNode(Node):
             if on else
             float(self.get_parameter("off_value").value)
         )
-
-        req = CommandLong.Request()
-        req.broadcast = False
         req.command = MAV_CMD_DO_SET_ACTUATOR
-        req.confirmation = 0
         params = [math.nan] * 6
         params[set_index - 1] = value
         req.param1, req.param2, req.param3 = params[0], params[1], params[2]
         req.param4, req.param5, req.param6 = params[3], params[4], params[5]
         req.param7 = 0.0
+        return req
+
+    def _build_servo_pwm_request(self, req: CommandLong.Request, on: bool) -> CommandLong.Request:
+        instance = int(self.get_parameter("servo_instance").value)
+        if on:
+            pwm = int(self.get_parameter("on_pwm_us").value)
+            pwm = max(0, min(pwm, _SERVO_PWM_MAX_US))
+        else:
+            pwm = int(self.get_parameter("off_pwm_us").value)
+        self.get_logger().info(
+            f"Sending spray {'ON' if on else 'OFF'} PWM {pwm}µs (instance={instance})",
+            throttle_duration_sec=1.0,
+        )
+        req.command = MAV_CMD_DO_SET_SERVO
+        req.param1 = float(instance)
+        req.param2 = float(pwm)
+        req.param3 = req.param4 = req.param5 = req.param6 = req.param7 = 0.0
         return req
 
     def _command_done(self, future, requested: bool, reason: str, seq: int) -> None:
