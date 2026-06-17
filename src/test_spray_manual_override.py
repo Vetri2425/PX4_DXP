@@ -75,9 +75,38 @@ def _install_ros_stubs() -> None:
         def __init__(self):
             self.data = False
 
+    class _Float32MultiArray:
+        def __init__(self):
+            self.data = []
+
     std_msg.Bool = _Bool
+    std_msg.Float32MultiArray = _Float32MultiArray
     sys.modules["std_msgs"] = std_msgs
     sys.modules["std_msgs.msg"] = std_msg
+
+    geometry_msgs = types.ModuleType("geometry_msgs")
+    geometry_msg = types.ModuleType("geometry_msgs.msg")
+
+    class _PoseStamped:
+        pass
+
+    class _TwistStamped:
+        pass
+
+    geometry_msg.PoseStamped = _PoseStamped
+    geometry_msg.TwistStamped = _TwistStamped
+    sys.modules["geometry_msgs"] = geometry_msgs
+    sys.modules["geometry_msgs.msg"] = geometry_msg
+
+    nav_msgs = types.ModuleType("nav_msgs")
+    nav_msg = types.ModuleType("nav_msgs.msg")
+
+    class _Path:
+        pass
+
+    nav_msg.Path = _Path
+    sys.modules["nav_msgs"] = nav_msgs
+    sys.modules["nav_msgs.msg"] = nav_msg
 
 
 _install_ros_stubs()
@@ -113,10 +142,17 @@ class _Clock:
 
 
 class _Logger:
-    def info(self, *a, **k):
-        pass
+    def __init__(self):
+        self.records = []
 
-    warn = info
+    def info(self, *a, **k):
+        self.records.append(("info", a, k))
+
+    def warn(self, *a, **k):
+        self.records.append(("warn", a, k))
+
+    def debug(self, *a, **k):
+        self.records.append(("debug", a, k))
 
 
 class _Pub:
@@ -128,17 +164,61 @@ class _Pub:
 
 
 class _Future:
+    def __init__(self, success=True, result=0, exc=None, auto_complete=True):
+        self._success = success
+        self._result = result
+        self._exc = exc
+        self._auto_complete = auto_complete
+        self._cb = None
+
     def add_done_callback(self, cb):
-        pass
+        self._cb = cb
+        if self._auto_complete:
+            cb(self)
+
+    def fire(self, success=None, result=None, exc=None):
+        # Deliver a deferred result on demand so tests can model late /
+        # out-of-order MAVROS replies.
+        if success is not None:
+            self._success = success
+        if result is not None:
+            self._result = result
+        if exc is not None:
+            self._exc = exc
+        if self._cb is not None:
+            self._cb(self)
+
+    def result(self):
+        if self._exc is not None:
+            raise self._exc
+        return types.SimpleNamespace(success=self._success, result=self._result)
 
 
 class _Cli:
-    def __init__(self):
+    def __init__(self, responses=None, deferred=False):
         self.requests = []
+        self.responses = list(responses or [])
+        self.deferred = deferred
+        self.futures = []
 
     def call_async(self, req):
         self.requests.append(req)
-        return _Future()
+        if self.deferred:
+            fut = _Future(auto_complete=False)
+            self.futures.append(fut)
+            return fut
+        if self.responses:
+            response = self.responses.pop(0)
+            if isinstance(response, Exception):
+                fut = _Future(exc=response)
+            elif isinstance(response, tuple):
+                fut = _Future(success=response[0], result=response[1])
+            else:
+                fut = _Future(success=bool(response))
+        else:
+            fut = _Future()
+        self.futures.append(fut)
+        return fut
 
 
 def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
@@ -152,13 +232,31 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "require_offboard": _Param(require_offboard),
         "active_timeout_s": _Param(0.5),
         "manual_override_timeout_s": _Param(10.0),
+        "use_distance_aware_spray": _Param(False),
+        "nozzle_forward_offset_m": _Param(0.0),
+        "nozzle_lateral_offset_m": _Param(0.0),
+        "solenoid_open_delay_s": _Param(0.10),
+        "solenoid_close_delay_s": _Param(0.05),
+        "anticipatory_margin_m": _Param(0.02),
+        "on_overspray_margin_m": _Param(0.02),
+        "off_overspray_margin_m": _Param(0.0),
+        "min_spray_speed_mps": _Param(0.05),
+        "max_xtrack_error_m": _Param(0.10),
+        "pose_timeout_s": _Param(0.5),
+        "velocity_timeout_s": _Param(0.5),
+        "path_clear_disarm_s": _Param(2.0),
+        "allow_legacy_spray_active_fallback": _Param(True),
     }
     node.get_parameter = lambda name: node._params[name]
     node._clock = _Clock()
     node.get_clock = lambda: node._clock
-    node.get_logger = lambda: _Logger()
+    node._logger = _Logger()
+    node.get_logger = lambda: node._logger
     node._command_cli = _Cli()
     node._state_pub = _Pub()
+    node._desired_pub = _Pub()
+    node._commanded_pub = _Pub()
+    node._debug_pub = _Pub()
     node._manual_state_pub = _Pub()
     node._desired_raw = False
     node._candidate = None
@@ -166,11 +264,26 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._desired_debounced = False
     node._commanded = False
     node._last_active_time = None
+    node._legacy_active_raw = False
     node._manual_active = False
     node._manual_deadline_ns = None
     node._armed = armed
     node._mode = mode
     node._service_ready = True
+    node._off_confirmed = True
+    node._last_off_send_time_ns = None
+    node._disarm_time_ns = None
+    node._cmd_seq = 0
+    node._path_model = None
+    node._pose_ned = None
+    node._pose_recv_time = None
+    node._vel_ned = (0.0, 0.0)
+    node._vel_recv_time = None
+    node._last_auto_source = ""
+    node._last_distance_event = ""
+    node._last_safety_block_reason = ""
+    node._pose_stale_logged = False
+    node._velocity_stale_logged = False
     return node
 
 
