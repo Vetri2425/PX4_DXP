@@ -378,6 +378,99 @@ async def test_entities_api_uses_dense_spline_points_for_extension_preview(tmp_p
 
 
 @pytest.mark.anyio
+async def test_entities_api_suppresses_extension_preview_on_closed_chain(tmp_path, monkeypatch):
+    """Connectivity-aware preview: a closed square (4 edges meeting corner-to-
+    corner) has no free end, so NO entity may show a run-up — matching the
+    vertex-anchored planner, which suppresses extensions on closed chains.
+    Internal corners are junctions, not open ends."""
+    mission_file = tmp_path / "square.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+
+    corners = [(0.0, 0.0), (0.0, 2.0), (2.0, 2.0), (2.0, 0.0), (0.0, 0.0)]
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            return [
+                SimpleNamespace(
+                    entity_id=f"E{i}",
+                    entity_type="LINE",
+                    layer="MARKINGS",
+                    color=7,
+                    geometry={"start": corners[i], "end": corners[i + 1]},
+                    is_mark=lambda: True,
+                )
+                for i in range(4)
+            ]
+
+        def load_entity_overrides(self, filename):
+            return {}
+
+        def load_extension_config(self, filename):
+            return {"enabled": True, "pre_extension_m": 0.5, "aft_extension_m": 0.5}
+
+        def load_entity_order(self, filename):
+            return []
+
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    data = await path_entities("square.dxf")
+
+    assert data.extension_config.enabled is True
+    for ent in data.entities:
+        assert ent.extension_preview.enabled is False, ent.entity_id
+        assert ent.extension_preview.pre_points == []
+        assert ent.extension_preview.aft_points == []
+
+
+@pytest.mark.anyio
+async def test_entities_api_extension_preview_only_at_open_ends_of_chain(tmp_path, monkeypatch):
+    """Open L-chain (two edges sharing one corner): the run-up appears only at
+    the two outer ends, never at the shared internal corner."""
+    mission_file = tmp_path / "lshape.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            return [
+                SimpleNamespace(
+                    entity_id="L0", entity_type="LINE", layer="M", color=7,
+                    geometry={"start": (0.0, 0.0), "end": (2.0, 0.0)},
+                    is_mark=lambda: True,
+                ),
+                SimpleNamespace(
+                    entity_id="L1", entity_type="LINE", layer="M", color=7,
+                    geometry={"start": (2.0, 0.0), "end": (2.0, 2.0)},
+                    is_mark=lambda: True,
+                ),
+            ]
+
+        def load_entity_overrides(self, filename):
+            return {}
+
+        def load_extension_config(self, filename):
+            return {"enabled": True, "pre_extension_m": 0.5, "aft_extension_m": 0.5}
+
+        def load_entity_order(self, filename):
+            return []
+
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    data = await path_entities("lshape.dxf")
+    by_id = {e.entity_id: e.extension_preview for e in data.entities}
+
+    # L0: free start at (0,0) -> PRE only; shared end at corner -> no AFT.
+    assert by_id["L0"].pre_points != [] and by_id["L0"].aft_points == []
+    # L1: shared start at corner -> no PRE; free end at (2,2) -> AFT only.
+    assert by_id["L1"].pre_points == [] and by_id["L1"].aft_points != []
+
+
+@pytest.mark.anyio
 async def test_entities_api_includes_entity_to_entity_transit_preview(tmp_path, monkeypatch):
     mission_file = tmp_path / "field.dxf"
     mission_file.write_text("0\nEOF\n", encoding="utf-8")

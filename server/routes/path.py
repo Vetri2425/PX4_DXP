@@ -161,6 +161,45 @@ def _subsample_points(
     return [pts[round(i * step)] for i in range(max_points)]
 
 
+# Matches PathEngine.group_join_tol_m: two mark endpoints this close are the
+# same chain junction, so neither is a free end eligible for an extension.
+_EXTENSION_JUNCTION_TOL_M = 0.05
+
+
+def _extension_endpoint_freeness(
+    endpoints: list[tuple[tuple[float, float], tuple[float, float]]],
+    tol: float = _EXTENSION_JUNCTION_TOL_M,
+) -> list[tuple[bool, bool]]:
+    """Per mark entity (start, end), decide whether each end is a FREE end.
+
+    An end is *free* when it does not coincide with any OTHER mark entity's
+    endpoint — i.e. it is the outer end of a chain, not an internal junction.
+    A self-closed entity (start ≈ end) has no free end.
+
+    This mirrors the vertex-anchored planner policy: extensions live only at a
+    chain's true open ends, never at internal corners or on closed loops. Doing
+    it by endpoint connectivity (not entity order) means preview and plan agree
+    even though the preview keeps DXF order while the planner reorders via TSP.
+    """
+    def _shared(pt, skip_idx) -> bool:
+        for j, (s, e) in enumerate(endpoints):
+            if j == skip_idx:
+                continue
+            if math.hypot(pt[0] - s[0], pt[1] - s[1]) <= tol:
+                return True
+            if math.hypot(pt[0] - e[0], pt[1] - e[1]) <= tol:
+                return True
+        return False
+
+    freeness = []
+    for i, (start, end) in enumerate(endpoints):
+        if math.hypot(start[0] - end[0], start[1] - end[1]) <= tol:
+            freeness.append((False, False))  # self-closed loop — no free end
+            continue
+        freeness.append((not _shared(start, i), not _shared(end, i)))
+    return freeness
+
+
 def _entity_extension_preview(
     ent,
     preview_pts: list[tuple[float, float]],
@@ -168,10 +207,15 @@ def _entity_extension_preview(
     is_mark: bool,
     pre_extension_m: float,
     aft_extension_m: float,
+    start_is_free: bool = True,
+    end_is_free: bool = True,
 ) -> EntityExtensionPreview:
     # Direction math is shared with the planner (analytic arc tangents,
     # finite differences for line-like geometry) so the preview cannot
     # drift from what split_mark_segment_with_extensions() actually plans.
+    # start_is_free/end_is_free gate WHERE a run-up may appear: only at a
+    # chain's true open ends, matching the vertex-anchored planner — an
+    # internal corner or a closed loop yields no preview extension.
     from path_engine.planners.extensions import (
         entity_extension_directions,
         offset_point,
@@ -187,13 +231,13 @@ def _entity_extension_preview(
 
     pre_points = []
     aft_points = []
-    if pre_extension_m > 0:
+    if pre_extension_m > 0 and start_is_free:
         start = preview_pts[0]
         pre_points = [
             _ned_point(offset_point(start, start_dir, -pre_extension_m)),
             _ned_point(start),
         ]
-    if aft_extension_m > 0:
+    if aft_extension_m > 0 and end_is_free:
         end = preview_pts[-1]
         aft_points = [
             _ned_point(end),
@@ -378,10 +422,17 @@ async def path_entities(name: str):
     overrides = await asyncio.to_thread(path_mgr.load_entity_overrides, safe)
     extension_config_data = await asyncio.to_thread(path_mgr.load_extension_config, safe)
     extension_config = PathExtensionConfig(**extension_config_data)
-    # (entity_id, first_pt, last_pt) per drawable MARK entity — endpoints
-    # only, so large per-entity point lists aren't retained past the loop.
-    mark_endpoints: list[tuple[str, tuple[float, float], tuple[float, float]]] = []
-    for order_index, ent in enumerate(entities):
+
+    # Pre-pass: resolve each entity's preview/tangent points and mark state so
+    # extension previews can be made connectivity-aware. Extensions only belong
+    # at a chain's true open ends; internal junctions (square corners) and
+    # closed loops get none — same rule split_mark_segment_with_extensions()
+    # applies. Computed here (before the build loop) because freeness of one
+    # entity's end depends on every other mark entity's endpoints.
+    resolved: list[tuple] = []  # (ent, preview_pts, tangent_pts, default_is_mark, is_mark)
+    mark_endpoints_for_freeness: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    mark_slot_of_entity: dict[int, int] = {}
+    for idx, ent in enumerate(entities):
         preview_pts = _entity_preview_tuples(ent)
         # SPLINE/ELLIPSE previews are subsampled for payload size. Compute
         # extension directions/endpoints from dense flattened vertices so the
@@ -391,11 +442,24 @@ async def path_entities(name: str):
             if ent.entity_type in ("SPLINE", "ELLIPSE")
             else preview_pts
         )
-        all_pts.extend(preview_pts)
         default_is_mark = ent.is_mark()
         is_mark = overrides.get(ent.entity_id, default_is_mark)
+        resolved.append((ent, preview_pts, tangent_pts, default_is_mark, is_mark))
+        if is_mark and tangent_pts:
+            mark_slot_of_entity[idx] = len(mark_endpoints_for_freeness)
+            mark_endpoints_for_freeness.append((tangent_pts[0], tangent_pts[-1]))
+
+    freeness = _extension_endpoint_freeness(mark_endpoints_for_freeness)
+
+    # (entity_id, first_pt, last_pt) per drawable MARK entity — endpoints
+    # only, so large per-entity point lists aren't retained past the loop.
+    mark_endpoints: list[tuple[str, tuple[float, float], tuple[float, float]]] = []
+    for order_index, (ent, preview_pts, tangent_pts, default_is_mark, is_mark) in enumerate(resolved):
+        all_pts.extend(preview_pts)
         if is_mark and tangent_pts:
             mark_endpoints.append((ent.entity_id, tangent_pts[0], tangent_pts[-1]))
+        slot = mark_slot_of_entity.get(order_index)
+        start_is_free, end_is_free = freeness[slot] if slot is not None else (True, True)
         extension_preview = _entity_extension_preview(
             ent,
             tangent_pts,
@@ -403,6 +467,8 @@ async def path_entities(name: str):
             is_mark=is_mark,
             pre_extension_m=extension_config.pre_extension_m,
             aft_extension_m=extension_config.aft_extension_m,
+            start_is_free=start_is_free,
+            end_is_free=end_is_free,
         )
         for ext_pt in extension_preview.pre_points + extension_preview.aft_points:
             all_pts.append((ext_pt.north, ext_pt.east))
