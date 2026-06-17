@@ -43,7 +43,6 @@ _SMOOTH_SKIP_GEOMETRY_TYPES = CURVED_GEOMETRY_TYPES
 
 
 _SEGMENT_JOIN_TOL_M = 0.01
-_CHAIN_STRAIGHT_DOT_MIN = math.cos(math.radians(5.0))
 
 
 def _point_distance(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -124,87 +123,6 @@ def _align_extension_boundaries_to_compensated_marks(
             curr.points[0] = prev.points[-1]
 
     return aligned
-
-
-def _segment_start_tangent(seg: PathSegment) -> tuple[float, float] | None:
-    for i in range(1, len(seg.points)):
-        d = _point_distance(seg.points[0], seg.points[i])
-        if d > 1e-9:
-            return (
-                (seg.points[i][0] - seg.points[0][0]) / d,
-                (seg.points[i][1] - seg.points[0][1]) / d,
-            )
-    return None
-
-
-def _segment_end_tangent(seg: PathSegment) -> tuple[float, float] | None:
-    for i in range(len(seg.points) - 2, -1, -1):
-        d = _point_distance(seg.points[i], seg.points[-1])
-        if d > 1e-9:
-            return (
-                (seg.points[-1][0] - seg.points[i][0]) / d,
-                (seg.points[-1][1] - seg.points[i][1]) / d,
-            )
-    return None
-
-
-def _merge_extension_target_run(run: list[PathSegment]) -> PathSegment:
-    if len(run) == 1:
-        return run[0]
-
-    points: list[tuple[float, float]] = []
-    sources: list[str] = []
-    for seg in run:
-        if seg.source_entity:
-            sources.append(seg.source_entity)
-        for pt in seg.points:
-            if points and _point_distance(points[-1], pt) <= _SEGMENT_JOIN_TOL_M:
-                continue
-            points.append(pt)
-
-    head = run[0]
-    metadata = {
-        "geometry_type": "LINE_CHAIN",
-        "line_like": True,
-        "grouped_from": sources,
-    }
-    return PathSegment(
-        segment_type=SegmentType.MARK,
-        points=points,
-        speed=head.speed,
-        segment_id=head.segment_id,
-        source_entity=f"group:{sources[0]}+{len(run) - 1}" if sources else head.source_entity,
-        metadata=metadata,
-    )
-
-
-def _extension_targets_for_segment(seg: PathSegment) -> list[PathSegment]:
-    """Return extension targets, splitting grouped chains only at real corners."""
-    if seg.segment_type != SegmentType.MARK:
-        return [seg]
-
-    members = seg.metadata.get("chain_members")
-    if not members:
-        return [seg]
-
-    runs: list[list[PathSegment]] = []
-    current: list[PathSegment] = []
-    previous_tangent: tuple[float, float] | None = None
-
-    for member in members:
-        start_tangent = _segment_start_tangent(member)
-        if current and previous_tangent is not None and start_tangent is not None:
-            dot = previous_tangent[0] * start_tangent[0] + previous_tangent[1] * start_tangent[1]
-            if dot < _CHAIN_STRAIGHT_DOT_MIN:
-                runs.append(current)
-                current = []
-        current.append(member)
-        previous_tangent = _segment_end_tangent(member)
-
-    if current:
-        runs.append(current)
-
-    return [_merge_extension_target_run(run) for run in runs]
 
 
 class PathEngine:
@@ -742,21 +660,25 @@ class PathEngine:
             }
 
         # Step 4: Apply drive extensions to line-like MARK segments.
-        # A composite line-chain (square/triangle/rectangle perimeter from
-        # connected LINE primitives) is split at real corners before extension.
-        # Straight-through CAD primitives stay one run, while each square corner
-        # gets tangent-aligned AFT/connector/PRE geometry. Curves and lone lines
-        # have no members and are extended as a single segment.
+        # Vertex-anchored policy: a composite line-chain (square/triangle/
+        # rectangle perimeter) is extended only at its two TRUE open ends — the
+        # chain start and chain end. Internal corners are NOT split and get no
+        # run-up/run-out, so consecutive edges meet exactly at the shared vertex
+        # and the rover pivots cleanly there. A *closed* chain (square) has no
+        # free end, so split_mark_segment_with_extensions() suppresses extensions
+        # entirely via its _is_closed_run() guard. This avoids the diagonal
+        # "transit stitch" spurs (135° out-and-back) that an earlier per-corner
+        # extension scheme produced between each edge's AFT and the next edge's
+        # PRE, which the differential rover could not track.
         if self.enable_path_extensions:
             extended: list[PathSegment] = []
             for seg in ordered:
-                for target in _extension_targets_for_segment(seg):
-                    extended.extend(split_mark_segment_with_extensions(
-                        target,
-                        pre_extension_m=self.pre_extension_m,
-                        aft_extension_m=self.aft_extension_m,
-                        transit_speed=self.transit_speed,
-                    ))
+                extended.extend(split_mark_segment_with_extensions(
+                    seg,
+                    pre_extension_m=self.pre_extension_m,
+                    aft_extension_m=self.aft_extension_m,
+                    transit_speed=self.transit_speed,
+                ))
             ordered = _insert_transit_connectors_between_segments(
                 extended,
                 transit_speed=self.transit_speed,
@@ -788,8 +710,16 @@ class PathEngine:
         redensified: list[PathSegment] = []
         for seg in ordered:
             if seg.segment_type == SegmentType.TRANSIT and len(seg.points) >= 2:
+                # PRE/AFT run-ups are colinear continuations of a mark line, so
+                # sample them at MARK spacing (not the coarser transit spacing) —
+                # the rover then tracks the run-up as tightly as the marked line
+                # and is fully settled on-line before/after the spray boundary.
+                is_extension = seg.metadata.get("extension_role") in ("pre", "aft")
+                transit_spacing = (
+                    self.mark_spacing if is_extension else self.transit_spacing
+                )
                 redensified.append(
-                    densify_segment(seg, self.mark_spacing, self.transit_spacing)
+                    densify_segment(seg, self.mark_spacing, transit_spacing)
                 )
             else:
                 redensified.append(seg)

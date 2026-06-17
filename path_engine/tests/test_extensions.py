@@ -645,7 +645,11 @@ class TestExtensionStitchingThroughEngine:
             (0.0, 0.0),
         ]
 
-    def test_square_extensions_add_explicit_aft_to_pre_connectors(self):
+    def test_square_extensions_vertex_anchored_no_corner_spurs(self):
+        """Vertex-anchored policy: a CLOSED square has no free end, so enabling
+        extensions must NOT inject per-corner run-ups or diagonal AFT->PRE
+        connector spurs. The grouped chain is recognised as a closed run and
+        extensions are suppressed — output matches the no-extension topology."""
         engine = PathEngine(
             enable_path_extensions=True,
             pre_extension_m=0.5,
@@ -657,24 +661,86 @@ class TestExtensionStitchingThroughEngine:
         )
         plan = engine.plan_segments(self._square_edges())
 
+        # No diagonal stitch connectors, and no out-and-back spurs.
         connectors = [
             s for s in plan.segments
             if s.metadata.get("extension_connector") is True
         ]
-        assert len(connectors) == 3
-        assert all(s.segment_type == SegmentType.TRANSIT for s in connectors)
+        assert connectors == []
 
-        # No hidden /path jumps remain between planned segments.
-        for prev, curr in zip(plan.segments, plan.segments[1:]):
-            assert _distance(prev.points[-1], curr.points[0]) < 1e-9
+        # The closed square collapses to a single clean MARK chain — identical
+        # topology to enable_path_extensions=False.
+        assert [s.segment_type for s in plan.segments] == [SegmentType.MARK]
+        assert plan.merged_waypoints == [
+            (0.0, 0.0),
+            (2.0, 0.0),
+            (2.0, 2.0),
+            (0.0, 2.0),
+            (0.0, 0.0),
+        ]
 
-        assert plan.segments[0].points[0] == (-0.5, 0.0)  # pre(A)
-        assert plan.segments[1].points == [(0.0, 0.0), (2.0, 0.0)]  # A->B
-        assert plan.segments[2].points[-1] == (2.5, 0.0)  # aft(B)
-        assert connectors[0].points[0] == (2.5, 0.0)
-        assert connectors[0].points[-1] == (2.0, -0.5)  # connector to pre(B)
-        assert plan.segments[4].points[0] == (2.0, -0.5)
-        assert plan.segments[4].points[-1] == (2.0, 0.0)
+        # No >100° heading reversal anywhere (the spur signature was 135°).
+        wps = plan.merged_waypoints
+        for i in range(1, len(wps) - 1):
+            ax, ay = wps[i][0] - wps[i - 1][0], wps[i][1] - wps[i - 1][1]
+            bx, by = wps[i + 1][0] - wps[i][0], wps[i + 1][1] - wps[i][1]
+            la, lb = math.hypot(ax, ay), math.hypot(bx, by)
+            if la < 1e-9 or lb < 1e-9:
+                continue
+            dot = max(-1.0, min(1.0, (ax * bx + ay * by) / (la * lb)))
+            assert math.degrees(math.acos(dot)) <= 100.0
+
+    def test_open_chain_extends_only_true_ends_dense(self):
+        """Vertex-anchored policy on an OPEN L-chain: a run-up is added at the
+        chain start and a run-out at the chain end (the two true open ends), the
+        internal corner is left clean (no spur), and the run-ups are sampled at
+        MARK spacing so they track as tightly as the mark line."""
+        engine = PathEngine(
+            enable_path_extensions=True,
+            pre_extension_m=0.5,
+            aft_extension_m=0.5,
+            optimize_order=False,
+            compensate_spray=False,
+            mark_spacing=0.05,
+            transit_spacing=0.5,
+        )
+        # Open L: (0,0)->(2,0) then (2,0)->(2,2). One internal 90° corner.
+        plan = engine.plan_segments([
+            PathSegment(
+                segment_type=SegmentType.MARK,
+                points=[(0.0, 0.0), (2.0, 0.0)],
+                speed=0.35,
+                source_entity="LINE_L0",
+                metadata={"geometry_type": "LINE"},
+            ),
+            PathSegment(
+                segment_type=SegmentType.MARK,
+                points=[(2.0, 0.0), (2.0, 2.0)],
+                speed=0.35,
+                source_entity="LINE_L1",
+                metadata={"geometry_type": "LINE"},
+            ),
+        ])
+
+        roles = [s.metadata.get("extension_role") for s in plan.segments]
+        assert roles.count("pre") == 1
+        assert roles.count("aft") == 1
+        # No diagonal stitch connectors at the internal corner.
+        assert not any(
+            s.metadata.get("extension_connector") is True for s in plan.segments
+        )
+
+        pre = next(s for s in plan.segments if s.metadata.get("extension_role") == "pre")
+        aft = next(s for s in plan.segments if s.metadata.get("extension_role") == "aft")
+        # Run-up colinear with first edge, ending at chain start (0,0).
+        assert pre.points[-1] == (0.0, 0.0)
+        assert abs(pre.points[0][0] - (-0.5)) < 1e-9 and abs(pre.points[0][1]) < 1e-9
+        # Run-out colinear with last edge, starting at chain end (2,2).
+        assert aft.points[0] == (2.0, 2.0)
+        assert abs(aft.points[-1][0] - 2.0) < 1e-9 and abs(aft.points[-1][1] - 2.5) < 1e-9
+        # Run-ups densified at MARK spacing (0.05): 0.5 m -> ~10 intervals.
+        assert len(pre.points) >= 10
+        assert len(aft.points) >= 10
 
     def test_spray_compensation_keeps_extensions_continuous(self):
         engine = PathEngine(
