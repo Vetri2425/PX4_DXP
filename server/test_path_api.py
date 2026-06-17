@@ -93,6 +93,19 @@ def test_path_manager_preview_caches_uploaded_file_result(tmp_path, monkeypatch)
     assert first is second
 
 
+def test_path_manager_clear_entity_overrides_invalidates_preview_cache(tmp_path):
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+
+    mgr = PathManager(str(tmp_path))
+    fpath = str(mission_file)
+    mgr._preview_cache[fpath] = (1, 2, object())
+
+    mgr.clear_entity_overrides("field.dxf")
+
+    assert fpath not in mgr._preview_cache
+
+
 @pytest.mark.anyio
 async def test_preview_api_returns_path_preview(monkeypatch):
     class FakePathManager:
@@ -306,6 +319,62 @@ async def test_entities_api_includes_extension_preview(tmp_path, monkeypatch):
     assert ext.aft_points[-1].north == 1.25
     assert data.bounds.north_min == -0.5
     assert data.bounds.north_max == 1.25
+
+
+@pytest.mark.anyio
+async def test_entities_api_uses_dense_spline_points_for_extension_preview(tmp_path, monkeypatch):
+    mission_file = tmp_path / "field.dxf"
+    mission_file.write_text("0\nEOF\n", encoding="utf-8")
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            assert filepath == str(mission_file)
+            return [
+                SimpleNamespace(
+                    entity_id="S1",
+                    entity_type="SPLINE",
+                    layer="MARKINGS",
+                    color=7,
+                    geometry={"vertices": [(0.0, 0.0), (1.0, 0.0), (1.0, 10.0)]},
+                    is_mark=lambda: True,
+                )
+            ]
+
+        def load_entity_overrides(self, filename):
+            return {}
+
+        def load_extension_config(self, filename):
+            return {
+                "enabled": True,
+                "pre_extension_m": 0.5,
+                "aft_extension_m": 0.25,
+            }
+
+        def load_entity_order(self, filename):
+            return []
+
+    import routes.path as path_route
+
+    def fake_preview_tuples(ent, max_points=200):
+        if max_points == 10000:
+            return [(0.0, 0.0), (1.0, 0.0), (1.0, 10.0)]
+        return [(0.0, 0.0), (0.0, 10.0)]
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(path_route, "_entity_preview_tuples", fake_preview_tuples)
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    data = await path_entities("field.dxf")
+
+    ext = data.entities[0].extension_preview
+    assert [pt.model_dump() for pt in data.entities[0].preview_points] == [
+        {"north": 0.0, "east": 0.0},
+        {"north": 0.0, "east": 10.0},
+    ]
+    assert ext.pre_points[0].north == pytest.approx(-0.5)
+    assert ext.pre_points[0].east == pytest.approx(0.0)
+    assert ext.aft_points[-1].north == pytest.approx(1.0)
+    assert ext.aft_points[-1].east == pytest.approx(10.25)
 
 
 @pytest.mark.anyio

@@ -480,6 +480,7 @@ class PathManager:
             os.remove(sidecar)
         except FileNotFoundError:
             pass
+        self._preview_cache.pop(fpath, None)
 
     @staticmethod
     def apply_entity_overrides(entities: list, overrides: dict[str, bool]) -> None:

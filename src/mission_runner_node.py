@@ -107,9 +107,18 @@ class MissionRunnerNode(Node):
         self.declare_parameter("stream_warmup_s",     0.5)   # stream before OFFBOARD
         self.declare_parameter("mode_switch_timeout_s", 5.0)
         self.declare_parameter("dry_run",            False)  # if true, never actually arms
+        self.declare_parameter("allow_legacy_lifecycle", False)
         self.declare_parameter("post_offboard_settle_s", 1.0)  # min wait after OFFBOARD before arm
         self.declare_parameter("arm_max_retries",        3)    # retry arm this many times
         self.declare_parameter("arm_retry_delay_s",      5.0)  # seconds between retries
+
+        if not bool(self.get_parameter("allow_legacy_lifecycle").value):
+            self.get_logger().error(
+                "mission_runner_node is legacy lifecycle control. The server "
+                "owns OFFBOARD/arming in normal operation; restart with "
+                "allow_legacy_lifecycle:=true only for isolated manual tests."
+            )
+            raise SystemExit(2)
 
         # ------------------------------------------------------------------
         # State

@@ -6,7 +6,7 @@ Brings up:
   2. rpp_controller_node      — computes /rpp/velocity_ned at 50 Hz
   3. spray_controller_node    — drives PX4 actuator-set AUX output from /spray/active
   4. xtrack_logger_node       — captures CSV for offline tuning analysis
-  5. path_publisher_node      — publishes the requested test path
+  5. path_publisher_node      — optional requested test path publisher
   6. mission_runner_node      — drives OFFBOARD lifecycle (off by default)
 
 This launch file uses ExecuteProcess directly because the repo is not yet
@@ -24,11 +24,17 @@ Order matters
 
 Launch arguments
 ----------------
-  path_name    Which test path to publish (default: straight_5m)
+  path_name    Which test path to publish when publish_test_path=true
                  Options: straight_5m, arc_quarter_1m5, lshape_2x2,
                           square_2x2, rectangle_3x2, circle_1m5
   auto_run     If true, mission_runner auto-switches to OFFBOARD + arms
                  (default: false — operator runs mission_runner manually)
+  allow_legacy_mission_runner
+               If true, permit mission_runner_node to own OFFBOARD lifecycle
+               (default: false — server owns lifecycle in normal operation)
+  publish_test_path
+               If true, start path_publisher_node and publish path_name
+               (default: false — server owns /path in normal operation)
   auto_origin  If true, offset path to start at rover's current position
                  instead of EKF origin (default: false)
   dry_run      If true, mission_runner skips arm/mode commands
@@ -38,15 +44,17 @@ Launch arguments
 Examples
 --------
   # SITL straight-line test, manual mission start:
-  ros2 launch src/launch/rpp_pipeline.launch.py path_name:=straight_5m
+  ros2 launch src/launch/rpp_pipeline.launch.py publish_test_path:=true path_name:=straight_5m
 
   # Hardware arc test, auto-run, debug logging:
-  ros2 launch src/launch/rpp_pipeline.launch.py path_name:=arc_quarter_1m5 \\
-      auto_run:=true log_level:=debug
+  ros2 launch src/launch/rpp_pipeline.launch.py publish_test_path:=true \\
+      path_name:=arc_quarter_1m5 auto_run:=true \\
+      allow_legacy_mission_runner:=true log_level:=debug
 
   # Dry-run telemetry capture, no arming:
-  ros2 launch src/launch/rpp_pipeline.launch.py path_name:=lshape_2x2 \\
-      auto_run:=true dry_run:=true
+  ros2 launch src/launch/rpp_pipeline.launch.py publish_test_path:=true \\
+      path_name:=lshape_2x2 auto_run:=true \\
+      allow_legacy_mission_runner:=true dry_run:=true
 """
 
 import os
@@ -74,6 +82,10 @@ def _node_cmd(script: str, log_level: str, params: dict | None = None) -> list[s
 def _build(context, *args, **kwargs):
     path_name = LaunchConfiguration("path_name").perform(context)
     auto_run = LaunchConfiguration("auto_run").perform(context).lower() == "true"
+    allow_legacy_mission_runner = (
+        LaunchConfiguration("allow_legacy_mission_runner").perform(context).lower() == "true"
+    )
+    publish_test_path = LaunchConfiguration("publish_test_path").perform(context).lower() == "true"
     auto_origin = LaunchConfiguration("auto_origin").perform(context).lower() == "true"
     dry_run = LaunchConfiguration("dry_run").perform(context).lower() == "true"
     log_level = LaunchConfiguration("log_level").perform(context)
@@ -156,7 +168,10 @@ def _build(context, *args, **kwargs):
         cmd=_node_cmd(
             os.path.join(src_dir, "mission_runner_node.py"),
             log_level,
-            {"dry_run": "true" if dry_run else "false"},
+            {
+                "dry_run": "true" if dry_run else "false",
+                "allow_legacy_lifecycle": "true" if allow_legacy_mission_runner else "false",
+            },
         ),
         name="mission_runner",
         output="screen",
@@ -169,9 +184,12 @@ def _build(context, *args, **kwargs):
         rpp_proc,
         spray_proc,
         xtrack_proc,
-        # Phase 2: path publisher waits 2s so subscribers are ready
-        TimerAction(period=0.3, actions=[path_proc]),
     ]
+
+    if publish_test_path:
+        # Optional test path injection. In normal server-driven operation, the
+        # FastAPI bridge publishes /path directly and this process stays absent.
+        actions.append(TimerAction(period=0.3, actions=[path_proc]))
 
     if auto_run:
         # Phase 3: mission_runner waits 4s — path is up, RPP has started outputting
@@ -186,6 +204,10 @@ def generate_launch_description():
             description="Test path name"),
         DeclareLaunchArgument("auto_run", default_value="false",
             description="If true, mission_runner auto-switches to OFFBOARD + arms"),
+        DeclareLaunchArgument("allow_legacy_mission_runner", default_value="false",
+            description="If true, mission_runner_node may own OFFBOARD lifecycle"),
+        DeclareLaunchArgument("publish_test_path", default_value="false",
+            description="If true, start path_publisher_node and publish path_name"),
         DeclareLaunchArgument("dry_run", default_value="false",
             description="If true, mission_runner skips arm/mode commands"),
         DeclareLaunchArgument("auto_origin", default_value="false",

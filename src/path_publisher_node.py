@@ -8,7 +8,7 @@ Input modes
 -----------
   1. Hardcoded paths (path_name parameter) — for SITL and quick testing
   2. QGC .waypoints file (mission_file parameter) — lat/lon converted to NED
-  3. Simple CSV file (mission_file parameter) — already in NED metres
+  3. CSV/DXF file (mission_file parameter) — planned through path_engine when needed
 
 Hardcoded paths
 ---------------
@@ -50,11 +50,12 @@ Usage
   # QGC waypoints file (lat/lon → NED via Karney):
   ros2 run ... path_publisher --ros-args -p mission_file:=/path/to/mission.waypoints
 
-  # Simple CSV (NED metres, no conversion):
+  # Simple CSV (NED metres, no conversion) or DXF (sidecars honored):
   ros2 run ... path_publisher --ros-args -p mission_file:=/path/to/path.csv
 """
 
 import csv
+import json
 import logging
 import math
 import os
@@ -65,7 +66,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
-from std_msgs.msg import Bool, Float32
+from std_msgs.msg import Float32
 
 try:
     from path_engine import PathEngine as _PathEngine
@@ -77,6 +78,108 @@ except ImportError:
     _HAS_PATH_ENGINE = False
 
 _logger = logging.getLogger("path_publisher")
+
+
+def _sidecar_path(filepath: str, suffix: str) -> str:
+    dirname = os.path.dirname(filepath)
+    basename = os.path.basename(filepath)
+    return os.path.join(dirname, f".{basename}.{suffix}.json")
+
+
+def _load_extension_sidecar(filepath: str) -> tuple[bool, float, float]:
+    default = (False, 0.5, 0.5)
+    try:
+        with open(_sidecar_path(filepath, "extensions"), encoding="utf-8") as f:
+            payload = json.load(f)
+        pre = float(payload.get("pre_extension_m", default[1]))
+        aft = float(payload.get("aft_extension_m", default[2]))
+        if pre < 0.0 or aft < 0.0:
+            return default
+        return (bool(payload.get("enabled", default[0])), pre, aft)
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return default
+
+
+def _load_entity_overrides_sidecar(filepath: str) -> dict[str, bool]:
+    try:
+        with open(_sidecar_path(filepath, "entities"), encoding="utf-8") as f:
+            payload = json.load(f)
+    except (FileNotFoundError, OSError, ValueError):
+        return {}
+
+    raw = payload.get("overrides", {})
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, bool] = {}
+    for entity_id, value in raw.items():
+        if isinstance(value, dict):
+            value = value.get("is_mark")
+        if isinstance(value, bool):
+            result[str(entity_id)] = value
+    return result
+
+
+def _load_entity_order_sidecar(filepath: str) -> list[str]:
+    try:
+        with open(_sidecar_path(filepath, "entity_order"), encoding="utf-8") as f:
+            payload = json.load(f)
+    except (FileNotFoundError, OSError, ValueError):
+        return []
+    raw = payload.get("entity_order", [])
+    if not isinstance(raw, list):
+        return []
+    return [str(v) for v in raw if isinstance(v, str)]
+
+
+def _plan_file_with_engine(
+    filepath: str,
+    *,
+    origin: tuple[float, float] = (0.0, 0.0),
+    start_position: tuple[float, float] | None = None,
+):
+    """Plan a mission file through PathEngine, honoring DXF sidecars when present."""
+    if _PathEngine is None:
+        raise ImportError("path_engine is required for PathEngine planning")
+
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext != ".dxf":
+        return _PathEngine().plan_file(
+            filepath,
+            origin=origin,
+            start_position=start_position,
+        )
+
+    enabled, pre_m, aft_m = _load_extension_sidecar(filepath)
+    overrides = _load_entity_overrides_sidecar(filepath)
+    saved_order = _load_entity_order_sidecar(filepath)
+    engine = _PathEngine(
+        enable_path_extensions=enabled,
+        pre_extension_m=pre_m,
+        aft_extension_m=aft_m,
+        optimize_order=not bool(saved_order),
+    )
+
+    if overrides or saved_order:
+        from path_engine.entity_order import apply_entity_order
+        from path_engine.parsers.dxf_parser import parse_dxf
+
+        entities = parse_dxf(filepath)
+        for ent in entities:
+            if ent.entity_id in overrides:
+                ent.is_mark_override = bool(overrides[ent.entity_id])
+        if saved_order:
+            entities = apply_entity_order(entities, saved_order)
+        return engine.plan_dxf_entities(
+            entities,
+            origin=origin,
+            start_position=start_position,
+        )
+
+    return engine.plan_file(
+        filepath,
+        origin=origin,
+        start_position=start_position,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -304,8 +407,7 @@ def load_mission_file(filepath: str, start_position: tuple[float, float] | None 
     elif ext == ".dxf":
         if _PathEngine is None:
             raise ImportError("path_engine is required for .dxf files")
-        engine = _PathEngine()
-        plan = engine.plan_file(filepath, start_position=start_position)
+        plan = _plan_file_with_engine(filepath, start_position=start_position)
         return plan.merged_waypoints
     else:
         # Try QGC format first, fall back to CSV
@@ -348,15 +450,6 @@ class PathPublisherNode(Node):
         )
         self._pub = self.create_publisher(Path, "/path", path_qos)
 
-        # /dyx/spray_cmd — spray ON/OFF control (edge-triggered from spray_flags)
-        spray_qos = QoSProfile(
-            depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-            history=HistoryPolicy.KEEP_LAST,
-        )
-        self._spray_pub = self.create_publisher(Bool, "/dyx/spray_cmd", spray_qos)
-
         # /dyx/mission/progress — 0.0→1.0 completion (1Hz)
         self._progress_pub = self.create_publisher(Float32, "/dyx/mission/progress", be_qos)
 
@@ -364,15 +457,15 @@ class PathPublisherNode(Node):
         self._origin_ned: tuple[float, float] | None = None  # (North, East)
         self._start_position: tuple[float, float] | None = None  # For TSP optimization
 
-        # Spray tracking state
+        # Progress tracking state. Spray state is encoded in /path.pose.position.z
+        # and consumed by rpp_controller -> /spray/active.
         self._spray_flags: list[bool] | None = None
         self._path_pts: list[tuple[float, float]] = []  # offset pts for pose lookup
         self._total_waypoints: int = 0
         self._waypoints_visited: int = 0
-        self._last_spray_state: bool | None = None
         self._mission_active: bool = False
 
-        # Subscribe to pose for spray edge-detection + progress tracking
+        # Subscribe to pose for auto-origin and progress tracking.
         self.create_subscription(
             PoseStamped, "/mavros/local_position/pose",
             self._pose_cb, be_qos)
@@ -410,9 +503,9 @@ class PathPublisherNode(Node):
                 f"E={ned[1]:.3f} (from ENU pose)"
             )
 
-        # Pose-driven spray edge-detection and progress tracking
-        if self._mission_active and self._spray_flags and self._path_pts:
-            self._update_spray_and_progress(pn, pe)
+        # Pose-driven progress tracking
+        if self._mission_active and self._path_pts:
+            self._update_progress(pn, pe)
 
     def _try_publish_with_origin(self):
         """Called every 200ms when auto_origin=True. Publishes once origin is known."""
@@ -445,13 +538,12 @@ class PathPublisherNode(Node):
                             "path_engine not installed — refusing .dxf mission"
                         )
                         return
-                    engine = _PathEngine()
                     origin = (
                         self._origin_ned
                         if self._auto_origin and self._origin_ned
                         else (0.0, 0.0)
                     )
-                    plan = engine.plan_file(
+                    plan = _plan_file_with_engine(
                         mission_file,
                         origin=origin,
                         start_position=self._start_position,
@@ -528,21 +620,13 @@ class PathPublisherNode(Node):
         self._path_pts = list(pts)
         self._total_waypoints = len(pts)
         self._waypoints_visited = 0
-        self._spray_flags = spray_flags
-        self._last_spray_state = None
+        self._spray_flags = path_spray_flags
         self._mission_active = True
 
-        if spray_flags:
-            # Publish initial spray command
-            initial_spray = spray_flags[0]
-            spray_msg = Bool()
-            spray_msg.data = initial_spray
-            self._spray_pub.publish(spray_msg)
-            self._last_spray_state = initial_spray
-
+        if path_spray_flags:
             self.get_logger().info(
-                f"Spray schedule loaded: {sum(spray_flags)} MARK / "
-                f"{len(spray_flags) - sum(spray_flags)} TRANSIT waypoints"
+                f"Spray schedule loaded: {sum(path_spray_flags)} MARK / "
+                f"{len(path_spray_flags) - sum(path_spray_flags)} TRANSIT waypoints"
             )
 
         # Start 1Hz progress timer
@@ -555,8 +639,8 @@ class PathPublisherNode(Node):
             f"frame={frame_id!r}"
         )
 
-    def _update_spray_and_progress(self, pn: float, pe: float):
-        """Project pose onto path segments, edge-detect spray, update progress.
+    def _update_progress(self, pn: float, pe: float):
+        """Project pose onto path segments and update progress.
 
         I2 fix: previously this used nearest-WAYPOINT Euclidean distance, which
         matches RPP only for densely spaced paths. RPP projects the pose onto
@@ -595,20 +679,10 @@ class PathPublisherNode(Node):
                     best_d = d
                     best_c = i + t
 
-        # Last crossed waypoint = floor(continuous index); progress + spray
-        # both key off it so the boundary fires where RPP actually places
-        # the rover on the path, not at the nearest discrete waypoint.
+        # Last crossed waypoint = floor(continuous index), matching where RPP
+        # places the rover on the path rather than the nearest discrete waypoint.
         last_crossed = min(int(best_c), self._total_waypoints - 1)
         self._waypoints_visited = last_crossed
-
-        # Edge-detect spray state change
-        if self._spray_flags:
-            state = self._spray_flags[min(last_crossed, len(self._spray_flags) - 1)]
-            if state != self._last_spray_state:
-                spray_msg = Bool()
-                spray_msg.data = bool(state)
-                self._spray_pub.publish(spray_msg)
-                self._last_spray_state = state
 
     def _progress_cb(self):
         """1Hz progress publisher — reports waypoint completion fraction."""

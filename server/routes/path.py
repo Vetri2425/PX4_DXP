@@ -382,15 +382,23 @@ async def path_entities(name: str):
     # only, so large per-entity point lists aren't retained past the loop.
     mark_endpoints: list[tuple[str, tuple[float, float], tuple[float, float]]] = []
     for order_index, ent in enumerate(entities):
-        pts = _entity_preview_tuples(ent)
-        all_pts.extend(pts)
+        preview_pts = _entity_preview_tuples(ent)
+        # SPLINE/ELLIPSE previews are subsampled for payload size. Compute
+        # extension directions/endpoints from dense flattened vertices so the
+        # preview arrow follows the same endpoint tangent used by execution.
+        tangent_pts = (
+            _entity_preview_tuples(ent, max_points=10000)
+            if ent.entity_type in ("SPLINE", "ELLIPSE")
+            else preview_pts
+        )
+        all_pts.extend(preview_pts)
         default_is_mark = ent.is_mark()
         is_mark = overrides.get(ent.entity_id, default_is_mark)
-        if is_mark and pts:
-            mark_endpoints.append((ent.entity_id, pts[0], pts[-1]))
+        if is_mark and tangent_pts:
+            mark_endpoints.append((ent.entity_id, tangent_pts[0], tangent_pts[-1]))
         extension_preview = _entity_extension_preview(
             ent,
-            pts,
+            tangent_pts,
             enabled=extension_config.enabled,
             is_mark=is_mark,
             pre_extension_m=extension_config.pre_extension_m,
@@ -414,7 +422,7 @@ async def path_entities(name: str):
             order_index=order_index,
             length_m=round(_entity_length_m(ent), 3),
             geometry=_jsonable_geometry(geometry),
-            preview_points=[_ned_point(pt) for pt in pts],
+            preview_points=[_ned_point(pt) for pt in preview_pts],
             extension_preview=extension_preview,
         ))
 

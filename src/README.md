@@ -36,9 +36,9 @@ path_publisher  ─→ /path
 | :--- | :--- | :--- |
 | [`rpp_controller_node.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/src/rpp_controller_node.py) | **Regulated Pure Pursuit Controller**:<br>• Tracks path waypoints and translates ENU poses to NED.<br>• Computes lookahead targets, worst-case preview curvatures, and lateral acceleration speed limits.<br>• Publishes relative NED velocity vectors and body yaw-rate feedforward signals. | **Subscribes to**:<br>• `/path` (`nav_msgs/Path`) - target waypoints<br>• `/mavros/local_position/pose` (`geometry_msgs/PoseStamped`) - ENU pose<br>• `/mavros/local_position/velocity_local` (`geometry_msgs/TwistStamped`) - ENU velocity<br>• `/mavros/gpsstatus/gps1/raw` (`mavros_msgs/GPSRAW`) - RTK fix gate<br><br>**Publishes to**:<br>• `/rpp/velocity_ned` (`geometry_msgs/Vector3Stamped`) - velocity setpoint<br>• `/rpp/yaw_rate_body` (`std_msgs/Float32`) - body yaw rate<br>• `/rpp/debug` (`std_msgs/Float32MultiArray`) - 39 performance metrics |
 | [`twist_to_setpoint_node.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/src/twist_to_setpoint_node.py) | **MAVROS Heartbeat Translator**:<br>• Subscribes to RPP velocity and body yaw-rate inputs at 50 Hz.<br>• Translates signals to MAVROS ENU coordinates and publishes them as raw setpoints.<br>• Computes explicit ENU yaw from velocity direction and freezes heading below 1 cm/s (P4/P0.5). | **Subscribes to**:<br>• `/rpp/velocity_ned`<br>• `/rpp/yaw_rate_body`<br><br>**Publishes to**:<br>• `/mavros/setpoint_raw/local` (`mavros_msgs/PositionTarget`) |
-| [`path_publisher_node.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/src/path_publisher_node.py) | **Test Path Publisher**:<br>• Publishes hardcoded test trajectories (`straight_5m`, `arc_quarter_1m5`, `lshape_2x2`, `square_2x2`, etc.) in the `local_ned` frame. | **Publishes to**:<br>• `/path` (TRANSIENT_LOCAL) |
+| [`path_publisher_node.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/src/path_publisher_node.py) | **Legacy/Test Path Publisher**:<br>• Publishes hardcoded test trajectories (`straight_5m`, `arc_quarter_1m5`, `lshape_2x2`, `square_2x2`, etc.) in the `local_ned` frame.<br>• Not started by default; the server owns `/path` in normal operation. | **Publishes to**:<br>• `/path` (TRANSIENT_LOCAL) |
 | [`xtrack_logger_node.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/src/xtrack_logger_node.py) | **Tuning CSV Logger**:<br>• Aggregates time-aligned telemetry (pose, speed, cross-track error, yaw-rates) from various topics at 20 Hz.<br>• Logs values to a CSV file (`/tmp/rpp_<path>_<ts>.csv`) for spreadsheet/pandas analysis. | **Subscribes to**:<br>• `/path`, `/mavros/local_position/pose`, `/rpp/debug`, `/rpp/velocity_ned`, `/mavros/setpoint_raw/local` |
-| [`mission_runner_node.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/src/mission_runner_node.py) | **Autonomous Offboard Manager**:<br>• Orchestrates the full automatic mission sequence: pre-streaming -> arming -> switching to OFFBOARD -> waiting for DONE status -> disarming. | **Subscribes to**:<br>• `/mavros/state`, `/rpp/debug`<br><br>**Calls Services**:<br>• `/mavros/cmd/arming`, `/mavros/set_mode` |
+| [`mission_runner_node.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/src/mission_runner_node.py) | **Legacy Autonomous Offboard Manager**:<br>• Orchestrates the full automatic mission sequence for isolated manual tests.<br>• Requires `allow_legacy_lifecycle:=true`; the server owns OFFBOARD lifecycle in normal operation. | **Subscribes to**:<br>• `/mavros/state`, `/rpp/debug`<br><br>**Calls Services**:<br>• `/mavros/cmd/arming`, `/mavros/set_mode` |
 
 ### Pipeline Launch
 
@@ -75,12 +75,12 @@ path_publisher  ─→ /path
 3. **Terminal 3: Launch RPP Node Pipeline**
    ```bash
    cd ~/PX4_DXP
-   ros2 launch src/launch/rpp_pipeline.launch.py path_name:=straight_5m
+   ros2 launch src/launch/rpp_pipeline.launch.py publish_test_path:=true path_name:=straight_5m
    ```
 
 4. **Terminal 4: Start the Automated Mission Runner**
    ```bash
-   ros2 run --prefix "python3" src/mission_runner_node.py
+   ros2 run --prefix "python3" src/mission_runner_node.py --ros-args -p allow_legacy_lifecycle:=true
    ```
 
 ### Hardware Deployment
@@ -91,8 +91,8 @@ Ensure the MAVROS companion services are active on the Jetson Orin before launch
 # Verify companion bridge state
 systemctl status px4-dxp.service
 
-# Launch the pipeline on hardware with auto-run enabled
-ros2 launch src/launch/rpp_pipeline.launch.py path_name:=straight_5m auto_run:=true
+# Launch the legacy test pipeline on hardware with auto-run enabled
+ros2 launch src/launch/rpp_pipeline.launch.py publish_test_path:=true path_name:=straight_5m auto_run:=true allow_legacy_mission_runner:=true
 ```
 
 > [!WARNING]
@@ -103,7 +103,7 @@ ros2 launch src/launch/rpp_pipeline.launch.py path_name:=straight_5m auto_run:=t
 For safety validation, run a dry-run mission:
 
 ```bash
-ros2 launch src/launch/rpp_pipeline.launch.py path_name:=arc_quarter_1m5 auto_run:=true dry_run:=true
+ros2 launch src/launch/rpp_pipeline.launch.py publish_test_path:=true path_name:=arc_quarter_1m5 auto_run:=true allow_legacy_mission_runner:=true dry_run:=true
 ```
 
 This runs the RPP and translator pipelines without publishing arming commands, allowing log captures of simulated target paths.
