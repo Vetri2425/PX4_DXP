@@ -51,7 +51,7 @@ Not your job: PX4 firmware, waypoint gen, log analysis — those live on Mac GCS
 | SSH to Jetson | `ssh flash@192.168.1.102` |
 | QGC | QGroundControl on macOS |
 
-## Current status (2026-06-15)
+## Current status (2026-06-17)
 
 - Phase 2 OFFBOARD stack running; FastAPI + mobile frontend built
 - **Controller + tuning phase CLOSED & VALIDATED** — frozen at validated config (`@510be9b`+ bug fixes). Production tracking = **segment / stop-pivot profile**. Do not re-open arc PID/lookahead tuning unless a regression appears.
@@ -66,7 +66,18 @@ Not your job: PX4 firmware, waypoint gen, log analysis — those live on Mac GCS
 - Known minor (not blocking): pivots ~6s near 5s align watchdog, 2/3 exit ~0.17 rad/s residual; speed loop overshoots (~0.42 vs 0.35) — tighten `RO_SPEED_P/I` when convenient.
 - **Auto-bag recorder LIVE** — `bag-autorecord.service` captures every API-started mission to `~/bags_jet` (start→complete). Validate via `tools/validate_build.py <dir>`.
 - Tracking profiles live: `tracking_profile=auto|segment|smooth` — auto splits missions per-entity (spray-flag + hard-corner splits), lines→segment, arcs/circles→smooth, pivot-align at transitions.
-- Phase 3 spray: **built & live** — `spray_controller_node.py` drives PX4 AUX via `MAV_CMD_DO_SET_ACTUATOR` (MAVROS), safety-gated (armed+OFFBOARD, staleness watchdog, debounce); manual test via `POST /api/spray/test`. QGC owns AUX pin/PWM config
+- Phase 3 spray: **built, live & hardware-validated (2026-06-17)** — `spray_controller_node.py` drives PX4 AUX1 via `MAV_CMD_DO_SET_ACTUATOR` cmd 187 (MAVROS), safety-gated (armed+OFFBOARD, staleness watchdog, debounce); manual test via `POST /api/spray/test`.
+  - **Validated spray config (SmartFLEX DC motor driver on AUX1):**
+    - `actuator_backend = mavlink_actuator` (cmd 187, normalized)
+    - `on_value = 1.0` → 3000 µs (full flow, field-confirmed)
+    - `off_value = -1.0` → 0 µs (motor fully stopped, field-confirmed)
+  - **Required QGC FCU params (source of truth — set via QGC, not Jetson):**
+    - `PWM_AUX_FUNC1 = 301` (RC AUX passthrough)
+    - `PWM_AUX_MIN1 = 0` (was 1000 — changed so OFF idles at 0 µs, not 1000 µs)
+    - `PWM_AUX_MAX1 = 3000` (SmartFLEX accepts 0–3000 µs range)
+    - `PWM_AUX_DIS1 = 0` (disarmed output = 0 µs)
+  - **Why not cmd 183 (DO_SET_SERVO):** PX4 denies cmd 183 with `PWM_AUX_FUNC1=301` (RC passthrough). Switching to `mavlink_servo_pwm` backend requires changing FUNC1 to Generic Actuator in QGC — deferred, not needed.
+  - **Bench test command (armed, no OFFBOARD needed):** `MAV_CMD_DO_SET_ACTUATOR` cmd 187 is accepted while armed in any mode. cmd 183 requires OFFBOARD.
 - robot_localization fusion: not yet built
 
 ### Active focus (Phase 3 — moved on from controller)
