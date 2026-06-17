@@ -247,7 +247,6 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "max_xtrack_error_m": _Param(0.10),
         "pose_timeout_s": _Param(0.5),
         "velocity_timeout_s": _Param(0.5),
-        "path_clear_disarm_s": _Param(2.0),
         "allow_legacy_spray_active_fallback": _Param(True),
         "actuator_backend": _Param("mavlink_actuator"),
         "servo_instance": _Param(1),
@@ -280,7 +279,6 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._service_ready = True
     node._off_confirmed = True
     node._last_off_send_time_ns = None
-    node._disarm_time_ns = None
     node._cmd_seq = 0
     node._path_model = None
     node._pose_ned = None

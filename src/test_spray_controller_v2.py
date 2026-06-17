@@ -266,25 +266,24 @@ def test_anticipation_lead_scales_with_fresh_speed():
     assert fast.desired is True
 
 
-def test_disarm_retains_path_briefly_then_clears_after_dwell():
+def test_disarm_retains_path_across_sustained_disarm():
+    """The spray model is NEVER discarded on disarm: spray is already gated off
+    by the armed/OFFBOARD safety gate, so retaining the path is harmless, and
+    discarding it broke the normal mission flow (path is published once,
+    sometimes before arm — clearing it left no model for the armed drive)."""
     node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=1.0)
     node._distance_aware_tick()
     assert node._commanded is True
 
-    # Disarm edge: spray OFF immediately, but path retained (flap guard).
+    # Disarm edge: spray OFF immediately, but path retained.
     node._state_cb(types.SimpleNamespace(armed=False, mode="OFFBOARD"))
     assert node._commanded is False
     assert node._path_model is not None
 
-    # Brief disarm (< dwell): a watchdog tick must NOT clear the path.
-    node._clock.ns += 1_000_000_000  # 1.0s < 2.0s dwell
+    # Even a long sustained disarm must NOT clear the path now.
+    node._clock.ns += 10_000_000_000  # 10s disarmed
     node._watchdog_tick()
     assert node._path_model is not None
-
-    # Sustained disarm (>= dwell): path is discarded.
-    node._clock.ns += 2_000_000_000  # 3.0s total
-    node._watchdog_tick()
-    assert node._path_model is None
 
 
 def test_brief_disarm_flap_keeps_path_and_resumes_spray():
@@ -296,7 +295,6 @@ def test_brief_disarm_flap_keeps_path_and_resumes_spray():
     node._state_cb(types.SimpleNamespace(armed=False, mode="OFFBOARD"))
     node._state_cb(types.SimpleNamespace(armed=True, mode="OFFBOARD"))
     assert node._path_model is not None
-    assert node._disarm_time_ns is None
 
     # Spray resumes on the next tick without any path republish.
     node._pose_recv_time = node.get_clock().now()
@@ -305,23 +303,24 @@ def test_brief_disarm_flap_keeps_path_and_resumes_spray():
     assert node._commanded is True
 
 
-def test_sustained_disarm_clears_path_and_prevents_stale_refire():
+def test_path_published_before_arm_survives_to_drive():
+    """Regression for auto-spray never firing: the mission /path is published
+    once (sometimes while still disarmed), then the rover arms and drives.
+    The model must persist so spray engages on the armed drive — no republish."""
     node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=1.0)
-    node._distance_aware_tick()
-    assert node._commanded is True
 
+    # Path already loaded while disarmed; a long pre-arm dwell elapses.
     node._state_cb(types.SimpleNamespace(armed=False, mode="OFFBOARD"))
-    node._clock.ns += 3_000_000_000  # past the dwell
+    node._clock.ns += 5_000_000_000  # 5s disarmed before arming
     node._watchdog_tick()
-    assert node._path_model is None
+    assert node._path_model is not None  # not cleared
 
-    # Re-arm with no fresh path: spray must stay OFF (fail-closed).
+    # Now arm + OFFBOARD and drive — spray must engage off the retained model.
     node._state_cb(types.SimpleNamespace(armed=True, mode="OFFBOARD"))
     node._pose_recv_time = node.get_clock().now()
     node._vel_recv_time = node.get_clock().now()
     node._distance_aware_tick()
-    assert node._desired_debounced is False
-    assert node._commanded is False
+    assert node._commanded is True
 
 
 def test_xtrack_gate_forces_off_through_tick():

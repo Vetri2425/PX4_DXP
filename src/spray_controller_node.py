@@ -355,11 +355,6 @@ class SprayControllerNode(Node):
         self.declare_parameter("max_xtrack_error_m", 0.10)
         self.declare_parameter("pose_timeout_s", 0.5)
         self.declare_parameter("velocity_timeout_s", 0.5)
-        # Sustained-disarm dwell before the loaded path is discarded. Spray is
-        # already gated off while disarmed; this dwell only protects an active
-        # mission path from a transient MAVROS State flap (a single spurious
-        # armed=False message must not wipe the path).
-        self.declare_parameter("path_clear_disarm_s", 2.0)
         self.declare_parameter("allow_legacy_spray_active_fallback", True)
         # Backend selector: "mavlink_actuator" (cmd 187, normalized) or
         # "mavlink_servo_pwm" (cmd 183, absolute PWM µs).
@@ -394,7 +389,6 @@ class SprayControllerNode(Node):
         # OFF before trusting the believed state (see end of __init__).
         self._off_confirmed = False
         self._last_off_send_time_ns: Optional[int] = None
-        self._disarm_time_ns: Optional[int] = None
         # Monotonic command id. Each dispatched command carries the id current
         # at send time; _command_done ignores any result that is not the latest
         # so a late/out-of-order MAVROS reply cannot overwrite newer state.
@@ -523,16 +517,8 @@ class SprayControllerNode(Node):
 
     def _state_cb(self, msg: State) -> None:
         prev_safe = self._safety_allows_on()
-        prev_armed = self._armed
         self._armed = bool(msg.armed)
         self._mode = str(msg.mode)
-        if prev_armed and not self._armed:
-            # Start the sustained-disarm timer; the path is only discarded
-            # after the disarm persists (see _maybe_clear_path_on_sustained_
-            # disarm) so a transient State flap cannot wipe an active mission.
-            self._disarm_time_ns = self.get_clock().now().nanoseconds
-        elif not prev_armed and self._armed:
-            self._disarm_time_ns = None
         now_safe = self._safety_allows_on()
         if prev_safe and not now_safe:
             # Safety-loss edge: command OFF immediately (bypass retry throttle).
@@ -661,8 +647,6 @@ class SprayControllerNode(Node):
                 self.get_logger().info("manual spray override expired — reverting")
                 self._commit_desired_state()
 
-        self._maybe_clear_path_on_sustained_disarm()
-
         if bool(self.get_parameter("use_distance_aware_spray").value):
             self._distance_aware_tick()
         elif bool(self.get_parameter("allow_legacy_spray_active_fallback").value):
@@ -675,20 +659,6 @@ class SprayControllerNode(Node):
             # the retry cadence rather than flooding MAVROS at the tick rate.
             self._force_off("safety gate")
         self._publish_manual_state()
-
-    def _maybe_clear_path_on_sustained_disarm(self) -> None:
-        if self._armed or self._disarm_time_ns is None or self._path_model is None:
-            return
-        elapsed_s = (
-            self.get_clock().now().nanoseconds - self._disarm_time_ns
-        ) * 1e-9
-        threshold_s = max(0.0, float(self.get_parameter("path_clear_disarm_s").value))
-        if elapsed_s >= threshold_s:
-            self._path_model = None
-            self._set_auto_desired(False, source="distance")
-            self.get_logger().warn(
-                f"Cleared spray path after sustained disarm ({elapsed_s:.1f}s)"
-            )
 
     def _legacy_active_watchdog_tick(self) -> None:
         timeout_s = max(0.0, float(self.get_parameter("active_timeout_s").value))
