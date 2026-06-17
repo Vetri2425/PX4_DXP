@@ -324,11 +324,13 @@ def test_manual_on_rejected_when_disarmed():
     assert all(p.param1 != 1.0 for p in node._command_cli.requests)
 
 
-def test_manual_on_rejected_when_not_offboard():
+def test_manual_on_allowed_when_not_offboard():
+    """Manual override does not require OFFBOARD — bench test works in any armed mode."""
     node = make_node(mode="MANUAL", require_offboard=True)
     node._manual_cb(_bool_msg(True))
-    assert node._manual_active is False
-    assert node._commanded is False
+    assert node._manual_active is True
+    assert node._commanded is True
+    assert _last_param1(node) == 1.0
 
 
 def test_manual_off_cancels_and_reverts_to_auto_off():

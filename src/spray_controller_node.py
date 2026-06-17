@@ -580,10 +580,13 @@ class SprayControllerNode(Node):
         # /spray/manual is a trusted bench-test input. In production it must
         # only be published by the server/safety UI, which owns mission-state
         # policy; this node still applies FCU fail-safes before honoring it.
+        # Manual override only requires armed — OFFBOARD is NOT required so
+        # bench testing works in any armed flight mode (cmd 187 is accepted
+        # by PX4 in any armed mode; OFFBOARD is an auto-spray constraint only).
         if msg.data:
-            if not self._safety_allows_on():
+            if not self._armed:
                 self.get_logger().warn(
-                    "manual spray ON rejected: safety gate (disarmed or wrong mode)"
+                    "manual spray ON rejected: FCU disarmed"
                 )
                 self._manual_active = False
                 self._manual_deadline_ns = None
@@ -831,6 +834,10 @@ class SprayControllerNode(Node):
     def _safety_allows_on(self) -> bool:
         if not self._armed:
             return False
+        if self._manual_active:
+            # Manual bench-test: armed is sufficient. OFFBOARD is enforced for
+            # autonomous spray only — cmd 187 is accepted in any armed mode.
+            return True
         require_offboard = bool(self.get_parameter("require_offboard").value)
         if require_offboard and self._mode != "OFFBOARD":
             return False
