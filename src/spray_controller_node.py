@@ -328,7 +328,12 @@ class SprayControllerNode(Node):
         super().__init__("spray_controller")
 
         self.declare_parameter("actuator_set_index", 1)
-        self.declare_parameter("on_value", 1.0)
+        # Normalized actuator values for mavlink_actuator backend (cmd 187).
+        # Mapping assumes PWM_AUX_MIN1=0, PWM_AUX_MAX1=2000 in QGC:
+        #   on_value  0.8  → 1800 µs  (spray ON)
+        #   off_value -1.0 →    0 µs  (spray OFF, motor fully stopped)
+        # Requires PWM_AUX_DIS1=0 so the output idles at 0 µs when armed.
+        self.declare_parameter("on_value", 0.8)
         self.declare_parameter("off_value", -1.0)
         self.declare_parameter("debounce_samples", 3)
         self.declare_parameter("reassert_hz", 2.0)
