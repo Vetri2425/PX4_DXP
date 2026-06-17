@@ -1,21 +1,21 @@
-"""Manual spray servo control — bench test and operator ON/OFF control.
+"""Manual spray servo control — enable gate, bench test, and operator ON/OFF.
 
 Endpoints
 ---------
-POST /api/spray/on     — hold spray ON until explicit OFF (operator control)
-POST /api/spray/off    — turn spray OFF immediately, cancel any active hold/timer
-POST /api/spray/test   — timed bench test: ON with auto-off, or immediate cancel
-GET  /api/spray/status — actual vs desired vs manual-override spray state
+POST /api/spray/enable  — lift the master spray gate; no motor action
+POST /api/spray/disable — close the master spray gate; stops any active spray
+POST /api/spray/on      — hold spray motor ON (requires enabled + armed)
+POST /api/spray/off     — stop spray motor; always safe, no gate
+POST /api/spray/test    — timed bench test: ON with auto-off (requires enabled)
+GET  /api/spray/status  — enabled state, actual vs desired vs manual-override
 
 Safety model (server layer; node and firmware layers sit beneath):
-- Manual ON is rejected while a mission is RUNNING — MARK control owns the
-  actuator during missions.
-- Manual ON is rejected when disarmed (FCU holds DISARMED PWM anyway; rejecting
-  here gives the operator an actionable error instead of silence).
-- /spray/on holds via a server-side keepalive that re-asserts True every
-  KEEPALIVE_INTERVAL_S seconds. If the server dies the node's
-  manual_override_timeout_s (10s default) turns spray OFF automatically.
-- /spray/off is always accepted — OFF is always safe regardless of state.
+- /spray/enable / /spray/disable: master gate. When disabled, /on and /test ON
+  are blocked (409). The node's spray_enabled parameter is also set so
+  autonomous mission spray is suppressed at the actuator level.
+- /spray/on requires enabled + armed + no RUNNING mission.
+- /spray/off is always accepted — OFF is unconditionally safe.
+- /spray/disable always succeeds and immediately stops any active spray/hold.
 - spray_controller_node's disarm / mode-loss / shutdown fail-safes outrank
   every server-side command entirely.
 """
@@ -28,7 +28,10 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 
 from auth import require_token
+from logging_setup import get_logger
 from models import MissionState, SprayTestRequest
+
+log = get_logger("server.spray")
 
 router = APIRouter(prefix="/spray", tags=["spray"],
                    dependencies=[Depends(require_token)])
@@ -39,6 +42,11 @@ DEFAULT_SPRAY_TEST_DURATION_S = 3.0
 # Must be less than spray_controller_node's manual_override_timeout_s (default
 # 10s) so the hold stays alive. 8s gives a 2s margin before the node times out.
 KEEPALIVE_INTERVAL_S = 8.0
+
+# Master enable gate. False = spray system disabled; /on and /test ON are
+# blocked; node param spray_enabled is also set to False so autonomous mission
+# spray cannot fire. Default False — operator must explicitly enable before use.
+_spray_enabled: bool = False
 
 _auto_off_task: Optional[asyncio.Task] = None
 _keepalive_task: Optional[asyncio.Task] = None
@@ -93,7 +101,58 @@ async def _keepalive_loop() -> None:
         return
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _check_spray_enabled() -> None:
+    """Raise 409 if the spray system has not been enabled."""
+    if not _spray_enabled:
+        raise HTTPException(
+            409,
+            "Spray system is disabled — call POST /api/spray/enable first",
+        )
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@router.post("/enable")
+async def spray_enable():
+    """Lift the master spray gate.
+
+    No motor action. Allows /spray/on and /spray/test to reach the actuator.
+    Also sets spray_enabled=True on the spray_controller node so autonomous
+    mission spray can fire during path execution.
+    """
+    global _spray_enabled
+    _spray_enabled = True
+    from main import ros_node
+    if ros_node is not None:
+        try:
+            await ros_node.set_spray_param_async("spray_enabled", True)
+        except Exception:
+            log.warning("Could not set node spray_enabled=True; server gate active", exc_info=True)
+    return {"enabled": True}
+
+
+@router.post("/disable")
+async def spray_disable():
+    """Close the master spray gate and stop any active spray immediately.
+
+    Cancels any active hold or bench-test timer, publishes manual OFF to the
+    node, and sets spray_enabled=False on the node so autonomous mission spray
+    is also suppressed. Always succeeds — disabling is always safe.
+    """
+    global _spray_enabled
+    _spray_enabled = False
+    _cancel_all()
+    from main import ros_node
+    if ros_node is not None:
+        ros_node.publish_spray_manual(False)
+        try:
+            await ros_node.set_spray_param_async("spray_enabled", False)
+        except Exception:
+            log.warning("Could not set node spray_enabled=False; server gate active", exc_info=True)
+    return {"enabled": False}
+
 
 @router.post("/on")
 async def spray_on():
@@ -106,6 +165,7 @@ async def spray_on():
     from main import offboard_ctrl, ros_node
     global _keepalive_task
 
+    _check_spray_enabled()
     if ros_node is None:
         raise HTTPException(503, "ROS bridge not ready")
     if offboard_ctrl is not None and offboard_ctrl.state == MissionState.RUNNING:
@@ -155,6 +215,7 @@ async def spray_test(req: SprayTestRequest):
         ros_node.publish_spray_manual(False)
         return {"manual": False}
 
+    _check_spray_enabled()
     if offboard_ctrl is not None and offboard_ctrl.state == MissionState.RUNNING:
         raise HTTPException(409, "Manual spray is blocked while a mission is RUNNING")
     state = ros_node.get_state()
@@ -182,11 +243,12 @@ async def spray_test(req: SprayTestRequest):
 
 @router.get("/status")
 async def spray_status():
-    """Actual commanded state, RPP MARK desire, manual-override, and hold state."""
+    """Enabled gate, actual commanded state, RPP MARK desire, manual-override, hold state."""
     from main import ros_node
     hold_active = _keepalive_task is not None and not _keepalive_task.done()
     if ros_node is None:
         return {
+            "enabled": _spray_enabled,
             "spraying": False,
             "spray_active_desired": False,
             "manual_override": False,
@@ -194,6 +256,7 @@ async def spray_status():
         }
     s = ros_node.get_state()
     return {
+        "enabled": _spray_enabled,
         "spraying": bool(s.get("spraying", False)),
         "spray_active_desired": bool(s.get("spray_active", False)),
         "manual_override": bool(s.get("spray_manual", False)),

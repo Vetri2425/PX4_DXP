@@ -369,6 +369,12 @@ class SprayControllerNode(Node):
         self.declare_parameter("servo_instance", 1)
         self.declare_parameter("off_pwm_us", 0)
         self.declare_parameter("on_pwm_us", 1800)
+        # Master enable gate. When False the node will not command spray ON
+        # from any source (manual override, mission auto-spray, reassert).
+        # The server sets this via the /api/spray/enable and /api/spray/disable
+        # endpoints. Default True so the node works standalone without the
+        # server; the server starts with disabled state and sets False on boot.
+        self.declare_parameter("spray_enabled", True)
 
         self._group = ReentrantCallbackGroup()
         self._desired_raw = False
@@ -584,7 +590,13 @@ class SprayControllerNode(Node):
         # bench testing works in any armed flight mode (cmd 187 is accepted
         # by PX4 in any armed mode; OFFBOARD is an auto-spray constraint only).
         if msg.data:
-            if not self._armed:
+            if not bool(self.get_parameter("spray_enabled").value):
+                self.get_logger().warn(
+                    "manual spray ON rejected: spray system disabled"
+                )
+                self._manual_active = False
+                self._manual_deadline_ns = None
+            elif not self._armed:
                 self.get_logger().warn(
                     "manual spray ON rejected: FCU disarmed"
                 )
@@ -832,6 +844,8 @@ class SprayControllerNode(Node):
             self._send_command(desired, reason="edge")
 
     def _safety_allows_on(self) -> bool:
+        if not bool(self.get_parameter("spray_enabled").value):
+            return False
         if not self._armed:
             return False
         if self._manual_active:

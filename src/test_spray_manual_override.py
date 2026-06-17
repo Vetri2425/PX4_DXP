@@ -253,6 +253,7 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "servo_instance": _Param(1),
         "off_pwm_us": _Param(0),
         "on_pwm_us": _Param(1800),
+        "spray_enabled": _Param(True),
     }
     node.get_parameter = lambda name: node._params[name]
     node._clock = _Clock()
@@ -322,6 +323,32 @@ def test_manual_on_rejected_when_disarmed():
     assert node._manual_active is False
     assert node._commanded is False
     assert all(p.param1 != 1.0 for p in node._command_cli.requests)
+
+
+def test_spray_disabled_blocks_manual_on():
+    """Master enable gate: spray_enabled=False blocks manual ON from any source."""
+    node = make_node(armed=True, mode="OFFBOARD")
+    node._params["spray_enabled"] = _Param(False)
+    node._manual_cb(_bool_msg(True))
+    assert node._manual_active is False
+    assert node._commanded is False
+    assert all(p.param1 != 1.0 for p in node._command_cli.requests)
+
+
+def test_spray_disabled_blocks_auto_spray():
+    """spray_enabled=False causes _safety_allows_on() to block autonomous spray."""
+    node = make_node(armed=True, mode="OFFBOARD")
+    node._params["spray_enabled"] = _Param(False)
+    assert node._safety_allows_on() is False
+
+
+def test_spray_enabled_allows_manual_on():
+    """spray_enabled=True + armed → manual ON goes through."""
+    node = make_node(armed=True, mode="OFFBOARD")
+    node._params["spray_enabled"] = _Param(True)
+    node._manual_cb(_bool_msg(True))
+    assert node._manual_active is True
+    assert node._commanded is True
 
 
 def test_manual_on_allowed_when_not_offboard():

@@ -11,7 +11,7 @@ from fastapi import HTTPException
 import main
 import routes.spray as spray_module
 from models import MissionState, SprayTestRequest
-from routes.spray import spray_off, spray_on, spray_status, spray_test
+from routes.spray import spray_disable, spray_enable, spray_off, spray_on, spray_status, spray_test
 
 
 class FakeNode:
@@ -34,8 +34,140 @@ class FakeController:
 @pytest.fixture(autouse=True)
 def _reset_tasks():
     spray_module._cancel_all()
+    spray_module._spray_enabled = True  # existing tests assume enabled
     yield
     spray_module._cancel_all()
+    spray_module._spray_enabled = False  # restore safe default between runs
+
+
+# ── spray_enable / spray_disable ─────────────────────────────────────────────
+
+class FakeNodeWithParams(FakeNode):
+    def __init__(self, state=None):
+        super().__init__(state)
+        self.param_sets = {}
+
+    async def set_spray_param_async(self, name, value):
+        self.param_sets[name] = value
+        return True, ""
+
+
+def test_spray_enable_sets_flag_and_node_param(monkeypatch):
+    node = FakeNodeWithParams()
+    monkeypatch.setattr(main, "ros_node", node)
+    spray_module._spray_enabled = False
+
+    async def run():
+        resp = await spray_enable()
+        assert resp == {"enabled": True}
+        assert spray_module._spray_enabled is True
+        assert node.param_sets.get("spray_enabled") is True
+
+    asyncio.run(run())
+
+
+def test_spray_disable_sets_flag_cancels_tasks_sends_off(monkeypatch):
+    node = FakeNodeWithParams({"armed": True})
+    monkeypatch.setattr(main, "ros_node", node)
+    monkeypatch.setattr(main, "offboard_ctrl", FakeController())
+    spray_module._spray_enabled = True
+
+    async def run():
+        await spray_on()
+        assert spray_module._keepalive_task is not None
+        resp = await spray_disable()
+        assert resp == {"enabled": False}
+        assert spray_module._spray_enabled is False
+        assert node.manual_calls[-1] is False
+        assert spray_module._keepalive_task is None
+        assert node.param_sets.get("spray_enabled") is False
+
+    asyncio.run(run())
+
+
+def test_spray_disable_safe_without_ros(monkeypatch):
+    monkeypatch.setattr(main, "ros_node", None)
+    spray_module._spray_enabled = True
+
+    async def run():
+        resp = await spray_disable()
+        assert resp == {"enabled": False}
+        assert spray_module._spray_enabled is False
+
+    asyncio.run(run())
+
+
+def test_spray_on_blocked_when_disabled(monkeypatch):
+    node = FakeNode({"armed": True})
+    monkeypatch.setattr(main, "ros_node", node)
+    monkeypatch.setattr(main, "offboard_ctrl", FakeController())
+    spray_module._spray_enabled = False
+
+    async def run():
+        with pytest.raises(HTTPException) as exc:
+            await spray_on()
+        assert exc.value.status_code == 409
+        assert node.manual_calls == []
+
+    asyncio.run(run())
+
+
+def test_spray_test_on_blocked_when_disabled(monkeypatch):
+    node = FakeNode({"armed": True})
+    monkeypatch.setattr(main, "ros_node", node)
+    monkeypatch.setattr(main, "offboard_ctrl", FakeController())
+    spray_module._spray_enabled = False
+
+    async def run():
+        with pytest.raises(HTTPException) as exc:
+            await spray_test(SprayTestRequest(on=True, duration_s=3.0))
+        assert exc.value.status_code == 409
+        assert node.manual_calls == []
+
+    asyncio.run(run())
+
+
+def test_spray_test_off_allowed_when_disabled(monkeypatch):
+    """Test cancel (on=False) is always safe even when disabled."""
+    node = FakeNode({"armed": True})
+    monkeypatch.setattr(main, "ros_node", node)
+    monkeypatch.setattr(main, "offboard_ctrl", FakeController())
+    spray_module._spray_enabled = False
+
+    async def run():
+        resp = await spray_test(SprayTestRequest(on=False))
+        assert resp == {"manual": False}
+        assert node.manual_calls == [False]
+
+    asyncio.run(run())
+
+
+def test_spray_off_allowed_when_disabled(monkeypatch):
+    """OFF is always safe regardless of enabled state."""
+    node = FakeNode({"armed": True})
+    monkeypatch.setattr(main, "ros_node", node)
+    spray_module._spray_enabled = False
+
+    async def run():
+        resp = await spray_off()
+        assert resp == {"spraying": False, "hold": False}
+        assert node.manual_calls == [False]
+
+    asyncio.run(run())
+
+
+def test_spray_status_includes_enabled_field(monkeypatch):
+    monkeypatch.setattr(main, "ros_node", None)
+
+    async def run():
+        spray_module._spray_enabled = False
+        resp = await spray_status()
+        assert resp["enabled"] is False
+        spray_module._spray_enabled = True
+        resp = await spray_status()
+        assert resp["enabled"] is True
+
+    asyncio.run(run())
 
 
 # ── spray_on ─────────────────────────────────────────────────────────────────
