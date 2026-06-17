@@ -242,6 +242,7 @@ def create_app() -> FastAPI:
     from routes.telemetry import router as tel_router
     from routes.rtk import router as rtk_router
     from routes.spray import router as spray_router
+    from routes.spray_params import router as spray_par_router
 
     app.include_router(sys_router, prefix="/api")
     app.include_router(veh_router, prefix="/api")
@@ -252,7 +253,8 @@ def create_app() -> FastAPI:
     app.include_router(rpp_par_router, prefix="/api")
     app.include_router(tel_router, prefix="/api")
     app.include_router(rtk_router, prefix="/api")
-    app.include_router(spray_router, prefix="/api")  # → /api/spray/*
+    app.include_router(spray_router, prefix="/api")   # → /api/spray/*
+    app.include_router(spray_par_router, prefix="/api")  # → /api/spray/params/*
 
     # Socket.IO
     app.mount("/socket.io", socket_app)

@@ -27,6 +27,11 @@ SRV_RPP_GET_PARAMS = f"/{RPP_NODE_NAME}/get_parameters"
 SRV_RPP_SET_PARAMS = f"/{RPP_NODE_NAME}/set_parameters"
 SRV_RPP_LIST_PARAMS = f"/{RPP_NODE_NAME}/list_parameters"
 
+# ── Spray Controller Parameter Services ────────────────────────────────────────
+SPRAY_NODE_NAME = "spray_controller"
+SRV_SPRAY_GET_PARAMS = f"/{SPRAY_NODE_NAME}/get_parameters"
+SRV_SPRAY_SET_PARAMS = f"/{SPRAY_NODE_NAME}/set_parameters"
+
 # ── RPP State Codes ───────────────────────────────────────────────────────────
 RPP_STALE = -1
 RPP_IDLE = 0

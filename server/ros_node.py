@@ -38,7 +38,13 @@ from geometry_msgs.msg import PoseStamped, Vector3Stamped
 from nav_msgs.msg import Path
 from std_msgs.msg import Bool, Float32MultiArray
 
-from config import SRV_RPP_GET_PARAMS, SRV_RPP_LIST_PARAMS, SRV_RPP_SET_PARAMS
+from config import (
+    SRV_RPP_GET_PARAMS,
+    SRV_RPP_LIST_PARAMS,
+    SRV_RPP_SET_PARAMS,
+    SRV_SPRAY_GET_PARAMS,
+    SRV_SPRAY_SET_PARAMS,
+)
 from logging_setup import get_logger
 from rpp_status import RppStatusMonitor
 
@@ -317,6 +323,21 @@ class RosBridgeNode(Node):
             self._rpp_param_list_cli = self.create_client(
                 ListParameters,
                 SRV_RPP_LIST_PARAMS,
+                callback_group=self._svc_group,
+            )
+
+        # ── Spray controller param service clients ────────────────────────────
+        self._spray_param_get_cli = None
+        self._spray_param_set_cli = None
+        if _HAS_PARAM_SRV:
+            self._spray_param_get_cli = self.create_client(
+                GetParameters,
+                SRV_SPRAY_GET_PARAMS,
+                callback_group=self._svc_group,
+            )
+            self._spray_param_set_cli = self.create_client(
+                SetParameters,
+                SRV_SPRAY_SET_PARAMS,
                 callback_group=self._svc_group,
             )
 
@@ -746,6 +767,110 @@ class RosBridgeNode(Node):
         results = list(result.results)
         if results and not results[0].successful:
             return False, results, results[0].reason or "RPP param set rejected"
+        return True, results, ""
+
+    # ── Spray controller param access ─────────────────────────────────────────
+
+    async def get_spray_param_async(
+        self, name: str, timeout: float = 5.0
+    ) -> tuple[bool, Any, str]:
+        """Returns (ok, value, message) for a single spray_controller param."""
+        if self._spray_param_get_cli is None:
+            return False, None, "Spray param service not available"
+        req = GetParameters.Request()
+        req.names = [name]
+        if not await self._service_ready_async(
+            self._spray_param_get_cli, timeout_sec=0.5
+        ):
+            return False, None, "spray_controller not running"
+        try:
+            result = await self._await_ros_future(
+                self._spray_param_get_cli.call_async(req), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            return False, None, "Spray param get timed out"
+        except Exception as exc:
+            return False, None, f"Spray param get failed: {exc}"
+        if result is None or not result.values:
+            return False, None, f"param '{name}' not found on spray_controller"
+        return True, _param_value_to_python(result.values[0]), ""
+
+    async def get_spray_params_bulk_async(
+        self, names: list[str], timeout: float = 5.0
+    ) -> tuple[bool, dict[str, Any], str]:
+        """Returns (ok, {name: value, ...}, message) for multiple spray params."""
+        if self._spray_param_get_cli is None:
+            return False, {}, "Spray param service not available"
+        req = GetParameters.Request()
+        req.names = names
+        if not await self._service_ready_async(
+            self._spray_param_get_cli, timeout_sec=0.5
+        ):
+            return False, {}, "spray_controller not running"
+        try:
+            result = await self._await_ros_future(
+                self._spray_param_get_cli.call_async(req), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            return False, {}, "Spray param get timed out"
+        except Exception as exc:
+            return False, {}, f"Spray param get failed: {exc}"
+        if result is None:
+            return False, {}, "Spray param get returned None"
+        values = {}
+        for n, v in zip(names, result.values):
+            values[n] = _param_value_to_python(v)
+        return True, values, ""
+
+    async def set_spray_param_async(
+        self, name: str, value: float | int | bool | str, timeout: float = 5.0
+    ) -> tuple[bool, str]:
+        """Set a single spray_controller parameter at runtime."""
+        if self._spray_param_set_cli is None:
+            return False, "Spray param service not available"
+        req = SetParameters.Request()
+        param = Parameter()
+        param.name = name
+        param.value = _python_to_param_value(value)
+        req.parameters = [param]
+        ok, _, msg = await self._call_spray_set_param(req, timeout)
+        return ok, msg
+
+    async def set_spray_params_bulk_async(
+        self, params: dict[str, float | int | bool | str], timeout: float = 5.0
+    ) -> tuple[bool, list[bool], str]:
+        """Set multiple spray_controller params atomically."""
+        if self._spray_param_set_cli is None:
+            return False, [], "Spray param service not available"
+        req = SetParameters.Request()
+        for name, value in params.items():
+            param = Parameter()
+            param.name = name
+            param.value = _python_to_param_value(value)
+            req.parameters.append(param)
+        ok, results, msg = await self._call_spray_set_param(req, timeout)
+        flags = [r.successful for r in results] if results else []
+        return ok, flags, msg
+
+    async def _call_spray_set_param(self, req, timeout: float) -> tuple[bool, list, str]:
+        """Shared rcl SetParameters call wrapper for spray_controller."""
+        if not await self._service_ready_async(
+            self._spray_param_set_cli, timeout_sec=0.5
+        ):
+            return False, [], "spray_controller not running"
+        try:
+            result = await self._await_ros_future(
+                self._spray_param_set_cli.call_async(req), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            return False, [], "Spray param set timed out"
+        except Exception as exc:
+            return False, [], f"Spray param set failed: {exc}"
+        if result is None:
+            return False, [], "Spray param set returned None"
+        results = list(result.results)
+        if results and not results[0].successful:
+            return False, results, results[0].reason or "Spray param set rejected"
         return True, results, ""
 
     async def list_rpp_params_async(
