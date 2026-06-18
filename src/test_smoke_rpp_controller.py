@@ -282,21 +282,26 @@ def test_smoke():
         )
         node._path_cb(mixed_msg)
         profiles = [r["profile"] for r in node._runs]
-        assert profiles == ["segment", "segment", "smooth"], (
-            f"Expected [segment, segment, smooth] runs, got {profiles}"
+        # _merge_collinear_runs fuses the MARK line and the collinear no-spray
+        # transit into ONE segment run: they meet at a straight (sub-threshold)
+        # junction, so no pivot is lost and the rover tracks them continuously
+        # (spray simply toggles off at the line end — the per-line PRE/MARK/AFT
+        # continuity behaviour). The arc is a profile change, so it stays a
+        # separate smooth run.
+        assert profiles == ["segment", "smooth"], (
+            f"Expected [segment, smooth] after collinear merge, got {profiles}"
         )
         assert node._run_idx == 0 and node._active_tracking_profile == "segment"
         # Conditioned path covers all runs without duplicated boundary points
         n_unique = sum(len(r["poses"]) for r in node._runs) - (len(node._runs) - 1)
         assert len(cap_conditioned.last.poses) == n_unique
         # Run advancing walks the queue and switches the active profile
-        assert node._advance_run() and node._active_tracking_profile == "segment"
         assert node._advance_run() and node._active_tracking_profile == "smooth"
         assert not node._advance_run(), "After the last run, mission is complete"
-        # Short transit run must be completable: travel gate caps at half run length
-        node._apply_run(1)
-        assert node._run_min_travel() <= 0.5 * node._runs[1]["length"] + 1e-9
-        print("PASS: mixed mission splits into per-entity runs (segment/segment/smooth)")
+        # Travel gate caps at half run length so a short run stays completable
+        node._apply_run(0)
+        assert node._run_min_travel() <= 0.5 * node._runs[0]["length"] + 1e-9
+        print("PASS: mixed mission — collinear line+transit fuse, arc stays smooth")
 
         # Closed-loop (circle) completion guard: a run whose first ≈ last
         # waypoint must require nearly the full circumference of travel before
