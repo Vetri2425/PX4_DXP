@@ -48,6 +48,17 @@ def fwd_component(v_n, v_e, yaw_ned):
     return v_n * math.cos(yaw_ned) + v_e * math.sin(yaw_ned)
 
 
+def alignment_sample_ok(heading_error, yaw_rate, heading_tolerance,
+                        yaw_rate_tolerance, timed_out,
+                        timeout_heading_tolerance):
+    """Mirror the controller's per-sample corner release gate."""
+    release_tolerance = heading_tolerance
+    if timed_out:
+        release_tolerance = max(heading_tolerance, timeout_heading_tolerance)
+    return (abs(heading_error) <= release_tolerance
+            and abs(yaw_rate) < yaw_rate_tolerance)
+
+
 class TestCornerPivot(unittest.TestCase):
     def test_points_at_exit_when_within_cone(self):
         """If the exit is within ±75° of the nose, command it exactly."""
@@ -94,6 +105,32 @@ class TestCornerPivot(unittest.TestCase):
         """A 90° corner must produce a non-zero vector (the original bug)."""
         v_n, v_e = corner_pivot_velocity(0.0, math.pi / 2, 0.08)
         self.assertGreater(math.hypot(v_n, v_e), FW_ZERO_VEL_THRESHOLD)
+
+    def test_timeout_does_not_release_large_heading_error(self):
+        """Triangle corner 1 timed out with 27° error and must keep pivoting."""
+        self.assertFalse(alignment_sample_ok(
+            math.radians(27.1), 0.01, math.radians(2.0), 0.05,
+            True, math.radians(5.0),
+        ))
+
+    def test_timeout_does_not_release_while_still_rotating(self):
+        """Triangle corner 2 was near target but yaw rate was still 0.103 rad/s."""
+        self.assertFalse(alignment_sample_ok(
+            math.radians(2.8), 0.103, math.radians(2.0), 0.05,
+            True, math.radians(5.0),
+        ))
+
+    def test_timeout_releases_only_relaxed_and_still(self):
+        self.assertTrue(alignment_sample_ok(
+            math.radians(4.0), 0.03, math.radians(2.0), 0.05,
+            True, math.radians(5.0),
+        ))
+
+    def test_before_timeout_uses_strict_heading_tolerance(self):
+        self.assertFalse(alignment_sample_ok(
+            math.radians(4.0), 0.03, math.radians(2.0), 0.05,
+            False, math.radians(5.0),
+        ))
 
 
 # ======================================================================

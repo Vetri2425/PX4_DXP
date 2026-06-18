@@ -101,7 +101,7 @@ def _build(context, *args, **kwargs):
         "tracking_profile", "segment_corner_threshold_deg",
         "segment_slowdown_dist", "segment_min_corner_speed",
         "segment_corner_acceptance_radius", "segment_heading_tolerance_deg",
-        "segment_yaw_rate_gain",
+        "segment_yaw_rate_gain", "segment_timeout_heading_tolerance_deg",
     ):
         val = LaunchConfiguration(name).perform(context)
         if val != "__unset__":
@@ -234,5 +234,6 @@ def generate_launch_description():
         DeclareLaunchArgument("segment_corner_acceptance_radius",     default_value="__unset__"),
         DeclareLaunchArgument("segment_heading_tolerance_deg",        default_value="__unset__"),
         DeclareLaunchArgument("segment_yaw_rate_gain",                default_value="__unset__"),
+        DeclareLaunchArgument("segment_timeout_heading_tolerance_deg", default_value="__unset__"),
         OpaqueFunction(function=_build),
     ])

@@ -284,9 +284,17 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "segment_heading_tolerance_deg": {
         "type": "float",
-        "default": 7.5,
+        "default": 2.0,
         "group": "Tracking Profile",
         "description": "Heading error tolerance before advancing from corner alignment to the next segment (deg)",
+        "min": 0.1,
+        "max": 45.0,
+    },
+    "segment_timeout_heading_tolerance_deg": {
+        "type": "float",
+        "default": 5.0,
+        "group": "Tracking Profile",
+        "description": "Relaxed heading tolerance after the pivot timeout; yaw rate must still settle before advancing (deg)",
         "min": 0.1,
         "max": 45.0,
     },

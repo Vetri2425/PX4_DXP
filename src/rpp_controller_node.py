@@ -349,10 +349,11 @@ class RPPControllerNode(Node):
         # tolerance for segment_align_settle_s before the state machine
         # advances. Prevents premature exit while the rover is still spinning.
         self.declare_parameter("segment_align_settle_s",               0.10)   # s (5 cycles @ 50 Hz)
-        # Pivot watchdog: at tight (2°) tolerance with RTK yaw noise the
-        # alignment can hunt; rather than deadlock, accept the best-effort
-        # heading after this long and move on.
+        # Pivot watchdog: after this long, relax the heading tolerance but
+        # still require yaw-rate settling. Never launch onto the next line
+        # merely because the timer expired while the rover is still turning.
         self.declare_parameter("segment_turn_timeout_s",               5.0)    # s
+        self.declare_parameter("segment_timeout_heading_tolerance_deg", 5.0)   # deg
 
         # P2.4 — Velocity-based pose extrapolation (latency closure)
         # When enabled, dead-reckon the pose forward by `vel_ned * pose_age`
@@ -1168,8 +1169,8 @@ class RPPControllerNode(Node):
         False once aligned (or alignment is not applicable), letting the
         normal control flow proceed. Already-aligned transitions (e.g. a
         transit continuing straight into an entity) pass through with no
-        stop. Like segment CORNER_ALIGN, yaw rate is the only actuation
-        here, so use_feedforward_yaw_rate is intentionally not consulted.
+        stop. Like segment CORNER_ALIGN, the firmware-aware velocity-vector
+        pivot is used here; use_feedforward_yaw_rate is intentionally ignored.
         """
         if not self._run_align_pending:
             return False
@@ -1191,7 +1192,15 @@ class RPPControllerNode(Node):
         yaw_rate_tol = float(self.get_parameter("segment_stop_yaw_rate_threshold").value)
         align_settle_s = float(self.get_parameter("segment_align_settle_s").value)
         now_align = self.get_clock().now()
-        heading_ok = abs(heading_err) <= heading_tol
+        release_heading_tol = heading_tol
+        if timed_out:
+            release_heading_tol = max(
+                heading_tol,
+                math.radians(float(self.get_parameter(
+                    "segment_timeout_heading_tolerance_deg"
+                ).value)),
+            )
+        heading_ok = abs(heading_err) <= release_heading_tol
         yaw_rate_ok = abs(self._latest_yaw_rate_ned) < yaw_rate_tol
         if heading_ok and yaw_rate_ok:
             if self._align_settle_since is None:
@@ -1200,7 +1209,7 @@ class RPPControllerNode(Node):
         else:
             self._align_settle_since = None
             settled = False
-        if settled or timed_out:
+        if settled:
             self._run_align_pending = False
             self._last_speed_cmd = 0.0
             self._reset_corner_pivot_state()
@@ -1208,6 +1217,33 @@ class RPPControllerNode(Node):
 
         final = self._path[-1].pose.position
         dist_to_goal = self._dist(pos_n, pos_e, final.x, final.y)
+
+        # Once the watchdog has relaxed the heading band, remove the pivot
+        # vector and let the rover physically stop rotating. Releasing only
+        # after the normal settle dwell prevents a corner-exit xtrack spike.
+        if timed_out and heading_ok:
+            self._last_speed_cmd = 0.0
+            self._publish_velocity(0.0, 0.0)
+            self._publish_yaw_rate(0.0)
+            self._publish_debug(
+                cross_track=0.0,
+                heading_err=heading_err,
+                lookahead=float("nan"),
+                speed=0.0,
+                kappa=0.0,
+                dist_goal=dist_to_goal,
+                pose_age_ms=pose_age_s * 1000.0,
+                state=StateCode.TRACKING,
+                l_d_raw=float("nan"),
+                kappa_speed=0.0,
+                yaw_rate=0.0,
+                spray_active=False,
+            )
+            self._publish_segment_debug(
+                SegmentStateCode.CORNER_ALIGN, 0, float("nan"), float("nan"),
+                float("nan"), target_heading, heading_err, 0.0,
+            )
+            return True
 
         # Stop-and-spin: hold zero velocity at the corner until the rover is
         # physically stopped (approach momentum gone), THEN pivot. Without
@@ -1885,7 +1921,15 @@ class RPPControllerNode(Node):
             yaw_rate_tol = float(self.get_parameter("segment_stop_yaw_rate_threshold").value)
             align_settle_s = float(self.get_parameter("segment_align_settle_s").value)
             now_align = self.get_clock().now()
-            heading_ok = abs(heading_err) <= heading_tol
+            release_heading_tol = heading_tol
+            if timed_out:
+                release_heading_tol = max(
+                    heading_tol,
+                    math.radians(float(self.get_parameter(
+                        "segment_timeout_heading_tolerance_deg"
+                    ).value)),
+                )
+            heading_ok = abs(heading_err) <= release_heading_tol
             yaw_rate_ok = abs(self._latest_yaw_rate_ned) < yaw_rate_tol
             if heading_ok and yaw_rate_ok:
                 if self._align_settle_since is None:
@@ -1896,7 +1940,7 @@ class RPPControllerNode(Node):
                 settled = False
             # Advance immediately for geometrically tangent junctions; otherwise
             # require the corner-stop settle/timeout gate for hard corners.
-            if path_corner_deg < threshold_deg or settled or timed_out:
+            if path_corner_deg < threshold_deg or settled:
                 self._segment_idx += 1
                 self._segment_state = SegmentStateCode.TRACK_SEGMENT
                 self._last_speed_cmd = 0.0
@@ -1907,6 +1951,34 @@ class RPPControllerNode(Node):
                 )
                 self._control_segment_profile(
                     pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
+                )
+                return
+
+            # After the watchdog relaxes the heading band, stop commanding
+            # the pivot vector and require the regular yaw-rate settle dwell
+            # before advancing onto the next segment.
+            if timed_out and heading_ok:
+                self._last_speed_cmd = 0.0
+                self._publish_velocity(0.0, 0.0)
+                self._publish_yaw_rate(0.0)
+                self._publish_debug(
+                    cross_track=signed_xtrack,
+                    heading_err=heading_err,
+                    lookahead=dist_to_corner,
+                    speed=0.0,
+                    kappa=0.0,
+                    dist_goal=dist_to_goal,
+                    pose_age_ms=pose_age_s * 1000.0,
+                    state=StateCode.TRACKING,
+                    l_d_raw=float("nan"),
+                    kappa_speed=0.0,
+                    yaw_rate=0.0,
+                    spray_active=spray_active,
+                )
+                self._publish_segment_debug(
+                    SegmentStateCode.CORNER_ALIGN, seg_idx,
+                    dist_to_end_along, dist_to_corner, corner_angle,
+                    target_heading, heading_err, 0.0,
                 )
                 return
 
@@ -2723,8 +2795,8 @@ class RPPControllerNode(Node):
 
     def _pivot_timed_out(self) -> bool:
         """Watchdog for the in-place pivot: True once CORNER_ALIGN has run
-        longer than segment_turn_timeout_s without meeting the heading
-        tolerance — caller should accept the best-effort heading and advance."""
+        longer than segment_turn_timeout_s. Callers may then use the relaxed
+        timeout heading tolerance, but must still wait for yaw-rate settling."""
         now = self.get_clock().now()
         if self._pivot_started is None:
             self._pivot_started = now
@@ -2736,9 +2808,13 @@ class RPPControllerNode(Node):
             return False
         if not self._pivot_timeout_warned:
             self._pivot_timeout_warned = True
+            relaxed_tol = float(self.get_parameter(
+                "segment_timeout_heading_tolerance_deg"
+            ).value)
             self.get_logger().warn(
-                f"Corner pivot timed out after {timeout:.1f}s — accepting "
-                f"current heading and advancing"
+                f"Corner pivot exceeded {timeout:.1f}s — relaxing heading "
+                f"tolerance to {relaxed_tol:.1f} deg; still waiting for "
+                "yaw-rate settle"
             )
         return True
 
