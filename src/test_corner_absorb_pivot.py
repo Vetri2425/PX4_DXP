@@ -217,6 +217,11 @@ def test_5_release_safety_gate(node):
     # Path whose first segment heads due-North (NED target heading = 0°).
     node._path = [pose(0.0, 0.0), pose(1.0, 0.0)]
     node._latest_yaw_rate_ned = 0.0
+    # Fresh, stopped velocity: the pivot-release contract now also requires a
+    # fresh below-threshold linear speed (_align_speed_ok), so the release tests
+    # must supply it — the rover is physically stopped when it releases.
+    node._latest_vel_time = node.get_clock().now()
+    node._latest_vel_ned = (0.0, 0.0)
 
     # (a) Grossly mis-headed (28°) → must keep holding, never release to TRACK.
     node._reset_corner_pivot_state()
