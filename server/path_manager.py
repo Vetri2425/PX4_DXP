@@ -398,14 +398,23 @@ class PathManager:
         enabled: bool,
         pre_extension_m: float,
         aft_extension_m: float,
-        per_line: bool = False,
+        per_line: bool | None = None,
     ) -> dict[str, float | bool]:
-        """Persist path extension config for a DXF mission file."""
+        """Persist path extension config for a DXF mission file.
+
+        ``per_line=None`` means "leave unchanged": preserve whatever was last
+        saved. This stops an older frontend that POSTs without the per_line field
+        from silently resetting it to False. Pass an explicit True/False to set it.
+        """
         safe, fpath = self._require_dxf(filename, "Path extensions are")
         if pre_extension_m < 0.0:
             raise ValueError("pre_extension_m must be >= 0.0")
         if aft_extension_m < 0.0:
             raise ValueError("aft_extension_m must be >= 0.0")
+
+        if per_line is None:
+            # Sticky: keep the previously saved per_line rather than defaulting.
+            per_line = bool(self.load_extension_config(filename)["per_line"])
 
         config = {
             "enabled": bool(enabled),

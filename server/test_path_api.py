@@ -641,6 +641,13 @@ def test_path_manager_saves_extension_config(tmp_path):
     assert saved_pl["per_line"] is True
     assert mgr.load_extension_config("field.dxf")["per_line"] is True
 
+    # sticky: omitting per_line (None) preserves the saved value, doesn't reset it
+    saved_omit = mgr.save_extension_config("field.dxf", True, 0.3, 0.3)
+    assert saved_omit["per_line"] is True
+    # explicit False still turns it off
+    saved_off = mgr.save_extension_config("field.dxf", True, 0.3, 0.3, per_line=False)
+    assert saved_off["per_line"] is False
+
 
 @pytest.mark.anyio
 async def test_extension_config_api_round_trip(tmp_path, monkeypatch):

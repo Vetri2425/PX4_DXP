@@ -336,9 +336,13 @@ class PathExtensionConfig(BaseModel):
     aft_extension_m: float = Field(0.5, ge=0.0)
     # When True, every CAD line is an independent PRE→MARK→AFT pass (each side of
     # a square/rectangle/polygon gets its own run-up/run-out, closed loops are no
-    # longer suppressed). When False (default), the connectivity-aware policy
-    # extends only a chain's true open ends.
-    per_line: bool = False
+    # longer suppressed). When False, the connectivity-aware policy extends only a
+    # chain's true open ends.
+    #
+    # None = "leave unchanged" on save: a client that omits per_line (e.g. an older
+    # frontend that predates this field) preserves the saved value instead of
+    # silently resetting it to False. Reads always resolve to a concrete bool.
+    per_line: Optional[bool] = None
 
 
 class PathExtensionConfigResponse(PathExtensionConfig):
