@@ -354,13 +354,30 @@ class RPPControllerNode(Node):
         # merely because the timer expired while the rover is still turning.
         self.declare_parameter("segment_turn_timeout_s",               5.0)    # s
         self.declare_parameter("segment_timeout_heading_tolerance_deg", 5.0)   # deg
-        # Connector look-through: when evaluating the heading delta for a
-        # run-transition pivot, skip over any preceding runs shorter than this
-        # threshold and use the last *substantial* run's heading instead.
-        # Prevents a short connector produced by adjacent apex waypoints from
-        # masking the true incoming heading and suppressing a required pivot.
-        # Set to 0 to disable (legacy behaviour).
-        self.declare_parameter("segment_connector_lookahead_m",         0.20)  # m
+        # Angle-aware pivot watchdog (Part B): a fixed timeout is wrong for a
+        # corner whose magnitude varies. The rover spot-turns at a roughly
+        # constant rate, so the budget scales with the corner angle:
+        #   budget = spinup_margin + corner_angle_rad / nominal_pivot_rate
+        # clamped to [segment_turn_timeout_s (min), segment_pivot_timeout_max_s].
+        # A 120° corner at 0.40 rad/s + 1.0 s spin-up ⇒ ~6.2 s, vs the old
+        # flat 5.0 s that released a 120° pivot ~20–30° short.
+        self.declare_parameter("segment_pivot_spinup_margin_s",        1.0)    # s
+        self.declare_parameter("segment_nominal_pivot_rate_rad_s",     0.40)   # rad/s (field-observed)
+        self.declare_parameter("segment_pivot_timeout_max_s",          9.0)    # s safety clamp
+        # Hard release gate: never launch onto the next leg while the heading
+        # error to that leg exceeds this, regardless of timeout. Backstops the
+        # relaxed timeout band so a mis-set tolerance cannot release a large
+        # residual error into forward TRACK acceleration.
+        self.declare_parameter("segment_pivot_release_max_deg",        10.0)   # deg
+        # Connector absorption (Part A): adjacent apex waypoints can leave a
+        # sub-threshold "connector" segment (e.g. 8 cm) between two real legs.
+        # If it survives into run-splitting it becomes its own pivot target and
+        # the remaining leg turn falls below segment_corner_threshold_deg, so
+        # the real leg is entered un-pivoted. Collapse any segment shorter than
+        # this that is bracketed by two genuine corners into a single corner
+        # vertex before splitting. Set to 0 to disable.
+        self.declare_parameter("connector_absorb_m",                   0.20)   # m
+        self.declare_parameter("connector_min_corner_deg",             20.0)   # deg (bracket gate)
 
         # P2.4 — Velocity-based pose extrapolation (latency closure)
         # When enabled, dead-reckon the pose forward by `vel_ned * pose_age`
@@ -432,7 +449,9 @@ class RPPControllerNode(Node):
         self._corner_stop_complete: bool = False               # stop confirmed; pivoting now
         self._pivot_started: RclTime | None = None             # when CORNER_ALIGN actuation began
         self._pivot_timeout_warned: bool = False
+        self._pivot_turn_angle_rad: float = 0.0                # corner magnitude this pivot must cover
         self._align_settle_since: RclTime | None = None        # heading+yaw-rate both OK since
+        self._run_align_turn_rad: float = 0.0                  # run-transition corner magnitude (for budget)
         self._last_segment_debug: tuple[float, ...] = (
             0.0, 0.0, 0.0, float("nan"), float("nan"),
             float("nan"), float("nan"), float("nan"), 0.0, 0.0,
@@ -602,10 +621,19 @@ class RPPControllerNode(Node):
         # tracked in sequence (see _apply_run/_advance_run). A forced
         # profile keeps the whole path as a single run.
         if requested == "auto":
+            connector_m = float(self.get_parameter("connector_absorb_m").value)
+            connector_min_corner = float(
+                self.get_parameter("connector_min_corner_deg").value
+            )
             raw_runs = [
                 sub
                 for run in self._split_runs_by_flag(raw_pts, raw_flags)
-                for sub in self._split_run_at_corners(*run, threshold)
+                for sub in self._split_run_at_corners(
+                    *self._absorb_short_connectors(
+                        *run, threshold, connector_m, connector_min_corner
+                    ),
+                    threshold,
+                )
             ]
         else:
             raw_runs = [(raw_pts, raw_flags)]
@@ -984,6 +1012,170 @@ class RPPControllerNode(Node):
         return out
 
     @classmethod
+    def _simplify_with_indices(
+        cls,
+        pts: list[tuple[float, float]],
+        flags: list[bool],
+        collinear_tol_deg: float = 5.0,
+    ) -> tuple[list[tuple[float, float]], list[bool], list[int]]:
+        """Like _simplify_path_for_profile but also returns, for each kept
+        vertex, its index in the *input* `pts`. Used by connector absorption to
+        map simplified corner vertices back to the raw run for splicing.
+
+        Duplicate (coincident) points are folded into the surviving vertex, so
+        the returned indices point at the first occurrence of each kept vertex.
+        """
+        if not pts:
+            return [], [], []
+        # Fold coincident points (mirror _simplify_path_for_profile), tracking
+        # the original index of each survivor.
+        clean_pts: list[tuple[float, float]] = [pts[0]]
+        clean_flags: list[bool] = [bool(flags[0])]
+        clean_idx: list[int] = [0]
+        for j in range(1, len(pts)):
+            pt, flag = pts[j], flags[j]
+            if math.hypot(pt[0] - clean_pts[-1][0], pt[1] - clean_pts[-1][1]) < 1e-6:
+                clean_flags[-1] = bool(clean_flags[-1] or flag)
+                continue
+            clean_pts.append(pt)
+            clean_flags.append(bool(flag))
+            clean_idx.append(j)
+
+        if len(clean_pts) < 3:
+            return clean_pts, clean_flags, clean_idx
+
+        tol = math.radians(collinear_tol_deg)
+        out_pts = [clean_pts[0]]
+        out_flags = [clean_flags[0]]
+        out_idx = [clean_idx[0]]
+        for i in range(1, len(clean_pts) - 1):
+            h0 = cls._segment_heading(out_pts[-1], clean_pts[i])
+            h1 = cls._segment_heading(clean_pts[i], clean_pts[i + 1])
+            heading_change = cls._heading_delta(h0, h1)
+            flag_boundary = (
+                clean_flags[i - 1] != clean_flags[i]
+                or clean_flags[i] != clean_flags[i + 1]
+            )
+            if heading_change <= tol and not flag_boundary:
+                continue
+            out_pts.append(clean_pts[i])
+            out_flags.append(clean_flags[i])
+            out_idx.append(clean_idx[i])
+        out_pts.append(clean_pts[-1])
+        out_flags.append(clean_flags[-1])
+        out_idx.append(clean_idx[-1])
+        return out_pts, out_flags, out_idx
+
+    @staticmethod
+    def _line_intersection(
+        a: tuple[float, float],
+        b: tuple[float, float],
+        c: tuple[float, float],
+        d: tuple[float, float],
+    ) -> tuple[float, float] | None:
+        """Intersection of infinite line (a→b) with infinite line (c→d).
+
+        Returns None when the directions are near-parallel (no stable
+        intersection). Used to recover the true corner apex two doubled
+        waypoints approximate.
+        """
+        d1x, d1y = b[0] - a[0], b[1] - a[1]
+        d2x, d2y = d[0] - c[0], d[1] - c[1]
+        denom = d1x * d2y - d1y * d2x
+        if abs(denom) < 1e-9:
+            return None
+        t = ((c[0] - a[0]) * d2y - (c[1] - a[1]) * d2x) / denom
+        return (a[0] + t * d1x, a[1] + t * d1y)
+
+    @classmethod
+    def _absorb_short_connectors(
+        cls,
+        pts: list[tuple[float, float]],
+        flags: list[bool],
+        threshold_deg: float,
+        connector_absorb_m: float,
+        min_corner_deg: float = 20.0,
+    ) -> tuple[list[tuple[float, float]], list[bool]]:
+        """Collapse sub-threshold connector segments before run splitting.
+
+        Adjacent apex waypoints in planner output can leave a very short
+        segment (e.g. 8 cm) between two real legs — a "connector". Left intact
+        it survives run-splitting as its own pivot target, and the remaining
+        leg turn then falls below segment_corner_threshold_deg, so the real leg
+        is entered un-pivoted (the triangle-apex-2 failure).
+
+        A segment between simplified corner vertices V[i]→V[i+1] is absorbed
+        when ALL hold:
+          * its length < connector_absorb_m, and
+          * it is *interior* (a real leg exists on each side), and
+          * both ends are genuine corners: the bend at V[i] (incoming leg vs
+            connector) AND at V[i+1] (connector vs outgoing leg) each exceed
+            min_corner_deg.
+        The two endpoints are replaced by the *intersection of the two adjacent
+        leg lines* — the true apex the doubled waypoints approximate — so both
+        legs keep their original headings (a plain midpoint sits off the leg
+        lines when the connector is lateral, bending the corner and leaving a
+        residual stub). If the legs are near-parallel or the intersection lands
+        implausibly far away, the midpoint is used as a safe fallback. The merge
+        vertex inherits the connector's flag, so mark/transit semantics hold.
+
+        The dual-corner gate is what protects a *real* short MARK stroke: a
+        deliberate short entity is not bracketed by two hard corners (it is
+        collinear-ish with, or flag-bounded from, its neighbours), so it is left
+        untouched. Arc/circle samples (gradual <min_corner_deg bends) are also
+        immune. connector_absorb_m ≤ 0 disables the pass.
+        """
+        if connector_absorb_m <= 0.0 or len(pts) < 4:
+            return list(pts), list(flags)
+
+        verts, vflags, vidx = cls._simplify_with_indices(pts, flags)
+        if len(verts) < 4:
+            return list(pts), list(flags)
+
+        min_corner = math.radians(min_corner_deg)
+        # Collect absorb actions as (raw_start_idx, raw_end_idx, midpoint, flag).
+        # Evaluate on the *original* simplified geometry; apply right-to-left so
+        # raw indices stay valid. Interior requires i in [1 .. len-3].
+        actions: list[tuple[int, int, tuple[float, float], bool]] = []
+        i = 1
+        while i <= len(verts) - 3:
+            a, b, c, d = verts[i - 1], verts[i], verts[i + 1], verts[i + 2]
+            seg_len = math.hypot(c[0] - b[0], c[1] - b[1])
+            if seg_len < connector_absorb_m:
+                bend_in = cls._heading_delta(
+                    cls._segment_heading(a, b), cls._segment_heading(b, c)
+                )
+                bend_out = cls._heading_delta(
+                    cls._segment_heading(b, c), cls._segment_heading(c, d)
+                )
+                if bend_in >= min_corner and bend_out >= min_corner:
+                    mid = ((b[0] + c[0]) * 0.5, (b[1] + c[1]) * 0.5)
+                    apex = cls._line_intersection(a, b, c, d)
+                    # Use the leg-line intersection unless it is missing
+                    # (near-parallel legs) or implausibly far from the connector
+                    # — then fall back to the midpoint.
+                    if apex is not None and math.hypot(
+                        apex[0] - mid[0], apex[1] - mid[1]
+                    ) <= max(0.5, 5.0 * seg_len):
+                        merge = apex
+                    else:
+                        merge = mid
+                    actions.append((vidx[i], vidx[i + 1], merge, bool(vflags[i])))
+                    i += 2   # skip past the absorbed connector
+                    continue
+            i += 1
+
+        if not actions:
+            return list(pts), list(flags)
+
+        out_pts = list(pts)
+        out_flags = list(flags)
+        for raw_a, raw_b, mid, flag in reversed(actions):
+            out_pts[raw_a:raw_b + 1] = [mid]
+            out_flags[raw_a:raw_b + 1] = [flag]
+        return out_pts, out_flags
+
+    @classmethod
     def _split_run_at_corners(
         cls,
         pts: list[tuple[float, float]],
@@ -1058,28 +1250,23 @@ class RPPControllerNode(Node):
         prev_run = self._runs[idx - 1] if idx > 0 else None
         run = self._runs[idx]
         self._run_align_pending = False
+        self._run_align_turn_rad = 0.0
         if prev_run and len(prev_run["poses"]) > 1 and len(run["poses"]) > 1:
-            # Walk backward past short connector runs to find the effective
-            # incoming heading. Adjacent apex waypoints can produce a short
-            # connector (e.g. 8 cm) that causes the rover to align to the
-            # connector heading rather than the true incoming leg heading,
-            # suppressing the pivot before the subsequent leg.
-            lookahead_m = float(self.get_parameter("segment_connector_lookahead_m").value)
-            effective_prev = prev_run
-            if lookahead_m > 0.0:
-                back = idx - 1
-                while effective_prev["length"] < lookahead_m and back > 0:
-                    back -= 1
-                    effective_prev = self._runs[back]
-            p0 = effective_prev["poses"][-2].pose.position
-            p1 = effective_prev["poses"][-1].pose.position
+            # Pivot before this run only if the heading steps by a hard corner.
+            # Connector absorption (_absorb_short_connectors) runs in
+            # conditioning, so prev_run's exit heading is already the true
+            # incoming leg heading — no look-through workaround needed here.
+            p0 = prev_run["poses"][-2].pose.position
+            p1 = prev_run["poses"][-1].pose.position
             h0 = math.atan2(p1.y - p0.y, p1.x - p0.x)
             n0 = run["poses"][0].pose.position
             n1 = run["poses"][1].pose.position
             h1 = math.atan2(n1.y - n0.y, n1.x - n0.x)
             threshold = math.radians(float(self.get_parameter("segment_corner_threshold_deg").value))
-            if abs(self._heading_delta(h0, h1)) >= threshold:
+            turn = abs(self._heading_delta(h0, h1))
+            if turn >= threshold:
                 self._run_align_pending = True
+                self._run_align_turn_rad = turn   # angle-aware pivot budget
         self._reset_corner_pivot_state()
         self._run_idx = idx
         self._path = run["poses"]
@@ -1207,7 +1394,9 @@ class RPPControllerNode(Node):
         heading_tol = math.radians(
             float(self.get_parameter("segment_heading_tolerance_deg").value)
         )
-        timed_out = self._corner_stop_complete and self._pivot_timed_out()
+        timed_out = self._corner_stop_complete and self._pivot_timed_out(
+            self._run_align_turn_rad
+        )
         yaw_rate_tol = float(self.get_parameter("segment_stop_yaw_rate_threshold").value)
         align_settle_s = float(self.get_parameter("segment_align_settle_s").value)
         now_align = self.get_clock().now()
@@ -1219,6 +1408,13 @@ class RPPControllerNode(Node):
                     "segment_timeout_heading_tolerance_deg"
                 ).value)),
             )
+        # Hard release gate: never launch onto the next leg while still grossly
+        # mis-headed, even if the timeout band relaxed. Backstops a mis-set
+        # relaxed tolerance from accelerating a large residual into TRACK.
+        release_heading_tol = min(
+            release_heading_tol,
+            math.radians(float(self.get_parameter("segment_pivot_release_max_deg").value)),
+        )
         heading_ok = abs(heading_err) <= release_heading_tol
         yaw_rate_ok = abs(self._latest_yaw_rate_ned) < yaw_rate_tol
         if heading_ok and yaw_rate_ok:
@@ -1936,7 +2132,9 @@ class RPPControllerNode(Node):
             c = self._path[seg_idx + 2].pose.position
             target_heading = math.atan2(c.y - b.y, c.x - b.x)
             heading_err = self._angle_wrap(target_heading - yaw_ned)
-            timed_out = self._corner_stop_complete and self._pivot_timed_out()
+            timed_out = self._corner_stop_complete and self._pivot_timed_out(
+                math.radians(path_corner_deg)
+            )
             yaw_rate_tol = float(self.get_parameter("segment_stop_yaw_rate_threshold").value)
             align_settle_s = float(self.get_parameter("segment_align_settle_s").value)
             now_align = self.get_clock().now()
@@ -1948,6 +2146,10 @@ class RPPControllerNode(Node):
                         "segment_timeout_heading_tolerance_deg"
                     ).value)),
                 )
+            release_heading_tol = min(
+                release_heading_tol,
+                math.radians(float(self.get_parameter("segment_pivot_release_max_deg").value)),
+            )
             heading_ok = abs(heading_err) <= release_heading_tol
             yaw_rate_ok = abs(self._latest_yaw_rate_ned) < yaw_rate_tol
             if heading_ok and yaw_rate_ok:
@@ -2767,6 +2969,7 @@ class RPPControllerNode(Node):
         self._corner_stop_complete = False
         self._pivot_started = None
         self._pivot_timeout_warned = False
+        self._pivot_turn_angle_rad = 0.0
         self._align_settle_since = None
 
     def _corner_stop_satisfied(self) -> bool:
@@ -2812,15 +3015,38 @@ class RPPControllerNode(Node):
             return True
         return False
 
-    def _pivot_timed_out(self) -> bool:
+    def _pivot_timeout_budget(self) -> float:
+        """Angle-aware pivot watchdog budget (seconds).
+
+        The rover spot-turns at a roughly constant rate, so a 120° corner needs
+        far longer than a 30° one. Budget = spinup_margin + angle/rate, floored
+        at the legacy segment_turn_timeout_s (so small corners are unchanged)
+        and clamped to segment_pivot_timeout_max_s. The corner magnitude is
+        captured at pivot start (self._pivot_turn_angle_rad)."""
+        base = float(self.get_parameter("segment_turn_timeout_s").value)
+        rate = float(self.get_parameter("segment_nominal_pivot_rate_rad_s").value)
+        margin = float(self.get_parameter("segment_pivot_spinup_margin_s").value)
+        max_s = float(self.get_parameter("segment_pivot_timeout_max_s").value)
+        angle = max(0.0, float(self._pivot_turn_angle_rad))
+        budget = margin + (angle / rate if rate > 1e-6 else 0.0)
+        budget = max(budget, base)          # never below the legacy floor
+        if max_s > 0.0:
+            budget = min(budget, max_s)     # safety clamp
+        return budget
+
+    def _pivot_timed_out(self, turn_angle_rad: float | None = None) -> bool:
         """Watchdog for the in-place pivot: True once CORNER_ALIGN has run
-        longer than segment_turn_timeout_s. Callers may then use the relaxed
-        timeout heading tolerance, but must still wait for yaw-rate settling."""
+        longer than the angle-aware budget (_pivot_timeout_budget). Callers may
+        then use the relaxed timeout heading tolerance, but must still wait for
+        yaw-rate settling. `turn_angle_rad` (the corner magnitude) is captured
+        on the first call to size the budget."""
         now = self.get_clock().now()
         if self._pivot_started is None:
             self._pivot_started = now
+            if turn_angle_rad is not None and math.isfinite(turn_angle_rad):
+                self._pivot_turn_angle_rad = abs(float(turn_angle_rad))
             return False
-        timeout = float(self.get_parameter("segment_turn_timeout_s").value)
+        timeout = self._pivot_timeout_budget()
         if timeout <= 0.0:
             return False
         if (now - self._pivot_started).nanoseconds * 1e-9 < timeout:
@@ -2831,8 +3057,9 @@ class RPPControllerNode(Node):
                 "segment_timeout_heading_tolerance_deg"
             ).value)
             self.get_logger().warn(
-                f"Corner pivot exceeded {timeout:.1f}s — relaxing heading "
-                f"tolerance to {relaxed_tol:.1f} deg; still waiting for "
+                f"Corner pivot exceeded {timeout:.1f}s "
+                f"(angle≈{math.degrees(self._pivot_turn_angle_rad):.0f}°) — relaxing "
+                f"heading tolerance to {relaxed_tol:.1f} deg; still waiting for "
                 "yaw-rate settle"
             )
         return True

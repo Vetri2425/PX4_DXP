@@ -196,30 +196,71 @@ def test_smoke():
         )
         print("PASS: segment lookahead stays on current side before corner acceptance")
 
-        # At a corner, segment mode should command zero velocity and a yaw-rate
-        # toward the next segment until heading tolerance is met.
+        # Corner actuation contract (firmware-aware, validated @081b668):
+        # PX4 rover_differential derives heading from the velocity-vector
+        # bearing and *ignores* the MAVROS yaw_rate field, freezing heading at
+        # |v|<0.01 m/s. So at a corner the controller does NOT spin via
+        # yaw_rate — it commands a forward-cone velocity VECTOR aimed at the
+        # exit heading and leaves yaw_rate at zero. The pivot has two phases:
+        #   1. CORNER_STOP  — zero velocity + zero yaw-rate (confirm stopped)
+        #   2. CORNER_ALIGN — nonzero forward-cone velocity + zero yaw-rate
         corner = node._path[1].pose.position
+        nxt = node._path[2].pose.position  # exit-side waypoint (90° turn east)
+        exit_heading = math.atan2(nxt.y - corner.y, nxt.x - corner.x)
+
+        # Phase 1 — CORNER_STOP: fresh pivot state, stop not yet confirmed.
         node._segment_idx = 0
         node._last_speed_cmd = 0.2
+        node._reset_corner_pivot_state()
         cap_vel.messages.clear()
         cap_yaw.messages.clear()
         node._control_segment_profile(corner.x, corner.y, 0.0, 0.02, 2.0)
         assert cap_vel.last is not None and cap_yaw.last is not None
-        assert abs(cap_vel.last.vector.x) < 1e-9 and abs(cap_vel.last.vector.y) < 1e-9
-        assert abs(cap_yaw.last.data) > 1e-4
-        print("PASS: segment corner align publishes zero velocity with nonzero yaw-rate")
+        assert abs(cap_vel.last.vector.x) < 1e-9 and abs(cap_vel.last.vector.y) < 1e-9, (
+            "CORNER_STOP must hold zero velocity until the stop is confirmed"
+        )
+        assert abs(cap_yaw.last.data) < 1e-9, "yaw_rate is firmware-inert — always zero"
+        print("PASS: segment corner stop holds zero velocity (yaw-rate inert)")
 
-        # Corner align is yaw-rate-only actuation, so it must keep pivoting
-        # even when use_feedforward_yaw_rate is disabled (deadlock guard).
-        from rclpy.parameter import Parameter
-        node.set_parameters([Parameter("use_feedforward_yaw_rate", value=False)])
+        # Phase 2 — CORNER_ALIGN: force stop-confirmed, expect a nonzero
+        # forward-cone velocity vector toward the exit heading, yaw-rate zero.
         node._segment_idx = 0
-        node._last_speed_cmd = 0.2
+        node._last_speed_cmd = 0.0
+        node._reset_corner_pivot_state()
+        node._corner_stop_complete = True
         cap_vel.messages.clear()
         cap_yaw.messages.clear()
         node._control_segment_profile(corner.x, corner.y, 0.0, 0.02, 2.0)
-        assert cap_yaw.last is not None and abs(cap_yaw.last.data) > 1e-4, (
-            "Corner align must command yaw-rate even with use_feedforward_yaw_rate=false"
+        assert cap_vel.last is not None and cap_yaw.last is not None
+        v_mag = math.hypot(cap_vel.last.vector.x, cap_vel.last.vector.y)
+        assert v_mag > 1e-4, "CORNER_ALIGN must command a nonzero pivot velocity vector"
+        cmd_bearing = math.atan2(cap_vel.last.vector.y, cap_vel.last.vector.x)
+        # Bearing must lean toward the exit heading but stay in the forward
+        # cone (no reverse-flip) — sign matches the +90° east turn.
+        assert 0.0 < cmd_bearing <= node._CORNER_MAX_BEARING_OFFSET_RAD + 1e-9, (
+            f"Pivot bearing {math.degrees(cmd_bearing):.1f}° must aim toward exit "
+            f"heading {math.degrees(exit_heading):.1f}° within the forward cone"
+        )
+        assert abs(cap_yaw.last.data) < 1e-9, "yaw_rate stays zero in CORNER_ALIGN"
+        print("PASS: segment corner align drives a forward-cone velocity vector (yaw-rate zero)")
+
+        # Deadlock guard: corner actuation is velocity-vector based, so the
+        # pivot must keep commanding velocity regardless of the (in-segment-only)
+        # use_feedforward_yaw_rate flag — it must never stall here.
+        from rclpy.parameter import Parameter
+        node.set_parameters([Parameter("use_feedforward_yaw_rate", value=False)])
+        node._segment_idx = 0
+        node._last_speed_cmd = 0.0
+        node._reset_corner_pivot_state()
+        node._corner_stop_complete = True
+        cap_vel.messages.clear()
+        cap_yaw.messages.clear()
+        node._control_segment_profile(corner.x, corner.y, 0.0, 0.02, 2.0)
+        assert cap_vel.last is not None and math.hypot(
+            cap_vel.last.vector.x, cap_vel.last.vector.y
+        ) > 1e-4, (
+            "Corner align must keep commanding pivot velocity with "
+            "use_feedforward_yaw_rate=false (deadlock guard)"
         )
         node.set_parameters([Parameter("use_feedforward_yaw_rate", value=True)])
         print("PASS: corner align ignores use_feedforward_yaw_rate=false (no deadlock)")
@@ -321,71 +362,43 @@ def test_smoke():
         assert node._advance_run() and node._run_align_pending, (
             "Run transition at a hard corner must request alignment pivot"
         )
-        # Misaligned at the corner (facing north, next leg goes east):
-        # alignment hold publishes zero velocity + yaw rate toward east.
+        # Misaligned at the corner (facing north, next leg goes east). Like
+        # segment CORNER_ALIGN, _run_alignment_hold is a firmware-aware
+        # velocity-vector pivot (yaw_rate is inert and stays zero): it first
+        # holds CORNER_STOP, then drives a forward-cone velocity toward the
+        # exit heading.
+        # Phase 1 — CORNER_STOP: fresh state, stop not yet confirmed.
+        node._reset_corner_pivot_state()
         cap_vel.messages.clear()
         cap_yaw.messages.clear()
         held = node._run_alignment_hold(1.0, 0.0, 0.0, 0.02)
         assert held, "Hold must engage while misaligned"
-        assert abs(cap_vel.last.vector.x) < 1e-9 and abs(cap_vel.last.vector.y) < 1e-9
-        assert cap_yaw.last.data > 1e-4, "Pivot toward east must be CW-positive in NED"
-        # Aligned (facing east): hold releases and clears the pending flag.
+        assert abs(cap_vel.last.vector.x) < 1e-9 and abs(cap_vel.last.vector.y) < 1e-9, (
+            "CORNER_STOP must hold zero velocity until the stop is confirmed"
+        )
+        assert abs(cap_yaw.last.data) < 1e-9, "yaw_rate is firmware-inert — always zero"
+
+        # Phase 2 — CORNER_ALIGN: force stop-confirmed; pivot drives a nonzero
+        # forward-cone velocity vector toward east (+E, forward N), yaw zero.
+        node._reset_corner_pivot_state()
+        node._corner_stop_complete = True
+        cap_vel.messages.clear()
+        cap_yaw.messages.clear()
+        held = node._run_alignment_hold(1.0, 0.0, 0.0, 0.02)
+        assert held, "Hold must engage while misaligned"
+        assert cap_vel.last.vector.y > 1e-4, "Pivot must lean east (+E) toward the next leg"
+        assert cap_vel.last.vector.x > 0.0, "Pivot velocity must stay in the forward cone"
+        assert abs(cap_yaw.last.data) < 1e-9, "yaw_rate stays zero during the pivot"
+
+        # Aligned (facing east): with the settle gate satisfied, the hold
+        # releases and clears the pending flag.
+        node._latest_yaw_rate_ned = 0.0
+        node._align_settle_since = None
+        node.set_parameters([Parameter("segment_align_settle_s", value=0.0)])
         assert not node._run_alignment_hold(1.0, 0.0, 1.5708, 0.02)
         assert not node._run_align_pending
+        node.set_parameters([Parameter("segment_align_settle_s", value=0.10)])
         print("PASS: hard-corner sub-split with alignment pivot at run transition")
-
-        # Connector look-through: a short run produced by adjacent apex
-        # waypoints must not suppress the required pivot before the next leg.
-        # Geometry: Leg2(-30°, 2m) → Connector(-120°, 8cm) → Leg3(-150°, 2m)
-        # Without the fix, Connector→Leg3 delta = 30° < 45° → no pivot (wrong).
-        # With the fix, look-through to Leg2: delta = 120° ≥ 45° → pivot (correct).
-        import math as _math
-        from geometry_msgs.msg import PoseStamped as _PS
-        from rclpy.time import Time as _Time
-
-        def _ned_pose(n, e):
-            ps = _PS()
-            ps.header.frame_id = "local_ned"
-            ps.pose.position.x = float(n)
-            ps.pose.position.y = float(e)
-            ps.pose.position.z = 0.0
-            ps.pose.orientation.w = 1.0
-            return ps
-
-        def _run(pts, length):
-            """Minimal run dict — only fields _apply_run touches."""
-            poses = [_ned_pose(n, e) for n, e in pts]
-            cum_s = [0.0] * len(poses)
-            return {
-                "poses": poses, "flags": [True] * len(poses),
-                "length": float(length), "profile": "segment",
-                "cum_s": cum_s, "closed": False,
-            }
-
-        # NED heading = atan2(Δeast, Δnorth)
-        # -30°: Δn=cos(-30°)≈0.866, Δe=sin(-30°)≈-0.500
-        # -120°: Δn=cos(-120°)≈-0.500, Δe=sin(-120°)≈-0.866
-        # -150°: Δn=cos(-150°)≈-0.866, Δe=sin(-150°)≈-0.500
-        leg2   = _run([(0.000, 0.000), (1.732, -1.000)], 2.000)   # heading -30°
-        conn   = _run([(1.732, -1.000), (1.692, -1.069)], 0.0845)  # heading -120°, 8.45cm
-        leg3   = _run([(1.692, -1.069), (0.825, -1.569)], 2.000)   # heading -150°
-
-        node._runs   = [leg2, conn, leg3]
-        node._run_idx = 0
-
-        # Leg2→Connector: 90° corner → pivot required (baseline, unchanged)
-        node._apply_run(1)
-        assert node._run_align_pending, \
-            "Leg2→Connector (90° corner): pivot must be required"
-
-        # Connector→Leg3: immediate delta = 30° (below 45° threshold).
-        # Look-through must find Leg2 and compute 120° total → pivot required.
-        node._apply_run(2)
-        assert node._run_align_pending, (
-            "Connector→Leg3: look-through to Leg2 must detect 120° total "
-            "corner and require a pivot (this was the false-short-run bug)"
-        )
-        print("PASS: connector look-through triggers pivot before Leg3 (120° via Leg2)")
 
         node.destroy_node()
         print("\n=== ALL SMOKE TESTS PASSED ===")
