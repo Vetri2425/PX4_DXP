@@ -345,15 +345,28 @@ class RPPControllerNode(Node):
         self.declare_parameter("segment_stop_speed_threshold",         0.02)   # m/s
         self.declare_parameter("segment_stop_yaw_rate_threshold",      0.05)   # rad/s (~2.9 deg/s)
         self.declare_parameter("segment_stop_dwell_s",                 0.30)   # s
-        # CORNER_ALIGN exit: heading error AND yaw-rate must both be within
-        # tolerance for segment_align_settle_s before the state machine
-        # advances. Prevents premature exit while the rover is still spinning.
-        self.declare_parameter("segment_align_settle_s",               0.10)   # s (5 cycles @ 50 Hz)
+        # Active braking at a corner stop. PX4 velocity-OFFBOARD does not brake
+        # on a zero setpoint — it coasts — so a rover that reaches the corner
+        # still at ~0.1-0.16 m/s drifts 2-3 cm before the dwell confirms, and
+        # then pivots from the wrong point. When velocity data is fresh and the
+        # rover is still above the stop threshold, command a small velocity
+        # opposing its motion (capped here) to actively decelerate. 0 disables.
+        self.declare_parameter("segment_brake_velocity_cap_m_s",       0.10)   # m/s
+        # CORNER_ALIGN exit: heading error AND yaw-rate (AND, when fresh, linear
+        # speed) must be within tolerance for segment_align_settle_s before the
+        # state machine advances. Prevents premature exit while the rover is
+        # still spinning or drifting.
+        self.declare_parameter("segment_align_settle_s",               0.20)   # s
+        self.declare_parameter("segment_align_speed_threshold",        0.05)   # m/s (release gate)
         # Pivot watchdog: after this long, relax the heading tolerance but
         # still require yaw-rate settling. Never launch onto the next line
         # merely because the timer expired while the rover is still turning.
         self.declare_parameter("segment_turn_timeout_s",               5.0)    # s
-        self.declare_parameter("segment_timeout_heading_tolerance_deg", 5.0)   # deg
+        # Forced-release tolerance after the angle-aware budget elapses. Tighter
+        # than the old 5°: a velocity-bearing pivot from a clean stop reaches
+        # ~2-3°. Kept >= the rate-limited asymptote (~3°) so the forced release
+        # stays REACHABLE — a 2° ceiling here would spin forever in the field.
+        self.declare_parameter("segment_timeout_heading_tolerance_deg", 3.0)   # deg
         # Angle-aware pivot watchdog (Part B): a fixed timeout is wrong for a
         # corner whose magnitude varies. The rover spot-turns at a roughly
         # constant rate, so the budget scales with the corner angle:
@@ -367,8 +380,9 @@ class RPPControllerNode(Node):
         # Hard release gate: never launch onto the next leg while the heading
         # error to that leg exceeds this, regardless of timeout. Backstops the
         # relaxed timeout band so a mis-set tolerance cannot release a large
-        # residual error into forward TRACK acceleration.
-        self.declare_parameter("segment_pivot_release_max_deg",        10.0)   # deg
+        # residual error into forward TRACK acceleration. Tightened to 3° for
+        # precision (per-line extension) missions where MARK entry must be <2 cm.
+        self.declare_parameter("segment_pivot_release_max_deg",        3.0)    # deg
         # Connector absorption (Part A): adjacent apex waypoints can leave a
         # sub-threshold "connector" segment (e.g. 8 cm) between two real legs.
         # If it survives into run-splitting it becomes its own pivot target and
@@ -1417,7 +1431,8 @@ class RPPControllerNode(Node):
         )
         heading_ok = abs(heading_err) <= release_heading_tol
         yaw_rate_ok = abs(self._latest_yaw_rate_ned) < yaw_rate_tol
-        if heading_ok and yaw_rate_ok:
+        speed_ok = self._align_speed_ok()
+        if heading_ok and yaw_rate_ok and speed_ok:
             if self._align_settle_since is None:
                 self._align_settle_since = now_align
             settled = (now_align - self._align_settle_since).nanoseconds * 1e-9 >= align_settle_s
@@ -1466,14 +1481,19 @@ class RPPControllerNode(Node):
         # the corner point during the first part of the turn.
         if not self._corner_stop_complete:
             if not self._corner_stop_satisfied():
+                # Active braking: PX4 coasts on a zero setpoint, so command a
+                # small velocity opposing the rover's motion to truly stop it at
+                # the corner point before pivoting. (0,0) when already stopped or
+                # velocity is stale.
                 self._last_speed_cmd = 0.0
-                self._publish_velocity(0.0, 0.0)
+                brake_n, brake_e = self._corner_brake_velocity()
+                self._publish_velocity(brake_n, brake_e)
                 self._publish_yaw_rate(0.0)
                 self._publish_debug(
                     cross_track=0.0,
                     heading_err=heading_err,
                     lookahead=float("nan"),
-                    speed=0.0,
+                    speed=math.hypot(brake_n, brake_e),
                     kappa=0.0,
                     dist_goal=dist_to_goal,
                     pose_age_ms=pose_age_s * 1000.0,
@@ -2152,7 +2172,8 @@ class RPPControllerNode(Node):
             )
             heading_ok = abs(heading_err) <= release_heading_tol
             yaw_rate_ok = abs(self._latest_yaw_rate_ned) < yaw_rate_tol
-            if heading_ok and yaw_rate_ok:
+            speed_ok = self._align_speed_ok()
+            if heading_ok and yaw_rate_ok and speed_ok:
                 if self._align_settle_since is None:
                     self._align_settle_since = now_align
                 settled = (now_align - self._align_settle_since).nanoseconds * 1e-9 >= align_settle_s
@@ -2208,14 +2229,18 @@ class RPPControllerNode(Node):
             if not self._corner_stop_complete:
                 if not self._corner_stop_satisfied():
                     self._segment_state = SegmentStateCode.CORNER_STOP
+                    # Active braking (see _run_alignment_hold twin): drive a
+                    # small velocity opposing the rover's motion so it physically
+                    # stops at the corner instead of coasting past it.
                     self._last_speed_cmd = 0.0
-                    self._publish_velocity(0.0, 0.0)
+                    brake_n, brake_e = self._corner_brake_velocity()
+                    self._publish_velocity(brake_n, brake_e)
                     self._publish_yaw_rate(0.0)
                     self._publish_debug(
                         cross_track=signed_xtrack,
                         heading_err=heading_err,
                         lookahead=dist_to_corner,
-                        speed=0.0,
+                        speed=math.hypot(brake_n, brake_e),
                         kappa=0.0,
                         dist_goal=dist_to_goal,
                         pose_age_ms=pose_age_s * 1000.0,
@@ -2961,7 +2986,49 @@ class RPPControllerNode(Node):
     # Hard cap on how long CORNER_STOP may hold before proceeding to the
     # pivot anyway — guards against a missing/noisy velocity_local topic
     # turning stop-confirmation into a deadlock.
-    _CORNER_STOP_MAX_HOLD_S = 2.0
+    _CORNER_STOP_MAX_HOLD_S = 2.0      # stale-velocity fallback cap
+    _CORNER_STOP_ABS_MAX_S = 5.0       # absolute anti-deadlock backstop (braking should stop well before)
+
+    def _vel_is_fresh(self) -> bool:
+        """True when /velocity_local has arrived within the last 0.3 s."""
+        if self._latest_vel_time is None:
+            return False
+        return (self.get_clock().now() - self._latest_vel_time).nanoseconds * 1e-9 < 0.3
+
+    def _corner_brake_velocity(self) -> tuple[float, float]:
+        """NED velocity command that actively decelerates a coasting rover.
+
+        Returns a small velocity opposing the rover's current motion, capped by
+        segment_brake_velocity_cap_m_s, so PX4 (which only coasts on a zero
+        setpoint) is driven to a true stop at the corner point. Returns (0, 0)
+        when velocity data is stale, braking is disabled, or the rover is
+        already below the stop threshold — i.e. never commands reverse below the
+        stop speed, so it cannot push the rover backwards past the corner.
+        """
+        if not self._vel_is_fresh():
+            return (0.0, 0.0)
+        cap = float(self.get_parameter("segment_brake_velocity_cap_m_s").value)
+        if cap <= 0.0:
+            return (0.0, 0.0)
+        v_n, v_e = self._latest_vel_ned
+        speed = math.hypot(v_n, v_e)
+        thresh = float(self.get_parameter("segment_stop_speed_threshold").value)
+        if speed < thresh:
+            return (0.0, 0.0)
+        mag = min(cap, speed)
+        return (-v_n / speed * mag, -v_e / speed * mag)
+
+    def _align_speed_ok(self) -> bool:
+        """Linear-speed gate for CORNER_ALIGN release: True when velocity is
+        stale (cannot check, don't block) or the rover's linear speed is below
+        segment_align_speed_threshold. Keeps the pivot from releasing while the
+        rover is still drifting, which would smear the next segment's entry."""
+        if not self._vel_is_fresh():
+            return True
+        v_n, v_e = self._latest_vel_ned
+        return math.hypot(v_n, v_e) < float(
+            self.get_parameter("segment_align_speed_threshold").value
+        )
 
     def _reset_corner_pivot_state(self):
         self._corner_stop_entered = None
@@ -2976,9 +3043,16 @@ class RPPControllerNode(Node):
         """True once the rover is confirmed physically stopped at the corner.
 
         Confirmation = actual ground speed AND yaw-rate (both from velocity_local)
-        below their thresholds continuously for segment_stop_dwell_s. When the
-        topic is stale (>0.3 s), both checks are skipped and the dwell timer
-        alone decides — the hard cap still fires at _CORNER_STOP_MAX_HOLD_S.
+        below their thresholds continuously for segment_stop_dwell_s.
+
+        Timeout policy (per-line extension fix): the rover is actively braked
+        toward zero by the caller, so a FRESH velocity that is still above the
+        stop threshold must NOT be allowed to time out into a pivot — that was
+        the old bug where the 2 s cap fired while the rover was still drifting at
+        ~0.14 m/s and the pivot started from the wrong point. The
+        _CORNER_STOP_MAX_HOLD_S cap now fires only when velocity data is STALE
+        (cannot confirm the stop), and a generous _CORNER_STOP_ABS_MAX_S backstop
+        prevents a true deadlock if braking never converges.
         """
         now = self.get_clock().now()
         if self._corner_stop_entered is None:
@@ -2988,14 +3062,13 @@ class RPPControllerNode(Node):
         yaw_rate_thresh = float(self.get_parameter("segment_stop_yaw_rate_threshold").value)
         dwell = float(self.get_parameter("segment_stop_dwell_s").value)
 
+        fresh = self._vel_is_fresh()
         speed_ok = True       # optimistic if no fresh data
         yaw_rate_ok = True
-        if self._latest_vel_time is not None:
-            vel_age = (now - self._latest_vel_time).nanoseconds * 1e-9
-            if vel_age < 0.3:
-                v_n, v_e = self._latest_vel_ned
-                speed_ok = math.hypot(v_n, v_e) < speed_thresh
-                yaw_rate_ok = abs(self._latest_yaw_rate_ned) < yaw_rate_thresh
+        if fresh:
+            v_n, v_e = self._latest_vel_ned
+            speed_ok = math.hypot(v_n, v_e) < speed_thresh
+            yaw_rate_ok = abs(self._latest_yaw_rate_ned) < yaw_rate_thresh
 
         both_ok = speed_ok and yaw_rate_ok
         if both_ok:
@@ -3006,10 +3079,21 @@ class RPPControllerNode(Node):
         else:
             self._corner_stop_settle_since = None  # any violation resets dwell
 
-        if (now - self._corner_stop_entered).nanoseconds * 1e-9 >= self._CORNER_STOP_MAX_HOLD_S:
+        held = (now - self._corner_stop_entered).nanoseconds * 1e-9
+        # Stale-velocity fallback: cannot confirm a stop, so the dwell-timer cap
+        # decides (legacy behaviour). A FRESH-but-still-moving rover is being
+        # braked and must keep waiting — do not pivot on this cap.
+        if not fresh and held >= self._CORNER_STOP_MAX_HOLD_S:
             self.get_logger().warn(
-                "CORNER_STOP hold cap reached without speed/yaw-rate confirmation — "
-                "proceeding to pivot",
+                "CORNER_STOP cap reached with STALE velocity — proceeding to pivot",
+                throttle_duration_sec=5.0,
+            )
+            return True
+        # Absolute anti-deadlock backstop (braking failed to converge).
+        if held >= self._CORNER_STOP_ABS_MAX_S:
+            self.get_logger().warn(
+                "CORNER_STOP absolute backstop reached — proceeding to pivot "
+                "(braking did not reach stop threshold)",
                 throttle_duration_sec=5.0,
             )
             return True
