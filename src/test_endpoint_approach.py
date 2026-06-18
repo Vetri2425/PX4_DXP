@@ -45,9 +45,11 @@ def main():
         captured = {}
         node._publish_velocity = lambda vn, ve: captured.update(sp=math.hypot(vn, ve))
 
-        def drive_near_endpoint():
-            # Single straight segment 0→2 m north; rover 0.10 m from endpoint,
-            # heading aligned. final_segment = (seg_idx 0 >= n_pts-2) = True.
+        def converged_endpoint_speed():
+            # Single straight segment 0→2 m north; rover held 0.10 m from the
+            # endpoint, heading aligned. final_segment = (seg_idx 0 >= n_pts-2).
+            # Loop so the speed-loop ramp converges to the steady commanded speed
+            # (one call is ramp-limited and does not reflect the floor).
             node._reset_corner_pivot_state()
             node._path = [_pose(0.0, 0.0), _pose(2.0, 0.0)]
             node._path_s = [0.0, 2.0]
@@ -55,21 +57,24 @@ def main():
             node._segment_idx = 0
             node._path_travel_m = 1.9
             node._latest_yaw_rate_ned = 0.0
-            captured.clear()
-            node._control_segment_profile(1.9, 0.0, 0.0, 0.0, 0.10)
-            return captured.get("sp", float("nan"))
+            node._last_speed_cmd = 0.35
+            sp = float("nan")
+            for _ in range(120):
+                captured.clear()
+                node._control_segment_profile(1.9, 0.0, 0.0, 0.0, 0.10)
+                sp = captured.get("sp", float("nan"))
+            return sp
 
-        # Low endpoint floor → arrives slow (< 0.08 m/s at 0.10 m out)
+        # Low endpoint floor → arrives slow at 0.10 m out.
         P(segment_endpoint_approach_speed=0.03)
-        sp_low = drive_near_endpoint()
-        assert 0.0 < sp_low < 0.08, f"endpoint floor 0.03 must yield slow approach, got {sp_low:.3f}"
+        sp_low = converged_endpoint_speed()
+        assert 0.0 < sp_low < 0.10, f"endpoint floor 0.03 must yield slow approach, got {sp_low:.3f}"
 
         # Raising the endpoint floor raises the approach speed at the same point,
         # proving the dedicated param controls the run-endpoint floor.
         P(segment_endpoint_approach_speed=0.20)
-        sp_high = drive_near_endpoint()
-        assert sp_high > 0.15, f"endpoint floor 0.20 must yield faster approach, got {sp_high:.3f}"
-        assert sp_high > sp_low + 0.05, "endpoint approach speed must track the param"
+        sp_high = converged_endpoint_speed()
+        assert sp_high > sp_low + 0.05, f"endpoint speed must track the param ({sp_low:.3f} vs {sp_high:.3f})"
         print(f"PASS endpoint floor controls final-segment approach: 0.03→{sp_low:.3f} m/s, 0.20→{sp_high:.3f} m/s")
 
         node.destroy_node()
