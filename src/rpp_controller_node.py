@@ -331,6 +331,17 @@ class RPPControllerNode(Node):
         self.declare_parameter("segment_corner_threshold_deg",         45.0)
         self.declare_parameter("segment_slowdown_dist",               0.50)
         self.declare_parameter("segment_min_corner_speed",             0.08)
+        # Final-segment (run-endpoint) goal-approach floor. A per-line PRE/AFT
+        # run ends AT a corner, so the rover must arrive slow enough for active
+        # braking to stop it within the corner point. The old endpoint floor was
+        # min_approach_linear_velocity (0.10 m/s); the speed loop overshot to
+        # ~0.13 and braking (0.08 cap) coasted 3-4.6 cm past the corner, smearing
+        # MARK entry to ~4.8 cm. A dedicated, lower floor here — separate from the
+        # WITHIN-run corner floor (segment_min_corner_speed) and the smooth/arc
+        # floor (min_approach_linear_velocity) — drops run-endpoint arrival to
+        # ~0.05 m/s (floor + overshoot) so drift is <1 cm, without touching the
+        # non-extension square's within-run corners or arc approaches.
+        self.declare_parameter("segment_endpoint_approach_speed",      0.03)   # m/s
         self.declare_parameter("segment_corner_acceptance_radius",     0.05)
         # Pivot exit tolerance. 2.0° gives the "spin in place, exit facing the
         # next point" behaviour; pair with FCU param RD_TRANS_TRN_DRV lowered
@@ -2541,7 +2552,10 @@ class RPPControllerNode(Node):
         # a run endpoint is a final segment too.
         if final_segment:
             max_decel = float(self.get_parameter("max_linear_decel").value)
-            approach_v = float(self.get_parameter("min_approach_linear_velocity").value)
+            # Run-endpoint floor (see param decl): lower than the smooth/arc
+            # min_approach_linear_velocity so the rover arrives slow enough for
+            # active braking to stop ON the corner point, not 4 cm past it.
+            approach_v = float(self.get_parameter("segment_endpoint_approach_speed").value)
             approach_d = max(
                 float(self.get_parameter("approach_velocity_scaling_dist").value),
                 (max_v * max_v) / (2.0 * max_decel) + 0.10,
