@@ -334,6 +334,59 @@ def test_smoke():
         assert not node._run_align_pending
         print("PASS: hard-corner sub-split with alignment pivot at run transition")
 
+        # Connector look-through: a short run produced by adjacent apex
+        # waypoints must not suppress the required pivot before the next leg.
+        # Geometry: Leg2(-30°, 2m) → Connector(-120°, 8cm) → Leg3(-150°, 2m)
+        # Without the fix, Connector→Leg3 delta = 30° < 45° → no pivot (wrong).
+        # With the fix, look-through to Leg2: delta = 120° ≥ 45° → pivot (correct).
+        import math as _math
+        from geometry_msgs.msg import PoseStamped as _PS
+        from rclpy.time import Time as _Time
+
+        def _ned_pose(n, e):
+            ps = _PS()
+            ps.header.frame_id = "local_ned"
+            ps.pose.position.x = float(n)
+            ps.pose.position.y = float(e)
+            ps.pose.position.z = 0.0
+            ps.pose.orientation.w = 1.0
+            return ps
+
+        def _run(pts, length):
+            """Minimal run dict — only fields _apply_run touches."""
+            poses = [_ned_pose(n, e) for n, e in pts]
+            cum_s = [0.0] * len(poses)
+            return {
+                "poses": poses, "flags": [True] * len(poses),
+                "length": float(length), "profile": "segment",
+                "cum_s": cum_s, "closed": False,
+            }
+
+        # NED heading = atan2(Δeast, Δnorth)
+        # -30°: Δn=cos(-30°)≈0.866, Δe=sin(-30°)≈-0.500
+        # -120°: Δn=cos(-120°)≈-0.500, Δe=sin(-120°)≈-0.866
+        # -150°: Δn=cos(-150°)≈-0.866, Δe=sin(-150°)≈-0.500
+        leg2   = _run([(0.000, 0.000), (1.732, -1.000)], 2.000)   # heading -30°
+        conn   = _run([(1.732, -1.000), (1.692, -1.069)], 0.0845)  # heading -120°, 8.45cm
+        leg3   = _run([(1.692, -1.069), (0.825, -1.569)], 2.000)   # heading -150°
+
+        node._runs   = [leg2, conn, leg3]
+        node._run_idx = 0
+
+        # Leg2→Connector: 90° corner → pivot required (baseline, unchanged)
+        node._apply_run(1)
+        assert node._run_align_pending, \
+            "Leg2→Connector (90° corner): pivot must be required"
+
+        # Connector→Leg3: immediate delta = 30° (below 45° threshold).
+        # Look-through must find Leg2 and compute 120° total → pivot required.
+        node._apply_run(2)
+        assert node._run_align_pending, (
+            "Connector→Leg3: look-through to Leg2 must detect 120° total "
+            "corner and require a pivot (this was the false-short-run bug)"
+        )
+        print("PASS: connector look-through triggers pivot before Leg3 (120° via Leg2)")
+
         node.destroy_node()
         print("\n=== ALL SMOKE TESTS PASSED ===")
         return True

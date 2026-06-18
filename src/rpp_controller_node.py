@@ -354,6 +354,13 @@ class RPPControllerNode(Node):
         # merely because the timer expired while the rover is still turning.
         self.declare_parameter("segment_turn_timeout_s",               5.0)    # s
         self.declare_parameter("segment_timeout_heading_tolerance_deg", 5.0)   # deg
+        # Connector look-through: when evaluating the heading delta for a
+        # run-transition pivot, skip over any preceding runs shorter than this
+        # threshold and use the last *substantial* run's heading instead.
+        # Prevents a short connector produced by adjacent apex waypoints from
+        # masking the true incoming heading and suppressing a required pivot.
+        # Set to 0 to disable (legacy behaviour).
+        self.declare_parameter("segment_connector_lookahead_m",         0.20)  # m
 
         # P2.4 — Velocity-based pose extrapolation (latency closure)
         # When enabled, dead-reckon the pose forward by `vel_ned * pose_age`
@@ -1052,8 +1059,20 @@ class RPPControllerNode(Node):
         run = self._runs[idx]
         self._run_align_pending = False
         if prev_run and len(prev_run["poses"]) > 1 and len(run["poses"]) > 1:
-            p0 = prev_run["poses"][-2].pose.position
-            p1 = prev_run["poses"][-1].pose.position
+            # Walk backward past short connector runs to find the effective
+            # incoming heading. Adjacent apex waypoints can produce a short
+            # connector (e.g. 8 cm) that causes the rover to align to the
+            # connector heading rather than the true incoming leg heading,
+            # suppressing the pivot before the subsequent leg.
+            lookahead_m = float(self.get_parameter("segment_connector_lookahead_m").value)
+            effective_prev = prev_run
+            if lookahead_m > 0.0:
+                back = idx - 1
+                while effective_prev["length"] < lookahead_m and back > 0:
+                    back -= 1
+                    effective_prev = self._runs[back]
+            p0 = effective_prev["poses"][-2].pose.position
+            p1 = effective_prev["poses"][-1].pose.position
             h0 = math.atan2(p1.y - p0.y, p1.x - p0.x)
             n0 = run["poses"][0].pose.position
             n1 = run["poses"][1].pose.position
