@@ -256,6 +256,74 @@ def offset_point(
     return _offset_point(p, direction, distance)
 
 
+# Corner angle (degrees) above which a vertex splits a line chain into separate
+# edges. 30° clears densification noise on straight sides while catching every
+# real polygon corner (square/rect = 90°, hexagon vertex turn = 60°).
+_EDGE_SPLIT_CORNER_DEG = 30.0
+
+
+def decompose_line_chain_to_edges(
+    segment: PathSegment,
+    corner_threshold_deg: float = _EDGE_SPLIT_CORNER_DEG,
+) -> list[PathSegment]:
+    """Split a line-like MARK segment into its straight edges at corner vertices.
+
+    Per-line extension mode treats each CAD line as an independent PRE/MARK/AFT
+    pass. A grouped shape (square / rectangle / polygon perimeter) arrives here as
+    ONE composite MARK run; this splits it back into the individual edges so each
+    edge can get its own run-up/run-out — including the sides of a *closed* square,
+    which the connectivity policy would otherwise leave un-extended.
+
+    Curved geometry (ARC / CIRCLE) and non-line / too-short segments are returned
+    unchanged (single-element list) so their analytic-tangent extension still
+    applies. Each emitted edge copies the parent metadata (so it stays classified
+    line-like) plus ``edge_index`` / ``edge_parent`` for traceability.
+    """
+    if segment.segment_type != SegmentType.MARK:
+        return [segment]
+    pts = segment.points
+    if len(pts) < 3:
+        return [segment]
+    if not _is_line_like_segment(segment):
+        # Arc / circle / unknown — keep whole; tangent extensions handle these.
+        return [segment]
+
+    thr = math.radians(corner_threshold_deg)
+    splits = [0]
+    for i in range(1, len(pts) - 1):
+        d0 = _unit_vector(pts[i - 1], pts[i])
+        d1 = _unit_vector(pts[i], pts[i + 1])
+        if d0 is None or d1 is None:
+            continue
+        dot = max(-1.0, min(1.0, d0[0] * d1[0] + d0[1] * d1[1]))
+        if math.acos(dot) >= thr:
+            splits.append(i)
+    splits.append(len(pts) - 1)
+
+    if len(splits) <= 2:
+        return [segment]  # no interior corner → a single straight edge already
+
+    edges: list[PathSegment] = []
+    for k, (a, b) in enumerate(zip(splits[:-1], splits[1:])):
+        if b <= a:
+            continue
+        edge_pts = list(pts[a:b + 1])
+        if len(edge_pts) < 2:
+            continue
+        meta = dict(segment.metadata)
+        meta["edge_index"] = k
+        meta["edge_parent"] = segment.source_entity
+        edges.append(PathSegment(
+            segment_type=SegmentType.MARK,
+            points=edge_pts,
+            speed=segment.speed,
+            segment_id=segment.segment_id,
+            source_entity=f"{segment.source_entity}:edge{k}",
+            metadata=meta,
+        ))
+    return edges or [segment]
+
+
 # ---------------------------------------------------------------------------
 # Main public function
 # ---------------------------------------------------------------------------
@@ -265,6 +333,7 @@ def split_mark_segment_with_extensions(
     pre_extension_m: float,
     aft_extension_m: float,
     transit_speed: float,
+    suppress_closed_loops: bool = True,
 ) -> list[PathSegment]:
     """Expand one MARK segment into [PRE-TRANSIT, MARK, AFT-TRANSIT].
 
@@ -338,7 +407,12 @@ def split_mark_segment_with_extensions(
         # closed-loop completion guard in RPP already drives the rover through the
         # start point at speed, so no separate run-up is needed. Curves keep their
         # analytic-tangent extensions (handled in the branch above).
-        if _is_closed_run(segment.points):
+        #
+        # per-line mode (suppress_closed_loops=False) opts out of this guard: the
+        # caller has already decomposed the chain into individual open edges via
+        # decompose_line_chain_to_edges(), so each edge is genuinely open and must
+        # get its own run-up/run-out even though the parent shape was closed.
+        if suppress_closed_loops and _is_closed_run(segment.points):
             log.debug(
                 "Path extensions suppressed for closed run %s (id=%s): "
                 "endpoints coincide — no linear run-up/run-out added.",

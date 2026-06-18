@@ -632,8 +632,14 @@ def test_path_manager_saves_extension_config(tmp_path):
         "enabled": True,
         "pre_extension_m": 0.4,
         "aft_extension_m": 0.6,
+        "per_line": False,
     }
     assert mgr.load_extension_config("field.dxf") == saved
+
+    # per-line round-trips through save/load
+    saved_pl = mgr.save_extension_config("field.dxf", True, 0.5, 0.5, per_line=True)
+    assert saved_pl["per_line"] is True
+    assert mgr.load_extension_config("field.dxf")["per_line"] is True
 
 
 @pytest.mark.anyio

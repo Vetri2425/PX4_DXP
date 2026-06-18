@@ -608,7 +608,7 @@ async def save_path_extensions(name: str, req: PathExtensionConfig):
 
     config = await _sidecar_call(
         path_mgr.save_extension_config,
-        name, req.enabled, req.pre_extension_m, req.aft_extension_m,
+        name, req.enabled, req.pre_extension_m, req.aft_extension_m, req.per_line,
         what="Saving extension config",
     )
     return PathExtensionConfigResponse(

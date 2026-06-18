@@ -19,6 +19,7 @@ from path_engine.planners.extensions import (
     _is_line_like_segment,
     _offset_point,
     _unit_vector,
+    decompose_line_chain_to_edges,
     split_mark_segment_with_extensions,
 )
 from path_engine.optimizers.shape_grouping import group_connected_segments
@@ -1247,3 +1248,124 @@ class TestMetadataPropagationChain:
         )
         result = split_mark_segment_with_extensions(seg, 0.5, 0.5, 0.50)
         assert result[0].metadata.get("some_key") == "some_value"
+
+
+class TestPerLineExtensions:
+    """Per-line mode: every CAD line is an independent PRE→MARK→AFT pass, even on
+    a closed square. Decomposition + suppress_closed_loops=False bypass the
+    connectivity policy. Legacy mode (default) stays byte-identical."""
+
+    def _square_chain(self):
+        edges = [
+            ((0.0, 0.0), (2.0, 0.0)),
+            ((2.0, 0.0), (2.0, 2.0)),
+            ((2.0, 2.0), (0.0, 2.0)),
+            ((0.0, 2.0), (0.0, 0.0)),
+        ]
+        segs = [
+            PathSegment(SegmentType.MARK, [a, b], speed=0.35,
+                        source_entity=f"LINE_E{i:03d}")
+            for i, (a, b) in enumerate(edges)
+        ]
+        grouped = group_connected_segments(segs)
+        assert len(grouped) == 1
+        return grouped[0]
+
+    # ── decomposition ──────────────────────────────────────────────────────
+    def test_decompose_square_into_four_edges(self):
+        chain = self._square_chain()
+        edges = decompose_line_chain_to_edges(chain)
+        assert len(edges) == 4
+        for e in edges:
+            assert e.segment_type == SegmentType.MARK
+            assert len(e.points) >= 2
+            # each edge is a straight, OPEN line (start != end)
+            assert _is_closed_run(e.points) is False
+
+    def test_decompose_single_line_is_unchanged(self):
+        seg = PathSegment(SegmentType.MARK, [(0.0, 0.0), (2.0, 0.0)],
+                          speed=0.35, source_entity="LINE_E001")
+        assert decompose_line_chain_to_edges(seg) == [seg]
+
+    def test_decompose_keeps_curves_whole(self):
+        # An arc-like segment must NOT be split — it keeps tangent extensions.
+        seg = PathSegment(
+            SegmentType.MARK,
+            [(0.0, 0.0), (0.5, 0.3), (1.0, 0.8), (1.4, 1.4)],
+            speed=0.35, source_entity="ARC_A1",
+            metadata={"geometry_type": "ARC"},
+        )
+        assert decompose_line_chain_to_edges(seg) == [seg]
+
+    # ── suppress_closed_loops flag ─────────────────────────────────────────
+    def test_closed_square_extends_per_line_when_unsuppressed(self):
+        # The decomposed edges are open, so each gets a full PRE/MARK/AFT triplet
+        # even though the parent shape was closed.
+        chain = self._square_chain()
+        for edge in decompose_line_chain_to_edges(chain):
+            parts = split_mark_segment_with_extensions(
+                edge, 0.5, 0.5, 0.50, suppress_closed_loops=False
+            )
+            roles = [p.metadata.get("extension_role") for p in parts]
+            assert roles == ["pre", None, "aft"]
+            assert [p.segment_type for p in parts] == [
+                SegmentType.TRANSIT, SegmentType.MARK, SegmentType.TRANSIT
+            ]
+
+    def test_suppress_default_still_blocks_closed_square(self):
+        # Legacy guard intact: the whole closed chain is still suppressed.
+        chain = self._square_chain()
+        result = split_mark_segment_with_extensions(chain, 0.5, 0.5, 0.50)
+        assert len(result) == 1 and result[0].segment_type == SegmentType.MARK
+
+    # ── full engine plan ───────────────────────────────────────────────────
+    def _square_segs(self):
+        edges = [
+            ((0.0, 0.0), (2.0, 0.0)), ((2.0, 0.0), (2.0, 2.0)),
+            ((2.0, 2.0), (0.0, 2.0)), ((0.0, 2.0), (0.0, 0.0)),
+        ]
+        return [
+            PathSegment(SegmentType.MARK, [a, b], speed=0.35,
+                        source_entity=f"LINE_E{i:03d}",
+                        metadata={"geometry_type": "LINE", "line_like": True})
+            for i, (a, b) in enumerate(edges)
+        ]
+
+    def test_engine_per_line_square_gives_four_passes(self):
+        eng = PathEngine(enable_path_extensions=True, pre_extension_m=0.5,
+                         aft_extension_m=0.5, per_line_extensions=True,
+                         compensate_spray=False, optimize_order=False)
+        plan = eng.plan_segments(self._square_segs())
+        pre = sum(1 for s in plan.segments if s.metadata.get("extension_role") == "pre")
+        aft = sum(1 for s in plan.segments if s.metadata.get("extension_role") == "aft")
+        mark = sum(1 for s in plan.segments
+                   if s.segment_type == SegmentType.MARK
+                   and not s.metadata.get("extension_role"))
+        assert (pre, mark, aft) == (4, 4, 4)
+
+    def test_engine_per_line_spray_flags_off_on_off(self):
+        eng = PathEngine(enable_path_extensions=True, per_line_extensions=True,
+                         compensate_spray=False, optimize_order=False)
+        plan = eng.plan_segments(self._square_segs())
+        # 4 lines → exactly 8 spray toggles (off→on then on→off per line).
+        toggles = sum(1 for a, b in zip(plan.spray_flags, plan.spray_flags[1:]) if a != b)
+        assert toggles == 8
+        assert any(plan.spray_flags) and not all(plan.spray_flags)
+
+    def test_engine_per_line_densifies_runups_at_mark_spacing(self):
+        eng = PathEngine(enable_path_extensions=True, pre_extension_m=0.5,
+                         aft_extension_m=0.5, per_line_extensions=True,
+                         mark_spacing=0.05, compensate_spray=False,
+                         optimize_order=False)
+        plan = eng.plan_segments(self._square_segs())
+        for s in plan.segments:
+            if s.metadata.get("extension_role") in ("pre", "aft"):
+                # 0.5 m at 0.05 m spacing → ~11 points, definitely not a 2-pt jump.
+                assert len(s.points) >= 8
+
+    def test_engine_legacy_mode_unchanged(self):
+        # per_line OFF → closed square still suppressed (one MARK, no extensions).
+        eng = PathEngine(enable_path_extensions=True, per_line_extensions=False,
+                         compensate_spray=False, optimize_order=False)
+        plan = eng.plan_segments(self._square_segs())
+        assert not any(s.metadata.get("extension_role") for s in plan.segments)

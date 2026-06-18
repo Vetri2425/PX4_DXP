@@ -26,7 +26,10 @@ from .parsers import load_mission_file, load_mission_segments, parse_dxf, entiti
 from .parsers.csv_parser import read_ned_csv_enhanced
 from .parsers.waypoints_parser import read_qgc_waypoints_as_segment
 from .planners.straight_line import densify_segment
-from .planners.extensions import split_mark_segment_with_extensions
+from .planners.extensions import (
+    decompose_line_chain_to_edges,
+    split_mark_segment_with_extensions,
+)
 from .planners.smooth import smooth_corners
 from .optimizers.segment_order import optimize_segment_order
 from .optimizers.shape_grouping import group_connected_segments
@@ -148,6 +151,7 @@ class PathEngine:
         enable_path_extensions: bool = False,
         pre_extension_m: float = 0.5,
         aft_extension_m: float = 0.5,
+        per_line_extensions: bool = False,
         corner_smooth_radius_m: float = 0.0,
         corner_smooth_arc_pts: int = 6,
         use_two_opt: bool = True,
@@ -186,6 +190,7 @@ class PathEngine:
         self.enable_path_extensions = enable_path_extensions
         self.pre_extension_m = pre_extension_m
         self.aft_extension_m = aft_extension_m
+        self.per_line_extensions = per_line_extensions
         self.corner_smooth_radius_m = corner_smooth_radius_m
         self.corner_smooth_arc_pts = corner_smooth_arc_pts
         self.use_two_opt = use_two_opt
@@ -673,12 +678,34 @@ class PathEngine:
         if self.enable_path_extensions:
             extended: list[PathSegment] = []
             for seg in ordered:
-                extended.extend(split_mark_segment_with_extensions(
-                    seg,
-                    pre_extension_m=self.pre_extension_m,
-                    aft_extension_m=self.aft_extension_m,
-                    transit_speed=self.transit_speed,
-                ))
+                # per-line mode: explode a composite line-chain (square / rect /
+                # polygon / L-shape perimeter) into its individual edges so each
+                # CAD line gets its OWN PRE/MARK/AFT, even on a closed shape.
+                # Legacy (vertex-anchored) mode leaves the chain whole and the
+                # closed-loop guard suppresses extensions — byte-identical to before.
+                edges = (
+                    decompose_line_chain_to_edges(seg)
+                    if self.per_line_extensions else [seg]
+                )
+                for edge in edges:
+                    parts = split_mark_segment_with_extensions(
+                        edge,
+                        pre_extension_m=self.pre_extension_m,
+                        aft_extension_m=self.aft_extension_m,
+                        transit_speed=self.transit_speed,
+                        suppress_closed_loops=not self.per_line_extensions,
+                    )
+                    if self.per_line_extensions:
+                        # Densify the spray-OFF PRE/AFT run-ups at MARK spacing
+                        # (0.05 m) so the rover gets a smooth approach/exit, not a
+                        # 2-point jump. MARK edges are already dense.
+                        parts = [
+                            densify_segment(p, self.mark_spacing, self.mark_spacing)
+                            if p.metadata.get("extension_role") in ("pre", "aft")
+                            else p
+                            for p in parts
+                        ]
+                    extended.extend(parts)
             ordered = _insert_transit_connectors_between_segments(
                 extended,
                 transit_speed=self.transit_speed,

@@ -344,6 +344,7 @@ class PathManager:
             "enabled": False,
             "pre_extension_m": 0.5,
             "aft_extension_m": 0.5,
+            "per_line": False,
         }
         fpath = os.path.join(self._dir, os.path.basename(filename))
         sidecar = self._extension_config_path(fpath)
@@ -367,12 +368,13 @@ class PathManager:
             "enabled": bool(payload.get("enabled", default["enabled"])),
             "pre_extension_m": pre,
             "aft_extension_m": aft,
+            "per_line": bool(payload.get("per_line", default["per_line"])),
         }
 
     def resolve_extension_settings(
         self, name: str
-    ) -> tuple[bool, float, float]:
-        """Resolve (enabled, pre_extension_m, aft_extension_m) for a path name.
+    ) -> tuple[bool, float, float, bool]:
+        """Resolve (enabled, pre_extension_m, aft_extension_m, per_line) for a path.
 
         Builtin paths never run through the extension stage, so they always
         resolve to disabled. Other paths use the saved per-file sidecar config.
@@ -381,12 +383,13 @@ class PathManager:
         executed mission stay in lock-step.
         """
         if name in BUILTIN_PATHS:
-            return False, 0.5, 0.5
+            return False, 0.5, 0.5, False
         cfg = self.load_extension_config(name)
         return (
             bool(cfg["enabled"]),
             float(cfg["pre_extension_m"]),
             float(cfg["aft_extension_m"]),
+            bool(cfg["per_line"]),
         )
 
     def save_extension_config(
@@ -395,6 +398,7 @@ class PathManager:
         enabled: bool,
         pre_extension_m: float,
         aft_extension_m: float,
+        per_line: bool = False,
     ) -> dict[str, float | bool]:
         """Persist path extension config for a DXF mission file."""
         safe, fpath = self._require_dxf(filename, "Path extensions are")
@@ -407,6 +411,7 @@ class PathManager:
             "enabled": bool(enabled),
             "pre_extension_m": float(pre_extension_m),
             "aft_extension_m": float(aft_extension_m),
+            "per_line": bool(per_line),
         }
         self._write_sidecar(
             self._extension_config_path(fpath),
@@ -642,7 +647,7 @@ class PathManager:
                 # all share the same waypoint count and spray flags. A bare
                 # PathEngine() here would drop PRE/AFT legs and desync the
                 # spray-flag length from the executed path.
-                enabled, pre_m, aft_m = self.resolve_extension_settings(name)
+                enabled, pre_m, aft_m, per_line = self.resolve_extension_settings(name)
                 overrides = self.load_entity_overrides(name)
                 saved_order = self.load_entity_order(name)
                 # Suppress optimizer when saved entity order is present so
@@ -652,6 +657,7 @@ class PathManager:
                     enable_path_extensions=enabled,
                     pre_extension_m=pre_m,
                     aft_extension_m=aft_m,
+                    per_line_extensions=per_line,
                     optimize_order=effective_optimize,
                 )
                 if overrides or saved_order:
@@ -844,6 +850,7 @@ class PathManager:
         enable_path_extensions = kwargs.pop("enable_path_extensions", None)
         pre_extension_m = kwargs.pop("pre_extension_m", None)
         aft_extension_m = kwargs.pop("aft_extension_m", None)
+        per_line_extensions = kwargs.pop("per_line_extensions", None)
         corner_smooth_radius_m = kwargs.pop("corner_smooth_radius_m", 0.0)
         corner_smooth_arc_pts = kwargs.pop("corner_smooth_arc_pts", 6)
         use_two_opt = kwargs.pop("use_two_opt", True)
@@ -871,12 +878,14 @@ class PathManager:
             enable_path_extensions = bool(enable_path_extensions)
             pre_extension_m = float(pre_extension_m) if pre_extension_m is not None else 0.5
             aft_extension_m = float(aft_extension_m) if aft_extension_m is not None else 0.5
+            per_line_extensions = bool(per_line_extensions)
         elif name in BUILTIN_PATHS:
             enable_path_extensions = False
             pre_extension_m = 0.5
             aft_extension_m = 0.5
+            per_line_extensions = False
         else:
-            enable_path_extensions, pre_extension_m, aft_extension_m = (
+            enable_path_extensions, pre_extension_m, aft_extension_m, per_line_extensions = (
                 self.resolve_extension_settings(name)
             )
 
@@ -978,6 +987,7 @@ class PathManager:
             enable_path_extensions=enable_path_extensions,
             pre_extension_m=pre_extension_m,
             aft_extension_m=aft_extension_m,
+            per_line_extensions=per_line_extensions,
             corner_smooth_radius_m=corner_smooth_radius_m,
             corner_smooth_arc_pts=corner_smooth_arc_pts,
             use_two_opt=use_two_opt,
