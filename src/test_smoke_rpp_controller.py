@@ -405,6 +405,92 @@ def test_smoke():
         node.set_parameters([Parameter("segment_align_settle_s", value=0.10)])
         print("PASS: hard-corner sub-split with alignment pivot at run transition")
 
+        # Spray-only collinear boundaries (PRE→MARK / MARK→AFT) must not trigger
+        # within-run corner slowdown — only real geometric corners may brake.
+        from rpp_controller_node import SegmentStateCode
+
+        ext_msg = Path()
+        ext_msg.header.frame_id = "local_ned"
+        ext_msg.header.stamp = node.get_clock().now().to_msg()
+        pre_pts = [(0.0, i * 0.05) for i in range(9)]              # 0.40 m PRE, spray OFF
+        mark_pts = [(0.0, 0.40 + i * 0.10) for i in range(17)]   # 0.40–2.00 m MARK, spray ON
+        aft_pts = [(0.0, 2.00 + i * 0.05) for i in range(11)]     # 2.00–2.50 m AFT, spray OFF
+        ext_msg.poses = (
+            [_make_path_pose(n, e, mark=False) for n, e in pre_pts]
+            + [_make_path_pose(n, e, mark=True) for n, e in mark_pts]
+            + [_make_path_pose(n, e, mark=False) for n, e in aft_pts]
+        )
+        node.set_parameters([Parameter("tracking_profile", value="segment")])
+        node._path_cb(ext_msg)
+        assert len(node._path) >= 4, "Segment simplify should keep spray boundary vertices"
+        # Rover 0.05 m before the PRE→MARK vertex, inside segment_slowdown_dist (0.5 m).
+        node._segment_idx = 0
+        node._last_speed_cmd = 0.35
+        cap_dbg.messages.clear()
+        cap_segment_dbg.messages.clear()
+        node._control_segment_profile(0.0, 0.35, math.pi / 2.0, 0.02, 2.5)
+        assert cap_segment_dbg.last is not None and cap_dbg.last is not None
+        seg_state = int(cap_segment_dbg.last.data[1])
+        speed_cmd = float(cap_dbg.last.data[3])
+        corner_deg = float(cap_segment_dbg.last.data[5])
+        assert abs(corner_deg) < 5.0, f"Expected collinear spray boundary, got {corner_deg:.1f}°"
+        assert seg_state != int(SegmentStateCode.PRE_CORNER_SLOWDOWN), (
+            "Spray-only boundary must not enter PRE_CORNER_SLOWDOWN"
+        )
+        assert speed_cmd >= 0.30, (
+            f"Expected mission-speed tracking at spray boundary, got {speed_cmd:.3f} m/s"
+        )
+        print("PASS: collinear PRE→MARK boundary keeps full speed (no corner slowdown)")
+
+        # Real 90° in-run corner must still slow before the turn.
+        node.set_parameters([Parameter("tracking_profile", value="segment")])
+        square_msg = Path()
+        square_msg.header.frame_id = "local_ned"
+        square_msg.header.stamp = node.get_clock().now().to_msg()
+        square_msg.poses = [
+            _make_path_pose(n, e) for n, e in gen_square_2x2()
+        ]
+        node._path_cb(square_msg)
+        node._segment_idx = 0
+        node._last_speed_cmd = 0.35
+        cap_dbg.messages.clear()
+        cap_segment_dbg.messages.clear()
+        node._control_segment_profile(1.75, 0.0, 0.0, 0.02, 2.0)
+        assert cap_segment_dbg.last is not None and cap_dbg.last is not None
+        seg_state = int(cap_segment_dbg.last.data[1])
+        speed_cmd = float(cap_dbg.last.data[3])
+        corner_deg = abs(float(cap_segment_dbg.last.data[5]))
+        assert corner_deg >= 45.0, f"Expected hard corner, got {corner_deg:.1f}°"
+        assert seg_state == int(SegmentStateCode.PRE_CORNER_SLOWDOWN), (
+            "90° corner must enter PRE_CORNER_SLOWDOWN inside slowdown_dist"
+        )
+        assert speed_cmd < 0.30, (
+            f"Expected reduced speed before hard corner, got {speed_cmd:.3f} m/s"
+        )
+        print("PASS: 90° corner still triggers PRE_CORNER_SLOWDOWN")
+
+        # Final-segment approach deceleration is independent of the corner gate.
+        straight_msg = Path()
+        straight_msg.header.frame_id = "local_ned"
+        straight_msg.header.stamp = node.get_clock().now().to_msg()
+        straight_msg.poses = [_make_path_pose(0.0, 0.0), _make_path_pose(5.0, 0.0)]
+        node._path_cb(straight_msg)
+        node._segment_idx = 0
+        node._last_speed_cmd = 0.35
+        cap_dbg.messages.clear()
+        cap_segment_dbg.messages.clear()
+        node._control_segment_profile(4.70, 0.0, 0.0, 0.02, 0.30)
+        assert cap_segment_dbg.last is not None and cap_dbg.last is not None
+        seg_state = int(cap_segment_dbg.last.data[1])
+        speed_cmd = float(cap_dbg.last.data[3])
+        assert seg_state == int(SegmentStateCode.PRE_CORNER_SLOWDOWN), (
+            "Final segment must still use approach deceleration"
+        )
+        assert speed_cmd < 0.30, (
+            f"Expected final-segment approach slowdown, got {speed_cmd:.3f} m/s"
+        )
+        print("PASS: final-segment approach deceleration unchanged")
+
         node.destroy_node()
         print("\n=== ALL SMOKE TESTS PASSED ===")
         return True

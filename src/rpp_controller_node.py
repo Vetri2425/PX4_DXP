@@ -2537,7 +2537,16 @@ class RPPControllerNode(Node):
         slowdown = float(self.get_parameter("segment_slowdown_dist").value)
         min_corner_speed = float(self.get_parameter("segment_min_corner_speed").value)
         self._segment_state = SegmentStateCode.TRACK_SEGMENT
-        if not final_segment and slowdown > 1e-6 and dist_to_corner < slowdown:
+        corner_threshold_deg = float(
+            self.get_parameter("segment_corner_threshold_deg").value
+        )
+        if (
+            not final_segment
+            and slowdown > 1e-6
+            and dist_to_corner < slowdown
+            and math.isfinite(corner_angle)
+            and abs(corner_angle) >= corner_threshold_deg
+        ):
             scale = self._clamp(dist_to_corner / slowdown, 0.0, 1.0)
             speed = max(min_corner_speed, max_v * scale)
             self._segment_state = SegmentStateCode.PRE_CORNER_SLOWDOWN
