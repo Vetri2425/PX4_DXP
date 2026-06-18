@@ -110,3 +110,9 @@ image_ref/
 
 # Rosbag topic lists (local scratch)
 tools/rosbag.txt
+
+# Generated DXF sidecars (entities/extensions cache, regenerated on parse)
+server/missions/.*.dxf.*.json
+
+# Local bag/trajectory analysis output (data + plots, not for tracking)
+analysis/
