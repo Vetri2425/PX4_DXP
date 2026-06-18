@@ -102,6 +102,10 @@ def _build(context, *args, **kwargs):
         "segment_slowdown_dist", "segment_min_corner_speed",
         "segment_corner_acceptance_radius", "segment_heading_tolerance_deg",
         "segment_yaw_rate_gain", "segment_timeout_heading_tolerance_deg",
+        "segment_pivot_release_max_deg", "segment_stop_speed_threshold",
+        "segment_stop_yaw_rate_threshold", "segment_stop_dwell_s",
+        "segment_brake_velocity_cap_m_s", "segment_align_settle_s",
+        "segment_align_speed_threshold",
     ):
         val = LaunchConfiguration(name).perform(context)
         if val != "__unset__":
@@ -235,5 +239,12 @@ def generate_launch_description():
         DeclareLaunchArgument("segment_heading_tolerance_deg",        default_value="__unset__"),
         DeclareLaunchArgument("segment_yaw_rate_gain",                default_value="__unset__"),
         DeclareLaunchArgument("segment_timeout_heading_tolerance_deg", default_value="__unset__"),
+        DeclareLaunchArgument("segment_pivot_release_max_deg",         default_value="__unset__"),
+        DeclareLaunchArgument("segment_stop_speed_threshold",          default_value="__unset__"),
+        DeclareLaunchArgument("segment_stop_yaw_rate_threshold",       default_value="__unset__"),
+        DeclareLaunchArgument("segment_stop_dwell_s",                  default_value="__unset__"),
+        DeclareLaunchArgument("segment_brake_velocity_cap_m_s",        default_value="__unset__"),
+        DeclareLaunchArgument("segment_align_settle_s",                default_value="__unset__"),
+        DeclareLaunchArgument("segment_align_speed_threshold",         default_value="__unset__"),
         OpaqueFunction(function=_build),
     ])
