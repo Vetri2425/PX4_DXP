@@ -55,6 +55,7 @@ from models import (
     EntityTransitPreview,
     LoadMissionRequest,
     LoadedPathResponse,
+    MissionState,
     MissionSummary,
     PathExtensionConfig,
     PathExtensionConfigResponse,
@@ -70,6 +71,7 @@ from models import (
 )
 from path_manager import UploadValidationError
 from path_engine.entity_order import apply_entity_order as _apply_entity_order_shared
+from mission_placement import GPS_SURVEYED, LOCAL_NED
 
 log = logging.getLogger("server.routes.path")
 
@@ -666,12 +668,28 @@ async def upload_path(file: UploadFile = File(...)):
 
 @path_router.post("/publish")
 async def publish_path(req: PathPublishRequest):
-    from main import ros_node, path_mgr
+    from main import offboard_ctrl, ros_node, path_mgr
     if ros_node is None:
         raise HTTPException(503, "ROS node not ready")
     name = req.name or req.file
     if not name:
         raise HTTPException(400, "Provide name or file")
+    if offboard_ctrl is not None and (
+        offboard_ctrl.has_protected_mission
+        or offboard_ctrl.state in {
+            MissionState.LOADING,
+            MissionState.ARMING,
+            MissionState.SWITCHING_OFFBOARD,
+            MissionState.RUNNING,
+            MissionState.STOPPING,
+            MissionState.DISARMING,
+        }
+    ):
+        raise HTTPException(
+            409,
+            "Cannot publish a diagnostic path while a protected mission is loaded "
+            f"or controller is {offboard_ctrl.state.value}",
+        )
     try:
         pts = path_mgr.load_path(name)
     except FileNotFoundError as exc:
@@ -1031,7 +1049,21 @@ async def load_mission_to_controller(req: LoadMissionRequest):
 
     try:
         spray_flags = [bool(f) for f in staged.get("spray_flags", [])]
-        offboard_ctrl.load_path(waypoints, name=safe_id, spray_flags=spray_flags)
+        origin_gps = None
+        if anchor is not None:
+            origin_gps = (anchor.get("lat"), anchor.get("lon"))
+        source_name = (staged.get("metadata") or {}).get("source") or safe_id
+        offboard_ctrl.load_path(
+            waypoints,
+            name=source_name,
+            spray_flags=spray_flags,
+            placement_mode=GPS_SURVEYED if anchor is not None else LOCAL_NED,
+            origin_gps=origin_gps,
+            mission_id=safe_id,
+            source_name=source_name,
+            is_staged=True,
+            allow_replace_protected=True,
+        )
     except Exception as exc:
         raise HTTPException(409, f"Controller load failed: {exc}")
 

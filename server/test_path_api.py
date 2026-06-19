@@ -1240,8 +1240,8 @@ async def test_plan_then_load_to_controller_round_trip(monkeypatch, tmp_path):
             self.loaded = None
             self.state = MissionState.IDLE
 
-        def load_path(self, points, name=None, spray_flags=None):
-            self.loaded = (list(points), name, spray_flags)
+        def load_path(self, points, name=None, spray_flags=None, **kwargs):
+            self.loaded = (list(points), name, spray_flags, kwargs)
 
     fake_ctrl = FakeController()
     monkeypatch.setattr(main, "path_mgr", FakePathManager())
@@ -1262,6 +1262,11 @@ async def test_plan_then_load_to_controller_round_trip(monkeypatch, tmp_path):
     assert resp["anchor_loaded"] is True
     # Controller received the exact aligned waypoints.
     assert fake_ctrl.loaded[0] == waypoints
+    assert fake_ctrl.loaded[1] == "soccer_field_penalty_area.dxf"
+    assert fake_ctrl.loaded[3]["mission_id"] == mid
+    assert fake_ctrl.loaded[3]["placement_mode"] == "GPS_SURVEYED"
+    assert fake_ctrl.loaded[3]["origin_gps"] == (13.0, 80.0)
+    assert fake_ctrl.loaded[3]["is_staged"] is True
 
 
 @pytest.mark.anyio

@@ -46,6 +46,7 @@ class PathPublishRequest(BaseModel):
 class MissionStartRequest(BaseModel):
     path_name: Optional[str] = None
     mission_file: Optional[str] = None
+    mission_id: Optional[str] = None
     auto_origin: bool = False
 
 
@@ -143,6 +144,8 @@ class MissionStatus(BaseModel):
     pose_age_ms: Optional[float] = None
     fcu_connected: Optional[bool] = None
     last_path_loaded: Optional[str] = None
+    loaded_mission_id: Optional[str] = None
+    running_mission_id: Optional[str] = None
 
 
 class ActivityEntry(BaseModel):
@@ -544,6 +547,13 @@ class LoadedPathResponse(BaseModel):
 
     loaded: bool = False
     name: Optional[str] = None
+    mission_id: Optional[str] = None
+    running_mission_id: Optional[str] = None
+    source_name: Optional[str] = None
+    placement_mode: str = "LOCAL_NED"
+    origin_gps: Optional[list[float]] = None
+    is_staged: bool = False
+    protected: bool = False
     state: str = "idle"
     num_waypoints: int = 0
     num_mark: int = 0

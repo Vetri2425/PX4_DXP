@@ -76,6 +76,11 @@ async def load_path_for_controller(
 ) -> list[tuple[float, float]]:
     """Load and validate a path without blocking the FastAPI event loop."""
     async with _load_lock:
+        if offboard_ctrl.has_protected_mission:
+            raise MissionLoadConflict(
+                f"Loaded mission {offboard_ctrl.loaded_mission_id!r} is staged/surveyed; "
+                "legacy load cannot replace it"
+            )
         prior_state = offboard_ctrl.state
         reason = load_block_reason(prior_state)
         if reason:
@@ -99,3 +104,53 @@ async def load_path_for_controller(
         offboard_ctrl.state = prior_state
         offboard_ctrl.load_path(points, name=name, spray_flags=spray_flags)
         return points
+
+
+async def start_mission_for_controller(
+    offboard_ctrl,
+    path_mgr,
+    ros_node,
+    *,
+    name: str | None = None,
+    mission_id: str | None = None,
+    auto_origin: bool = False,
+) -> tuple[bool, str]:
+    """Start the resident mission, preserving legacy load-and-start for local paths."""
+    if offboard_ctrl.has_protected_mission and name:
+        raise MissionLoadConflict(
+            f"Loaded mission {offboard_ctrl.loaded_mission_id!r} is staged/surveyed; "
+            "path_name cannot replace it during start"
+        )
+
+    origin = (0.0, 0.0)
+    start_position = None
+    origin_pre_applied = False
+
+    if auto_origin and not offboard_ctrl.has_protected_mission:
+        if ros_node is None:
+            raise MissionLoadConflict("ROS node not ready")
+        pose_origin = pose_origin_or_error(ros_node.get_state())
+        if isinstance(pose_origin, str):
+            raise MissionLoadConflict(pose_origin)
+        origin = pose_origin
+        start_position = origin
+        if not name:
+            loaded = offboard_ctrl.loaded_path_name
+            if loaded and loaded != "unknown":
+                name = loaded
+
+    if name:
+        await load_path_for_controller(
+            offboard_ctrl,
+            path_mgr,
+            name,
+            origin=origin,
+            start_position=start_position,
+            auto_origin=auto_origin,
+        )
+        origin_pre_applied = auto_origin
+
+    return await offboard_ctrl.start_async(
+        auto_origin=auto_origin and not origin_pre_applied,
+        expected_mission_id=mission_id,
+    )

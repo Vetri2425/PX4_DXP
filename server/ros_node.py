@@ -156,6 +156,8 @@ class RosBridgeNode(Node):
         "pos_n": 0.0,
         "pos_e": 0.0,
         "pose_received": False,
+        "global_position_received": False,
+        "gps_fix_received": False,
         "heading_ned_deg": 0.0,
         "battery_v": 0.0,
         "battery_pct": 0.0,
@@ -195,6 +197,8 @@ class RosBridgeNode(Node):
         # We expose this timestamp so callers can detect true process death.
         self._state_recv_time: float | None = None
         self._pose_recv_time: float | None = None  # last /mavros/local_position/pose
+        self._global_pos_recv_time: float | None = None
+        self._gps_fix_recv_time: float | None = None
         self._MAVROS_STATE_TIMEOUT_S = 2.0  # MAVROS publishes /state ~10 Hz
 
         # Callback groups: subs mutually exclusive, services reentrant
@@ -357,7 +361,6 @@ class RosBridgeNode(Node):
 
     def _cb_pose(self, msg) -> None:
         """ENU (MAVROS REP-103) → NED conversion."""
-        self._pose_recv_time = time.monotonic()
         q = msg.pose.orientation
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
@@ -365,6 +368,7 @@ class RosBridgeNode(Node):
         yaw_ned = math.pi / 2.0 - yaw_enu
         yaw_ned = math.atan2(math.sin(yaw_ned), math.cos(yaw_ned))
         with self._lock:
+            self._pose_recv_time = time.monotonic()
             self._state["pos_n"] = msg.pose.position.y  # ENU y = North → pos_n
             self._state["pos_e"] = msg.pose.position.x  # ENU x = East  → pos_e
             self._state["pose_received"] = True
@@ -389,16 +393,20 @@ class RosBridgeNode(Node):
             pass
 
         with self._lock:
+            self._global_pos_recv_time = time.monotonic()
             self._state["lat"] = msg.latitude
             self._state["lon"] = msg.longitude
             self._state["alt"] = msg.altitude
             self._state["hrms"] = hrms
             self._state["vrms"] = vrms
+            self._state["global_position_received"] = True
 
     def _cb_gps_raw(self, msg) -> None:
         with self._lock:
+            self._gps_fix_recv_time = time.monotonic()
             self._state["gps_fix"] = msg.fix_type
             self._state["gps_sat"] = msg.satellites_visible
+            self._state["gps_fix_received"] = True
 
     def _cb_rpp_debug(self, msg: Float32MultiArray) -> None:
         # /rpp/debug is append-only. Consume stable legacy fields first and
@@ -458,6 +466,28 @@ class RosBridgeNode(Node):
         """
         with self._lock:
             state = dict(self._state)
+            pose_recv_time = self._pose_recv_time
+            global_pos_recv_time = self._global_pos_recv_time
+            gps_fix_recv_time = self._gps_fix_recv_time
+        now = time.monotonic()
+        state["local_pose_age_ms"] = (
+            (now - pose_recv_time) * 1000.0 if pose_recv_time is not None else None
+        )
+        state["global_position_age_ms"] = (
+            (now - global_pos_recv_time) * 1000.0
+            if global_pos_recv_time is not None else None
+        )
+        state["gps_fix_age_ms"] = (
+            (now - gps_fix_recv_time) * 1000.0
+            if gps_fix_recv_time is not None else None
+        )
+        state["pose_global_skew_ms"] = (
+            # Callback receive-time skew from monotonic clocks. This is not
+            # sensor-time or ROS-header timestamp synchronization.
+            abs(pose_recv_time - global_pos_recv_time) * 1000.0
+            if pose_recv_time is not None and global_pos_recv_time is not None
+            else None
+        )
         # Outside the lock — monotonic check does not need it
         if self._state_recv_time is not None:
             age = time.monotonic() - self._state_recv_time

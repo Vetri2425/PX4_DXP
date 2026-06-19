@@ -99,6 +99,9 @@ SPRAY_DEFAULT_ON = os.environ.get("ROVER_SPRAY_DEFAULT_ON", "1") == "1"
 
 # ── Safety / watchdog thresholds ──────────────────────────────────────────────
 POSE_STALE_MS = 500.0  # consider pose stale above this
+GLOBAL_POSITION_STALE_MS = float(os.environ.get("ROVER_GLOBAL_POS_STALE_MS", "500"))
+GPS_FIX_STALE_MS = float(os.environ.get("ROVER_GPS_FIX_STALE_MS", "500"))
+POSE_GLOBAL_MAX_SKEW_MS = float(os.environ.get("ROVER_POSE_GPS_MAX_SKEW_MS", "100"))
 SAFETY_STALE_GRACE_S = 1.0  # auto-abort after this long in STALE
 DONE_SETTLE_S = 1.0  # require this much DONE before auto-completing
 SETPOINT_STREAM_GRACE_S = 0.5  # path/setpoint settle time before OFFBOARD request

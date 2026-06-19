@@ -93,6 +93,7 @@ def register_handlers(sio) -> None:
     @sio.on("mission_load")
     async def on_mission_load(sid, data):
         from main import offboard_ctrl, path_mgr
+        from mission_loading import MissionLoadConflict, load_path_for_controller
         if not _auth_ok(data):
             return await _emit_unauth(sio, sid)
         name = (data.get("path_name") or data.get("mission_file")
@@ -102,25 +103,48 @@ def register_handlers(sio) -> None:
                            {"message": "No path name provided"}, to=sid)
             return
         try:
-            pts = path_mgr.load_path(name)
-            from mission_loading import spray_flags_for_path
-            spray_flags = spray_flags_for_path(path_mgr, name, len(pts))
-            offboard_ctrl.load_path(pts, name=name, spray_flags=spray_flags)
+            pts = await load_path_for_controller(offboard_ctrl, path_mgr, name)
             await sio.emit("mission_loaded",
-                           {"name": name, "num_points": len(pts)}, to=sid)
+                           {"name": name,
+                            "mission_id": offboard_ctrl.loaded_mission_id,
+                            "num_points": len(pts)}, to=sid)
+        except MissionLoadConflict as exc:
+            await sio.emit("mission_error",
+                           {"message": str(exc), "status": 409}, to=sid)
         except Exception as exc:
             await sio.emit("mission_error", {"message": str(exc)}, to=sid)
 
     @sio.on("mission_start")
     async def on_mission_start(sid, data=None):
-        from main import offboard_ctrl
+        from main import offboard_ctrl, path_mgr, ros_node
+        from mission_loading import MissionLoadConflict, start_mission_for_controller
+        from mission_placement import PlacementError
         if not _auth_ok(data):
             return await _emit_unauth(sio, sid)
-        ok, msg = await offboard_ctrl.start_async()
+        payload = data if isinstance(data, dict) else {}
+        name = payload.get("path_name") or payload.get("mission_file")
+        try:
+            ok, msg = await start_mission_for_controller(
+                offboard_ctrl,
+                path_mgr,
+                ros_node,
+                name=name,
+                mission_id=payload.get("mission_id"),
+                auto_origin=bool(payload.get("auto_origin", False)),
+            )
+        except MissionLoadConflict as exc:
+            ok, msg, status = False, str(exc), 409
+        except PlacementError as exc:
+            ok, msg, status = False, str(exc), 422
+        except Exception as exc:
+            ok, msg, status = False, str(exc), 409
+        else:
+            status = 200 if ok else 409
         await sio.emit("mission_status_update",
                        {"state":   offboard_ctrl.state.value,
                         "success": ok,
-                        "message": msg}, to=sid)
+                        "message": msg,
+                        "status": status}, to=sid)
 
     @sio.on("mission_stop")
     async def on_mission_stop(sid, data=None):

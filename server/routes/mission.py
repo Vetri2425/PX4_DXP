@@ -15,9 +15,9 @@ from config import RPP_STALE, RPP_STATE_NAMES
 from mission_loading import (
     MissionLoadConflict,
     load_path_for_controller,
-    pose_origin_or_error,
-    spray_flags_for_path,
+    start_mission_for_controller,
 )
+from mission_placement import PlacementError
 from models import (
     LoadedPathResponse,
     MissionLoadRequest,
@@ -47,14 +47,20 @@ async def load_mission(req: MissionLoadRequest):
     if not name:
         raise HTTPException(400, "Provide path_name or mission_file")
     try:
-        pts = path_mgr.load_path(name)
+        pts = await load_path_for_controller(offboard_ctrl, path_mgr, name)
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc))
+    except MissionLoadConflict as exc:
+        raise HTTPException(409, str(exc))
+    except PlacementError as exc:
+        raise HTTPException(422, str(exc))
     except Exception as exc:
         raise HTTPException(400, f"Load failed: {exc}")
-    spray_flags = spray_flags_for_path(path_mgr, name, len(pts))
-    offboard_ctrl.load_path(pts, name=name, spray_flags=spray_flags)
-    return {"loaded": name, "num_points": len(pts)}
+    return {
+        "loaded": name,
+        "mission_id": offboard_ctrl.loaded_mission_id,
+        "num_points": len(pts),
+    }
 
 
 @router.post("/start")
@@ -65,45 +71,24 @@ async def start_mission(req: MissionStartRequest | None = None):
 
     auto_origin = req.auto_origin if req else False
     name = (req.path_name or req.mission_file) if req else None
-    origin = (0.0, 0.0)
-    start_position = None
-    origin_pre_applied = False
-
-    if auto_origin:
-        if ros_node is None:
-            raise HTTPException(503, "ROS node not ready")
-        s = ros_node.get_state()
-        pose_origin = pose_origin_or_error(s)
-        if isinstance(pose_origin, str):
-            raise HTTPException(409, pose_origin)
-        origin = pose_origin
-        start_position = origin
-        if not name:
-            loaded = offboard_ctrl.loaded_path_name
-            if loaded and loaded != "unknown":
-                name = loaded
-
-    if name:
-        try:
-            pts = await load_path_for_controller(
-                offboard_ctrl,
-                path_mgr,
-                name,
-                origin=origin,
-                start_position=start_position,
-                auto_origin=auto_origin,
-            )
-        except FileNotFoundError as exc:
-            raise HTTPException(404, str(exc))
-        except MissionLoadConflict as exc:
-            raise HTTPException(409, str(exc))
-        except Exception as exc:
-            raise HTTPException(400, f"Path load failed: {exc}")
-        origin_pre_applied = auto_origin
-
-    ok, msg = await offboard_ctrl.start_async(
-        auto_origin=auto_origin and not origin_pre_applied
-    )
+    mission_id = req.mission_id if req else None
+    try:
+        ok, msg = await start_mission_for_controller(
+            offboard_ctrl,
+            path_mgr,
+            ros_node,
+            name=name,
+            mission_id=mission_id,
+            auto_origin=auto_origin,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc))
+    except MissionLoadConflict as exc:
+        raise HTTPException(409, str(exc))
+    except PlacementError as exc:
+        raise HTTPException(422, str(exc))
+    except Exception as exc:
+        raise HTTPException(400, f"Path load failed: {exc}")
     if not ok:
         raise HTTPException(409, f"Mission start failed: {msg}")
     return {"state": offboard_ctrl.state.value, "message": msg}
@@ -130,6 +115,8 @@ async def mission_status():
     from main import offboard_ctrl, ros_node
     state = offboard_ctrl.state if offboard_ctrl else "idle"
     last_path_loaded = offboard_ctrl.loaded_path_name if offboard_ctrl else None
+    loaded_mission_id = offboard_ctrl.loaded_mission_id if offboard_ctrl else None
+    running_mission_id = offboard_ctrl.running_mission_id if offboard_ctrl else None
     s = {}
     if ros_node is not None:
         try:
@@ -168,4 +155,6 @@ async def mission_status():
         pose_age_ms    = pose_age_ms,
         fcu_connected  = s.get("connected"),
         last_path_loaded = last_path_loaded,
+        loaded_mission_id = loaded_mission_id,
+        running_mission_id = running_mission_id,
     )
