@@ -38,7 +38,7 @@ from std_msgs.msg import Bool, Float32MultiArray
 
 MAV_CMD_DO_SET_ACTUATOR = 187
 MAV_CMD_DO_SET_SERVO = 183
-_SERVO_PWM_MAX_US = 2200
+_SERVO_PWM_MAX_US = 3000
 TRANSIT_TO_MARK = "TRANSIT_TO_MARK"
 MARK_TO_TRANSIT = "MARK_TO_TRANSIT"
 
@@ -363,7 +363,7 @@ class SprayControllerNode(Node):
         # number maps to the physical AUX pin driving the spray driver.
         self.declare_parameter("servo_instance", 1)
         self.declare_parameter("off_pwm_us", 0)
-        self.declare_parameter("on_pwm_us", 1800)
+        self.declare_parameter("on_pwm_us", 2500)
         # Master enable gate. When False the node will not command spray ON
         # from any source (manual override, mission auto-spray, reassert).
         # The server sets this via the /api/spray/enable and /api/spray/disable

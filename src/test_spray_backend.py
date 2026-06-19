@@ -30,7 +30,7 @@ from spray_controller_node import (  # noqa: E402
 def _servo_node(
     servo_instance: int = 1,
     off_pwm_us: int = 0,
-    on_pwm_us: int = 1800,
+    on_pwm_us: int = 2500,
 ) -> SprayControllerNode:
     node = make_node()
     node._params["actuator_backend"] = _Param("mavlink_servo_pwm")
@@ -72,11 +72,11 @@ def test_servo_pwm_off_command():
 
 
 def test_servo_pwm_on_command():
-    node = _servo_node(servo_instance=1, off_pwm_us=0, on_pwm_us=1800)
+    node = _servo_node(servo_instance=1, off_pwm_us=0, on_pwm_us=2500)
     req = _req(node, on=True)
     assert req.command == MAV_CMD_DO_SET_SERVO
     assert req.param1 == 1.0
-    assert req.param2 == 1800.0, f"expected param2=1800, got {req.param2}"
+    assert req.param2 == 2500.0, f"expected param2=2500, got {req.param2}"
     print("PASS test_servo_pwm_on_command")
 
 
