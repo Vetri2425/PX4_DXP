@@ -116,7 +116,8 @@ def register_handlers(sio) -> None:
 
     @sio.on("mission_start")
     async def on_mission_start(sid, data=None):
-        from main import offboard_ctrl, path_mgr, ros_node
+        from main import mission_capture, offboard_ctrl, path_mgr, ros_node
+        from mission_debug_capture import CaptureUnavailable
         from mission_loading import MissionLoadConflict, start_mission_for_controller
         from mission_placement import PlacementError
         if not _auth_ok(data):
@@ -131,7 +132,17 @@ def register_handlers(sio) -> None:
                 name=name,
                 mission_id=payload.get("mission_id"),
                 auto_origin=bool(payload.get("auto_origin", False)),
+                capture_coordinator=mission_capture,
+                transport="socketio",
+                start_request={
+                    "path_name": payload.get("path_name"),
+                    "mission_file": payload.get("mission_file"),
+                    "mission_id": payload.get("mission_id"),
+                    "auto_origin": bool(payload.get("auto_origin", False)),
+                },
             )
+        except CaptureUnavailable as exc:
+            ok, msg, status = False, f"Mission capture unavailable: {exc}", 503
         except MissionLoadConflict as exc:
             ok, msg, status = False, str(exc), 409
         except PlacementError as exc:
@@ -148,18 +159,26 @@ def register_handlers(sio) -> None:
 
     @sio.on("mission_stop")
     async def on_mission_stop(sid, data=None):
-        from main import offboard_ctrl
+        from main import mission_capture, offboard_ctrl
         if not _auth_ok(data):
             return await _emit_unauth(sio, sid)
         result = await offboard_ctrl.stop_async()
+        if result.get("success") and mission_capture is not None:
+            mission_capture.record_terminal(
+                None, "operator_stop", state=offboard_ctrl.state.value, details=result
+            )
         await sio.emit("mission_status_update", result, to=sid)
 
     @sio.on("mission_abort")
     async def on_mission_abort(sid, data=None):
-        from main import offboard_ctrl
+        from main import mission_capture, offboard_ctrl
         if not _auth_ok(data):
             return await _emit_unauth(sio, sid)
         result = await offboard_ctrl.abort_async()
+        if mission_capture is not None:
+            mission_capture.record_terminal(
+                None, "operator_abort", state=offboard_ctrl.state.value, details=result
+            )
         await sio.emit("mission_status_update", result, to=sid)
 
     @sio.on("request_params")

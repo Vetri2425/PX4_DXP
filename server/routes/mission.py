@@ -65,7 +65,8 @@ async def load_mission(req: MissionLoadRequest):
 
 @router.post("/start")
 async def start_mission(req: MissionStartRequest | None = None):
-    from main import offboard_ctrl, path_mgr, ros_node
+    from main import mission_capture, offboard_ctrl, path_mgr, ros_node
+    from mission_debug_capture import CaptureUnavailable
     if offboard_ctrl is None:
         raise HTTPException(503, "Controller not ready")
 
@@ -80,7 +81,17 @@ async def start_mission(req: MissionStartRequest | None = None):
             name=name,
             mission_id=mission_id,
             auto_origin=auto_origin,
+            capture_coordinator=mission_capture,
+            transport="rest",
+            start_request={
+                "path_name": req.path_name if req else None,
+                "mission_file": req.mission_file if req else None,
+                "mission_id": mission_id,
+                "auto_origin": auto_origin,
+            },
         )
+    except CaptureUnavailable as exc:
+        raise HTTPException(503, f"Mission capture unavailable: {exc}")
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc))
     except MissionLoadConflict as exc:
@@ -96,18 +107,36 @@ async def start_mission(req: MissionStartRequest | None = None):
 
 @router.post("/stop")
 async def stop_mission():
-    from main import offboard_ctrl
+    from main import mission_capture, offboard_ctrl
     if offboard_ctrl is None:
         raise HTTPException(503, "Controller not ready")
-    return await offboard_ctrl.stop_async()
+    result = await offboard_ctrl.stop_async()
+    if result.get("success") and mission_capture is not None:
+        mission_capture.record_terminal(
+            None, "operator_stop", state=offboard_ctrl.state.value, details=result
+        )
+    return result
 
 
 @router.post("/abort")
 async def abort_mission():
-    from main import offboard_ctrl
+    from main import mission_capture, offboard_ctrl
     if offboard_ctrl is None:
         raise HTTPException(503, "Controller not ready")
-    return await offboard_ctrl.abort_async()
+    result = await offboard_ctrl.abort_async()
+    if mission_capture is not None:
+        mission_capture.record_terminal(
+            None, "operator_abort", state=offboard_ctrl.state.value, details=result
+        )
+    return result
+
+
+@router.get("/debug-capture/status")
+async def debug_capture_status():
+    from main import mission_capture
+    if mission_capture is None:
+        return {"state": "unavailable", "required": None}
+    return mission_capture.get_status()
 
 
 @router.get("/status", response_model=MissionStatus)

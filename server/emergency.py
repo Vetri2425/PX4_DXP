@@ -24,10 +24,12 @@ class EmergencyHandler:
         ros_node,
         offboard_controller,
         activity_log: deque,
+        mission_capture=None,
     ) -> None:
         self._node       = ros_node
         self._controller = offboard_controller
         self._log        = activity_log
+        self._mission_capture = mission_capture
 
     async def estop_async(self) -> dict:
         """Execute emergency stop. Returns {success, message}."""
@@ -81,5 +83,13 @@ class EmergencyHandler:
         ts = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
         self._log.append({"timestamp": ts, "level": "error", "message": msg})
         getattr(log, level)(msg)
+
+        if self._mission_capture is not None:
+            self._mission_capture.record_terminal(
+                None,
+                "emergency_stop",
+                state=MissionState.ABORTED.value,
+                details={"success": not errors, "errors": errors},
+            )
 
         return {"success": not errors, "message": msg}

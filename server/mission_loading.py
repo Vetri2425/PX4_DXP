@@ -114,6 +114,9 @@ async def start_mission_for_controller(
     name: str | None = None,
     mission_id: str | None = None,
     auto_origin: bool = False,
+    capture_coordinator=None,
+    transport: str = "internal",
+    start_request: dict | None = None,
 ) -> tuple[bool, str]:
     """Start the resident mission, preserving legacy load-and-start for local paths."""
     if offboard_ctrl.has_protected_mission and name:
@@ -150,7 +153,42 @@ async def start_mission_for_controller(
         )
         origin_pre_applied = auto_origin
 
-    return await offboard_ctrl.start_async(
-        auto_origin=auto_origin and not origin_pre_applied,
-        expected_mission_id=mission_id,
-    )
+    capture_id = None
+    if capture_coordinator is not None:
+        capture_id = await capture_coordinator.begin_capture(
+            offboard_ctrl,
+            start_request=start_request or {
+                "path_name": name,
+                "mission_id": mission_id,
+                "auto_origin": auto_origin,
+            },
+            transport=transport,
+        )
+
+    def _placement_hook(payload: dict) -> None:
+        if capture_coordinator is not None:
+            capture_coordinator.record_placement(capture_id, payload)
+
+    try:
+        ok, message = await offboard_ctrl.start_async(
+            auto_origin=auto_origin and not origin_pre_applied,
+            expected_mission_id=mission_id,
+            pre_publish_hook=_placement_hook if capture_id else None,
+        )
+    except Exception as exc:
+        if capture_coordinator is not None:
+            capture_coordinator.record_start_result(
+                capture_id,
+                success=False,
+                state=offboard_ctrl.state.value,
+                message=str(exc),
+            )
+        raise
+    if capture_coordinator is not None:
+        capture_coordinator.record_start_result(
+            capture_id,
+            success=ok,
+            state=offboard_ctrl.state.value,
+            message=message,
+        )
+    return ok, message

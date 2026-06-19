@@ -79,6 +79,21 @@ MISSION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "missions
 # Aligned-DXF missions are staged here before the operator confirms a load.
 STAGING_DIR = os.path.join(MISSION_DIR, "staging")
 
+# Mission-scoped debug capture coordination. Field deployments set capture
+# required so an API mission cannot publish /path until rosbag is ready. The
+# code default is OFF (fail-open) so developer installs and the test suite never
+# hard-depend on the recorder; rover-server.service sets
+# MISSION_CAPTURE_REQUIRED=1 to enforce fail-closed capture in the field.
+MISSION_DEBUG_CONTROL_DIR = os.environ.get(
+    "MISSION_DEBUG_CONTROL_DIR",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "runtime", "mission-debug"),
+)
+MISSION_CAPTURE_REQUIRED = os.environ.get("MISSION_CAPTURE_REQUIRED", "0") == "1"
+MISSION_CAPTURE_ACK_TIMEOUT_S = float(
+    os.environ.get("MISSION_CAPTURE_ACK_TIMEOUT_S", "3.0")
+)
+
 # ── DXF alignment / mission-handoff ───────────────────────────────────────────
 # Max allowable least-squares RMSE (metres) for multi-point DXF→NED alignment.
 # Plans whose residual exceeds this are rejected (422) and never staged.

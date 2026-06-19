@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 from collections import deque
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from config import (
     RPP_IDLE,
@@ -235,6 +235,7 @@ class OffboardController:
         self,
         auto_origin: bool = False,
         expected_mission_id: str | None = None,
+        pre_publish_hook: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[bool, str]:
         async with self._lifecycle_lock():
             if self._node is None:
@@ -289,6 +290,10 @@ class OffboardController:
                 return False, msg
 
             pts_to_publish = list(self._loaded_source_pts)
+            rover_local_ned = None
+            if fcu.get("pose_received", False):
+                rover_local_ned = [float(fcu.get("pos_n", 0.0)), float(fcu.get("pos_e", 0.0))]
+            survey_translation_ned = None
             spray_flags_to_publish = (
                 list(self._loaded_spray_flags)
                 if self._loaded_spray_flags is not None else None
@@ -300,6 +305,7 @@ class OffboardController:
                         self._origin_gps,
                         fcu,
                     )
+                    survey_translation_ned = [float(translation[0]), float(translation[1])]
                 except (PlacementError, ImportError) as exc:
                     self._state = MissionState.ERROR
                     msg = f"start: surveyed placement failed: {exc}"
@@ -330,6 +336,7 @@ class OffboardController:
                     self._log_entry("error", msg)
                     return False, msg
                 off_n, off_e = pose_origin
+                rover_local_ned = [float(off_n), float(off_e)]
                 pts_to_publish = [
                     (n + off_n, e + off_e) for n, e in self._loaded_source_pts
                 ]
@@ -339,6 +346,33 @@ class OffboardController:
 
             armed_here = False
             try:
+                if pre_publish_hook is not None:
+                    # Debug-capture placement snapshot. This is best-effort
+                    # telemetry only — a failure here (e.g. full disk writing the
+                    # sidecar) must never abort a mission start, so it is isolated
+                    # from the control path below.
+                    try:
+                        pre_publish_hook({
+                            "placement_mode": self._placement_mode,
+                            "origin_gps": list(self._origin_gps) if self._origin_gps else None,
+                            "rover_local_ned_at_resolution": rover_local_ned,
+                            "survey_translation_ned": survey_translation_ned,
+                            "resolved_first_waypoint_ned": list(pts_to_publish[0]),
+                            "point_count": len(pts_to_publish),
+                            "spray_on_count": (
+                                sum(1 for flag in spray_flags_to_publish if flag)
+                                if spray_flags_to_publish is not None else 0
+                            ),
+                            "spray_off_count": (
+                                len(spray_flags_to_publish)
+                                - sum(1 for flag in spray_flags_to_publish if flag)
+                                if spray_flags_to_publish is not None else len(pts_to_publish)
+                            ),
+                        })
+                    except Exception as exc:
+                        self._log_entry(
+                            "warning", f"pre-publish capture hook failed (ignored): {exc}"
+                        )
                 # Publish the mission path before the OFFBOARD request so the
                 # 50 Hz setpoint stream carries mission setpoints, not just the
                 # streamer's zero-velocity bootstrap, when PX4 evaluates entry.

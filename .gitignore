@@ -111,6 +111,9 @@ image_ref/
 # Rosbag topic lists (local scratch)
 tools/rosbag.txt
 
+# Runtime mission-debug recorder handshake files
+runtime/mission-debug/
+
 # Generated DXF sidecars (entities/extensions cache, regenerated on parse)
 server/missions/.*.dxf.*.json
 

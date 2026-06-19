@@ -36,7 +36,15 @@ Environment=ROS_LOCALHOST_ONLY=0
 Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/home/flash/PX4_DXP/config/fastdds_no_shm.xml
 Environment=HOME=/home/flash
 Environment=BAGS_DIR=/home/flash/bags_jet
-# Set BAG_RECORD_ALL=1 here to capture ALL topics instead of the curated debug set.
+Environment=PX4_DXP_DIR=/home/flash/PX4_DXP
+Environment=MISSION_DEBUG_CONTROL_DIR=/home/flash/PX4_DXP/runtime/mission-debug
+Environment=BAG_QOS_OVERRIDES=/home/flash/PX4_DXP/config/rosbag_qos_overrides.yaml
+Environment=ROVER_TOKEN_FILE=/home/flash/PX4_DXP/config/rover_token
+Environment=BAG_POST_TAIL_S=2.0
+# Storage limits are site-configurable via a systemd drop-in.
+Environment=BAG_MIN_FREE_BYTES=5368709120
+Environment=BAG_LOW_FREE_BYTES=2147483648
+Environment=BAG_MAX_TOTAL_BYTES=53687091200
 
 # Output
 StandardOutput=journal

@@ -72,6 +72,7 @@ _listener: Optional["object"] = None
 _telemetry_task: Optional[asyncio.Task] = None
 bridge_health: Optional["object"] = None
 rtk_manager: Optional["object"] = None
+mission_capture: Optional["object"] = None
 
 # Bounded, thread-safe ring buffer (deque maxlen). All log appends are atomic
 # under the GIL; bounded eviction is built in. Replaces the racy list+trim.
@@ -97,6 +98,7 @@ socket_app = socketio.ASGIApp(sio)
 async def lifespan(app: FastAPI):
     global ros_node, offboard_ctrl, path_mgr, emergency_handler
     global _executor, _beacon, _listener, _telemetry_task, bridge_health, rtk_manager
+    global mission_capture
 
     configure_logging()
     init_auth()
@@ -123,10 +125,14 @@ async def lifespan(app: FastAPI):
     from offboard_controller import OffboardController
     from path_manager import PathManager
     from rtk_manager import AsyncRTKManager
+    from mission_debug_capture import MissionDebugCoordinator
 
     path_mgr = PathManager(MISSION_DIR)
     offboard_ctrl = OffboardController(ros_node, activity_log)
-    emergency_handler = EmergencyHandler(ros_node, offboard_ctrl, activity_log)
+    mission_capture = MissionDebugCoordinator()
+    emergency_handler = EmergencyHandler(
+        ros_node, offboard_ctrl, activity_log, mission_capture
+    )
     rtk_manager = AsyncRTKManager()
 
     # ── Register Socket.IO handlers ───────────────────────────────────────────
@@ -360,6 +366,12 @@ async def _telemetry_loop() -> None:
                     and ros_node.get_rpp_monitor().is_done()
                 ):
                     offboard_ctrl.mark_completed()
+                    if mission_capture is not None:
+                        mission_capture.record_terminal(
+                            None,
+                            "mission_completed",
+                            state=offboard_ctrl.state.value,
+                        )
                     await sio.emit(
                         "mission_completed",
                         {
