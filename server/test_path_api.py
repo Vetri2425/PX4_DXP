@@ -1,4 +1,6 @@
+import math
 import os
+import shutil
 import sys
 
 # Ensure server directory is in python path
@@ -1827,3 +1829,115 @@ def test_preview_spray_flags_match_executed_path_with_extensions(tmp_path):
     # PRE/AFT extensions are TRANSIT → spray OFF at the ends.
     assert preview.waypoints[0].spray is False
     assert preview.waypoints[-1].spray is False
+
+
+# ── Spray-compensation ownership contract (strict controller-only) ────────────
+#
+# Production planning preserves exact CAD MARK geometry (2.000000 m); the runtime
+# spray_controller owns latency anticipation. The API must not let a client
+# resurrect the legacy 2.0315 m geometric pre-shift via compensate_spray=true.
+
+_SQUARE_DXF = os.path.join(
+    os.path.dirname(__file__), "..", "Simple Demo", "square_2x2.dxf"
+)
+
+
+def test_path_plan_request_default_compensate_spray_is_false():
+    # A request that omits the field must default to uncompensated geometry.
+    req = PathPlanRequest(source="square_2x2.dxf")
+    assert req.compensate_spray is False
+
+
+def test_path_plan_request_explicit_false_compensate_spray_accepted():
+    req = PathPlanRequest(source="square_2x2.dxf", compensate_spray=False)
+    assert req.compensate_spray is False
+
+
+def test_path_plan_request_rejects_explicit_compensate_spray_true():
+    # Strict contract: an explicit true is rejected at the API edge (-> HTTP 422).
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        PathPlanRequest(source="square_2x2.dxf", compensate_spray=True)
+
+
+# The server layer chains the square's four connected LINE primitives into one
+# closed MARK polyline. Geometry stays exact: perimeter = 4 x 2.0 = 8.0 m and the
+# loop closes (endpoint distance 0). Legacy per-side compensation would inflate
+# the perimeter to 4 x 2.0315 = 8.126 m, so 8.0 is the uncompensated witness.
+# (The four-separate-2.0-m-sides decomposition is proven at the engine level in
+# path_engine/tests/test_production_geometry.py.)
+_SQUARE_PERIMETER_M = 8.0
+
+
+def _route_mark_lengths(segments):
+    return [
+        (s.get("source"), s["length_m"])
+        for s in segments
+        if s["type"] == "MARK" and not s.get("is_extension")
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(not os.path.isfile(_SQUARE_DXF), reason="square_2x2.dxf missing")
+async def test_plan_api_default_request_is_uncompensated(tmp_path, monkeypatch):
+    # End-to-end through the /plan route with the real planner: a default request
+    # (compensate_spray omitted) preserves the exact CAD perimeter (8.0 m), not the
+    # legacy compensated 8.126 m.
+    shutil.copy(_SQUARE_DXF, tmp_path / "square_2x2.dxf")
+    monkeypatch.setattr(main, "path_mgr", PathManager(str(tmp_path)))
+
+    data = await plan_path(PathPlanRequest(source="square_2x2.dxf"))
+
+    marks = _route_mark_lengths(data.segments)
+    assert marks, "expected at least one MARK segment"
+    assert sum(length for _, length in marks) == _SQUARE_PERIMETER_M
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(not os.path.isfile(_SQUARE_DXF), reason="square_2x2.dxf missing")
+async def test_plan_api_explicit_false_is_uncompensated(tmp_path, monkeypatch):
+    # An explicit {"compensate_spray": false} request is identical to the default.
+    shutil.copy(_SQUARE_DXF, tmp_path / "square_2x2.dxf")
+    monkeypatch.setattr(main, "path_mgr", PathManager(str(tmp_path)))
+
+    data = await plan_path(
+        PathPlanRequest(source="square_2x2.dxf", compensate_spray=False)
+    )
+
+    marks = _route_mark_lengths(data.segments)
+    assert marks, "expected at least one MARK segment"
+    assert sum(length for _, length in marks) == _SQUARE_PERIMETER_M
+
+
+@pytest.mark.skipif(not os.path.isfile(_SQUARE_DXF), reason="square_2x2.dxf missing")
+def test_path_manager_plan_path_default_perimeter_is_exact(tmp_path):
+    # Server-layer planner (path_manager.plan_path) defaults to uncompensated:
+    # exact 8.000000 m closed MARK perimeter from raw segment points.
+    shutil.copy(_SQUARE_DXF, tmp_path / "square_2x2.dxf")
+    mgr = PathManager(str(tmp_path))
+
+    result = mgr.plan_path("square_2x2.dxf", include_segment_points=True)
+
+    marks = [
+        s for s in result["segments"]
+        if s["type"] == "MARK" and not s.get("is_extension")
+    ]
+    assert marks, "expected at least one MARK segment"
+    total = 0.0
+    for s in marks:
+        pts = s["points"]
+        total += sum(
+            math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
+            for i in range(1, len(pts))
+        )
+    assert abs(total - _SQUARE_PERIMETER_M) < 1e-6
+
+
+def test_plan_and_stage_request_rejects_compensate_spray_true():
+    # plan-and-stage shares PathPlanRequest, so staged output cannot silently
+    # return to 2.0315 m via a replayed request that forces compensation.
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        PathPlanRequest(source="square_2x2.dxf", compensate_spray=True)

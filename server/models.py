@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class VehicleMode(str, Enum):
@@ -397,7 +397,10 @@ class PathPlanRequest(BaseModel):
     marking_speed: float = 0.35  # MARK speed (m/s)
     transit_speed: float = 0.50  # TRANSIT speed (m/s)
     optimize: bool = True  # Reorder segments for minimal dead-heading
-    compensate_spray: bool = True  # Apply spray latency compensation
+    # Planner preserves CAD geometry; runtime spray_controller owns latency
+    # anticipation (use_distance_aware_spray). Strict: True is rejected by the
+    # validator below — geometric pre-compensation is offline-only (PathEngine).
+    compensate_spray: bool = False
     # Deprecated trio: ignored by /api/path/plan (a warning is logged and
     # returned in the response `warnings` when set explicitly). Configure
     # extensions via GET/POST /api/path/{name}/extensions instead.
@@ -411,6 +414,24 @@ class PathPlanRequest(BaseModel):
     max_waypoints: int = Field(10000, ge=100, le=500000)  # Hard publication guard
     max_segments: int = Field(2000, ge=1, le=100000)  # Hard segment-count guard
     include_waypoints: bool = True  # If False, return summary only (no waypoint arrays)
+
+    @field_validator("compensate_spray")
+    @classmethod
+    def _reject_geometric_compensation(cls, v: bool) -> bool:
+        # STRICT controller-only ownership: production planning routes preserve
+        # exact CAD MARK geometry; the runtime spray_controller owns latency
+        # anticipation (use_distance_aware_spray). Reject geometric pre-shift at
+        # the API edge so a client cannot resurrect 2.0315 m MARK segments.
+        # Offline/diagnostic geometric compensation remains available by calling
+        # PathEngine(compensate_spray=True) directly, off the API.
+        if v:
+            raise ValueError(
+                "compensate_spray=true is not accepted on production planning "
+                "routes: the planner preserves exact CAD geometry and the "
+                "spray_controller owns latency anticipation. For offline "
+                "geometric pre-compensation, call PathEngine directly."
+            )
+        return v
 
 
 class PathPlanResponse(BaseModel):

@@ -706,7 +706,9 @@ class PathEngine:
                 transit_speed=self.transit_speed,
             )
 
-        # Step 5: Apply spray latency compensation to MARK segments
+        # Step 5: Optional geometric spray latency compensation (legacy/offline).
+        # Production planning disables this: planner preserves CAD geometry;
+        # runtime spray_controller owns latency anticipation.
         if self.compensate_spray:
             compensated: list[PathSegment] = []
             for seg in ordered:

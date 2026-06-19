@@ -668,6 +668,7 @@ class PathManager:
                     aft_extension_m=aft_m,
                     per_line_extensions=per_line,
                     optimize_order=effective_optimize,
+                    compensate_spray=False,
                 )
                 if overrides or saved_order:
                     entities = self.parse_dxf(fpath)
@@ -851,7 +852,9 @@ class PathManager:
         auto_origin = bool(kwargs.pop("auto_origin", False))
         layer_mapping = kwargs.pop("layer_mapping", None)
         optimize = kwargs.pop("optimize", True)
-        compensate_spray = kwargs.pop("compensate_spray", True)
+        # Production default: planner preserves CAD MARK endpoints exactly.
+        # Runtime spray_controller owns latency anticipation.
+        compensate_spray = kwargs.pop("compensate_spray", False)
         extension_kwargs_provided = any(
             key in kwargs
             for key in ("enable_path_extensions", "pre_extension_m", "aft_extension_m")
