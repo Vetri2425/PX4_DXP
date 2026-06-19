@@ -2365,7 +2365,13 @@ class RPPControllerNode(Node):
             if path_corner_deg < threshold_deg or settled:
                 self._segment_idx += 1
                 self._segment_state = SegmentStateCode.TRACK_SEGMENT
-                self._last_speed_cmd = 0.0
+                # Collinear (sub-threshold) junctions keep momentum so the rover
+                # flows through a spray-only PRE/MARK/AFT boundary instead of
+                # dipping to ~0 and ramping back up (field: 0.08-0.11 m/s dips at
+                # PRE->MARK / MARK->AFT). Only a real corner (reached here via the
+                # stop/align settle gate) zeroes speed for the pivot.
+                if path_corner_deg >= threshold_deg:
+                    self._last_speed_cmd = 0.0
                 self._reset_corner_pivot_state()
                 self._publish_segment_debug(
                     self._segment_state, self._segment_idx, float("nan"),

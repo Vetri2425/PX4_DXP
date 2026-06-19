@@ -399,6 +399,11 @@ def test_smoke():
         # releases and clears the pending flag.
         node._latest_yaw_rate_ned = 0.0
         node._align_settle_since = None
+        # Fresh, stopped velocity: pivot release also requires a fresh
+        # below-threshold linear speed (_align_speed_ok), so supply it — the
+        # rover is physically stopped when it releases.
+        node._latest_vel_time = node.get_clock().now()
+        node._latest_vel_ned = (0.0, 0.0)
         node.set_parameters([Parameter("segment_align_settle_s", value=0.0)])
         assert not node._run_alignment_hold(1.0, 0.0, 1.5708, 0.02)
         assert not node._run_align_pending
