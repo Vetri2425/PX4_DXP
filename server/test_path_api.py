@@ -1038,11 +1038,15 @@ async def test_plan_api_coincident_ref_points():
 # ── Gap A: unit-scale frame consistency ───────────────────────────────────────
 
 def test_affine_scale_is_unity_when_ref_points_share_metric_frame():
-    """Gap A regression.
+    """Gap A regression — affine math contract.
 
-    A cm-unit DXF square whose ref points are 10 m apart in GPS must yield an
-    affine scale ≈ 1.0 once the ref points are scaled into the metric frame —
-    not ≈100 (raw cm fed against metric NED) or ≈0.01.
+    This exercises the math function ``dxf_to_ned_affine`` in isolation. The
+    engine no longer applies any unit scaling to ref points: they arrive
+    pre-scaled in local-NED metres from the /entities preview (the DXF parser
+    applies $INSUNITS metres-per-unit to all geometry, ref points included).
+    This test documents the invariant the upstream scaling must preserve — ref
+    points that share the geometry's metric frame yield scale ≈ 1.0, whereas
+    raw (unscaled) cm points fed against metric NED yield a wrong scale.
     """
     from path_engine.ned import dxf_to_ned_affine
 
@@ -1095,6 +1099,104 @@ async def test_plan_api_rmse_gate_rejects_high_residual(monkeypatch):
         await plan_path(req)
     assert exc.value.status_code == 422
     assert "rmse" in exc.value.detail.lower()
+
+
+# ── Scale gate: reject non-unity alignment scale (double-scaling defense) ───────
+
+def _fake_pm_with_alignment(meta: dict):
+    """Path-manager stub returning a fixed alignment_metadata for gate tests."""
+    class FakePathManager:
+        def plan_path(self, source, summary_only=False, **kwargs):
+            return {
+                "source": source,
+                "num_waypoints": 2,
+                "num_segments": 1,
+                "mark_length_m": 1.0,
+                "transit_length_m": 0.0,
+                "total_length_m": 1.0,
+                "segments": [],
+                "merged_waypoints": [(0.0, 0.0), (1.0, 0.0)],
+                "spray_flags": [True, True],
+                "alignment_metadata": meta,
+                "warnings": [],
+            }
+    return FakePathManager()
+
+
+@pytest.mark.anyio
+async def test_plan_api_scale_gate_rejects_double_scaled_refpoints(monkeypatch):
+    """A unit/frame mismatch (e.g. double-scaled cm ref points) drives the affine
+    scale to ~100. The RMSE gate can't catch it (2-point fit → rmse≈0), so the
+    scale gate must reject it with 422 and stage nothing."""
+    meta = {
+        "method": "least_squares",
+        "scale": 100.0,
+        "rmse": 0.0,                 # 2-point fit is exactly determined
+        "origin_gps": (13.0, 80.0),
+    }
+    monkeypatch.setattr(main, "path_mgr", _fake_pm_with_alignment(meta))
+    req = PathPlanRequest(source="soccer_field_penalty_area.dxf")
+
+    with pytest.raises(HTTPException) as exc:
+        await plan_path(req)
+    assert exc.value.status_code == 422
+    assert "scale" in exc.value.detail.lower()
+
+
+@pytest.mark.anyio
+async def test_plan_api_scale_gate_accepts_unity_scale(monkeypatch):
+    """A healthy fit (scale≈1.0) passes the scale gate."""
+    meta = {
+        "method": "least_squares",
+        "scale": 1.002,
+        "rmse": 0.0,
+        "origin_gps": (13.0, 80.0),
+    }
+    monkeypatch.setattr(main, "path_mgr", _fake_pm_with_alignment(meta))
+    # include_waypoints=False → pure gate check, no staging side-effects.
+    req = PathPlanRequest(source="soccer_field_penalty_area.dxf", include_waypoints=False)
+
+    # Should not raise on the scale gate (summary returns normally).
+    result = await plan_path(req)
+    assert result is not None
+
+
+def test_engine_does_not_rescale_metric_ref_points():
+    """Engine-level Gap A regression: ref points arrive in local-NED metres and
+    must feed the affine solve unchanged. Re-applying unit_scale would double-scale
+    them and corrupt the fit, so the parameter no longer exists — passing it is an
+    error, and a metric-frame fit yields scale ≈ 1.0."""
+    import inspect
+    import math
+    from path_engine.engine import PathEngine
+    from path_engine.core import PathSegment, SegmentType
+
+    # The double-scaling knob must be gone from the signature.
+    sig = inspect.signature(PathEngine._plan_from_segments)
+    assert "ref_unit_scale" not in sig.parameters
+
+    engine = PathEngine()
+    # A 10 m line in metric local-NED (as the parser/preview would emit).
+    seg = PathSegment(
+        segment_type=SegmentType.MARK,
+        points=[(0.0, 0.0), (0.0, 10.0)],
+        speed=0.4,
+        segment_id="seg0",
+        source_entity="LINE_0",
+    )
+    # Two ref points, 10 m apart east, mapped to GPS 10 m apart east.
+    ref_dxf = [(0.0, 0.0), (0.0, 10.0)]      # local-NED metres
+    ref_gps = [(13.0, 80.0), (13.0, 80.0 + 10.0 / (111320.0 * math.cos(math.radians(13.0))))]
+
+    plan = engine._plan_from_segments(
+        [seg],
+        origin_gps=(13.0, 80.0),
+        ref_points_dxf=ref_dxf,
+        ref_points_gps=ref_gps,
+    )
+    scale = (plan.alignment_metadata or {}).get("scale")
+    assert scale is not None
+    assert abs(scale - 1.0) < 0.02
 
 
 # ── Gaps C & E: staging + load-to-controller round-trip ────────────────────────

@@ -69,13 +69,14 @@ Not your job: PX4 firmware, waypoint gen, log analysis — those live on Mac GCS
 - Phase 3 spray: **built, live & hardware-validated (2026-06-17)** — `spray_controller_node.py` drives PX4 AUX1 via `MAV_CMD_DO_SET_ACTUATOR` cmd 187 (MAVROS), safety-gated (armed+OFFBOARD, staleness watchdog, debounce); manual test via `POST /api/spray/test`.
   - **Validated spray config (SmartFLEX DC motor driver on AUX1):**
     - `actuator_backend = mavlink_actuator` (cmd 187, normalized)
-    - `on_value = 1.0` → 3000 µs (full flow, field-confirmed)
+    - `on_value = 1.0` → maps to `PWM_AUX_MAX1` (full flow). **`on_value` is a NORMALIZED actuator value, range −1.0…+1.0 only — NOT PWM µs and it sets no PX4 param.** Strength is the QGC `PWM_AUX_MAX1` knob below, not `on_value`. (`on_pwm_us`/`off_pwm_us` are dead in this backend; only the unused `mavlink_servo_pwm`/cmd-183 backend reads them.)
     - `off_value = -1.0` → 0 µs (motor fully stopped, field-confirmed)
   - **Required QGC FCU params (source of truth — set via QGC, not Jetson):**
     - `PWM_AUX_FUNC1 = 301` (RC AUX passthrough)
     - `PWM_AUX_MIN1 = 0` (was 1000 — changed so OFF idles at 0 µs, not 1000 µs)
-    - `PWM_AUX_MAX1 = 3000` (SmartFLEX accepts 0–3000 µs range)
+    - `PWM_AUX_MAX1 = 15000` (2026-06-19: raised 3000→15000 — at 3000 the SmartFLEX motor ran too slow / spray dripped, not smooth. 15000 µs is far beyond normal servo range; SmartFLEX maps a wide PWM band to motor speed. TODO: confirm thermal/stability over a sustained run.)
     - `PWM_AUX_DIS1 = 0` (disarmed output = 0 µs)
+  - **Reading actual AUX1 output:** `/mavros/rc/out` does NOT publish on the Jetson link (restricted pluginlist; PX4 not emitting SERVO_OUTPUT_RAW). Read AUX1 PWM via QGC → MAVLink Inspector → `SERVO_OUTPUT_RAW.servo9_raw`.
   - **Why not cmd 183 (DO_SET_SERVO):** PX4 denies cmd 183 with `PWM_AUX_FUNC1=301` (RC passthrough). Switching to `mavlink_servo_pwm` backend requires changing FUNC1 to Generic Actuator in QGC — deferred, not needed.
   - **Bench test command (armed, no OFFBOARD needed):** `MAV_CMD_DO_SET_ACTUATOR` cmd 187 is accepted while armed in any mode. cmd 183 requires OFFBOARD.
 - robot_localization fusion: not yet built

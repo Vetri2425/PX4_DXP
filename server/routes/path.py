@@ -34,6 +34,7 @@ from config import (
     MAX_UPLOAD_BYTES,
     MISSION_DIR,
     RMSE_MAX,
+    SCALE_FIT_TOLERANCE,
     SPRAY_DEFAULT_ON,
     SPRAY_LITERS_PER_METER,
     STAGING_DIR,
@@ -342,6 +343,33 @@ def _entity_preview_tuples(ent, max_points: int = 200) -> list[tuple[float, floa
         pts = []
 
     return _subsample_points([(float(n), float(e)) for n, e in pts], max_points=max_points)
+
+
+def _assert_alignment_scale(alignment_meta: dict) -> None:
+    """Reject an alignment whose least-squares scale strays too far from unity.
+
+    Ref points and segment geometry share a metric frame, so a healthy multi-point
+    fit lands scale≈1.0. A large deviation signals a unit/frame mismatch (e.g. the
+    historical double-scaling of cm ref points → scale≈100). A 2-point fit is
+    exactly determined so its RMSE is ~0 and the RMSE gate cannot catch this —
+    this scale gate is the only defense. single_point/gps_origin modes report
+    scale=1.0 and pass by definition.
+    """
+    scale = alignment_meta.get("scale", 1.0)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise HTTPException(
+            422,
+            f"Alignment produced a non-physical scale ({scale}). "
+            "Re-verify the reference points.",
+        )
+    if abs(scale - 1.0) > SCALE_FIT_TOLERANCE:
+        raise HTTPException(
+            422,
+            f"Alignment scale {scale:.4f} is outside the safe range "
+            f"[{1.0 - SCALE_FIT_TOLERANCE:.2f}, {1.0 + SCALE_FIT_TOLERANCE:.2f}] — "
+            "likely a unit/frame mismatch between reference points and geometry. "
+            "Re-verify the reference points.",
+        )
 
 
 def _jsonable_geometry(geometry: dict) -> dict:
@@ -838,6 +866,7 @@ async def plan_path(req: PathPlanRequest):
             f"Alignment error too high (rmse={rmse:.3f} m, max {RMSE_MAX:.3f} m). "
             "Re-verify the reference points.",
         )
+    _assert_alignment_scale(alignment_meta)
 
     # Gaps C & E: stage the fully-aligned mission so the operator can confirm and
     # load exactly what was previewed. Scoped to the aligned-DXF flow only — built-in
@@ -1100,6 +1129,7 @@ async def align_path(name: str, req: AlignRequest):
     meta = result.get("alignment_metadata") or {}
     if not meta.get("method"):
         raise HTTPException(422, "No alignment produced — check ref_points / origin_gps.")
+    _assert_alignment_scale(meta)
 
     waypoints = result.get("merged_waypoints", [])
     sample = [list(p) for p in waypoints[:req.sample_points]] if req.sample_points else []
@@ -1274,6 +1304,7 @@ async def plan_and_stage(name: str, req: PathPlanRequest):
             f"Alignment error too high (rmse={rmse:.3f} m, max {RMSE_MAX:.3f} m). "
             "Re-verify the reference points.",
         )
+    _assert_alignment_scale(alignment_meta)
 
     mission_summary = None
     if result.get("merged_waypoints"):

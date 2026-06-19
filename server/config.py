@@ -83,6 +83,13 @@ STAGING_DIR = os.path.join(MISSION_DIR, "staging")
 # Max allowable least-squares RMSE (metres) for multi-point DXF→NED alignment.
 # Plans whose residual exceeds this are rejected (422) and never staged.
 RMSE_MAX = float(os.environ.get("ROVER_ALIGN_RMSE_MAX", "0.05"))
+# Max allowable deviation of the least-squares scale from unity for multi-point
+# DXF→NED alignment. Ref points and segment geometry share a metric frame, so a
+# healthy fit lands scale≈1.0; a large deviation means a unit/frame mismatch
+# (e.g. double-scaled cm points → scale≈100). A 2-point fit is exactly determined
+# so its RMSE is ~0 and cannot catch this — the scale gate is the only defense.
+# Rejected (422) and never staged. 0.25 → accept scale in [0.75, 1.25].
+SCALE_FIT_TOLERANCE = float(os.environ.get("ROVER_ALIGN_SCALE_TOL", "0.25"))
 # Staged-mission lifetime (seconds). Older staging files are pruned on each plan.
 STAGING_TTL_S = float(os.environ.get("ROVER_STAGING_TTL_S", "3600"))
 # Litres of marking material consumed per metre of MARK path (site-tunable).
