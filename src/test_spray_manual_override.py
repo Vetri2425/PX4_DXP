@@ -251,7 +251,7 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "actuator_backend": _Param("mavlink_actuator"),
         "servo_instance": _Param(1),
         "off_pwm_us": _Param(0),
-        "on_pwm_us": _Param(2500),
+        "on_pwm_us": _Param(1800),
         "spray_enabled": _Param(True),
     }
     node.get_parameter = lambda name: node._params[name]

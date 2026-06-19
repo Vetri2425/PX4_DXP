@@ -106,11 +106,11 @@ SPRAY_PARAM_SCHEMA: dict[str, dict] = {
     },
     "on_pwm_us": {
         "type": "int",
-        "default": 2500,
+        "default": 1800,
         "group": "Actuator Backend",
         "description": "Absolute PWM ON value in µs for mavlink_servo_pwm backend",
         "min": 0,
-        "max": 3000,
+        "max": 2200,
     },
     "off_pwm_us": {
         "type": "int",
@@ -118,7 +118,7 @@ SPRAY_PARAM_SCHEMA: dict[str, dict] = {
         "group": "Actuator Backend",
         "description": "Absolute PWM OFF value in µs for mavlink_servo_pwm backend",
         "min": 0,
-        "max": 3000,
+        "max": 2200,
     },
     # ── Distance-Aware Spray ──────────────────────────────────────────────────
     "use_distance_aware_spray": {
