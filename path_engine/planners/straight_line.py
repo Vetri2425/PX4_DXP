@@ -11,6 +11,15 @@ import math
 
 from ..core import PathSegment, SegmentType
 
+# Float-noise guard for interval counting. A segment whose length equals the
+# spacing can arrive as ``0.05000000000000004`` after upstream arithmetic;
+# without this epsilon ``ceil(length / spacing)`` rounds 1.0000…→2 and splits a
+# clean 5 cm interval into two 2.5 cm ones. Subdividing only when the length
+# exceeds one spacing by more than _SPACING_EPS keeps the max-interval guarantee
+# (worst case spacing + 1e-6) while eliminating the spurious split. 1e-6 matches
+# the project's geometry tolerance (see tests/test_production_geometry._TOL).
+_SPACING_EPS = 1e-6
+
 
 def densify_line(
     start: tuple[float, float],
@@ -35,7 +44,8 @@ def densify_line(
     if length < 1e-9:
         return [start]
 
-    n_steps = max(2, int(math.ceil(length / spacing)) + 1)
+    n_intervals = max(1, int(math.ceil((length - _SPACING_EPS) / spacing)))
+    n_steps = n_intervals + 1
     pts: list[tuple[float, float]] = []
     for i in range(n_steps):
         t = i / (n_steps - 1)

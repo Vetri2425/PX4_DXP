@@ -691,12 +691,19 @@ class PathEngine:
                         suppress_closed_loops=not self.per_line_extensions,
                     )
                     if self.per_line_extensions:
-                        # Densify the spray-OFF PRE/AFT run-ups at MARK spacing
-                        # (0.05 m) so the rover gets a smooth approach/exit, not a
-                        # 2-point jump. MARK edges are already dense.
+                        # Re-densify the decomposed MARK edges at MARK spacing.
+                        # Shape grouping's corner dedup (_merge_chain, tol ==
+                        # mark_spacing) strips ~half the points from the merged
+                        # chain, so an extracted edge arrives with up to 0.10 m
+                        # gaps; re-densifying each straight edge restores uniform
+                        # <=0.05 m spacing with its exact corner endpoints intact.
+                        # PRE/AFT run-ups are intentionally left as 2-point stubs
+                        # here — they are densified exactly once downstream in
+                        # Step 5b (single owner), avoiding a double pass that
+                        # otherwise re-split 5 cm intervals into 2.5 cm ones.
                         parts = [
-                            densify_segment(p, self.mark_spacing, self.mark_spacing)
-                            if p.metadata.get("extension_role") in ("pre", "aft")
+                            densify_segment(p, self.mark_spacing, self.transit_spacing)
+                            if p.segment_type == SegmentType.MARK
                             else p
                             for p in parts
                         ]
@@ -734,11 +741,19 @@ class PathEngine:
         redensified: list[PathSegment] = []
         for seg in ordered:
             if seg.segment_type == SegmentType.TRANSIT and len(seg.points) >= 2:
-                # PRE/AFT run-ups are colinear continuations of a mark line, so
-                # sample them at MARK spacing (not the coarser transit spacing) —
-                # the rover then tracks the run-up as tightly as the marked line
-                # and is fully settled on-line before/after the spray boundary.
-                is_extension = seg.metadata.get("extension_role") in ("pre", "aft")
+                # Extension geometry (PRE/AFT run-ups AND the spray-OFF connectors
+                # that bridge one edge's AFT to the next edge's PRE) is colinear
+                # with / part of the structured spray pass, so sample it at MARK
+                # spacing (not the coarser transit spacing) — the rover then tracks
+                # the run-up/connector as tightly as the marked line and is fully
+                # settled on-line before/after each spray boundary. Generic mission
+                # TRANSIT (deadheads, transit entities — neither flag set) keeps the
+                # coarser transit_spacing. PRE/AFT are densified for the first and
+                # only time here (Step 4 leaves them as 2-point stubs).
+                is_extension = (
+                    seg.metadata.get("extension_role") in ("pre", "aft")
+                    or seg.metadata.get("extension_connector") is True
+                )
                 transit_spacing = (
                     self.mark_spacing if is_extension else self.transit_spacing
                 )
