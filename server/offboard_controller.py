@@ -97,6 +97,7 @@ class OffboardController:
         self._placement_mode = LOCAL_NED
         self._origin_gps: tuple[float, float] | None = None
         self._is_staged_mission = False
+        self._spray_mode = "continuous"
         # Serialises lifecycle calls. Created lazily on first use: on
         # Python 3.9 asyncio.Lock() binds an event loop at construction,
         # and the controller is built at server startup outside any loop.
@@ -141,6 +142,10 @@ class OffboardController:
             self._placement_mode == GPS_SURVEYED
             or self._is_staged_mission
         )
+
+    @property
+    def spray_mode(self) -> str:
+        return self._spray_mode
 
     def loaded_path_summary(self, sample: int = 20) -> dict:
         """Read-only snapshot of the path currently resident in the controller.
@@ -194,6 +199,7 @@ class OffboardController:
         source_name: str | None = None,
         is_staged: bool = False,
         allow_replace_protected: bool = False,
+        spray_mode: str = "continuous",
     ) -> None:
         reason = load_block_reason(self._state)
         if reason:
@@ -230,6 +236,7 @@ class OffboardController:
         self._source_name = source_name or name or new_mission_id
         self._placement_mode = placement_mode
         self._is_staged_mission = bool(is_staged)
+        self._spray_mode = str(spray_mode or "continuous")
         self._origin_gps = (
             (float(origin_gps[0]), float(origin_gps[1]))
             if origin_gps is not None else None
@@ -323,6 +330,12 @@ class OffboardController:
                 msg = "start: FCU not connected"
                 self._log_entry("error", msg)
                 return False, msg
+
+            if self._spray_mode == "point":
+                return await self._start_point_shell_async(
+                    expected_mission_id=expected_mission_id,
+                    pre_publish_hook=pre_publish_hook,
+                )
 
             pts_to_publish = list(self._loaded_source_pts)
             resolved_mission_pts = list(pts_to_publish)
@@ -521,6 +534,72 @@ class OffboardController:
                     except Exception:
                         pass
                 return False, f"unexpected start failure: {exc}"
+
+    async def _start_point_shell_async(
+        self,
+        *,
+        expected_mission_id: str | None,
+        pre_publish_hook: Callable[[dict[str, Any]], None] | None,
+    ) -> tuple[bool, str]:
+        """Arm and enter OFFBOARD for point missions without publishing a full path."""
+        if self._node is None:
+            return False, "ROS node not available"
+        if expected_mission_id is not None and expected_mission_id != self._loaded_mission_id:
+            msg = (
+                f"start: mission identity mismatch: expected {expected_mission_id!r}, "
+                f"loaded {self._loaded_mission_id!r}"
+            )
+            self._log_entry("error", msg)
+            return False, msg
+
+        fcu = self._node.get_state()
+        if not fcu.get("connected", False):
+            self._state = MissionState.ERROR
+            return False, "start: FCU not connected"
+
+        if pre_publish_hook is not None:
+            try:
+                pre_publish_hook(
+                    {
+                        "placement_mode": self._placement_mode,
+                        "spray_mode": self._spray_mode,
+                        "point_count": len(self._loaded_source_pts),
+                        "published_point_count": 0,
+                    }
+                )
+            except Exception as exc:
+                self._log_entry("warning", f"pre-publish capture hook failed (ignored): {exc}")
+
+        armed_here = False
+        try:
+            self._state = MissionState.ARMING
+            ok, why = await self._node.arm_async(True)
+            if not ok:
+                self._state = MissionState.ERROR
+                return False, f"arm failed: {why}"
+            armed_here = True
+
+            self._state = MissionState.SWITCHING_OFFBOARD
+            await asyncio.sleep(SETPOINT_STREAM_GRACE_S)
+            ok, why = await self._node.set_mode_async("OFFBOARD")
+            if not ok:
+                self._state = MissionState.ERROR
+                await self._node.arm_async(False)
+                return False, f"OFFBOARD failed: {why}"
+
+            self._state = MissionState.RUNNING
+            self._running_mission_id = self._loaded_mission_id
+            self._log_entry("info", f"point mission shell running: {self._path_name}")
+            return True, "point shell running"
+        except Exception as exc:
+            self._state = MissionState.ERROR
+            self._running_mission_id = None
+            if armed_here:
+                try:
+                    await self._node.arm_async(False)
+                except Exception:
+                    pass
+            return False, f"unexpected point start failure: {exc}"
 
     async def stop_async(self) -> dict[str, Any]:
         """Soft stop: publish a single-point stop-path → RPP zeroes velocity.

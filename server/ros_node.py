@@ -34,16 +34,27 @@ from rclpy.qos import (
     ReliabilityPolicy,
 )
 
-from geometry_msgs.msg import PoseStamped, Vector3Stamped
+from geometry_msgs.msg import PoseStamped, TwistStamped, Vector3Stamped
 from nav_msgs.msg import Path
-from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, String
+
+from spray_runtime_protocol import (
+    RUNTIME_STATUS_MAX_AGE_S,
+    RUNTIME_STATUS_TOPIC,
+    deserialize_runtime_status,
+    parse_dwell_response,
+    serialize_dwell_command,
+)
 
 from config import (
     SRV_RPP_GET_PARAMS,
     SRV_RPP_LIST_PARAMS,
     SRV_RPP_SET_PARAMS,
+    SRV_SPRAY_APPLY_MISSION_CONFIG,
+    SRV_SPRAY_CANCEL_DWELL,
     SRV_SPRAY_GET_PARAMS,
     SRV_SPRAY_SET_PARAMS,
+    SRV_SPRAY_START_DWELL,
 )
 from logging_setup import get_logger
 from rpp_status import RppStatusMonitor
@@ -178,6 +189,7 @@ class RosBridgeNode(Node):
         "rpp_state": 0,
         "v_north": 0.0,
         "v_east": 0.0,
+        "yaw_rate_rad_s": 0.0,
         # B1 — predictive κ and pre-clamp Ld for tuning analysis
         "l_d_raw_m": 0.0,
         "kappa_speed": 0.0,
@@ -199,6 +211,7 @@ class RosBridgeNode(Node):
         self._pose_recv_time: float | None = None  # last /mavros/local_position/pose
         self._global_pos_recv_time: float | None = None
         self._gps_fix_recv_time: float | None = None
+        self._velocity_recv_time: float | None = None
         self._MAVROS_STATE_TIMEOUT_S = 2.0  # MAVROS publishes /state ~10 Hz
 
         # Callback groups: subs mutually exclusive, services reentrant
@@ -261,10 +274,25 @@ class RosBridgeNode(Node):
             _qos_best_effort(),
             callback_group=self._sub_group,
         )
+        if _HAS_MAVROS:
+            self.create_subscription(
+                TwistStamped,
+                "/mavros/local_position/velocity_local",
+                self._cb_velocity_local,
+                _qos_best_effort(),
+                callback_group=self._sub_group,
+            )
         self.create_subscription(
             Bool,
             "/spray/state",
             self._cb_spray_state,
+            _qos_best_effort(),
+            callback_group=self._sub_group,
+        )
+        self.create_subscription(
+            String,
+            RUNTIME_STATUS_TOPIC,
+            self._cb_spray_runtime_status,
             _qos_best_effort(),
             callback_group=self._sub_group,
         )
@@ -333,6 +361,12 @@ class RosBridgeNode(Node):
         # ── Spray controller param service clients ────────────────────────────
         self._spray_param_get_cli = None
         self._spray_param_set_cli = None
+        self._spray_apply_cli = None
+        self._spray_start_dwell_cli = None
+        self._spray_cancel_dwell_cli = None
+        self._spray_runtime_status: dict[str, Any] = {}
+        self._spray_runtime_status_recv_time: float | None = None
+        self._spray_dwell_revision = 0
         if _HAS_PARAM_SRV:
             self._spray_param_get_cli = self.create_client(
                 GetParameters,
@@ -344,6 +378,26 @@ class RosBridgeNode(Node):
                 SRV_SPRAY_SET_PARAMS,
                 callback_group=self._svc_group,
             )
+        try:
+            from std_srvs.srv import Trigger
+
+            self._spray_apply_cli = self.create_client(
+                Trigger,
+                SRV_SPRAY_APPLY_MISSION_CONFIG,
+                callback_group=self._svc_group,
+            )
+            self._spray_start_dwell_cli = self.create_client(
+                Trigger,
+                SRV_SPRAY_START_DWELL,
+                callback_group=self._svc_group,
+            )
+            self._spray_cancel_dwell_cli = self.create_client(
+                Trigger,
+                SRV_SPRAY_CANCEL_DWELL,
+                callback_group=self._svc_group,
+            )
+        except ImportError:
+            Trigger = None  # type: ignore
 
         # Do not wait for services here: RosBridgeNode is constructed
         # inside FastAPI lifespan, so startup service discovery must not block
@@ -436,6 +490,22 @@ class RosBridgeNode(Node):
             self._state["v_north"] = msg.vector.x
             self._state["v_east"] = msg.vector.y
 
+    def _cb_velocity_local(self, msg: TwistStamped) -> None:
+        # MAVROS velocity_local is ENU; yaw rate CCW+ → NED CW+ via negation.
+        with self._lock:
+            self._velocity_recv_time = time.monotonic()
+            self._state["yaw_rate_rad_s"] = -float(msg.twist.angular.z)
+
+    def _cb_spray_runtime_status(self, msg: String) -> None:
+        try:
+            status = deserialize_runtime_status(msg.data)
+        except (TypeError, ValueError) as exc:
+            log.warning("invalid spray runtime status ignored: %s", exc)
+            return
+        with self._lock:
+            self._spray_runtime_status = status
+            self._spray_runtime_status_recv_time = time.monotonic()
+
     def _cb_spray_state(self, msg: Bool) -> None:
         with self._lock:
             self._state["spraying"] = bool(msg.data)
@@ -469,6 +539,7 @@ class RosBridgeNode(Node):
             pose_recv_time = self._pose_recv_time
             global_pos_recv_time = self._global_pos_recv_time
             gps_fix_recv_time = self._gps_fix_recv_time
+            velocity_recv_time = self._velocity_recv_time
         now = time.monotonic()
         state["local_pose_age_ms"] = (
             (now - pose_recv_time) * 1000.0 if pose_recv_time is not None else None
@@ -480,6 +551,10 @@ class RosBridgeNode(Node):
         state["gps_fix_age_ms"] = (
             (now - gps_fix_recv_time) * 1000.0
             if gps_fix_recv_time is not None else None
+        )
+        state["velocity_age_ms"] = (
+            (now - velocity_recv_time) * 1000.0
+            if velocity_recv_time is not None else None
         )
         state["pose_global_skew_ms"] = (
             # Callback receive-time skew from monotonic clocks. This is not
@@ -881,6 +956,128 @@ class RosBridgeNode(Node):
         ok, results, msg = await self._call_spray_set_param(req, timeout)
         flags = [r.successful for r in results] if results else []
         return ok, flags, msg
+
+    async def trigger_spray_apply_mission_config_async(
+        self, timeout: float = 5.0
+    ) -> tuple[bool, str]:
+        if self._spray_apply_cli is None:
+            return False, "spray apply service not available"
+        from std_srvs.srv import Trigger
+
+        req = Trigger.Request()
+        if not await self._service_ready_async(self._spray_apply_cli, timeout_sec=0.5):
+            return False, "spray_controller apply service not running"
+        try:
+            result = await self._await_ros_future(
+                self._spray_apply_cli.call_async(req), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            return False, "spray apply_mission_config timed out"
+        except Exception as exc:
+            return False, f"spray apply_mission_config failed: {exc}"
+        if result is None:
+            return False, "spray apply_mission_config returned None"
+        if not bool(result.success):
+            return False, result.message or "spray apply_mission_config rejected"
+        return True, result.message or "ok"
+
+    async def start_spray_dwell_async(
+        self,
+        *,
+        mission_id: str,
+        point_index: int,
+        duration_s: float,
+        command_id: int,
+        configuration_revision: int,
+        timeout: float = 5.0,
+    ) -> tuple[bool, str]:
+        if self._spray_start_dwell_cli is None or self._spray_param_set_cli is None:
+            return False, "spray dwell service not available"
+        from std_srvs.srv import Trigger
+
+        with self._lock:
+            self._spray_dwell_revision = max(
+                self._spray_dwell_revision + 1, time.monotonic_ns()
+            )
+            revision = self._spray_dwell_revision
+        params = {"pending_dwell_command_json": serialize_dwell_command(
+            revision=revision,
+            mission_id=mission_id,
+            point_index=point_index,
+            command_id=command_id,
+            duration_s=duration_s,
+            configuration_revision=configuration_revision,
+        )}
+        ok, _, why = await self.set_spray_params_bulk_async(params, timeout=timeout)
+        if not ok:
+            return False, why or "failed to stage dwell parameters"
+        req = Trigger.Request()
+        if not await self._service_ready_async(self._spray_start_dwell_cli, timeout_sec=0.5):
+            return False, "spray start_dwell service not running"
+        try:
+            result = await self._await_ros_future(
+                self._spray_start_dwell_cli.call_async(req), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            return False, "spray start_dwell timed out"
+        except Exception as exc:
+            return False, f"spray start_dwell failed: {exc}"
+        if result is None:
+            return False, "spray start_dwell returned None"
+        if not bool(result.success):
+            return False, result.message or "spray start_dwell rejected"
+        try:
+            accepted = parse_dwell_response(result.message)
+        except (TypeError, ValueError) as exc:
+            return False, f"invalid dwell acceptance response: {exc}"
+        if int(accepted.get("command_id", -1)) != command_id:
+            return False, "dwell acceptance command mismatch"
+        return True, result.message
+
+    async def cancel_spray_dwell_async(self, timeout: float = 5.0) -> tuple[bool, str]:
+        if self._spray_cancel_dwell_cli is None or self._spray_param_set_cli is None:
+            return False, "spray cancel dwell service not available"
+        from std_srvs.srv import Trigger
+
+        with self._lock:
+            self._spray_dwell_revision = max(
+                self._spray_dwell_revision + 1, time.monotonic_ns()
+            )
+            cancel_revision = self._spray_dwell_revision
+        ok, _, why = await self.set_spray_params_bulk_async(
+            {"dwell_cancel_revision": cancel_revision}, timeout=timeout
+        )
+        if not ok:
+            return False, why or "failed to invalidate prepared dwell commands"
+        req = Trigger.Request()
+        if not await self._service_ready_async(self._spray_cancel_dwell_cli, timeout_sec=0.5):
+            return False, "spray cancel_dwell service not running"
+        try:
+            result = await self._await_ros_future(
+                self._spray_cancel_dwell_cli.call_async(req), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            return False, "spray cancel_dwell timed out"
+        except Exception as exc:
+            return False, f"spray cancel_dwell failed: {exc}"
+        if result is None:
+            return False, "spray cancel_dwell returned None"
+        return bool(result.success), result.message or "ok"
+
+    def get_spray_runtime_status(self) -> dict[str, Any]:
+        with self._lock:
+            status = dict(self._spray_runtime_status)
+            recv_time = self._spray_runtime_status_recv_time
+        age_s = time.monotonic() - recv_time if recv_time is not None else float("inf")
+        status["status_age_s"] = age_s
+        status["status_stale"] = age_s > RUNTIME_STATUS_MAX_AGE_S
+        return status
+
+    def update_spray_runtime_status(self, status: dict[str, Any]) -> None:
+        """Test hook; production updates arrive only from the ROS subscriber."""
+        with self._lock:
+            self._spray_runtime_status = dict(status)
+            self._spray_runtime_status_recv_time = time.monotonic()
 
     async def _call_spray_set_param(self, req, timeout: float) -> tuple[bool, list, str]:
         """Shared rcl SetParameters call wrapper for spray_controller."""

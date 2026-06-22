@@ -123,13 +123,16 @@ async def spray_enable():
     mission spray can fire during path execution.
     """
     global _spray_enabled
-    _spray_enabled = True
     from main import ros_node
-    if ros_node is not None:
-        try:
-            await ros_node.set_spray_param_async("spray_enabled", True)
-        except Exception:
-            log.warning("Could not set node spray_enabled=True; server gate active", exc_info=True)
+    if ros_node is None:
+        raise HTTPException(503, "ROS bridge not ready")
+    try:
+        ok, why = await ros_node.set_spray_param_async("spray_enabled", True)
+    except Exception as exc:
+        raise HTTPException(503, f"Could not enable spray controller: {exc}") from exc
+    if not ok:
+        raise HTTPException(503, why or "Could not enable spray controller")
+    _spray_enabled = True
     return {"enabled": True}
 
 
@@ -244,21 +247,47 @@ async def spray_test(req: SprayTestRequest):
 @router.get("/status")
 async def spray_status():
     """Enabled gate, actual commanded state, RPP MARK desire, manual-override, hold state."""
-    from main import ros_node
+    from main import point_mission, ros_node
     hold_active = _keepalive_task is not None and not _keepalive_task.done()
     if ros_node is None:
-        return {
+        payload = {
             "enabled": _spray_enabled,
             "spraying": False,
             "spray_active_desired": False,
             "manual_override": False,
             "hold_active": hold_active,
+            "spray_mode": "continuous",
+            "active_mode": "continuous",
+            "configuration_revision": 0,
+            "model_revision": 0,
+            "ready": False,
         }
+        if point_mission is not None:
+            payload.update(point_mission.status.as_dict())
+        return payload
     s = ros_node.get_state()
-    return {
+    runtime = ros_node.get_spray_runtime_status()
+    payload = {
         "enabled": _spray_enabled,
         "spraying": bool(s.get("spraying", False)),
         "spray_active_desired": bool(s.get("spray_active", False)),
         "manual_override": bool(s.get("spray_manual", False)),
         "hold_active": hold_active,
+        "spray_mode": runtime.get("spray_mode", "continuous"),
+        "active_mode": runtime.get("spray_mode", "continuous"),
+        "configuration_revision": int(runtime.get("configuration_revision", 0)),
+        "model_revision": int(runtime.get("model_revision", 0)),
+        "ready": bool(runtime.get("ready", False)) and not runtime.get("status_stale", True),
+        "node_operator_enabled": bool(runtime.get("operator_enabled", False)),
+        "active_dwell": bool(runtime.get("active_dwell", False)),
+        "dwell_remaining_s": float(runtime.get("dwell_remaining_s", 0.0)),
+        "commanded_on": bool(runtime.get("commanded_on", False)),
+        "confirmed_off": bool(runtime.get("confirmed_off", False)),
+        "status_age_s": runtime.get("status_age_s"),
+        "status_stale": runtime.get("status_stale", True),
+        "last_transition": runtime.get("last_transition", ""),
+        "last_error": runtime.get("last_error", ""),
     }
+    if point_mission is not None:
+        payload.update(point_mission.status.as_dict())
+    return payload

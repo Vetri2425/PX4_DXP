@@ -11,7 +11,7 @@ from config import (
     POSE_GLOBAL_MAX_SKEW_MS,
     POSE_STALE_MS,
 )
-from path_engine.ned import latlon_to_ned
+from path_engine.ned import apply_affine_transform, latlon_to_ned
 
 LOCAL_NED = "LOCAL_NED"
 GPS_SURVEYED = "GPS_SURVEYED"
@@ -23,6 +23,26 @@ GPS_FIX_TYPE_RTK_FIXED = 6
 
 class PlacementError(ValueError):
     """Raised when a mission cannot be placed safely in the live local frame."""
+
+
+def align_design_points(
+    source_points: Iterable[tuple[float, float]], alignment_metadata: dict | None
+) -> list[tuple[float, float]]:
+    """Apply the path engine's exact design-to-anchor-NED affine transform."""
+    meta = alignment_metadata or {}
+    if not meta.get("method"):
+        raise PlacementError("DESIGN Point coordinates require alignment metadata")
+    try:
+        scale = float(meta["scale"])
+        theta = math.radians(float(meta["rotation_deg"]))
+        offset_n = float(meta["offset_n"])
+        offset_e = float(meta["offset_e"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PlacementError("Point alignment metadata is incomplete") from exc
+    return [
+        apply_affine_transform(_finite_pair(point, "design point"), scale, theta, offset_n, offset_e)
+        for point in source_points
+    ]
 
 
 def _finite_pair(value, label: str) -> tuple[float, float]:

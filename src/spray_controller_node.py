@@ -20,12 +20,15 @@ from __future__ import annotations
 
 import math
 import signal
+import threading
 import time
-from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import rclpy
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.callback_groups import (
+    MutuallyExclusiveCallbackGroup,
+)
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
@@ -33,14 +36,43 @@ from geometry_msgs.msg import PoseStamped, TwistStamped
 from mavros_msgs.msg import State
 from mavros_msgs.srv import CommandLong
 from nav_msgs.msg import Path
-from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, String
+from std_srvs.srv import Trigger
+
+from spray_config import SprayConfiguration, SprayMode, validate_spray_configuration
+from spray_controller_modes import (
+    DwellState,
+    auto_safety_status,
+    build_path_model_for_config,
+    continuous_distance_decision,
+    point_mode_decision,
+)
+from spray_runtime_protocol import (
+    RUNTIME_STATUS_TOPIC,
+    deserialize_dwell_command,
+    dwell_response_message,
+    serialize_runtime_status,
+)
 
 
 MAV_CMD_DO_SET_ACTUATOR = 187
 MAV_CMD_DO_SET_SERVO = 183
 _SERVO_PWM_MAX_US = 2200
-TRANSIT_TO_MARK = "TRANSIT_TO_MARK"
-MARK_TO_TRANSIT = "MARK_TO_TRANSIT"
+from spray_path_model import (  # noqa: E402
+    MARK_TO_TRANSIT,
+    TRANSIT_TO_MARK,
+    SprayBoundary,
+    SprayDecision,
+    SprayPathModel,
+    SprayProjection,
+    build_path_model as _build_path_model,
+    make_spray_decision as _make_spray_decision,
+    next_boundary as _next_boundary,
+    nozzle_position_ned as _nozzle_position_ned,
+    pose_to_ned as _pose_to_ned,
+    project_onto_path as _project_onto_path,
+    yaw_ned_from_enu_quaternion as _yaw_ned_from_enu_quaternion,
+)
 
 
 def _best_effort_qos(depth: int = 1) -> QoSProfile:
@@ -67,257 +99,6 @@ def _path_qos(depth: int = 1) -> QoSProfile:
         reliability=ReliabilityPolicy.RELIABLE,
         durability=DurabilityPolicy.TRANSIENT_LOCAL,
         history=HistoryPolicy.KEEP_LAST,
-    )
-
-
-@dataclass(frozen=True)
-class SprayBoundary:
-    s: float
-    kind: str
-
-
-@dataclass(frozen=True)
-class SprayPathModel:
-    points: list[tuple[float, float]]
-    flags: list[bool]
-    cumulative_s: list[float]
-    boundaries: list[SprayBoundary]
-
-
-@dataclass(frozen=True)
-class SprayProjection:
-    segment_index: int
-    t: float
-    proj_n: float
-    proj_e: float
-    s: float
-    xtrack_error_m: float
-    current_flag: bool
-
-
-@dataclass(frozen=True)
-class SprayDecision:
-    desired: bool
-    geometry_desired: bool
-    safety_ok: bool
-    safety_reason: str
-    projection: Optional[SprayProjection]
-    next_boundary: Optional[SprayBoundary]
-    distance_to_boundary_m: float
-    event: str
-    debug: list[float]
-
-
-def _build_path_model(
-    points: list[tuple[float, float]],
-    flags: list[bool],
-) -> SprayPathModel:
-    clean_points = [(float(n), float(e)) for n, e in points]
-    clean_flags = [bool(f) for f in flags]
-    if len(clean_points) != len(clean_flags):
-        raise ValueError("points and flags must have equal length")
-    cumulative_s: list[float] = []
-    total = 0.0
-    for i, point in enumerate(clean_points):
-        if i > 0:
-            prev = clean_points[i - 1]
-            total += math.hypot(point[0] - prev[0], point[1] - prev[1])
-        cumulative_s.append(total)
-
-    boundaries: list[SprayBoundary] = []
-    for i in range(1, len(clean_flags)):
-        if clean_flags[i - 1] == clean_flags[i]:
-            continue
-        kind = TRANSIT_TO_MARK if clean_flags[i] else MARK_TO_TRANSIT
-        boundaries.append(SprayBoundary(cumulative_s[i], kind))
-
-    return SprayPathModel(clean_points, clean_flags, cumulative_s, boundaries)
-
-
-def _yaw_ned_from_enu_quaternion(q) -> float:
-    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-    yaw_enu = math.atan2(siny_cosp, cosy_cosp)
-    return (math.pi / 2.0 - yaw_enu + math.pi) % (2.0 * math.pi) - math.pi
-
-
-def _pose_to_ned(pose_msg: PoseStamped) -> tuple[float, float, float]:
-    north = float(pose_msg.pose.position.y)
-    east = float(pose_msg.pose.position.x)
-    yaw_ned = _yaw_ned_from_enu_quaternion(pose_msg.pose.orientation)
-    return north, east, yaw_ned
-
-
-def _nozzle_position_ned(
-    pose_n: float,
-    pose_e: float,
-    yaw_ned: float,
-    forward_offset_m: float,
-    lateral_offset_m: float,
-) -> tuple[float, float]:
-    """Apply body-frame nozzle offsets in NED; lateral is positive to rover-right."""
-    nozzle_n = (
-        pose_n
-        + forward_offset_m * math.cos(yaw_ned)
-        - lateral_offset_m * math.sin(yaw_ned)
-    )
-    nozzle_e = (
-        pose_e
-        + forward_offset_m * math.sin(yaw_ned)
-        + lateral_offset_m * math.cos(yaw_ned)
-    )
-    return nozzle_n, nozzle_e
-
-
-def _project_onto_path(
-    model: SprayPathModel,
-    point_n: float,
-    point_e: float,
-) -> Optional[SprayProjection]:
-    if not model.points:
-        return None
-    if len(model.points) == 1:
-        n, e = model.points[0]
-        return SprayProjection(
-            segment_index=0,
-            t=0.0,
-            proj_n=n,
-            proj_e=e,
-            s=0.0,
-            xtrack_error_m=math.hypot(point_n - n, point_e - e),
-            current_flag=model.flags[0],
-        )
-
-    best: Optional[SprayProjection] = None
-    best_dist = float("inf")
-    for i in range(len(model.points) - 1):
-        a_n, a_e = model.points[i]
-        b_n, b_e = model.points[i + 1]
-        d_n = b_n - a_n
-        d_e = b_e - a_e
-        seg_len_sq = d_n * d_n + d_e * d_e
-        if seg_len_sq <= 1e-12:
-            t = 0.0
-            proj_n, proj_e = a_n, a_e
-            seg_len = 0.0
-        else:
-            t = ((point_n - a_n) * d_n + (point_e - a_e) * d_e) / seg_len_sq
-            t = max(0.0, min(1.0, t))
-            proj_n = a_n + t * d_n
-            proj_e = a_e + t * d_e
-            seg_len = math.sqrt(seg_len_sq)
-
-        dist = math.hypot(point_n - proj_n, point_e - proj_e)
-        # Equal-distance ties happen exactly at shared vertices. Prefer the
-        # later segment so a TRANSIT->MARK vertex is considered MARK, and a
-        # MARK->TRANSIT vertex is considered TRANSIT.
-        if dist < best_dist - 1e-12 or abs(dist - best_dist) <= 1e-12:
-            current_flag = model.flags[i + 1] if t >= 1.0 - 1e-12 else model.flags[i]
-            best_dist = dist
-            best = SprayProjection(
-                segment_index=i,
-                t=t,
-                proj_n=proj_n,
-                proj_e=proj_e,
-                s=model.cumulative_s[i] + t * seg_len,
-                xtrack_error_m=dist,
-                current_flag=current_flag,
-            )
-    return best
-
-
-def _next_boundary(
-    model: SprayPathModel,
-    current_s: float,
-    current_flag: bool,
-) -> Optional[SprayBoundary]:
-    wanted = MARK_TO_TRANSIT if current_flag else TRANSIT_TO_MARK
-    for boundary in model.boundaries:
-        if boundary.kind == wanted and boundary.s > current_s + 1e-9:
-            return boundary
-    return None
-
-
-def _make_spray_decision(
-    model: Optional[SprayPathModel],
-    nozzle_n: Optional[float],
-    nozzle_e: Optional[float],
-    speed_mps: float,
-    safety_ok: bool,
-    safety_reason: str,
-    solenoid_open_delay_s: float,
-    solenoid_close_delay_s: float,
-    on_overspray_margin_m: float,
-    off_overspray_margin_m: float,
-    max_xtrack_error_m: float,
-) -> SprayDecision:
-    projection: Optional[SprayProjection] = None
-    boundary: Optional[SprayBoundary] = None
-    distance_to_boundary = float("inf")
-    geometry_desired = False
-    event = ""
-
-    if model is not None and nozzle_n is not None and nozzle_e is not None:
-        projection = _project_onto_path(model, nozzle_n, nozzle_e)
-    if projection is not None:
-        boundary = _next_boundary(model, projection.s, projection.current_flag)
-        geometry_desired = projection.current_flag
-        if projection.xtrack_error_m > max_xtrack_error_m:
-            safety_ok = False
-            safety_reason = (
-                f"xtrack error {projection.xtrack_error_m:.3f}m "
-                f"> {max_xtrack_error_m:.3f}m"
-            )
-        if boundary is not None:
-            distance_to_boundary = boundary.s - projection.s
-            # ON is intentionally early by solenoid delay plus overspray
-            # margin. OFF is early only by close delay; an explicit OFF
-            # overspray margin delays shutoff so the MARK tail is not cut short.
-            on_lead = speed_mps * solenoid_open_delay_s + on_overspray_margin_m
-            off_lead = max(
-                0.0,
-                speed_mps * solenoid_close_delay_s - off_overspray_margin_m,
-            )
-            if (
-                not projection.current_flag
-                and boundary.kind == TRANSIT_TO_MARK
-                and distance_to_boundary <= on_lead
-            ):
-                geometry_desired = True
-                event = "on_early"
-            elif (
-                projection.current_flag
-                and boundary.kind == MARK_TO_TRANSIT
-                and distance_to_boundary <= off_lead
-            ):
-                geometry_desired = False
-                event = "off_early"
-
-    desired = bool(geometry_desired and safety_ok)
-    debug = [
-        1.0 if model is not None else 0.0,
-        float(speed_mps),
-        float(nozzle_n) if nozzle_n is not None else math.nan,
-        float(nozzle_e) if nozzle_e is not None else math.nan,
-        projection.s if projection is not None else math.nan,
-        projection.xtrack_error_m if projection is not None else math.nan,
-        1.0 if projection is not None and projection.current_flag else 0.0,
-        boundary.s if boundary is not None else math.nan,
-        distance_to_boundary,
-        1.0 if geometry_desired else 0.0,
-        1.0 if safety_ok else 0.0,
-        1.0 if desired else 0.0,
-    ]
-    return SprayDecision(
-        desired=desired,
-        geometry_desired=geometry_desired,
-        safety_ok=safety_ok,
-        safety_reason=safety_reason,
-        projection=projection,
-        next_boundary=boundary,
-        distance_to_boundary_m=distance_to_boundary,
-        event=event,
-        debug=debug,
     )
 
 
@@ -367,11 +148,41 @@ class SprayControllerNode(Node):
         # Master enable gate. When False the node will not command spray ON
         # from any source (manual override, mission auto-spray, reassert).
         # The server sets this via the /api/spray/enable and /api/spray/disable
-        # endpoints. Default True so the node works standalone without the
-        # server; the server starts with disabled state and sets False on boot.
-        self.declare_parameter("spray_enabled", True)
+        # endpoints. Fail closed after node restart; mission loading never
+        # changes this operator-owned authorization state.
+        self.declare_parameter("spray_enabled", False)
+        self.declare_parameter("spray_mode", "continuous")
+        self.declare_parameter("dash_on_distance_m", 0.30)
+        self.declare_parameter("dash_off_distance_m", 0.30)
+        self.declare_parameter("dash_phase_reset", "per_mark_region")
+        self.declare_parameter("point_default_dwell_s", 2.0)
+        self.declare_parameter("point_arrival_tolerance_m", 0.05)
+        self.declare_parameter("point_settle_time_s", 0.10)
+        self.declare_parameter("point_leg_timeout_s", 120.0)
+        self.declare_parameter("point_settle_speed_mps", 0.05)
+        self.declare_parameter("point_settle_yaw_rate_rad_s", 0.05)
+        self.declare_parameter("configuration_revision", 0)
+        self.declare_parameter("mission_config_mission_id", "")
+        # One JSON envelope is one atomic ROS parameter transaction. Trigger
+        # validates its revision; cancellation invalidates prepared envelopes.
+        self.declare_parameter("pending_dwell_command_json", "")
+        self.declare_parameter("dwell_cancel_revision", 0)
 
-        self._group = ReentrantCallbackGroup()
+        self._state_group = MutuallyExclusiveCallbackGroup()
+        self._latency_group = self._state_group
+        self._model_group = MutuallyExclusiveCallbackGroup()
+        self._service_group = self._state_group
+        self._config_lock = threading.Lock()
+        self._state_lock = threading.RLock()
+        self._config_ready = False
+        self._config_error = ""
+        self._active_config = self._configuration_from_node_parameters()
+        self._config_ready = True
+        self._model_revision = 0
+        self._dwell_state: Optional[DwellState] = None
+        self._last_dwell_revision = 0
+        self._invalidated_dwell_revision = 0
+        self._last_transition = "startup"
         self._desired_raw = False
         self._candidate: Optional[bool] = None
         self._candidate_count = 0
@@ -408,7 +219,7 @@ class SprayControllerNode(Node):
         self._command_cli = self.create_client(
             CommandLong,
             command_service,
-            callback_group=self._group,
+            callback_group=self._service_group,
         )
 
         self._state_pub = self.create_publisher(Bool, "/spray/state", _best_effort_qos())
@@ -424,33 +235,36 @@ class SprayControllerNode(Node):
         self._manual_state_pub = self.create_publisher(
             Bool, "/spray/manual_state", _best_effort_qos()
         )
+        self._runtime_status_pub = self.create_publisher(
+            String, RUNTIME_STATUS_TOPIC, _best_effort_qos()
+        )
         self.create_subscription(
             Bool,
             "/spray/active",
             self._active_cb,
             _best_effort_qos(),
-            callback_group=self._group,
+            callback_group=self._latency_group,
         )
         self.create_subscription(
             Path,
             "/path",
             self._path_cb,
             _path_qos(),
-            callback_group=self._group,
+            callback_group=self._model_group,
         )
         self.create_subscription(
             PoseStamped,
             "/mavros/local_position/pose",
             self._pose_cb,
             _best_effort_qos(),
-            callback_group=self._group,
+            callback_group=self._latency_group,
         )
         self.create_subscription(
             TwistStamped,
             "/mavros/local_position/velocity_local",
             self._vel_cb,
             _best_effort_qos(),
-            callback_group=self._group,
+            callback_group=self._latency_group,
         )
         # Reliable VOLATILE (depth 1): a manual command must arrive, but a
         # stale override must never be re-delivered to a restarted node.
@@ -464,21 +278,49 @@ class SprayControllerNode(Node):
                 durability=DurabilityPolicy.VOLATILE,
                 history=HistoryPolicy.KEEP_LAST,
             ),
-            callback_group=self._group,
+            callback_group=self._service_group,
         )
         self.create_subscription(
             State,
             "/mavros/state",
             self._state_cb,
             _state_qos(),
-            callback_group=self._group,
+            callback_group=self._latency_group,
         )
 
-        self._watchdog_timer = self.create_timer(0.02, self._watchdog_tick)
+        self.create_service(
+            Trigger,
+            "/spray/apply_mission_config",
+            self._apply_mission_config_srv,
+            callback_group=self._service_group,
+        )
+        self.create_service(
+            Trigger,
+            "/spray/start_dwell",
+            self._start_dwell_srv,
+            callback_group=self._service_group,
+        )
+        self.create_service(
+            Trigger,
+            "/spray/cancel_dwell",
+            self._cancel_dwell_srv,
+            callback_group=self._service_group,
+        )
+
+        self._watchdog_timer = self.create_timer(
+            0.02, self._watchdog_tick, callback_group=self._latency_group
+        )
+        self._runtime_status_timer = self.create_timer(
+            0.1, self._publish_runtime_status, callback_group=self._latency_group
+        )
         reassert_hz = max(0.0, float(self.get_parameter("reassert_hz").value))
         self._reassert_timer = None
         if reassert_hz > 0.0:
-            self._reassert_timer = self.create_timer(1.0 / reassert_hz, self._reassert_tick)
+            self._reassert_timer = self.create_timer(
+                1.0 / reassert_hz,
+                self._reassert_tick,
+                callback_group=self._latency_group,
+            )
 
         if self._command_cli.wait_for_service(timeout_sec=2.0):
             self._service_ready = True
@@ -506,6 +348,245 @@ class SprayControllerNode(Node):
         # / service-probe retry path issues the OFF as soon as it appears.
         self._send_command(False, reason="startup")
 
+    def _configuration_from_node_parameters(self) -> SprayConfiguration:
+        raw = {
+            "spray_mode": str(self.get_parameter("spray_mode").value),
+            "solenoid_open_delay_s": float(self.get_parameter("solenoid_open_delay_s").value),
+            "solenoid_close_delay_s": float(self.get_parameter("solenoid_close_delay_s").value),
+            "on_overspray_margin_m": float(self.get_parameter("on_overspray_margin_m").value),
+            "off_overspray_margin_m": float(self.get_parameter("off_overspray_margin_m").value),
+            "min_spray_speed_mps": float(self.get_parameter("min_spray_speed_mps").value),
+            "max_xtrack_error_m": float(self.get_parameter("max_xtrack_error_m").value),
+            "nozzle_forward_offset_m": float(self.get_parameter("nozzle_forward_offset_m").value),
+            "nozzle_lateral_offset_m": float(self.get_parameter("nozzle_lateral_offset_m").value),
+            "dash_on_distance_m": float(self.get_parameter("dash_on_distance_m").value),
+            "dash_off_distance_m": float(self.get_parameter("dash_off_distance_m").value),
+            "dash_phase_reset": str(self.get_parameter("dash_phase_reset").value),
+            "point_default_dwell_s": float(self.get_parameter("point_default_dwell_s").value),
+            "point_arrival_tolerance_m": float(
+                self.get_parameter("point_arrival_tolerance_m").value
+            ),
+            "point_settle_time_s": float(self.get_parameter("point_settle_time_s").value),
+            "point_leg_timeout_s": float(self.get_parameter("point_leg_timeout_s").value),
+            "point_settle_speed_mps": float(self.get_parameter("point_settle_speed_mps").value),
+            "point_settle_yaw_rate_rad_s": float(
+                self.get_parameter("point_settle_yaw_rate_rad_s").value
+            ),
+            "require_offboard": bool(self.get_parameter("require_offboard").value),
+            "debounce_samples": int(self.get_parameter("debounce_samples").value),
+            "pose_timeout_s": float(self.get_parameter("pose_timeout_s").value),
+            "velocity_timeout_s": float(self.get_parameter("velocity_timeout_s").value),
+            "configuration_revision": int(self.get_parameter("configuration_revision").value),
+            "mission_id": str(self.get_parameter("mission_config_mission_id").value),
+        }
+        return validate_spray_configuration(raw)
+
+    def _get_config_snapshot(self) -> SprayConfiguration:
+        with self._config_lock:
+            return self._active_config
+
+    def _set_config_snapshot(self, config: SprayConfiguration, *, ready: bool, error: str = "") -> None:
+        with self._config_lock:
+            self._active_config = config
+            self._config_ready = ready
+            self._config_error = error
+
+    def _reset_decision_state(self, reason: str) -> None:
+        self._candidate = None
+        self._candidate_count = 0
+        self._desired_raw = False
+        self._desired_debounced = False
+        self._last_distance_event = ""
+        self._last_safety_block_reason = ""
+        self._last_transition = reason
+
+    def _invalidate_dwell(self, reason: str) -> None:
+        with self._state_lock:
+            self._invalidated_dwell_revision = max(
+                self._invalidated_dwell_revision, self._last_dwell_revision
+            )
+            if self._dwell_state is not None:
+                self._dwell_state = DwellState(
+                    command_id=self._dwell_state.command_id,
+                    mission_id=self._dwell_state.mission_id,
+                    point_index=self._dwell_state.point_index,
+                    start_mono_ns=self._dwell_state.start_mono_ns,
+                    expiry_mono_ns=self._dwell_state.expiry_mono_ns,
+                    cancelled=True,
+                )
+            self._last_transition = reason
+
+    def _apply_mission_config_from_parameters(self) -> tuple[bool, str]:
+        self._force_off("mission configuration apply", force=True)
+        self._invalidate_dwell("mission configuration apply")
+        try:
+            config = self._configuration_from_node_parameters()
+        except ValueError as exc:
+            self._set_config_snapshot(self._get_config_snapshot(), ready=False, error=str(exc))
+            return False, str(exc)
+        self._set_config_snapshot(config, ready=True, error="")
+        with self._state_lock:
+            self._path_model = None
+            self._model_revision += 1
+            self._reset_decision_state("mission_config_applied")
+        self.get_logger().info(
+            f"spray mission config applied: mode={config.mode.value} "
+            f"revision={config.revision} mission_id={config.mission_id!r}"
+        )
+        self._publish_runtime_status()
+        return True, "configuration applied"
+
+    def _apply_mission_config_srv(self, _request, response):
+        ok, message = self._apply_mission_config_from_parameters()
+        response.success = ok
+        response.message = message
+        return response
+
+    def _start_dwell_srv(self, _request, response):
+        config = self._get_config_snapshot()
+        if config.mode != SprayMode.POINT:
+            response.success = False
+            response.message = "dwell rejected: spray_mode is not point"
+            return response
+        if not self._config_ready:
+            response.success = False
+            response.message = f"dwell rejected: spray config not ready ({self._config_error})"
+            return response
+        try:
+            command = deserialize_dwell_command(
+                str(self.get_parameter("pending_dwell_command_json").value)
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            response.success = False
+            response.message = f"dwell rejected: invalid command envelope ({exc})"
+            return response
+        command_id = command["command_id"]
+        mission_id = command["mission_id"]
+        point_index = command["point_index"]
+        duration_s = command["duration_s"]
+        revision = command["revision"]
+        if command_id <= 0:
+            response.success = False
+            response.message = "dwell rejected: invalid command_id"
+            return response
+        if point_index < 0:
+            response.success = False
+            response.message = "dwell rejected: invalid point_index"
+            return response
+        if not math.isfinite(duration_s) or duration_s <= 0.0:
+            response.success = False
+            response.message = "dwell rejected: duration_s must be > 0"
+            return response
+        if config.mission_id and mission_id and mission_id != config.mission_id:
+            response.success = False
+            response.message = "dwell rejected: mission_id mismatch"
+            return response
+        if command["configuration_revision"] != config.revision:
+            response.success = False
+            response.message = "dwell rejected: configuration revision mismatch"
+            return response
+        if not self._safety_allows_on():
+            response.success = False
+            response.message = "dwell rejected: safety gate blocks spray ON"
+            return response
+        with self._state_lock:
+            now_ns = time.monotonic_ns()
+            if revision <= self._invalidated_dwell_revision:
+                response.success = False
+                response.message = "dwell rejected: command revision was cancelled"
+                return response
+            if revision <= self._last_dwell_revision:
+                response.success = False
+                response.message = "dwell rejected: stale or duplicate command revision"
+                return response
+            if (
+                self._dwell_state is not None
+                and self._dwell_state.active
+                and now_ns < self._dwell_state.expiry_mono_ns
+            ):
+                response.success = False
+                response.message = "dwell rejected: another dwell is active"
+                return response
+            expiry_ns = now_ns + int(duration_s * 1e9)
+            self._dwell_state = DwellState(
+                command_id=command_id,
+                mission_id=mission_id,
+                point_index=point_index,
+                start_mono_ns=now_ns,
+                expiry_mono_ns=expiry_ns,
+            )
+            self._last_dwell_revision = revision
+            self._last_transition = f"dwell_started:{point_index}"
+        response.success = True
+        response.message = dwell_response_message(command_id, expiry_ns * 1e-9)
+        self._publish_runtime_status()
+        return response
+
+    def _cancel_dwell_srv(self, _request, response):
+        with self._state_lock:
+            self._invalidated_dwell_revision = max(
+                self._invalidated_dwell_revision,
+                int(self.get_parameter("dwell_cancel_revision").value),
+            )
+        try:
+            pending = deserialize_dwell_command(
+                str(self.get_parameter("pending_dwell_command_json").value)
+            )
+            with self._state_lock:
+                self._invalidated_dwell_revision = max(
+                    self._invalidated_dwell_revision, pending["revision"]
+                )
+        except (KeyError, TypeError, ValueError):
+            pass
+        self._force_off("dwell_cancelled", force=True)
+        response.success = True
+        response.message = "dwell cancelled"
+        self._publish_runtime_status()
+        return response
+
+    def get_runtime_status(self) -> dict[str, Any]:
+        config = self._get_config_snapshot()
+        now_ns = time.monotonic_ns()
+        with self._state_lock:
+            dwell = self._dwell_state
+            active_dwell = bool(
+                dwell is not None and dwell.active and now_ns < dwell.expiry_mono_ns
+            )
+            dwell_remaining_s = (
+                max(0.0, (dwell.expiry_mono_ns - now_ns) * 1e-9)
+                if active_dwell and dwell is not None
+                else 0.0
+            )
+            snapshot = {
+                "model_revision": self._model_revision,
+                "commanded_on": self._commanded,
+                "confirmed_off": self._off_confirmed and not self._commanded,
+                "last_transition": self._last_transition,
+            }
+        return {
+            "timestamp_monotonic_s": now_ns * 1e-9,
+            "spray_mode": config.mode.value,
+            "active_mode": config.mode.value,
+            "configuration_revision": config.revision,
+            "model_revision": snapshot["model_revision"],
+            "ready": self._config_ready,
+            "operator_enabled": bool(self.get_parameter("spray_enabled").value),
+            "commanded_on": snapshot["commanded_on"],
+            "confirmed_off": snapshot["confirmed_off"],
+            "active_dwell": active_dwell,
+            "dwell_command_id": dwell.command_id if dwell is not None else None,
+            "dwell_mission_id": dwell.mission_id if dwell is not None else None,
+            "dwell_point_index": dwell.point_index if dwell is not None else None,
+            "dwell_remaining_s": dwell_remaining_s,
+            "last_transition": snapshot["last_transition"],
+            "last_error": self._config_error,
+        }
+
+    def _publish_runtime_status(self) -> None:
+        msg = String()
+        msg.data = serialize_runtime_status(self.get_runtime_status())
+        self._runtime_status_pub.publish(msg)
+
     def _service_probe_tick(self) -> None:
         if self._service_ready:
             return
@@ -521,7 +602,7 @@ class SprayControllerNode(Node):
         self._mode = str(msg.mode)
         now_safe = self._safety_allows_on()
         if prev_safe and not now_safe:
-            # Safety-loss edge: command OFF immediately (bypass retry throttle).
+            self._invalidate_dwell("safety loss")
             self._force_off("FCU left armed/OFFBOARD safe state", force=True)
         elif not prev_safe and now_safe and self._desired_debounced:
             self._commit_desired_state()
@@ -539,20 +620,33 @@ class SprayControllerNode(Node):
         points = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
         flags = [p.pose.position.z > 0.5 for p in msg.poses]
         if not points:
-            self._path_model = None
+            with self._state_lock:
+                self._path_model = None
+                self._model_revision += 1
             self._set_auto_desired(False, source="distance")
             self.get_logger().warn("spray path cleared: received empty /path")
             return
         try:
-            self._path_model = _build_path_model(points, flags)
+            base_model = _build_path_model(points, flags)
+            config = self._get_config_snapshot()
+            model = build_path_model_for_config(base_model, config)
         except ValueError as exc:
-            self._path_model = None
+            with self._state_lock:
+                self._path_model = None
             self._set_auto_desired(False, source="distance")
             self.get_logger().warn(f"spray path rejected: {exc}")
             return
+        current = self._get_config_snapshot()
+        if current.revision != config.revision or current.mode != config.mode:
+            self.get_logger().warn("discarded path model built for replaced spray configuration")
+            return
+        with self._state_lock:
+            self._path_model = model
+            self._model_revision += 1
+            self._reset_decision_state("path_model_updated")
         self.get_logger().info(
             f"spray path loaded: {len(points)} points, "
-            f"{len(self._path_model.boundaries)} boundaries"
+            f"{len(model.boundaries)} boundaries, mode={config.mode.value}"
         )
 
     def _pose_cb(self, msg: PoseStamped) -> None:
@@ -647,6 +741,7 @@ class SprayControllerNode(Node):
                 self.get_logger().info("manual spray override expired — reverting")
                 self._commit_desired_state()
 
+        self._dwell_expiry_tick()
         if bool(self.get_parameter("use_distance_aware_spray").value):
             self._distance_aware_tick()
         elif bool(self.get_parameter("allow_legacy_spray_active_fallback").value):
@@ -677,9 +772,10 @@ class SprayControllerNode(Node):
                     return
 
     def _distance_aware_tick(self) -> None:
+        config = self._get_config_snapshot()
         model = self._path_model
-        pose_fresh, pose_age_s = self._pose_is_fresh()
-        velocity_fresh, velocity_age_s = self._velocity_is_fresh()
+        pose_fresh, pose_age_s = self._pose_is_fresh(config)
+        velocity_fresh, velocity_age_s = self._velocity_is_fresh(config)
         pose = self._pose_ned if pose_fresh else None
         speed = math.hypot(self._vel_ned[0], self._vel_ned[1]) if velocity_fresh else 0.0
 
@@ -694,50 +790,33 @@ class SprayControllerNode(Node):
             self.get_logger().warn(f"spray velocity stale ({velocity_age_s:.2f}s)")
             self._velocity_stale_logged = True
 
-        nozzle_n: Optional[float] = None
-        nozzle_e: Optional[float] = None
-        if pose is not None:
-            nozzle_n, nozzle_e = _nozzle_position_ned(
-                pose[0],
-                pose[1],
-                pose[2],
-                float(self.get_parameter("nozzle_forward_offset_m").value),
-                float(self.get_parameter("nozzle_lateral_offset_m").value),
-            )
-
+        dwell_active = (
+            self._dwell_state is not None
+            and self._dwell_state.active
+            and time.monotonic_ns() < self._dwell_state.expiry_mono_ns
+        )
         safety_ok, safety_reason = self._auto_safety_status(
             pose_fresh,
             speed,
             velocity_fresh=velocity_fresh,
+            dwell_active=dwell_active,
         )
-        decision = _make_spray_decision(
-            model=model,
-            nozzle_n=nozzle_n,
-            nozzle_e=nozzle_e,
-            speed_mps=speed,
-            safety_ok=safety_ok,
-            safety_reason=safety_reason,
-            solenoid_open_delay_s=max(
-                0.0,
-                float(self.get_parameter("solenoid_open_delay_s").value),
-            ),
-            solenoid_close_delay_s=max(
-                0.0,
-                float(self.get_parameter("solenoid_close_delay_s").value),
-            ),
-            on_overspray_margin_m=max(
-                0.0,
-                float(self.get_parameter("on_overspray_margin_m").value),
-            ),
-            off_overspray_margin_m=max(
-                0.0,
-                float(self.get_parameter("off_overspray_margin_m").value),
-            ),
-            max_xtrack_error_m=max(
-                0.0,
-                float(self.get_parameter("max_xtrack_error_m").value),
-            ),
-        )
+        if config.mode == SprayMode.POINT:
+            decision = point_mode_decision(
+                dwell=self._dwell_state,
+                now_mono_ns=time.monotonic_ns(),
+                safety_ok=safety_ok,
+                safety_reason=safety_reason,
+            )
+        else:
+            decision = continuous_distance_decision(
+                model=model,
+                pose_ned=pose,
+                speed_mps=speed,
+                safety_ok=safety_ok,
+                safety_reason=safety_reason,
+                config=config,
+            )
         self._publish_debug(decision.debug)
 
         if decision.event and decision.event != self._last_distance_event:
@@ -756,20 +835,38 @@ class SprayControllerNode(Node):
         elif decision.safety_ok:
             self._last_safety_block_reason = ""
 
-        self._set_auto_desired(decision.desired, source="distance")
+        source = "point" if config.mode == SprayMode.POINT else "distance"
+        self._set_auto_desired(decision.desired, source=source)
 
-    def _pose_is_fresh(self) -> tuple[bool, float]:
+    def _dwell_expiry_tick(self) -> None:
+        dwell = self._dwell_state
+        if dwell is None or not dwell.active:
+            return
+        now_ns = time.monotonic_ns()
+        if now_ns < dwell.expiry_mono_ns:
+            return
+        self._force_off("dwell_expired", force=True)
+        self._last_transition = f"dwell_expired:{dwell.point_index}"
+        self._publish_runtime_status()
+
+    def _pose_is_fresh(self, config: SprayConfiguration | None = None) -> tuple[bool, float]:
         if self._pose_recv_time is None:
             return False, float("inf")
         age_s = (self.get_clock().now() - self._pose_recv_time).nanoseconds * 1e-9
-        timeout_s = max(0.0, float(self.get_parameter("pose_timeout_s").value))
+        if config is None:
+            timeout_s = max(0.0, float(self.get_parameter("pose_timeout_s").value))
+        else:
+            timeout_s = config.safety.pose_timeout_s
         return age_s <= timeout_s, age_s
 
-    def _velocity_is_fresh(self) -> tuple[bool, float]:
+    def _velocity_is_fresh(self, config: SprayConfiguration | None = None) -> tuple[bool, float]:
         if self._vel_recv_time is None:
             return False, float("inf")
         age_s = (self.get_clock().now() - self._vel_recv_time).nanoseconds * 1e-9
-        timeout_s = max(0.0, float(self.get_parameter("velocity_timeout_s").value))
+        if config is None:
+            timeout_s = max(0.0, float(self.get_parameter("velocity_timeout_s").value))
+        else:
+            timeout_s = config.safety.velocity_timeout_s
         return age_s <= timeout_s, age_s
 
     def _auto_safety_status(
@@ -777,22 +874,21 @@ class SprayControllerNode(Node):
         pose_fresh: bool,
         speed: float,
         velocity_fresh: bool = True,
+        dwell_active: bool = False,
     ) -> tuple[bool, str]:
-        if not self._armed:
-            return False, "disarmed"
-        require_offboard = bool(self.get_parameter("require_offboard").value)
-        if require_offboard and self._mode != "OFFBOARD":
-            return False, "not OFFBOARD"
-        if self._path_model is None:
-            return False, "path not loaded"
-        if not pose_fresh:
-            return False, "pose stale"
-        if not velocity_fresh:
-            return False, "velocity stale"
-        min_speed = max(0.0, float(self.get_parameter("min_spray_speed_mps").value))
-        if speed < min_speed:
-            return False, "below min spray speed"
-        return True, ""
+        config = self._get_config_snapshot()
+        if not self._config_ready:
+            return False, self._config_error or "spray configuration not ready"
+        return auto_safety_status(
+            config=config,
+            armed=self._armed,
+            mode=self._mode,
+            path_model=self._path_model,
+            pose_fresh=pose_fresh,
+            speed=speed,
+            velocity_fresh=velocity_fresh,
+            dwell_active=dwell_active,
+        )
 
     def _reassert_tick(self) -> None:
         if self._effective_desired() and self._commanded and self._safety_allows_on():
@@ -828,8 +924,7 @@ class SprayControllerNode(Node):
         return True
 
     def _force_off(self, reason: str, force: bool = False) -> None:
-        # Fail-safes outrank the manual override — clear it so spray cannot
-        # come back ON without a fresh, safety-gated manual command.
+        self._invalidate_dwell(reason)
         self._manual_active = False
         self._manual_deadline_ns = None
         self._publish_desired_state(False)
@@ -1002,6 +1097,7 @@ class SprayControllerNode(Node):
         self._manual_state_pub.publish(msg)
 
     def shutdown_off(self) -> None:
+        self._invalidate_dwell("shutdown")
         self._desired_raw = False
         self._desired_debounced = False
         self._manual_active = False
@@ -1026,15 +1122,18 @@ class SprayControllerNode(Node):
 def main() -> None:
     rclpy.init()
     node: SprayControllerNode | None = None
+    executor: MultiThreadedExecutor | None = None
     try:
         node = SprayControllerNode()
+        executor = MultiThreadedExecutor(num_threads=3)
+        executor.add_node(node)
 
         def _signal_handler(signum, frame):
             raise KeyboardInterrupt
 
         signal.signal(signal.SIGINT, _signal_handler)
         signal.signal(signal.SIGTERM, _signal_handler)
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
@@ -1043,6 +1142,8 @@ def main() -> None:
                 node.shutdown_off()
             except Exception:
                 pass
+            if executor is not None:
+                executor.shutdown()
             node.destroy_node()
         rclpy.try_shutdown()
 

@@ -120,6 +120,67 @@ SPRAY_PARAM_SCHEMA: dict[str, dict] = {
         "min": 0,
         "max": 2200,
     },
+    # ── Spray Mode ────────────────────────────────────────────────────────────
+    "spray_mode": {
+        "type": "string",
+        "default": "continuous",
+        "group": "Spray Mode",
+        "description": "Mission spray mode: continuous, dash, or point",
+    },
+    "dash_on_distance_m": {
+        "type": "float",
+        "default": 0.30,
+        "group": "Spray Mode",
+        "description": "Dash mode: spray ON distance along MARK arc length (m)",
+        "min": 0.0,
+        "max": 10.0,
+    },
+    "dash_off_distance_m": {
+        "type": "float",
+        "default": 0.30,
+        "group": "Spray Mode",
+        "description": "Dash mode: spray OFF distance along MARK arc length (m)",
+        "min": 0.0,
+        "max": 10.0,
+    },
+    "dash_phase_reset": {
+        "type": "string",
+        "default": "per_mark_region",
+        "group": "Spray Mode",
+        "description": "Dash phase reset: per_mark_region or continuous",
+    },
+    "point_default_dwell_s": {
+        "type": "float",
+        "default": 2.0,
+        "group": "Spray Mode",
+        "description": "Point mode default dwell duration (s)",
+        "min": 0.1,
+        "max": 60.0,
+    },
+    "point_arrival_tolerance_m": {
+        "type": "float",
+        "default": 0.05,
+        "group": "Spray Mode",
+        "description": "Point mode arrival distance tolerance (m)",
+        "min": 0.01,
+        "max": 1.0,
+    },
+    "point_settle_time_s": {
+        "type": "float",
+        "default": 0.10,
+        "group": "Spray Mode",
+        "description": "Point mode sustained settle duration before dwell (s)",
+        "min": 0.0,
+        "max": 5.0,
+    },
+    "point_leg_timeout_s": {
+        "type": "float",
+        "default": 120.0,
+        "group": "Spray Mode",
+        "description": "Point mode navigation timeout per leg (s)",
+        "min": 5.0,
+        "max": 600.0,
+    },
     # ── Distance-Aware Spray ──────────────────────────────────────────────────
     "use_distance_aware_spray": {
         "type": "bool",
@@ -222,6 +283,30 @@ SPRAY_PARAM_SCHEMA: dict[str, dict] = {
     },
 }
 
+# These values are captured into SprayConfiguration and intentionally remain
+# stable for a mission. Changing them requires staging/loading a replacement;
+# direct actuator/backend/manual-timeout values are read live by the node.
+MISSION_BOUND_PARAMS = {
+    "spray_mode",
+    "dash_on_distance_m",
+    "dash_off_distance_m",
+    "dash_phase_reset",
+    "point_default_dwell_s",
+    "point_arrival_tolerance_m",
+    "point_settle_time_s",
+    "point_leg_timeout_s",
+    "solenoid_open_delay_s",
+    "solenoid_close_delay_s",
+    "on_overspray_margin_m",
+    "off_overspray_margin_m",
+    "min_spray_speed_mps",
+    "max_xtrack_error_m",
+    "nozzle_forward_offset_m",
+    "nozzle_lateral_offset_m",
+    "require_offboard",
+    "debounce_samples",
+}
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -299,6 +384,8 @@ async def set_spray_param(name: str, req: SprayParamSetRequest) -> SprayParamSet
     if name not in SPRAY_PARAM_SCHEMA:
         known = ", ".join(_roster())
         raise HTTPException(422, f"Unknown spray param '{name}'. Known: {known}")
+    if name in MISSION_BOUND_PARAMS:
+        raise HTTPException(409, f"Spray param '{name}' is mission-bound; stage and reload the mission")
 
     from main import ros_node
 
@@ -322,6 +409,12 @@ async def set_spray_params_bulk(req: SprayParamSetBulkRequest) -> SprayParamSetB
         raise HTTPException(
             422,
             f"Unknown spray param(s): {', '.join(unknown)}. Known: {known}",
+        )
+    mission_bound = sorted(MISSION_BOUND_PARAMS.intersection(req.parameters))
+    if mission_bound:
+        raise HTTPException(
+            409,
+            "Mission-bound spray params require mission reload: " + ", ".join(mission_bound),
         )
 
     from main import ros_node

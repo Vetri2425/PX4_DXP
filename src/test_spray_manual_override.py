@@ -25,7 +25,12 @@ def _install_ros_stubs() -> None:
 
     cbg = types.ModuleType("rclpy.callback_groups")
     cbg.ReentrantCallbackGroup = object
+    cbg.MutuallyExclusiveCallbackGroup = object
     sys.modules["rclpy.callback_groups"] = cbg
+
+    rclpy_exec = types.ModuleType("rclpy.executors")
+    rclpy_exec.MultiThreadedExecutor = object
+    sys.modules["rclpy.executors"] = rclpy_exec
 
     rclpy_node = types.ModuleType("rclpy.node")
     rclpy_node.Node = object
@@ -79,8 +84,13 @@ def _install_ros_stubs() -> None:
         def __init__(self):
             self.data = []
 
+    class _String:
+        def __init__(self):
+            self.data = ""
+
     std_msg.Bool = _Bool
     std_msg.Float32MultiArray = _Float32MultiArray
+    std_msg.String = _String
     sys.modules["std_msgs"] = std_msgs
     sys.modules["std_msgs.msg"] = std_msg
 
@@ -107,6 +117,21 @@ def _install_ros_stubs() -> None:
     nav_msg.Path = _Path
     sys.modules["nav_msgs"] = nav_msgs
     sys.modules["nav_msgs.msg"] = nav_msg
+
+    std_srvs = types.ModuleType("std_srvs")
+    std_srv = types.ModuleType("std_srvs.srv")
+
+    class _Trigger:
+        class Request:
+            pass
+
+        class Response:
+            success = False
+            message = ""
+
+    std_srv.Trigger = _Trigger
+    sys.modules["std_srvs"] = std_srvs
+    sys.modules["std_srvs.srv"] = std_srv
 
 
 _install_ros_stubs()
@@ -253,6 +278,20 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "off_pwm_us": _Param(0),
         "on_pwm_us": _Param(1800),
         "spray_enabled": _Param(True),
+        "spray_mode": _Param("continuous"),
+        "dash_on_distance_m": _Param(0.30),
+        "dash_off_distance_m": _Param(0.30),
+        "dash_phase_reset": _Param("per_mark_region"),
+        "point_default_dwell_s": _Param(2.0),
+        "point_arrival_tolerance_m": _Param(0.05),
+        "point_settle_time_s": _Param(0.10),
+        "point_leg_timeout_s": _Param(120.0),
+        "point_settle_speed_mps": _Param(0.05),
+        "point_settle_yaw_rate_rad_s": _Param(0.05),
+        "configuration_revision": _Param(0),
+        "mission_config_mission_id": _Param(""),
+        "pending_dwell_command_json": _Param(""),
+        "dwell_cancel_revision": _Param(0),
     }
     node.get_parameter = lambda name: node._params[name]
     node._clock = _Clock()
@@ -290,6 +329,18 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._last_safety_block_reason = ""
     node._pose_stale_logged = False
     node._velocity_stale_logged = False
+    from spray_config import SprayConfiguration
+
+    node._config_lock = __import__("threading").Lock()
+    node._state_lock = __import__("threading").RLock()
+    node._config_ready = True
+    node._config_error = ""
+    node._active_config = SprayConfiguration()
+    node._model_revision = 0
+    node._dwell_state = None
+    node._last_dwell_revision = 0
+    node._invalidated_dwell_revision = 0
+    node._last_transition = "test"
     return node
 
 

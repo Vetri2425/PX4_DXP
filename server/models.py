@@ -63,6 +63,23 @@ class SprayTestRequest(BaseModel):
     duration_s: Optional[float] = None
 
 
+class SprayModeConfig(BaseModel):
+    """Mission-bound spray configuration staged with each mission."""
+
+    spray_mode: Literal["continuous", "dash", "point"] = "continuous"
+    dash_on_distance_m: float = 0.30
+    dash_off_distance_m: float = 0.30
+    dash_phase_reset: Literal["per_mark_region", "continuous"] = "per_mark_region"
+    point_default_dwell_s: float = 2.0
+    point_arrival_tolerance_m: float = 0.05
+    point_settle_time_s: float = 0.10
+    point_leg_timeout_s: float = 120.0
+    point_settle_speed_mps: float = 0.05
+    point_settle_yaw_rate_rad_s: float = 0.05
+    point_mission_points: list[dict[str, Any]] = Field(default_factory=list)
+    point_source_frame: Literal["LOCAL_NED", "GPS_SURVEYED", "DESIGN"] = "LOCAL_NED"
+
+
 class ParamSetRequest(BaseModel):
     # PX4 has int (SYS_AUTOSTART), float (RO_YAW_RATE_P), and bool params.
     value: Union[bool, int, float, str]
@@ -414,6 +431,18 @@ class PathPlanRequest(BaseModel):
     max_waypoints: int = Field(10000, ge=100, le=500000)  # Hard publication guard
     max_segments: int = Field(2000, ge=1, le=100000)  # Hard segment-count guard
     include_waypoints: bool = True  # If False, return summary only (no waypoint arrays)
+    spray_mode: Literal["continuous", "dash", "point"] = "continuous"
+    dash_on_distance_m: float = Field(0.30, ge=0.0)
+    dash_off_distance_m: float = Field(0.30, ge=0.0)
+    dash_phase_reset: Literal["per_mark_region", "continuous"] = "per_mark_region"
+    point_default_dwell_s: float = Field(2.0, gt=0.0)
+    point_arrival_tolerance_m: float = Field(0.05, gt=0.0)
+    point_settle_time_s: float = Field(0.10, ge=0.0)
+    point_leg_timeout_s: float = Field(120.0, gt=0.0)
+    point_settle_speed_mps: float = Field(0.05, ge=0.0)
+    point_settle_yaw_rate_rad_s: float = Field(0.05, ge=0.0)
+    point_mission_points: list[dict[str, Any]] = Field(default_factory=list)
+    point_source_frame: Literal["LOCAL_NED", "GPS_SURVEYED", "DESIGN"] = "LOCAL_NED"
 
     @field_validator("compensate_spray")
     @classmethod
@@ -559,6 +588,20 @@ class StagedMissionResponse(BaseModel):
     waypoints: list[list[float]] = Field(default_factory=list)
     spray_flags: list[bool] = Field(default_factory=list)
     segment_runs: list[dict] = Field(default_factory=list)  # derived spray on/off runs
+    spray_mode: str = "continuous"
+    dash_on_distance_m: float = 0.30
+    dash_off_distance_m: float = 0.30
+    dash_phase_reset: str = "per_mark_region"
+    point_default_dwell_s: float = 2.0
+    point_arrival_tolerance_m: float = 0.05
+    point_settle_time_s: float = 0.10
+    point_leg_timeout_s: float = 120.0
+    point_settle_speed_mps: float = 0.05
+    point_settle_yaw_rate_rad_s: float = 0.05
+    point_mission_points: list[dict[str, Any]] = Field(default_factory=list)
+    point_source_frame: str = ""
+    point_mission_points_original: list[dict[str, Any]] = Field(default_factory=list)
+    configuration_revision: int = 0
     alignment_metadata: Optional[dict] = None
     metadata: Optional[dict] = None
 

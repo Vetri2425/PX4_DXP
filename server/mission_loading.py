@@ -170,11 +170,24 @@ async def start_mission_for_controller(
             capture_coordinator.record_placement(capture_id, payload)
 
     try:
+        if offboard_ctrl.spray_mode == "point":
+            from main import point_mission
+
+            if point_mission is None:
+                raise MissionLoadConflict("point mission orchestrator not ready")
+            if ros_node is None:
+                raise MissionLoadConflict("ROS node not ready")
+            point_mission.prepare(ros_node.get_state())
         ok, message = await offboard_ctrl.start_async(
             auto_origin=auto_origin and not origin_pre_applied,
             expected_mission_id=mission_id,
             pre_publish_hook=_placement_hook if capture_id else None,
         )
+        if ok and offboard_ctrl.spray_mode == "point":
+            started, why = await point_mission.start(ros_node, offboard_ctrl)
+            if not started:
+                await offboard_ctrl.stop_async()
+                ok, message = False, why
     except Exception as exc:
         if capture_coordinator is not None:
             capture_coordinator.record_start_result(

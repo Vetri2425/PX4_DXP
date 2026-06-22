@@ -31,6 +31,9 @@ SRV_RPP_LIST_PARAMS = f"/{RPP_NODE_NAME}/list_parameters"
 SPRAY_NODE_NAME = "spray_controller"
 SRV_SPRAY_GET_PARAMS = f"/{SPRAY_NODE_NAME}/get_parameters"
 SRV_SPRAY_SET_PARAMS = f"/{SPRAY_NODE_NAME}/set_parameters"
+SRV_SPRAY_APPLY_MISSION_CONFIG = "/spray/apply_mission_config"
+SRV_SPRAY_START_DWELL = "/spray/start_dwell"
+SRV_SPRAY_CANCEL_DWELL = "/spray/cancel_dwell"
 
 # ── RPP State Codes ───────────────────────────────────────────────────────────
 RPP_STALE = -1

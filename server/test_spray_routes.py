@@ -25,6 +25,21 @@ class FakeNode:
     def publish_spray_manual(self, on):
         self.manual_calls.append(bool(on))
 
+    def get_spray_runtime_status(self):
+        return {
+            "spray_mode": "continuous",
+            "configuration_revision": 2,
+            "model_revision": 3,
+            "ready": True,
+            "operator_enabled": True,
+            "status_stale": False,
+            "status_age_s": 0.01,
+            "active_dwell": False,
+            "dwell_remaining_s": 0.0,
+            "commanded_on": bool(self.state.get("spraying", False)),
+            "confirmed_off": not bool(self.state.get("spraying", False)),
+        }
+
 
 class FakeController:
     def __init__(self, state=MissionState.IDLE):

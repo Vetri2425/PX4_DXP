@@ -107,9 +107,11 @@ async def start_mission(req: MissionStartRequest | None = None):
 
 @router.post("/stop")
 async def stop_mission():
-    from main import mission_capture, offboard_ctrl
+    from main import mission_capture, offboard_ctrl, point_mission, ros_node
     if offboard_ctrl is None:
         raise HTTPException(503, "Controller not ready")
+    if point_mission is not None and point_mission.is_active():
+        await point_mission.abort(ros_node)
     result = await offboard_ctrl.stop_async()
     if result.get("success") and mission_capture is not None:
         mission_capture.record_terminal(
@@ -120,9 +122,11 @@ async def stop_mission():
 
 @router.post("/abort")
 async def abort_mission():
-    from main import mission_capture, offboard_ctrl
+    from main import mission_capture, offboard_ctrl, point_mission, ros_node
     if offboard_ctrl is None:
         raise HTTPException(503, "Controller not ready")
+    if point_mission is not None:
+        await point_mission.abort(ros_node)
     result = await offboard_ctrl.abort_async()
     if mission_capture is not None:
         mission_capture.record_terminal(

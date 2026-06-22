@@ -40,6 +40,14 @@ from config import (
     STAGING_DIR,
     STAGING_TTL_S,
 )
+from spray_mission_config import (
+    apply_spray_mission_config,
+    is_point_mode_staged,
+    next_configuration_revision,
+    staged_spray_defaults,
+    validate_staged_spray_config,
+)
+
 from models import (
     AlignRequest,
     AlignResponse,
@@ -71,7 +79,7 @@ from models import (
 )
 from path_manager import UploadValidationError
 from path_engine.entity_order import apply_entity_order as _apply_entity_order_shared
-from mission_placement import GPS_SURVEYED, LOCAL_NED
+from mission_placement import GPS_SURVEYED, LOCAL_NED, PlacementError, align_design_points
 
 log = logging.getLogger("server.routes.path")
 
@@ -648,6 +656,28 @@ async def save_path_extensions(name: str, req: PathExtensionConfig):
     )
 
 
+@path_router.post("/parse-point-csv")
+async def parse_point_csv(file: UploadFile = File(...)):
+    """Parse a point-mission CSV (north,east[,dwell_s]) into staged-ready points."""
+    import sys
+    from pathlib import Path as FsPath
+
+    src = FsPath(__file__).resolve().parents[2] / "src"
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    from point_ingest import parse_point_csv_text, points_to_staged_dict
+
+    content = (await file.read()).decode("utf-8", errors="replace")
+    try:
+        points = parse_point_csv_text(content)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    return {
+        "num_points": len(points),
+        "point_mission_points": points_to_staged_dict(points),
+    }
+
+
 # ── Upload ────────────────────────────────────────────────────────────────────
 
 @path_router.post("/upload")
@@ -953,12 +983,47 @@ def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
 
     # Anchor leads the artifact (Gap E): the microcontroller/controller consumes
     # the global anchor header before the waypoint stream.
+    spray_defaults = staged_spray_defaults()
+    configuration_revision = next_configuration_revision()
+    point_rows = list(req.point_mission_points or spray_defaults["point_mission_points"])
+    original_point_rows = [dict(row) for row in point_rows]
+    point_source_frame = req.point_source_frame
+    if point_rows and point_source_frame == "DESIGN":
+        try:
+            aligned = align_design_points(
+                [(float(row["north_m"]), float(row["east_m"])) for row in point_rows],
+                alignment_meta,
+            )
+        except (KeyError, TypeError, ValueError, PlacementError) as exc:
+            raise HTTPException(422, f"Point coordinate alignment failed: {exc}") from exc
+        point_rows = [
+            {**row, "north_m": n, "east_m": e}
+            for row, (n, e) in zip(point_rows, aligned)
+        ]
+        point_source_frame = GPS_SURVEYED
+    elif point_rows and point_source_frame == GPS_SURVEYED and anchor is None:
+        raise PlacementError("GPS_SURVEYED Point coordinates require a mission anchor")
+
     staged_payload = {
         "anchor": anchor,
         "mission_id": mission_id,
         "created_at": time.time(),
         "waypoints": result.get("merged_waypoints", []),
         "spray_flags": result.get("spray_flags", []),
+        "configuration_revision": configuration_revision,
+        "spray_mode": req.spray_mode,
+        "dash_on_distance_m": req.dash_on_distance_m,
+        "dash_off_distance_m": req.dash_off_distance_m,
+        "dash_phase_reset": req.dash_phase_reset,
+        "point_default_dwell_s": req.point_default_dwell_s,
+        "point_arrival_tolerance_m": req.point_arrival_tolerance_m,
+        "point_settle_time_s": req.point_settle_time_s,
+        "point_leg_timeout_s": req.point_leg_timeout_s,
+        "point_settle_speed_mps": req.point_settle_speed_mps,
+        "point_settle_yaw_rate_rad_s": req.point_settle_yaw_rate_rad_s,
+        "point_mission_points": point_rows,
+        "point_mission_points_original": original_point_rows,
+        "point_source_frame": point_source_frame,
         "alignment_metadata": alignment_meta,
         "metadata": {
             "source": result["source"],
@@ -1034,9 +1099,12 @@ async def load_mission_to_controller(req: LoadMissionRequest):
     except (OSError, ValueError) as exc:
         raise HTTPException(422, f"Could not read staged mission: {exc}")
 
+    point_mode = is_point_mode_staged(staged)
     waypoints = [tuple(pt) for pt in staged.get("waypoints", [])]
-    if not waypoints:
+    if not point_mode and not waypoints:
         raise HTTPException(422, "Staged mission has no waypoints.")
+    if point_mode and not staged.get("point_mission_points"):
+        raise HTTPException(422, "Point-mode staged mission has no point_mission_points.")
 
     anchor = staged.get("anchor")
     if anchor:
@@ -1047,14 +1115,49 @@ async def load_mission_to_controller(req: LoadMissionRequest):
             anchor.get("rotation_deg", 0.0), anchor.get("scale", 1.0),
         )
 
+    from main import point_mission, ros_node
+
     try:
+        try:
+            validated_spray_config = validate_staged_spray_config(staged)
+        except ValueError as exc:
+            raise HTTPException(422, f"Invalid spray configuration: {exc}") from exc
+        ok, why, spray_config = await apply_spray_mission_config(ros_node, staged)
+        spray_mode = str(staged.get("spray_mode", "continuous")).lower()
+        spray_config_degraded = False
+        if not ok:
+            if spray_mode in {"dash", "point"}:
+                raise HTTPException(503, f"Spray controller dependency unavailable: {why}")
+            # Legacy and Continuous navigation retain their previous load
+            # behavior. Spray stays under its existing operator gate, and the
+            # response explicitly reports that mission config was not applied.
+            spray_config_degraded = True
+            spray_config = validated_spray_config
+
         spray_flags = [bool(f) for f in staged.get("spray_flags", [])]
+        if spray_config_degraded:
+            spray_flags = [False] * len(waypoints)
         origin_gps = None
         if anchor is not None:
             origin_gps = (anchor.get("lat"), anchor.get("lon"))
         source_name = (staged.get("metadata") or {}).get("source") or safe_id
+
+        if point_mode:
+            if point_mission is not None and spray_config is not None:
+                await point_mission.replace_from_staged(staged, spray_config, ros_node)
+            first = staged["point_mission_points"][0]
+            load_points = [
+                (float(first["north_m"]), float(first["east_m"])),
+                (float(first["north_m"]), float(first["east_m"])),
+            ]
+            spray_flags = [False, False]
+        else:
+            if point_mission is not None:
+                await point_mission.cancel_and_drain(ros_node, reason="non_point_load")
+            load_points = waypoints
+
         offboard_ctrl.load_path(
-            waypoints,
+            load_points,
             name=source_name,
             spray_flags=spray_flags,
             placement_mode=GPS_SURVEYED if anchor is not None else LOCAL_NED,
@@ -1063,7 +1166,10 @@ async def load_mission_to_controller(req: LoadMissionRequest):
             source_name=source_name,
             is_staged=True,
             allow_replace_protected=True,
+            spray_mode=staged.get("spray_mode", "continuous"),
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(409, f"Controller load failed: {exc}")
 
@@ -1072,6 +1178,8 @@ async def load_mission_to_controller(req: LoadMissionRequest):
         "mission_id": safe_id,
         "num_waypoints": len(waypoints),
         "anchor_loaded": anchor is not None,
+        "spray_config_applied": not spray_config_degraded,
+        "spray_config_degraded_reason": why if spray_config_degraded else "",
     }
 
 
@@ -1401,6 +1509,7 @@ async def get_staged_mission(mission_id: str):
     except (TypeError, ValueError, IndexError, KeyError) as exc:
         raise HTTPException(422, f"Malformed staged waypoints: {exc}")
 
+    spray_defaults = staged_spray_defaults()
     return StagedMissionResponse(
         mission_id=staged.get("mission_id", safe_id),
         created_at=staged.get("created_at"),
@@ -1409,6 +1518,26 @@ async def get_staged_mission(mission_id: str):
         waypoints=wp_out,
         spray_flags=[bool(f) for f in spray_flags],
         segment_runs=_spray_runs(wp_out, spray_flags),
+        spray_mode=staged.get("spray_mode", spray_defaults["spray_mode"]),
+        dash_on_distance_m=float(staged.get("dash_on_distance_m", spray_defaults["dash_on_distance_m"])),
+        dash_off_distance_m=float(staged.get("dash_off_distance_m", spray_defaults["dash_off_distance_m"])),
+        dash_phase_reset=staged.get("dash_phase_reset", spray_defaults["dash_phase_reset"]),
+        point_default_dwell_s=float(staged.get("point_default_dwell_s", spray_defaults["point_default_dwell_s"])),
+        point_arrival_tolerance_m=float(
+            staged.get("point_arrival_tolerance_m", spray_defaults["point_arrival_tolerance_m"])
+        ),
+        point_settle_time_s=float(staged.get("point_settle_time_s", spray_defaults["point_settle_time_s"])),
+        point_leg_timeout_s=float(staged.get("point_leg_timeout_s", spray_defaults["point_leg_timeout_s"])),
+        point_settle_speed_mps=float(
+            staged.get("point_settle_speed_mps", spray_defaults["point_settle_speed_mps"])
+        ),
+        point_settle_yaw_rate_rad_s=float(
+            staged.get("point_settle_yaw_rate_rad_s", spray_defaults["point_settle_yaw_rate_rad_s"])
+        ),
+        point_mission_points=list(staged.get("point_mission_points") or []),
+        point_source_frame=str(staged.get("point_source_frame") or ""),
+        point_mission_points_original=list(staged.get("point_mission_points_original") or []),
+        configuration_revision=int(staged.get("configuration_revision", 0)),
         alignment_metadata=staged.get("alignment_metadata"),
         metadata=staged.get("metadata"),
     )
