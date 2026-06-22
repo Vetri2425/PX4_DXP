@@ -15,7 +15,7 @@ import sockets.events as socket_events
 from mission_placement import GPS_SURVEYED
 from models import MissionLoadRequest, MissionStartRequest, MissionState, PathPublishRequest
 from offboard_controller import OffboardController
-from routes.mission import load_mission, start_mission
+from routes.mission import clear_mission, load_mission, start_mission
 
 
 @pytest.fixture
@@ -231,6 +231,63 @@ async def test_legacy_load_cannot_replace_surveyed_mission(monkeypatch):
     assert exc.value.status_code == 409
     assert mgr.loads == []
     assert ctrl.loaded_mission_id == "stg_field"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("state", [MissionState.IDLE, MissionState.COMPLETED])
+async def test_clear_protected_mission_resets_resident_state(monkeypatch, state):
+    ctrl = OffboardController(FakeNode(), deque())
+    load_protected(ctrl)
+    ctrl.state = state
+    monkeypatch.setattr(main, "offboard_ctrl", ctrl)
+
+    response = await clear_mission()
+
+    assert response.cleared is True
+    assert response.status.loaded is False
+    assert response.status.state == "idle"
+    assert response.status.name is None
+    assert response.status.mission_id is None
+    assert response.status.running_mission_id is None
+    assert response.status.source_name is None
+    assert response.status.placement_mode == "LOCAL_NED"
+    assert response.status.origin_gps is None
+    assert response.status.is_staged is False
+    assert response.status.protected is False
+    assert response.status.num_waypoints == 0
+    assert response.status.has_spray_flags is False
+    assert ctrl.spray_mode == "continuous"
+
+
+@pytest.mark.anyio
+async def test_clear_rejected_while_mission_running(monkeypatch):
+    ctrl = OffboardController(FakeNode(), deque())
+    load_protected(ctrl)
+    ctrl.state = MissionState.RUNNING
+    monkeypatch.setattr(main, "offboard_ctrl", ctrl)
+
+    with pytest.raises(HTTPException) as exc:
+        await clear_mission()
+
+    assert exc.value.status_code == 409
+    assert ctrl.loaded_mission_id == "stg_field"
+    assert ctrl.has_protected_mission is True
+
+
+@pytest.mark.anyio
+async def test_legacy_load_succeeds_after_clear(monkeypatch):
+    ctrl = OffboardController(FakeNode(), deque())
+    load_protected(ctrl)
+    mgr = FakePathManager()
+    monkeypatch.setattr(main, "offboard_ctrl", ctrl)
+    monkeypatch.setattr(main, "path_mgr", mgr)
+
+    await clear_mission()
+    response = await load_mission(MissionLoadRequest(path_name="local.csv"))
+
+    assert response["loaded"] == "local.csv"
+    assert ctrl.loaded_mission_id == "local.csv"
+    assert ctrl.has_protected_mission is False
 
 
 class FakeSio:

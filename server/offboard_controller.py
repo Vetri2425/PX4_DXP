@@ -48,6 +48,14 @@ ABORT_NOOP_STATES = {
 }
 STOP_SETTLE_S = 0.1
 ENTRY_COINCIDENT_TOLERANCE_M = 1e-6
+CLEAR_ALLOWED_STATES = {
+    MissionState.IDLE,
+    MissionState.COMPLETED,
+}
+
+
+class MissionClearConflict(Exception):
+    """Raised when resident mission state cannot be cleared safely."""
 
 
 def _build_runtime_entry_path(
@@ -255,6 +263,33 @@ class OffboardController:
             f"Path loaded: {self._path_name} ({len(points)} pts, "
             f"id={self._loaded_mission_id}, placement={self._placement_mode})",
         )
+
+    async def clear_mission_async(self) -> dict[str, Any]:
+        """Clear the resident mission without deleting its source artifact."""
+        async with self._lifecycle_lock():
+            if self._state not in CLEAR_ALLOWED_STATES:
+                raise MissionClearConflict(
+                    f"Cannot clear mission while controller state is {self._state.value}; "
+                    "stop or abort the mission first"
+                )
+
+            cleared_name = self._path_name
+            self._loaded_source_pts = ()
+            self._loaded_spray_flags = None
+            self._path_name = None
+            self._loaded_mission_id = None
+            self._running_mission_id = None
+            self._source_name = None
+            self._placement_mode = LOCAL_NED
+            self._origin_gps = None
+            self._is_staged_mission = False
+            self._spray_mode = "continuous"
+            self._state = MissionState.IDLE
+            self._log_entry(
+                "info",
+                f"Resident mission cleared: {cleared_name or 'none'}",
+            )
+            return self.loaded_path_summary()
 
     # ── Lifecycle (async) ─────────────────────────────────────────────────────
 

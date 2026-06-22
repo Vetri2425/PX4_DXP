@@ -627,6 +627,13 @@ class LoadedPathResponse(BaseModel):
     sample_truncated: bool = False
 
 
+class MissionClearResponse(BaseModel):
+    """Confirmation and post-clear controller snapshot."""
+
+    cleared: bool
+    status: LoadedPathResponse
+
+
 class LoadMissionRequest(BaseModel):
     """Payload for committing a staged mission to the controller."""
 
