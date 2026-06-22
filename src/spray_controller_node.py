@@ -28,7 +28,6 @@ import rclpy
 from rclpy.callback_groups import (
     MutuallyExclusiveCallbackGroup,
 )
-from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
@@ -1122,18 +1121,20 @@ class SprayControllerNode(Node):
 def main() -> None:
     rclpy.init()
     node: SprayControllerNode | None = None
-    executor: MultiThreadedExecutor | None = None
     try:
         node = SprayControllerNode()
-        executor = MultiThreadedExecutor(num_threads=3)
-        executor.add_node(node)
 
         def _signal_handler(signum, frame):
             raise KeyboardInterrupt
 
         signal.signal(signal.SIGINT, _signal_handler)
         signal.signal(signal.SIGTERM, _signal_handler)
-        executor.spin()
+        # Single-threaded executor: rclpy's MultiThreadedExecutor busy-spins a
+        # full core with timers on Humble, which starved MAVROS on the Jetson
+        # (FCU read as disconnected). All heavy work here is already async
+        # (call_async), so one thread is sufficient; serialized callbacks also
+        # remove any cross-callback-group data race (_state_lock kept as guard).
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
@@ -1142,8 +1143,6 @@ def main() -> None:
                 node.shutdown_off()
             except Exception:
                 pass
-            if executor is not None:
-                executor.shutdown()
             node.destroy_node()
         rclpy.try_shutdown()
 
