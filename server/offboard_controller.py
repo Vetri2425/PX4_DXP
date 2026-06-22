@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import math
 from collections import deque
 from typing import Any, Callable, Optional
 
@@ -46,6 +47,40 @@ ABORT_NOOP_STATES = {
     MissionState.ABORTED,
 }
 STOP_SETTLE_S = 0.1
+ENTRY_COINCIDENT_TOLERANCE_M = 1e-6
+
+
+def _build_runtime_entry_path(
+    points: list[tuple[float, float]],
+    spray_flags: list[bool] | None,
+    rover_ned: tuple[float, float],
+) -> tuple[list[tuple[float, float]], list[bool] | None, dict[str, Any]]:
+    """Prepend a spray-OFF acquisition leg without changing mission data."""
+    original_first = points[0]
+    distance_m = math.hypot(
+        rover_ned[0] - original_first[0], rover_ned[1] - original_first[1]
+    )
+    evidence = {
+        "entry_transit_added": distance_m > ENTRY_COINCIDENT_TOLERANCE_M,
+        "entry_start_ned": list(rover_ned),
+        "entry_target_ned": list(original_first),
+        "entry_distance_m": distance_m,
+        "entry_target_original_spray_on": (
+            bool(spray_flags[0]) if spray_flags is not None else None
+        ),
+    }
+    if not evidence["entry_transit_added"]:
+        return list(points), list(spray_flags) if spray_flags is not None else None, evidence
+
+    if spray_flags is None:
+        return [rover_ned, original_first, *points], None, evidence
+    # The duplicate marks the end of the runtime-only entry run. For MARK-first
+    # it is also the zero-distance OFF->ON boundary; PRE-first stays OFF->OFF.
+    return (
+        [rover_ned, original_first, *points],
+        [False, False, *spray_flags],
+        evidence,
+    )
 
 
 class OffboardController:
@@ -290,6 +325,7 @@ class OffboardController:
                 return False, msg
 
             pts_to_publish = list(self._loaded_source_pts)
+            resolved_mission_pts = list(pts_to_publish)
             rover_local_ned = None
             if fcu.get("pose_received", False):
                 rover_local_ned = [float(fcu.get("pos_n", 0.0)), float(fcu.get("pos_e", 0.0))]
@@ -306,6 +342,7 @@ class OffboardController:
                         fcu,
                     )
                     survey_translation_ned = [float(translation[0]), float(translation[1])]
+                    resolved_mission_pts = list(pts_to_publish)
                 except (PlacementError, ImportError) as exc:
                     self._state = MissionState.ERROR
                     msg = f"start: surveyed placement failed: {exc}"
@@ -344,6 +381,51 @@ class OffboardController:
                     "info", f"auto_origin offset: +{off_n:.3f}N +{off_e:.3f}E"
                 )
 
+            entry_evidence = {
+                "entry_transit_added": False,
+                "entry_start_ned": None,
+                "entry_target_ned": list(resolved_mission_pts[0]),
+                "entry_distance_m": None,
+                "entry_target_original_spray_on": None,
+            }
+            final_local_pose_age_ms = fcu.get("local_pose_age_ms")
+            if self._placement_mode == GPS_SURVEYED:
+                # Resolve again from one fresh, internally coherent snapshot. This
+                # snapshot owns both final GPS placement and the injected entry leg.
+                final_fcu = self._node.get_state()
+                try:
+                    resolved_mission_pts, translation = resolve_surveyed_points(
+                        self._loaded_source_pts,
+                        self._origin_gps,
+                        final_fcu,
+                    )
+                except (PlacementError, ImportError) as exc:
+                    self._state = MissionState.ERROR
+                    msg = f"start: surveyed placement failed: {exc}"
+                    self._log_entry("error", msg)
+                    self._running_mission_id = None
+                    raise PlacementError(msg) from exc
+                rover_ned = (
+                    float(final_fcu["pos_n"]),
+                    float(final_fcu["pos_e"]),
+                )
+                rover_local_ned = list(rover_ned)
+                survey_translation_ned = [float(translation[0]), float(translation[1])]
+                final_local_pose_age_ms = final_fcu.get("local_pose_age_ms")
+                pts_to_publish, spray_flags_to_publish, entry_evidence = (
+                    _build_runtime_entry_path(
+                        list(resolved_mission_pts),
+                        spray_flags_to_publish,
+                        rover_ned,
+                    )
+                )
+                self._log_entry(
+                    "info",
+                    "runtime entry transit: "
+                    f"{entry_evidence['entry_distance_m']:.3f} m "
+                    f"({'added' if entry_evidence['entry_transit_added'] else 'coincident; unchanged'})",
+                )
+
             armed_here = False
             try:
                 if pre_publish_hook is not None:
@@ -357,7 +439,12 @@ class OffboardController:
                             "origin_gps": list(self._origin_gps) if self._origin_gps else None,
                             "rover_local_ned_at_resolution": rover_local_ned,
                             "survey_translation_ned": survey_translation_ned,
-                            "resolved_first_waypoint_ned": list(pts_to_publish[0]),
+                            "resolved_first_waypoint_ned": list(resolved_mission_pts[0]),
+                            "published_first_waypoint_ned": list(pts_to_publish[0]),
+                            "source_point_count": len(self._loaded_source_pts),
+                            "published_point_count": len(pts_to_publish),
+                            "final_local_pose_age_ms": final_local_pose_age_ms,
+                            **entry_evidence,
                             "point_count": len(pts_to_publish),
                             "spray_on_count": (
                                 sum(1 for flag in spray_flags_to_publish if flag)
@@ -376,10 +463,10 @@ class OffboardController:
                 # Publish the mission path before the OFFBOARD request so the
                 # 50 Hz setpoint stream carries mission setpoints, not just the
                 # streamer's zero-velocity bootstrap, when PX4 evaluates entry.
-                self._node.publish_path(
-                    pts_to_publish,
-                    spray_flags=spray_flags_to_publish,
-                )
+                publish_kwargs = {"spray_flags": spray_flags_to_publish}
+                if entry_evidence["entry_transit_added"]:
+                    publish_kwargs["runtime_entry"] = True
+                self._node.publish_path(pts_to_publish, **publish_kwargs)
 
                 # ── Arm ───────────────────────────────────────────────────────
                 self._state = MissionState.ARMING

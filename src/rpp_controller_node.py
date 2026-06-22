@@ -185,6 +185,8 @@ from mavros_msgs.msg import GPSRAW          # P0.3 RTK fix gate
 from nav_msgs.msg import Path
 from std_msgs.msg import Bool, Float32MultiArray, MultiArrayDimension, Float32
 
+from rpp_path_conditioning import split_leading_entry_transit
+
 
 # ---------------------------------------------------------------------------
 # Diagnostic state codes (published in /rpp/debug index 7)
@@ -639,13 +641,23 @@ class RPPControllerNode(Node):
             self.get_parameter("segment_corner_threshold_deg").value
         )
 
+        entry_run, profile_pts, profile_flags = split_leading_entry_transit(
+            raw_pts,
+            raw_flags,
+            marked=(
+                abs(msg.poses[0].pose.orientation.x - 1.0) < 1e-6
+                and abs(msg.poses[0].pose.orientation.w) < 1e-6
+            ),
+        )
+
         # Auto profile resolves PER RUN, not per path: a DXF mission mixes
         # line entities (segment tracking) and arc/circle entities (smooth
         # RPP) in one Path. Spray-flag transitions are the entity boundaries
         # the planner gives us, so each contiguous same-flag run is
         # classified and conditioned independently, then the runs are
         # tracked in sequence (see _apply_run/_advance_run). A forced
-        # profile keeps the whole path as a single run.
+        # profile keeps the mission path as a single run. A leading runtime
+        # entry transit remains separate so smoothing cannot bypass waypoint 0.
         if requested == "auto":
             connector_m = float(self.get_parameter("connector_absorb_m").value)
             connector_min_corner = float(
@@ -653,7 +665,7 @@ class RPPControllerNode(Node):
             )
             raw_runs = [
                 sub
-                for run in self._split_runs_by_flag(raw_pts, raw_flags)
+                for run in self._split_runs_by_flag(profile_pts, profile_flags)
                 for sub in self._split_run_at_corners(
                     *self._absorb_short_connectors(
                         *run, threshold, connector_m, connector_min_corner
@@ -666,7 +678,9 @@ class RPPControllerNode(Node):
             # so spray transitions do not create endpoint slowdown/reacquisition.
             raw_runs = self._merge_collinear_runs(raw_runs, threshold)
         else:
-            raw_runs = [(raw_pts, raw_flags)]
+            raw_runs = [(profile_pts, profile_flags)]
+        if entry_run is not None:
+            raw_runs.insert(0, entry_run)
 
         stamp = msg.header.stamp
         runs: list[dict] = []

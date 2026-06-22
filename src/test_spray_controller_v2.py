@@ -379,6 +379,20 @@ def test_duplicate_zero_length_segment_no_crash_and_fail_closed_when_unsafe():
     assert decision.safety_ok is False
 
 
+def test_runtime_entry_stays_off_until_original_mark_start():
+    model = _build_path_model(
+        points=[(-2.0, 0.0), (0.0, 0.0), (0.0, 0.0), (1.0, 0.0)],
+        flags=[False, False, True, True],
+    )
+
+    entry = _decision(model=model, nozzle_n=-1.0, nozzle_e=0.0, speed_mps=0.0)
+    boundary = _decision(model=model, nozzle_n=0.0, nozzle_e=0.0, speed_mps=0.0)
+
+    assert entry.geometry_desired is False
+    assert entry.desired is False
+    assert boundary.geometry_desired is True
+
+
 def test_full_distance_aware_tick_anticipatory_on_and_off():
     node = _make_distance_node(path_model=_straight_mark_path(), pose_n=0.91, speed=1.0)
     node._distance_aware_tick()

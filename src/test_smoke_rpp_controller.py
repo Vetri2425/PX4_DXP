@@ -447,6 +447,32 @@ def test_smoke():
         )
         print("PASS: collinear PRE→MARK boundary keeps full speed (no corner slowdown)")
 
+        # A MARK-first runtime entry uses a duplicate OFF->ON waypoint. Even a
+        # forced smooth profile must keep rover->waypoint0 as its own OFF run so
+        # corner smoothing cannot round away the original mission entry.
+        entry_msg = Path()
+        entry_msg.header.frame_id = "local_ned"
+        entry_msg.header.stamp = node.get_clock().now().to_msg()
+        entry_msg.poses = [
+            _make_path_pose(-2.0, 1.0, mark=False),
+            _make_path_pose(0.0, 0.0, mark=False),
+            _make_path_pose(0.0, 0.0, mark=True),
+            _make_path_pose(0.0, 2.0, mark=True),
+        ]
+        entry_msg.poses[0].pose.orientation.x = 1.0
+        entry_msg.poses[0].pose.orientation.w = 0.0
+        node.set_parameters([Parameter("tracking_profile", value="smooth")])
+        node._path_cb(entry_msg)
+        assert len(node._runs) == 2
+        assert [r["profile"] for r in node._runs] == ["smooth", "smooth"]
+        assert node._runs[0]["flags"] == [False, False]
+        assert all(node._runs[1]["flags"])
+        entry_end = node._runs[0]["poses"][-1].pose.position
+        mark_start = node._runs[1]["poses"][0].pose.position
+        assert (entry_end.x, entry_end.y) == (0.0, 0.0)
+        assert (mark_start.x, mark_start.y) == (0.0, 0.0)
+        print("PASS: forced smooth preserves separate OFF entry and original MARK start")
+
         # Real 90° in-run corner must still slow before the turn.
         node.set_parameters([Parameter("tracking_profile", value="segment")])
         square_msg = Path()

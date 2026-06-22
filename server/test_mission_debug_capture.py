@@ -120,6 +120,41 @@ def test_staged_json_is_copied_byte_for_byte(monkeypatch, tmp_path):
     assert session.manifest["mission"]["staged_artifact"]["sha256"] == recorder.sha256_file(staged)
 
 
+def test_runtime_entry_evidence_is_promoted_into_manifest(monkeypatch, tmp_path):
+    repo, _, _ = _configure_recorder(monkeypatch, tmp_path)
+    session = recorder.CaptureSession({
+        "capture_id": "capture-entry",
+        "source_name": "field.dxf",
+        "loaded_mission_id": "stg_entry",
+        "placement_mode": "GPS_SURVEYED",
+        "loaded_path": {"num_waypoints": 2, "num_mark": 2, "num_transit": 0},
+    })
+    session.prepare()
+    placement = {
+        "entry_transit_added": True,
+        "entry_start_ned": [10.0, 20.0],
+        "entry_target_ned": [1.0, 2.0],
+        "entry_distance_m": 19.2,
+        "resolved_first_waypoint_ned": [1.0, 2.0],
+        "published_first_waypoint_ned": [10.0, 20.0],
+        "source_point_count": 2,
+        "published_point_count": 4,
+        "point_count": 4,
+    }
+    atomic_json(
+        repo / "runtime" / "mission-debug" / "placement" / "capture-entry.json",
+        placement,
+    )
+
+    session.update_from_control()
+
+    assert session.manifest["placement"]["resolved_first_waypoint_ned"] == [1.0, 2.0]
+    assert session.manifest["placement"]["published_first_waypoint_ned"] == [10.0, 20.0]
+    assert session.manifest["placement"]["entry_transit_added"] is True
+    assert session.manifest["mission"]["source_point_count"] == 2
+    assert session.manifest["mission"]["published_point_count"] == 4
+
+
 def test_disk_low_preflight_refuses(monkeypatch, tmp_path):
     _configure_recorder(monkeypatch, tmp_path)
     usage = namedtuple("usage", "total used free")

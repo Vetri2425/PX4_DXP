@@ -937,6 +937,7 @@ class RosBridgeNode(Node):
         points: list[tuple[float, float]],
         frame_id: str = "local_ned",
         spray_flags: list[bool] | None = None,
+        runtime_entry: bool = False,
     ) -> None:
         """Publish nav_msgs/Path. Empty list → see publish_stop_path()."""
         if spray_flags is None:
@@ -954,13 +955,19 @@ class RosBridgeNode(Node):
         path = Path()
         path.header.stamp = self.get_clock().now().to_msg()
         path.header.frame_id = frame_id
-        for (n, e), spray in zip(points, flags):
+        for index, ((n, e), spray) in enumerate(zip(points, flags)):
             ps = PoseStamped()
             ps.header = path.header
             ps.pose.position.x = float(n)
             ps.pose.position.y = float(e)
             ps.pose.position.z = 1.0 if spray else 0.0
-            ps.pose.orientation.w = 1.0
+            if runtime_entry and index == 0:
+                # Explicit marker consumed only by RPP conditioning. Position z
+                # remains the spray channel, so the spray controller sees OFF.
+                ps.pose.orientation.x = 1.0
+                ps.pose.orientation.w = 0.0
+            else:
+                ps.pose.orientation.w = 1.0
             path.poses.append(ps)
         self._path_pub.publish(path)
         log.info(

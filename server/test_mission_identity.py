@@ -54,8 +54,10 @@ class FakeNode:
     def get_rpp_monitor(self):
         return FakeMonitor()
 
-    def publish_path(self, points, frame_id="local_ned", spray_flags=None):
-        self.calls.append(("publish_path", list(points), spray_flags))
+    def publish_path(
+        self, points, frame_id="local_ned", spray_flags=None, runtime_entry=False
+    ):
+        self.calls.append(("publish_path", list(points), spray_flags, runtime_entry))
 
     async def arm_async(self, arm):
         self.calls.append(("arm", arm))

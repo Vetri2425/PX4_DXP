@@ -376,9 +376,18 @@ class CaptureSession:
                 "rover_local_ned_at_resolution": None,
                 "survey_translation_ned": None,
                 "resolved_first_waypoint_ned": None,
+                "published_first_waypoint_ned": None,
+                "entry_transit_added": None,
+                "entry_start_ned": None,
+                "entry_target_ned": None,
+                "entry_distance_m": None,
+                "entry_target_original_spray_on": None,
+                "final_local_pose_age_ms": None,
             },
             "mission": {
                 "point_count": loaded.get("num_waypoints"),
+                "source_point_count": loaded.get("num_waypoints"),
+                "published_point_count": None,
                 "spray_on_count": loaded.get("num_mark"),
                 "spray_off_count": loaded.get("num_transit"),
                 "staged_artifact": staged_info,
@@ -563,7 +572,10 @@ class CaptureSession:
             for key in self.manifest["placement"]:
                 if key in placement:
                     self.manifest["placement"][key] = placement[key]
-            for key in ("point_count", "spray_on_count", "spray_off_count"):
+            for key in (
+                "point_count", "source_point_count", "published_point_count",
+                "spray_on_count", "spray_off_count",
+            ):
                 if key in placement:
                     self.manifest["mission"][key] = placement[key]
 
