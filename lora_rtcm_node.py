@@ -2,9 +2,11 @@
 """LoRa -> MAVROS RTK injection for PX4.
 
 Reads RTCM3 frames from a local serial LoRa module, validates CRC-24Q,
-and publishes them to /mavros/gps_rtk/send_rtcm.
-Auto-reconnects with exponential backoff on serial errors.
+and publishes them to /mavros/gps_rtk/send_rtcm.  Serial reconnect and
+MAVROS outage are recoverable without a new API start request.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -12,6 +14,7 @@ import os
 import signal
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import rclpy
@@ -20,40 +23,54 @@ from mavros_msgs.msg import RTCM
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
-# RTCM3 frame constants
-_RTCM3_PREAMBLE = 0xD3
-_RTCM3_HEADER_LEN = 3
-_RTCM3_CRC_LEN = 3
+from rtcm3_parser import (
+    Rtcm3StreamParser,
+    build_rtcm3_frame,
+    parse_allowed_message_types,
+    rtcm3_crc24q,
+)
+from rtk_transport import TransportRateTracker
 
-# CRC-24Q lookup table
-_CRC24Q_TABLE = [0] * 256
-for _i in range(256):
-    _crc = _i << 16
-    for _ in range(8):
-        _crc = ((_crc << 1) ^ 0x1864CFB) if (_crc & 0x800000) else (_crc << 1)
-        _crc &= 0xFFFFFF
-    _CRC24Q_TABLE[_i] = _crc
-
-
-def _rtcm3_crc(data: bytes, length: int) -> int:
-    crc = 0
-    for i in range(length):
-        crc = ((crc << 8) ^ _CRC24Q_TABLE[((crc >> 16) & 0xFF) ^ data[i]]) & 0xFFFFFF
-    return crc
+# Re-export for tests that import CRC helpers from this module.
+__all__ = ["LoraRtcmNode", "build_rtcm3_frame", "rtcm3_crc24q"]
 
 
 class LoraRtcmNode(Node):
-    """ROS2 node that streams RTCM3 corrections from serial LoRa to MAVROS.
+    """ROS2 node that streams validated RTCM3 corrections from serial LoRa."""
 
-    Reconnects automatically with exponential backoff on serial errors.
-    """
-
-    def __init__(self, serial_port: str, baudrate: int, status_file: str | None = None):
+    def __init__(
+        self,
+        serial_port: str,
+        baudrate: int,
+        *,
+        status_file: str | None = None,
+        session_id: str | None = None,
+        reconnect_interval_s: float = 5.0,
+        module_disconnect_timeout_s: float = 120.0,
+        max_frame_size: int = 1029,
+        max_bytes_per_sec: float = 65536.0,
+        max_frames_per_sec: float = 50.0,
+        allowed_message_types: str | None = None,
+        status_write_interval_s: float = 1.0,
+    ):
         super().__init__("lora_rtcm_node")
 
         self.serial_port = serial_port
         self.baudrate = baudrate
         self._status_file = Path(status_file) if status_file else None
+        self._session_id = session_id or uuid.uuid4().hex
+        self._process_id = os.getpid()
+        self._reconnect_interval_s = max(0.5, reconnect_interval_s)
+        self._module_disconnect_timeout_s = max(5.0, module_disconnect_timeout_s)
+        self._status_write_interval_s = max(0.25, status_write_interval_s)
+
+        self._parser = Rtcm3StreamParser(
+            max_frame_size=max_frame_size,
+            allowed_message_types=parse_allowed_message_types(allowed_message_types),
+            max_bytes_per_sec=max_bytes_per_sec,
+            max_frames_per_sec=max_frames_per_sec,
+        )
+        self._rate_tracker = TransportRateTracker()
 
         rtcm_qos = QoSProfile(
             depth=10,
@@ -64,41 +81,110 @@ class LoraRtcmNode(Node):
 
         self._stop_event = threading.Event()
         self._stats_lock = threading.Lock()
+        self._serial_open = False
         self._connected = False
-        self._frames = 0
-        self._bytes = 0
-        self._last_frame_wall_time = None
-        self._last_error = None
-        self._reconnect_count = 0
-        self._window_frames = 0
-        self._window_bytes = 0
+        self._lifecycle_state = "starting"
+        self._last_error: str | None = None
+        self._last_injected_frame_monotonic: float | None = None
+        self._serial_open_since_monotonic: float | None = None
+        self._serial_absent_since: float | None = None
+        self._bytes_injected = 0
+        self._dropped_no_subscriber = 0
+        self._dropped_publish_fail = 0
+        self._status_dirty = True
+        self._last_status_write = 0.0
+        self._shutting_down = False
+        self._status_timer = None
+        self._health_timer = None
 
-        self.create_timer(1.0, lambda: self._write_status("connected" if self._connected else "connecting"))
-        self.create_timer(30.0, self._check_health)
+        self._status_timer = self.create_timer(
+            self._status_write_interval_s,
+            self._maybe_write_status,
+        )
+        self._health_timer = self.create_timer(30.0, self._check_health)
 
-        self.get_logger().info(f"Starting LoRa RTK on {serial_port} @ {baudrate} baud")
+        self.get_logger().info(
+            f"Starting LoRa RTK session={self._session_id} on {serial_port} @ {baudrate}"
+        )
         self._write_status("starting")
 
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread = threading.Thread(target=self._run, daemon=True, name="lora-serial")
         self._thread.start()
 
-    def request_stop(self):
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    def request_stop(self) -> None:
         self._stop_event.set()
 
-    def _write_status(self, state: str):
-        if self._status_file is None:
-            return
+    def _injection_topic_ready(self) -> bool:
+        try:
+            return self.pub.get_subscription_count() > 0
+        except Exception:
+            return False
+
+    def _set_lifecycle(self, state: str, *, last_error: str | None = None) -> None:
         with self._stats_lock:
-            payload = {
+            self._lifecycle_state = state
+            if last_error is not None:
+                self._last_error = last_error
+            self._status_dirty = True
+
+    def _build_status_payload(self, state: str) -> dict:
+        with self._stats_lock:
+            stats = self._parser.snapshot_stats()
+            now = time.monotonic()
+            self._rate_tracker.sample(now, stats.valid_frames, stats.bytes_received)
+            dropped_total = (
+                stats.dropped_frames + self._dropped_no_subscriber + self._dropped_publish_fail
+            )
+            return {
+                "session_id": self._session_id,
+                "process_id": self._process_id,
                 "mode": "lora",
+                "lifecycle_state": state,
                 "state": state,
+                "serial_port": self.serial_port,
+                "baudrate": self.baudrate,
+                "serial_open": self._serial_open,
+                "serial_open_since_monotonic": self._serial_open_since_monotonic,
                 "connected": self._connected,
-                "frames": self._frames,
-                "bytes": self._bytes,
-                "last_frame_time": self._last_frame_wall_time,
+                "process_alive": True,
+                "valid_frames": stats.valid_frames,
+                "invalid_frames": stats.invalid_frames,
+                "crc_errors": stats.crc_errors,
+                "dropped_frames": dropped_total,
+                "dropped_no_subscriber": self._dropped_no_subscriber,
+                "bytes_received": stats.bytes_received,
+                "bytes_injected": self._bytes_injected,
+                "last_valid_frame_time": stats.last_valid_frame_monotonic,
+                "last_injected_frame_time": self._last_injected_frame_monotonic,
+                "valid_frame_rate_hz": self._rate_tracker.valid_frame_rate_hz,
+                "bytes_per_sec": self._rate_tracker.bytes_per_sec,
+                "injection_topic_ready": self._injection_topic_ready(),
                 "last_error": self._last_error,
                 "updated_at": time.time(),
+                "updated_at_monotonic": now,
             }
+
+    def _maybe_write_status(self) -> None:
+        if self._shutting_down:
+            return
+        if self._status_file is None:
+            return
+        if not self._status_dirty and (time.monotonic() - self._last_status_write) < self._status_write_interval_s:
+            return
+        self._write_status(self._lifecycle_state)
+
+    def _write_status(self, state: str) -> None:
+        if self._status_file is None:
+            return
+        payload = self._build_status_payload(state)
+        with self._stats_lock:
+            self._lifecycle_state = state
+            self._status_dirty = False
+            self._last_status_write = time.monotonic()
         tmp_path = self._status_file.with_suffix(".tmp")
         try:
             tmp_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
@@ -106,146 +192,143 @@ class LoraRtcmNode(Node):
         except Exception as exc:
             self.get_logger().debug(f"Failed to write status file: {exc}")
 
-    def _check_health(self):
-        with self._stats_lock:
-            frames = self._window_frames
-            bytess = self._window_bytes
-            self._window_frames = 0
-            self._window_bytes = 0
-            last = self._last_frame_wall_time
-
-        age = time.time() - last if last is not None else None
+    def _check_health(self) -> None:
+        if self._shutting_down:
+            return
+        stats = self._parser.snapshot_stats()
+        last = stats.last_valid_frame_monotonic
+        age = time.monotonic() - last if last is not None else None
         if age is None or age > 30.0:
             self.get_logger().warn(
                 f"No LoRa RTCM data for {age:.0f}s" if age is not None else "No LoRa RTCM data yet"
-                f" (reconnects: {self._reconnect_count})"
             )
         else:
             self.get_logger().info(
-                f"LoRa RTCM: {frames} frames, {bytess} bytes in last 30s"
-                f" (reconnects: {self._reconnect_count})"
+                f"LoRa RTCM: valid={stats.valid_frames} injected={self._bytes_injected}B"
             )
 
-    @staticmethod
-    def _parse_rtcm_frames(buf: bytes, logger=None):
-        """Extract complete, CRC-valid RTCM3 frames from a byte buffer."""
-        frames = []
-        i = 0
-        while i < len(buf):
-            if buf[i] != _RTCM3_PREAMBLE:
-                i += 1
+    def _publish_frames(self, frames: list[bytes]) -> None:
+        topic_ready = self._injection_topic_ready()
+        for frame in frames:
+            if not topic_ready:
+                with self._stats_lock:
+                    self._dropped_no_subscriber += 1
+                    self._status_dirty = True
                 continue
-
-            if i + _RTCM3_HEADER_LEN > len(buf):
-                break
-
-            length_field = (buf[i + 1] << 8) | buf[i + 2]
-            msg_len = length_field & 0x03FF
-            total_frame = _RTCM3_HEADER_LEN + msg_len + _RTCM3_CRC_LEN
-
-            if i + total_frame > len(buf):
-                break
-
-            frame = buf[i : i + total_frame]
-            payload_len = _RTCM3_HEADER_LEN + msg_len
-            expected_crc = (
-                (frame[payload_len] << 16)
-                | (frame[payload_len + 1] << 8)
-                | frame[payload_len + 2]
-            )
-            computed_crc = _rtcm3_crc(frame, payload_len)
-            if computed_crc != expected_crc:
-                if logger:
-                    logger.warn(
-                        f"RTCM3 CRC mismatch at offset {i}: "
-                        f"expected 0x{expected_crc:06X}, got 0x{computed_crc:06X}"
-                    )
-                i += 1
+            msg = RTCM()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.data = list(frame)
+            try:
+                self.pub.publish(msg)
+            except Exception as exc:
+                with self._stats_lock:
+                    self._dropped_publish_fail += 1
+                    self._last_error = str(exc)
+                    self._status_dirty = True
                 continue
+            with self._stats_lock:
+                # bytes_injected counts validated RTCM frame bytes handed to the
+                # ROS publisher when a subscriber was visible and publish()
+                # returned without raising. It cannot prove downstream
+                # MAVROS/PX4 receipt.
+                self._bytes_injected += len(frame)
+                self._last_injected_frame_monotonic = time.monotonic()
+                self._last_error = None
+                self._status_dirty = True
+            self._set_lifecycle("streaming")
 
-            frames.append(frame)
-            i += total_frame
-
-        return frames, buf[i:]
-
-    def _run(self):
-        attempt = 0
-
+    def _run(self) -> None:
         while not self._stop_event.is_set():
-            buf = b""
+            ser = None
             try:
                 self.get_logger().info(
                     f"Opening {self.serial_port} @ {self.baudrate} baud"
-                    + (f" (reconnect #{self._reconnect_count})" if self._reconnect_count else "")
                 )
-                with serial.Serial(self.serial_port, self.baudrate, timeout=1.0) as ser:
-                    with self._stats_lock:
-                        self._connected = True
-                        self._last_error = None
-                    self._write_status("connected")
-                    attempt = 0  # reset backoff on successful open
+                ser = serial.Serial(self.serial_port, self.baudrate, timeout=1.0)
+                with self._stats_lock:
+                    self._serial_open = True
+                    self._connected = True
+                    self._serial_open_since_monotonic = time.monotonic()
+                    self._serial_absent_since = None
+                    self._last_error = None
+                    self._status_dirty = True
+                self._set_lifecycle("connected")
 
-                    while not self._stop_event.is_set():
+                while not self._stop_event.is_set():
+                    try:
                         chunk = ser.read(1024)
-                        if not chunk:
-                            continue
+                    except serial.SerialException as exc:
+                        raise exc
+                    if not chunk:
+                        continue
 
-                        buf += chunk
-                        frames, buf = self._parse_rtcm_frames(buf, self.get_logger())
-                        for frame in frames:
-                            msg = RTCM()
-                            msg.header.stamp = self.get_clock().now().to_msg()
-                            msg.data = list(frame)
-                            self.pub.publish(msg)
-                            with self._stats_lock:
-                                self._frames += 1
-                                self._bytes += len(frame)
-                                self._window_frames += 1
-                                self._window_bytes += len(frame)
-                                self._last_frame_wall_time = time.time()
-                                self._last_error = None
-                            self._write_status("streaming")
+                    frames = self._parser.feed(chunk)
+                    if frames:
+                        self._publish_frames(frames)
+                    elif self._parser.snapshot_stats().valid_frames == 0:
+                        self._set_lifecycle("connected")
 
             except serial.SerialException as exc:
                 with self._stats_lock:
+                    self._serial_open = False
                     self._connected = False
+                    self._serial_open_since_monotonic = None
                     self._last_error = str(exc)
-                    self._reconnect_count += 1
-                self.get_logger().error(
-                    f"LoRa serial error: {exc} — reconnect #{self._reconnect_count}"
-                )
-                self._write_status("error")
+                    self._status_dirty = True
+                    if self._serial_absent_since is None:
+                        self._serial_absent_since = time.monotonic()
+                    absent_for = time.monotonic() - self._serial_absent_since
+                if absent_for >= self._module_disconnect_timeout_s:
+                    self._set_lifecycle("module_disconnected", last_error=str(exc))
+                else:
+                    self._set_lifecycle("reconnecting", last_error=str(exc))
+                self.get_logger().error(f"LoRa serial error: {exc}")
             except Exception as exc:
                 with self._stats_lock:
+                    self._serial_open = False
                     self._connected = False
+                    self._serial_open_since_monotonic = None
                     self._last_error = str(exc)
-                    self._reconnect_count += 1
-                self.get_logger().error(
-                    f"LoRa unexpected error: {exc} — reconnect #{self._reconnect_count}"
-                )
-                self._write_status("error")
-            else:
-                # Clean exit from inner loop — stop was requested
+                    self._status_dirty = True
+                self._set_lifecycle("reconnecting", last_error=str(exc))
+                self.get_logger().error(f"LoRa unexpected error: {exc}")
+            finally:
+                if ser is not None:
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
                 with self._stats_lock:
+                    self._serial_open = False
                     self._connected = False
-                break
+                    self._serial_open_since_monotonic = None
+                    self._status_dirty = True
 
             if self._stop_event.is_set():
                 break
 
-            # Exponential backoff: min(5 * 2^attempt, 60) seconds
-            backoff = min(5 * (2 ** attempt), 60)
-            attempt += 1
-            self.get_logger().info(f"Reconnecting LoRa in {backoff}s...")
-            self._write_status("reconnecting")
-            self._stop_event.wait(backoff)
+            self._set_lifecycle("reconnecting")
+            self._stop_event.wait(self._reconnect_interval_s)
 
-    def destroy_node(self):
+    def _destroy_timers(self) -> None:
+        for label, attr in (("status", "_status_timer"), ("health", "_health_timer")):
+            timer = getattr(self, attr, None)
+            if timer is None:
+                continue
+            try:
+                self.destroy_timer(timer)
+            except Exception as exc:
+                self.get_logger().debug(f"Failed to destroy {label} timer: {exc}")
+            setattr(self, attr, None)
+
+    def destroy_node(self) -> None:
+        self._shutting_down = True
         self.get_logger().info("Shutting down LoRa RTK node...")
-        self._write_status("stopping")
         self.request_stop()
-        if self._thread.is_alive():
-            self._thread.join(timeout=2)
+        thread = getattr(self, "_thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5)
+        self._destroy_timers()
         super().destroy_node()
 
 
@@ -253,9 +336,17 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="LoRa RTCM3 injector")
     parser.add_argument("--serial-port", required=True, help="Serial device, e.g. /dev/ttyUSB0")
     parser.add_argument("--baudrate", required=True, type=int, help="Serial baudrate, e.g. 115200")
+    parser.add_argument("--status-file", help="JSON status file for the FastAPI RTK manager")
+    parser.add_argument("--session-id", help="Session identity echoed in status reports")
+    parser.add_argument("--reconnect-interval-s", type=float, default=5.0)
+    parser.add_argument("--module-disconnect-timeout-s", type=float, default=120.0)
+    parser.add_argument("--max-frame-size", type=int, default=1029)
+    parser.add_argument("--max-bytes-per-sec", type=float, default=65536.0)
+    parser.add_argument("--max-frames-per-sec", type=float, default=50.0)
     parser.add_argument(
-        "--status-file",
-        help="Optional JSON status file for the FastAPI RTK manager",
+        "--allowed-message-types",
+        default="",
+        help="Comma-separated RTCM message types to allow; empty allows all",
     )
     return parser.parse_args(argv)
 
@@ -264,7 +355,18 @@ def main(argv=None):
     args = parse_args(argv)
 
     rclpy.init()
-    node = LoraRtcmNode(args.serial_port, args.baudrate, status_file=args.status_file)
+    node = LoraRtcmNode(
+        args.serial_port,
+        args.baudrate,
+        status_file=args.status_file,
+        session_id=args.session_id,
+        reconnect_interval_s=args.reconnect_interval_s,
+        module_disconnect_timeout_s=args.module_disconnect_timeout_s,
+        max_frame_size=args.max_frame_size,
+        max_bytes_per_sec=args.max_bytes_per_sec,
+        max_frames_per_sec=args.max_frames_per_sec,
+        allowed_message_types=args.allowed_message_types or None,
+    )
 
     def _handle_signal(signum, _frame):
         node.get_logger().info(f"Received signal {signum}; stopping LoRa node")

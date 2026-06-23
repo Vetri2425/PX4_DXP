@@ -135,6 +135,19 @@ BRIDGE_RECOVERY_COOLDOWN_S = 30.0   # suppress detection after a recovery (MAVRO
 # of px4-dxp (Phase 3B) only after detection is validated in the field.
 BRIDGE_AUTO_RECOVER = os.environ.get("ROVER_BRIDGE_AUTO_RECOVER", "0") == "1"
 
+# ── LoRa RTK transport (Task_03) ─────────────────────────────────────────────
+LORA_NO_DATA_WARN_S = float(os.environ.get("LORA_NO_DATA_WARN_S", "15.0"))
+LORA_NO_DATA_FAIL_S = float(os.environ.get("LORA_NO_DATA_FAIL_S", "60.0"))
+LORA_RECONNECT_INTERVAL_S = float(os.environ.get("LORA_RECONNECT_INTERVAL_S", "5.0"))
+LORA_MAX_RESTARTS_PER_MIN = int(os.environ.get("LORA_MAX_RESTARTS_PER_MIN", "5"))
+LORA_MODULE_DISCONNECT_TIMEOUT_S = float(
+    os.environ.get("LORA_MODULE_DISCONNECT_TIMEOUT_S", "120.0")
+)
+LORA_MAX_FRAME_SIZE = int(os.environ.get("LORA_MAX_FRAME_SIZE", "1029"))
+LORA_MAX_BYTES_PER_SEC = float(os.environ.get("LORA_MAX_BYTES_PER_SEC", "65536"))
+LORA_MAX_FRAMES_PER_SEC = float(os.environ.get("LORA_MAX_FRAMES_PER_SEC", "50"))
+LORA_ALLOWED_MESSAGE_TYPES = os.environ.get("LORA_ALLOWED_MESSAGE_TYPES", "").strip()
+
 # ── Auth ──────────────────────────────────────────────────────────────────────
 TOKEN_FILE_DEFAULT = os.environ.get(
     "ROVER_TOKEN_FILE",

@@ -150,7 +150,12 @@ async def lifespan(app: FastAPI):
     emergency_handler = EmergencyHandler(
         ros_node, offboard_ctrl, activity_log, mission_capture
     )
-    rtk_manager = AsyncRTKManager()
+    def _rtk_navigation_state() -> dict:
+        if ros_node is None:
+            return {}
+        return ros_node.get_state()
+
+    rtk_manager = AsyncRTKManager(navigation_provider=_rtk_navigation_state)
 
     # ── Register Socket.IO handlers ───────────────────────────────────────────
     from sockets.events import register_handlers
@@ -197,7 +202,7 @@ async def lifespan(app: FastAPI):
 
     if rtk_manager is not None:
         try:
-            await rtk_manager.stop_all()
+            await rtk_manager.shutdown()
         except Exception:
             log.exception("RTK manager stop raised")
 

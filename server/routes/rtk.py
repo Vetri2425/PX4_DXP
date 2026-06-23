@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from auth import require_token
-from rtk_manager import RTKProcessError
+from rtk_manager import RTKConflictError, RTKProcessError, RTKValidationError
 
 router = APIRouter(prefix="/rtk", tags=["rtk"], dependencies=[Depends(require_token)])
 
@@ -27,6 +27,7 @@ class LoraStartRequest(BaseModel):
 
 
 class RTKStatusResponse(BaseModel):
+    # Backward-compatible fields
     mode: str
     pid: int | None
     running: bool
@@ -36,6 +37,36 @@ class RTKStatusResponse(BaseModel):
     bytes: int
     last_frame_age_s: float | None
     last_error: str | None
+
+    # Task_03 fields
+    active_source: str | None = None
+    desired_source: str | None = None
+    lifecycle_state: str = "IDLE"
+    serial_port: str | None = None
+    baudrate: int | None = None
+    session_started_at: str | None = None
+    process_alive: bool = False
+    serial_open: bool = False
+    reconnecting: bool = False
+    restart_count: int = 0
+    valid_frames: int = 0
+    invalid_frames: int = 0
+    crc_error_count: int = 0
+    dropped_frames: int = 0
+    bytes_received: int = 0
+    bytes_injected: int = 0
+    last_valid_rtcm_age_s: float | None = None
+    valid_frame_rate_hz: float | None = None
+    bytes_per_sec: float | None = None
+    injection_topic_ready: bool | None = None
+    stream_healthy: bool | None = None
+    transport_reason: str | None = None
+    stop_reason: str | None = None
+    gps_fix_type: int | None = None
+    rtk_fixed: bool | None = None
+    rtk_float: bool | None = None
+    pose_age_s: float | None = None
+    rpp_rtk_wait: bool | None = None
 
 
 def _now() -> str:
@@ -59,6 +90,34 @@ def _status_response(status) -> RTKStatusResponse:
         bytes=status.bytes,
         last_frame_age_s=status.last_frame_age_s,
         last_error=status.last_error,
+        active_source=status.active_source,
+        desired_source=status.desired_source,
+        lifecycle_state=status.lifecycle_state,
+        serial_port=status.serial_port,
+        baudrate=status.baudrate,
+        session_started_at=status.session_started_at,
+        process_alive=status.process_alive,
+        serial_open=status.serial_open,
+        reconnecting=status.reconnecting,
+        restart_count=status.restart_count,
+        valid_frames=status.valid_frames,
+        invalid_frames=status.invalid_frames,
+        crc_error_count=status.crc_error_count,
+        dropped_frames=status.dropped_frames,
+        bytes_received=status.bytes_received,
+        bytes_injected=status.bytes_injected,
+        last_valid_rtcm_age_s=status.last_valid_rtcm_age_s,
+        valid_frame_rate_hz=status.valid_frame_rate_hz,
+        bytes_per_sec=status.bytes_per_sec,
+        injection_topic_ready=status.injection_topic_ready,
+        stream_healthy=status.stream_healthy,
+        transport_reason=status.transport_reason,
+        stop_reason=status.stop_reason,
+        gps_fix_type=status.gps_fix_type,
+        rtk_fixed=status.rtk_fixed,
+        rtk_float=status.rtk_float,
+        pose_age_s=status.pose_age_s,
+        rpp_rtk_wait=status.rpp_rtk_wait,
     )
 
 
@@ -80,9 +139,12 @@ async def start_ntrip(req: NtripStartRequest):
             user=req.user,
             password=req.password,
         )
+    except RTKConflictError as exc:
+        _record("error", f"NTRIP RTK start conflict: {exc}")
+        raise HTTPException(409, str(exc)) from exc
     except RTKProcessError as exc:
         _record("error", f"NTRIP RTK start failed: {exc}")
-        raise HTTPException(500, str(exc)) from exc
+        raise HTTPException(503, str(exc)) from exc
 
     _record("info", f"NTRIP RTK started pid={status.pid}")
     return _status_response(status)
@@ -95,11 +157,24 @@ async def start_lora(req: LoraStartRequest):
             baudrate=req.baudrate,
             serial_port=req.serial_port,
         )
+    except RTKValidationError as exc:
+        _record("error", f"LoRa RTK start invalid: {exc}")
+        raise HTTPException(422, str(exc)) from exc
+    except RTKConflictError as exc:
+        _record("error", f"LoRa RTK start conflict: {exc}")
+        raise HTTPException(409, str(exc)) from exc
     except RTKProcessError as exc:
         _record("error", f"LoRa RTK start failed: {exc}")
-        raise HTTPException(500, str(exc)) from exc
+        raise HTTPException(503, str(exc)) from exc
 
-    _record("info", f"LoRa RTK started pid={status.pid}")
+    _record("info", f"LoRa RTK started desired_source=lora pid={status.pid}")
+    return _status_response(status)
+
+
+@router.post("/lora/stop", response_model=RTKStatusResponse)
+async def stop_lora():
+    status = await _manager().stop_lora(reason="user_stop")
+    _record("info", "LoRa RTK stopped by user")
     return _status_response(status)
 
 
