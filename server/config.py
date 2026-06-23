@@ -148,6 +148,59 @@ LORA_MAX_BYTES_PER_SEC = float(os.environ.get("LORA_MAX_BYTES_PER_SEC", "65536")
 LORA_MAX_FRAMES_PER_SEC = float(os.environ.get("LORA_MAX_FRAMES_PER_SEC", "50"))
 LORA_ALLOWED_MESSAGE_TYPES = os.environ.get("LORA_ALLOWED_MESSAGE_TYPES", "").strip()
 
+# ── NTRIP RTK transport (Task_03.1) ─────────────────────────────────────────
+NTRIP_CONNECT_TIMEOUT_S = float(os.environ.get("NTRIP_CONNECT_TIMEOUT_S", "10.0"))
+NTRIP_RECV_TIMEOUT_S = float(os.environ.get("NTRIP_RECV_TIMEOUT_S", "12.0"))
+NTRIP_NO_RTCM_WARN_S = float(os.environ.get("NTRIP_NO_RTCM_WARN_S", "15.0"))
+NTRIP_NO_RTCM_RECONNECT_S = float(os.environ.get("NTRIP_NO_RTCM_RECONNECT_S", "45.0"))
+NTRIP_RECONNECT_INITIAL_S = float(os.environ.get("NTRIP_RECONNECT_INITIAL_S", "2.0"))
+NTRIP_RECONNECT_MAX_S = float(os.environ.get("NTRIP_RECONNECT_MAX_S", "30.0"))
+NTRIP_RECONNECT_JITTER_FRAC = float(os.environ.get("NTRIP_RECONNECT_JITTER_FRAC", "0.2"))
+NTRIP_PUBLISH_ERROR_UNHEALTHY_THRESHOLD = int(
+    os.environ.get("NTRIP_PUBLISH_ERROR_UNHEALTHY_THRESHOLD", "5")
+)
+NTRIP_MAX_RESTARTS_PER_MIN = int(os.environ.get("NTRIP_MAX_RESTARTS_PER_MIN", "5"))
+NTRIP_RESTART_COOLDOWN_S = float(os.environ.get("NTRIP_RESTART_COOLDOWN_S", "60.0"))
+NTRIP_SUPERVISOR_RESTART_DELAY_S = float(
+    os.environ.get("NTRIP_SUPERVISOR_RESTART_DELAY_S", "2.0")
+)
+# Dedicated child exit code for confirmed caster authentication rejection.
+NTRIP_AUTH_EXIT_CODE = 2
+
+
+def _validate_ntrip_config() -> None:
+    # Boot-critical: this runs at import time, so an invalid NTRIP_* environment
+    # value (e.g. NTRIP_NO_RTCM_RECONNECT_S <= NTRIP_NO_RTCM_WARN_S) raises here
+    # and prevents the entire server from starting — fail-fast by design, so a
+    # misconfigured deployment is caught loudly rather than silently degrading
+    # RTK self-healing. Validate NTRIP_* overrides before deploying a drop-in.
+    errors: list[str] = []
+    if NTRIP_CONNECT_TIMEOUT_S <= 0:
+        errors.append("NTRIP_CONNECT_TIMEOUT_S must be > 0")
+    if NTRIP_RECV_TIMEOUT_S <= 0:
+        errors.append("NTRIP_RECV_TIMEOUT_S must be > 0")
+    if NTRIP_NO_RTCM_WARN_S <= 0:
+        errors.append("NTRIP_NO_RTCM_WARN_S must be > 0")
+    if NTRIP_NO_RTCM_RECONNECT_S <= NTRIP_NO_RTCM_WARN_S:
+        errors.append("NTRIP_NO_RTCM_RECONNECT_S must be > NTRIP_NO_RTCM_WARN_S")
+    if NTRIP_RECONNECT_MAX_S < NTRIP_RECONNECT_INITIAL_S:
+        errors.append("NTRIP_RECONNECT_MAX_S must be >= NTRIP_RECONNECT_INITIAL_S")
+    if not (0.0 <= NTRIP_RECONNECT_JITTER_FRAC <= 0.5):
+        errors.append("NTRIP_RECONNECT_JITTER_FRAC must be between 0.0 and 0.5")
+    if NTRIP_PUBLISH_ERROR_UNHEALTHY_THRESHOLD < 1:
+        errors.append("NTRIP_PUBLISH_ERROR_UNHEALTHY_THRESHOLD must be >= 1")
+    if NTRIP_MAX_RESTARTS_PER_MIN < 1:
+        errors.append("NTRIP_MAX_RESTARTS_PER_MIN must be >= 1")
+    if NTRIP_RESTART_COOLDOWN_S <= 0:
+        errors.append("NTRIP_RESTART_COOLDOWN_S must be > 0")
+    if NTRIP_SUPERVISOR_RESTART_DELAY_S < 0:
+        errors.append("NTRIP_SUPERVISOR_RESTART_DELAY_S must be >= 0")
+    if errors:
+        raise ValueError("Invalid NTRIP configuration: " + "; ".join(errors))
+
+
+_validate_ntrip_config()
+
 # ── Auth ──────────────────────────────────────────────────────────────────────
 TOKEN_FILE_DEFAULT = os.environ.get(
     "ROVER_TOKEN_FILE",

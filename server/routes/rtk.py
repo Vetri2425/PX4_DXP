@@ -67,6 +67,20 @@ class RTKStatusResponse(BaseModel):
     rtk_float: bool | None = None
     pose_age_s: float | None = None
     rpp_rtk_wait: bool | None = None
+    user_requested: bool | None = None
+    host: str | None = None
+    port: int | None = None
+    mountpoint: str | None = None
+    username: str | None = None
+    connected: bool | None = None
+    last_exit_code: int | None = None
+    last_process_error: str | None = None
+    publish_error_count: int = 0
+    injection_healthy: bool | None = None
+    valid_rtcm_bytes: int = 0
+    frames_published: int = 0
+    invalid_scan_events: int = 0
+    dropped_complete_frames: int = 0
 
 
 def _now() -> str:
@@ -118,6 +132,20 @@ def _status_response(status) -> RTKStatusResponse:
         rtk_float=status.rtk_float,
         pose_age_s=status.pose_age_s,
         rpp_rtk_wait=status.rpp_rtk_wait,
+        user_requested=status.user_requested,
+        host=status.host,
+        port=status.port,
+        mountpoint=status.mountpoint,
+        username=status.username,
+        connected=status.connected,
+        last_exit_code=status.last_exit_code,
+        last_process_error=status.last_process_error,
+        publish_error_count=status.publish_error_count,
+        injection_healthy=status.injection_healthy,
+        valid_rtcm_bytes=status.valid_rtcm_bytes,
+        frames_published=status.frames_published,
+        invalid_scan_events=status.invalid_scan_events,
+        dropped_complete_frames=status.dropped_complete_frames,
     )
 
 
@@ -139,6 +167,9 @@ async def start_ntrip(req: NtripStartRequest):
             user=req.user,
             password=req.password,
         )
+    except RTKValidationError as exc:
+        _record("error", f"NTRIP RTK start invalid: {exc}")
+        raise HTTPException(422, str(exc)) from exc
     except RTKConflictError as exc:
         _record("error", f"NTRIP RTK start conflict: {exc}")
         raise HTTPException(409, str(exc)) from exc

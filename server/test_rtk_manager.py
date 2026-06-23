@@ -13,10 +13,18 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config import LORA_MAX_RESTARTS_PER_MIN, LORA_NO_DATA_FAIL_S, LORA_NO_DATA_WARN_S
+from config import (
+    LORA_MAX_RESTARTS_PER_MIN,
+    LORA_NO_DATA_FAIL_S,
+    LORA_NO_DATA_WARN_S,
+    NTRIP_AUTH_EXIT_CODE,
+    NTRIP_MAX_RESTARTS_PER_MIN,
+    NTRIP_RESTART_COOLDOWN_S,
+)
 from rtk_manager import (
     AsyncRTKManager,
     LoRaLifecycleState,
+    NtripLifecycleState,
     RTKConflictError,
     RTKProcessError,
     RTKValidationError,
@@ -34,6 +42,17 @@ class FakeClock:
         self.t += dt
 
 
+class FakeStdin:
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+    def write(self, _data: bytes) -> None:
+        return None
+
+
 class FakeProcess:
     def __init__(self, pid: int = 4242):
         self.pid = pid
@@ -41,7 +60,7 @@ class FakeProcess:
         self._waiters: list[asyncio.Future] = []
         self.terminated = False
         self.killed = False
-        self.stdin = None
+        self.stdin = FakeStdin()
 
     def terminate(self) -> None:
         self.terminated = True
@@ -695,3 +714,515 @@ async def test_shutdown_stops_without_restart(repo_root, monkeypatch):
     assert status.desired_source is None
     assert manager._supervisor_task is None  # noqa: SLF001
     assert _pending_rtk_tasks() == []
+
+
+@pytest.mark.anyio
+async def test_ntrip_start_sets_session(repo_root, monkeypatch):
+    clock = FakeClock()
+    manager = AsyncRTKManager(
+        lora_script=repo_root / "lora_rtcm_node.py",
+        ntrip_script=repo_root / "ntrip_rtcm_node.py",
+        clock=clock,
+    )
+    proc = FakeProcess()
+
+    async def fake_exec(*_cmd, **_kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    status = await manager.start_ntrip(
+        host="caster.example.com",
+        port=2101,
+        mountpoint="MOUNT",
+        user="rover",
+        password="secret-pass",
+    )
+    assert status.desired_source == "ntrip"
+    assert status.user_requested is True
+    assert status.host == "caster.example.com"
+    assert status.lifecycle_state == NtripLifecycleState.STARTING.value
+    assert "secret-pass" not in str(status)
+
+
+@pytest.mark.anyio
+async def test_ntrip_user_stop_disables_restart(repo_root, monkeypatch):
+    import rtk_manager as rtk_manager_module
+
+    monkeypatch.setattr(rtk_manager_module, "NTRIP_SUPERVISOR_RESTART_DELAY_S", 0.1)
+    clock = FakeClock()
+    manager = AsyncRTKManager(
+        lora_script=repo_root / "lora_rtcm_node.py",
+        ntrip_script=repo_root / "ntrip_rtcm_node.py",
+        clock=clock,
+        startup_grace_s=0.01,
+    )
+    calls = {"n": 0}
+
+    async def fake_exec(*_cmd, **_kwargs):
+        calls["n"] += 1
+        return FakeProcess(pid=9000 + calls["n"])
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await manager.start_ntrip(
+        host="caster",
+        port=2101,
+        mountpoint="MP",
+        user="u",
+        password="p",
+    )
+    manager._process.exit(1)  # noqa: SLF001
+    await asyncio.sleep(0.6)
+    await manager.stop_all()
+    await asyncio.sleep(0.3)
+    assert calls["n"] == 1
+
+
+@pytest.mark.anyio
+async def test_ntrip_crash_restarts_while_user_requested(repo_root, monkeypatch):
+    import rtk_manager as rtk_manager_module
+
+    monkeypatch.setattr(rtk_manager_module, "NTRIP_SUPERVISOR_RESTART_DELAY_S", 0.1)
+    clock = FakeClock()
+    manager = AsyncRTKManager(
+        lora_script=repo_root / "lora_rtcm_node.py",
+        ntrip_script=repo_root / "ntrip_rtcm_node.py",
+        clock=clock,
+        startup_grace_s=0.01,
+    )
+    procs: list[FakeProcess] = []
+
+    async def fake_exec(*_cmd, **_kwargs):
+        p = FakeProcess(pid=9100 + len(procs))
+        procs.append(p)
+        return p
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await manager.start_ntrip(
+        host="caster",
+        port=2101,
+        mountpoint="MP",
+        user="u",
+        password="p",
+    )
+    procs[0].exit(1)
+    await asyncio.sleep(1.2)
+    status = await manager.status()
+    assert status.desired_source == "ntrip"
+    assert status.restart_count >= 1
+    assert len(procs) >= 2
+
+
+@pytest.mark.anyio
+async def test_ntrip_auth_exit_no_restart(repo_root, monkeypatch):
+    clock = FakeClock()
+    manager = AsyncRTKManager(
+        lora_script=repo_root / "lora_rtcm_node.py",
+        ntrip_script=repo_root / "ntrip_rtcm_node.py",
+        clock=clock,
+        startup_grace_s=0.01,
+    )
+    proc = FakeProcess(pid=9200)
+    calls = {"n": 0}
+
+    async def fake_exec(*_cmd, **_kwargs):
+        calls["n"] += 1
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await manager.start_ntrip(
+        host="caster",
+        port=2101,
+        mountpoint="MP",
+        user="u",
+        password="bad",
+    )
+    proc.exit(NTRIP_AUTH_EXIT_CODE)
+    await manager.status()
+    await asyncio.sleep(1.0)
+    assert calls["n"] == 1
+    status = await manager.status()
+    assert status.lifecycle_state == NtripLifecycleState.AUTH_FAILED.value
+    assert status.restart_count == 0
+
+
+@pytest.mark.anyio
+async def test_ntrip_restart_throttle_enters_cooldown(repo_root, monkeypatch):
+    clock = FakeClock()
+    manager = AsyncRTKManager(
+        lora_script=repo_root / "lora_rtcm_node.py",
+        ntrip_script=repo_root / "ntrip_rtcm_node.py",
+        clock=clock,
+        startup_grace_s=0.01,
+    )
+    proc = FakeProcess(pid=9300)
+
+    async def fake_exec(*_cmd, **_kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await manager.start_ntrip(
+        host="caster",
+        port=2101,
+        mountpoint="MP",
+        user="u",
+        password="p",
+    )
+    session = manager._ntrip_session  # noqa: SLF001
+    for _ in range(NTRIP_MAX_RESTARTS_PER_MIN):
+        session.restart_timestamps.append(clock())
+        clock.advance(0.1)
+    assert manager._can_restart_ntrip_locked(session) is False  # noqa: SLF001
+    assert session.lifecycle_state == NtripLifecycleState.FAILED
+    assert session.transport_reason == "restart_throttled"
+    assert session.restart_cooldown_until == pytest.approx(
+        clock() + NTRIP_RESTART_COOLDOWN_S
+    )
+
+
+@pytest.mark.anyio
+async def test_ntrip_child_status_metrics(repo_root, monkeypatch):
+    clock = FakeClock()
+    manager = AsyncRTKManager(
+        lora_script=repo_root / "lora_rtcm_node.py",
+        ntrip_script=repo_root / "ntrip_rtcm_node.py",
+        clock=clock,
+    )
+    proc = FakeProcess()
+
+    async def fake_exec(*_cmd, **_kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await manager.start_ntrip(
+        host="caster",
+        port=2101,
+        mountpoint="MP",
+        user="u",
+        password="p",
+    )
+    _write_child_status(
+        manager._status_file,  # noqa: SLF001
+        manager._ntrip_session.session_id,  # noqa: SLF001
+        proc.pid,
+        clock=clock,
+        mode="ntrip",
+        lifecycle_state="streaming_valid_rtcm",
+        state="streaming_valid_rtcm",
+        connected=True,
+        last_valid_rtcm_age_s=0.5,
+        valid_frame_rate_hz=1.2,
+        bytes_per_sec=200.0,
+        publish_error_count=0,
+        injection_healthy=True,
+        invalid_scan_events=2,
+        dropped_complete_frames=1,
+        valid_rtcm_bytes=500,
+        frames_published=4,
+    )
+    status = await manager.status()
+    assert status.lifecycle_state == NtripLifecycleState.STREAMING_VALID_RTCM.value
+    assert status.last_valid_rtcm_age_s == 0.5
+    assert status.valid_frame_rate_hz == 1.2
+    assert status.invalid_scan_events == 2
+
+
+@pytest.mark.anyio
+async def test_ntrip_start_sets_session(repo_root, monkeypatch):
+    clock = FakeClock()
+    manager = AsyncRTKManager(
+        lora_script=repo_root / "lora_rtcm_node.py",
+        ntrip_script=repo_root / "ntrip_rtcm_node.py",
+        clock=clock,
+    )
+    proc = FakeProcess()
+
+    async def fake_exec(*_cmd, **_kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    status = await manager.start_ntrip(
+        host="caster.example.com",
+        port=2101,
+        mountpoint="MOUNT",
+        user="rover",
+        password="secret-pass",
+    )
+    assert status.desired_source == "ntrip"
+    assert status.user_requested is True
+    assert status.host == "caster.example.com"
+    assert status.lifecycle_state == NtripLifecycleState.STARTING.value
+    assert "secret-pass" not in str(status)
+
+
+@pytest.mark.anyio
+async def test_ntrip_user_stop_disables_restart(repo_root, monkeypatch):
+    import rtk_manager as rtk_manager_module
+
+    monkeypatch.setattr(rtk_manager_module, "NTRIP_SUPERVISOR_RESTART_DELAY_S", 0.1)
+    clock = FakeClock()
+    manager = AsyncRTKManager(
+        lora_script=repo_root / "lora_rtcm_node.py",
+        ntrip_script=repo_root / "ntrip_rtcm_node.py",
+        clock=clock,
+        startup_grace_s=0.01,
+    )
+    calls = {"n": 0}
+
+    async def fake_exec(*_cmd, **_kwargs):
+        calls["n"] += 1
+        return FakeProcess(pid=9000 + calls["n"])
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await manager.start_ntrip(
+        host="caster",
+        port=2101,
+        mountpoint="MP",
+        user="u",
+        password="p",
+    )
+    manager._process.exit(1)  # noqa: SLF001
+    await asyncio.sleep(0.6)
+    await manager.stop_all()
+    await asyncio.sleep(0.3)
+    assert calls["n"] == 1
+
+
+@pytest.mark.anyio
+async def test_ntrip_crash_restarts_while_user_requested(repo_root, monkeypatch):
+    import rtk_manager as rtk_manager_module
+
+    monkeypatch.setattr(rtk_manager_module, "NTRIP_SUPERVISOR_RESTART_DELAY_S", 0.1)
+    clock = FakeClock()
+    manager = AsyncRTKManager(
+        lora_script=repo_root / "lora_rtcm_node.py",
+        ntrip_script=repo_root / "ntrip_rtcm_node.py",
+        clock=clock,
+        startup_grace_s=0.01,
+    )
+    procs: list[FakeProcess] = []
+
+    async def fake_exec(*_cmd, **_kwargs):
+        p = FakeProcess(pid=9100 + len(procs))
+        procs.append(p)
+        return p
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await manager.start_ntrip(
+        host="caster",
+        port=2101,
+        mountpoint="MP",
+        user="u",
+        password="p",
+    )
+    procs[0].exit(1)
+    await asyncio.sleep(1.2)
+    status = await manager.status()
+    assert status.desired_source == "ntrip"
+    assert status.restart_count >= 1
+    assert len(procs) >= 2
+
+
+@pytest.mark.anyio
+async def test_ntrip_auth_exit_no_restart(repo_root, monkeypatch):
+    clock = FakeClock()
+    manager = AsyncRTKManager(
+        lora_script=repo_root / "lora_rtcm_node.py",
+        ntrip_script=repo_root / "ntrip_rtcm_node.py",
+        clock=clock,
+        startup_grace_s=0.01,
+    )
+    proc = FakeProcess(pid=9200)
+    calls = {"n": 0}
+
+    async def fake_exec(*_cmd, **_kwargs):
+        calls["n"] += 1
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await manager.start_ntrip(
+        host="caster",
+        port=2101,
+        mountpoint="MP",
+        user="u",
+        password="bad",
+    )
+    proc.exit(NTRIP_AUTH_EXIT_CODE)
+    await manager.status()
+    await asyncio.sleep(1.0)
+    assert calls["n"] == 1
+    status = await manager.status()
+    assert status.lifecycle_state == NtripLifecycleState.AUTH_FAILED.value
+    assert status.restart_count == 0
+
+
+@pytest.mark.anyio
+async def test_ntrip_restart_throttle_enters_cooldown(repo_root, monkeypatch):
+    clock = FakeClock()
+    manager = AsyncRTKManager(
+        lora_script=repo_root / "lora_rtcm_node.py",
+        ntrip_script=repo_root / "ntrip_rtcm_node.py",
+        clock=clock,
+        startup_grace_s=0.01,
+    )
+    proc = FakeProcess(pid=9300)
+
+    async def fake_exec(*_cmd, **_kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await manager.start_ntrip(
+        host="caster",
+        port=2101,
+        mountpoint="MP",
+        user="u",
+        password="p",
+    )
+    session = manager._ntrip_session  # noqa: SLF001
+    for _ in range(NTRIP_MAX_RESTARTS_PER_MIN):
+        session.restart_timestamps.append(clock())
+        clock.advance(0.1)
+    assert manager._can_restart_ntrip_locked(session) is False  # noqa: SLF001
+    assert session.lifecycle_state == NtripLifecycleState.FAILED
+    assert session.transport_reason == "restart_throttled"
+    assert session.restart_cooldown_until == pytest.approx(
+        clock() + NTRIP_RESTART_COOLDOWN_S
+    )
+
+
+@pytest.mark.anyio
+async def test_ntrip_child_status_metrics(repo_root, monkeypatch):
+    clock = FakeClock()
+    manager = AsyncRTKManager(
+        lora_script=repo_root / "lora_rtcm_node.py",
+        ntrip_script=repo_root / "ntrip_rtcm_node.py",
+        clock=clock,
+    )
+    proc = FakeProcess()
+
+    async def fake_exec(*_cmd, **_kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await manager.start_ntrip(
+        host="caster",
+        port=2101,
+        mountpoint="MP",
+        user="u",
+        password="p",
+    )
+    _write_child_status(
+        manager._status_file,  # noqa: SLF001
+        manager._ntrip_session.session_id,  # noqa: SLF001
+        proc.pid,
+        clock=clock,
+        mode="ntrip",
+        lifecycle_state="streaming_valid_rtcm",
+        state="streaming_valid_rtcm",
+        connected=True,
+        last_valid_rtcm_age_s=0.5,
+        valid_frame_rate_hz=1.2,
+        bytes_per_sec=200.0,
+        publish_error_count=0,
+        injection_healthy=True,
+        invalid_scan_events=2,
+        dropped_complete_frames=1,
+        valid_rtcm_bytes=500,
+        frames_published=4,
+    )
+    status = await manager.status()
+    assert status.lifecycle_state == NtripLifecycleState.STREAMING_VALID_RTCM.value
+    assert status.last_valid_rtcm_age_s == 0.5
+    assert status.valid_frame_rate_hz == 1.2
+    assert status.invalid_scan_events == 2
+    assert status.password if hasattr(status, "password") else True
+
+@pytest.mark.anyio
+async def test_ntrip_auth_exit_after_grace_terminal_without_status_poll(
+    repo_root, monkeypatch
+):
+    """Regression: an auth rejection that surfaces AFTER the startup grace must
+    become terminal via the supervisor alone — no /api/rtk/status poll required.
+    Previously the exit-code -> AUTH_FAILED reaping lived only in status(), so an
+    unpolled auth failure restart-looped 5x/min forever."""
+    import rtk_manager as rtk_manager_module
+
+    monkeypatch.setattr(rtk_manager_module, "NTRIP_SUPERVISOR_RESTART_DELAY_S", 0.1)
+    clock = FakeClock()
+    manager = AsyncRTKManager(
+        lora_script=repo_root / "lora_rtcm_node.py",
+        ntrip_script=repo_root / "ntrip_rtcm_node.py",
+        clock=clock,
+        startup_grace_s=0.01,
+    )
+    procs: list[FakeProcess] = []
+
+    async def fake_exec(*_cmd, **_kwargs):
+        p = FakeProcess(pid=9400 + len(procs))
+        procs.append(p)
+        return p
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await manager.start_ntrip(
+        host="caster",
+        port=2101,
+        mountpoint="MP",
+        user="u",
+        password="bad",
+    )
+    # Exit with the auth code AFTER the startup grace already elapsed, and never
+    # call status() before the supervisor processes the exit.
+    procs[0].exit(NTRIP_AUTH_EXIT_CODE)
+    await asyncio.sleep(1.2)
+
+    session = manager._ntrip_session  # noqa: SLF001
+    assert session.lifecycle_state == NtripLifecycleState.AUTH_FAILED
+    assert session.reconnect_enabled is False
+    assert session.restart_count == 0
+    assert session.last_exit_code == NTRIP_AUTH_EXIT_CODE
+    assert len(procs) == 1  # supervisor never relaunched the auth-failing child
+
+    # The reported status agrees once polled, and still no relaunch.
+    status = await manager.status()
+    assert status.lifecycle_state == NtripLifecycleState.AUTH_FAILED.value
+    assert status.restart_count == 0
+    assert len(procs) == 1
+    await manager.shutdown()
+
+
+@pytest.mark.anyio
+async def test_ntrip_whitespace_fields_raise_validation(repo_root):
+    """Whitespace-only NTRIP fields (which pass Pydantic min_length) must raise
+    RTKValidationError so the route can map them to HTTP 422, not 500."""
+    manager = AsyncRTKManager(
+        lora_script=repo_root / "lora_rtcm_node.py",
+        ntrip_script=repo_root / "ntrip_rtcm_node.py",
+    )
+    with pytest.raises(RTKValidationError):
+        await manager.start_ntrip(
+            host="   ",
+            port=2101,
+            mountpoint="MP",
+            user="u",
+            password="p",
+        )
+
+
+@pytest.mark.anyio
+async def test_ntrip_start_route_maps_validation_to_422(monkeypatch):
+    """The NTRIP start route returns HTTP 422 (not 500) on RTKValidationError,
+    matching the LoRa route's validation behaviour."""
+    import main
+    from fastapi import HTTPException
+
+    from routes.rtk import NtripStartRequest, start_ntrip
+
+    class _FakeManager:
+        async def start_ntrip(self, **_kwargs):
+            raise RTKValidationError("host, mountpoint, and user are required")
+
+    monkeypatch.setattr(main, "rtk_manager", _FakeManager(), raising=False)
+
+    req = NtripStartRequest(host=" ", port=2101, mountpoint="MP", user="u", **{"pass": "p"})
+    with pytest.raises(HTTPException) as excinfo:
+        await start_ntrip(req)
+    assert excinfo.value.status_code == 422
