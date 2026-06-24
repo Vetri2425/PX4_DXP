@@ -73,7 +73,7 @@ def test_surveyed_placement_ignores_lora_lifecycle(lora_lifecycle: str):
 
     bad = surveyed_state(gps_fix=5)
     bad["lora_lifecycle_state"] = lora_lifecycle
-    with pytest.raises(PlacementError, match="below RTK_FIXED"):
+    with pytest.raises(PlacementError, match="below required"):
         resolve_surveyed_points([(0.0, 0.0)], (13.072066, 80.261956), bad)
 
 

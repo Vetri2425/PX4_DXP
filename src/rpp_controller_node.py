@@ -185,6 +185,7 @@ from mavros_msgs.msg import GPSRAW          # P0.3 RTK fix gate
 from nav_msgs.msg import Path
 from std_msgs.msg import Bool, Float32MultiArray, MultiArrayDimension, Float32
 
+from point_leg_trajectory import is_collinear_straight_leg
 from rpp_path_conditioning import split_leading_entry_transit
 
 
@@ -641,13 +642,14 @@ class RPPControllerNode(Node):
             self.get_parameter("segment_corner_threshold_deg").value
         )
 
+        runtime_entry_marked = (
+            abs(msg.poses[0].pose.orientation.x - 1.0) < 1e-6
+            and abs(msg.poses[0].pose.orientation.w) < 1e-6
+        )
         entry_run, profile_pts, profile_flags = split_leading_entry_transit(
             raw_pts,
             raw_flags,
-            marked=(
-                abs(msg.poses[0].pose.orientation.x - 1.0) < 1e-6
-                and abs(msg.poses[0].pose.orientation.w) < 1e-6
-            ),
+            marked=runtime_entry_marked,
         )
 
         # Auto profile resolves PER RUN, not per path: a DXF mission mixes
@@ -685,24 +687,39 @@ class RPPControllerNode(Node):
         stamp = msg.header.stamp
         runs: list[dict] = []
         for run_pts, run_flags in raw_runs:
-            profile = (
-                requested if requested != "auto"
-                else self._classify_auto_profile(run_pts, threshold)
+            point_leg_densified = (
+                runtime_entry_marked
+                and len(run_pts) >= 3
+                and is_collinear_straight_leg(run_pts)
             )
-            if profile == "segment":
-                c_pts, c_flags = self._simplify_path_for_profile(
-                    run_pts, run_flags
-                )
-            else:
+            if point_leg_densified:
+                # Point-mode straight leg: smooth resample only — intermediates
+                # are projection geometry, not segment corner goals.
+                profile = "smooth"
                 c_pts, c_flags = run_pts, run_flags
-                if corner_r > 0.0 and len(c_pts) >= 3:
-                    c_pts, c_flags = self._smooth_corners(
-                        c_pts, corner_r, max(2, arc_pts), c_flags
-                    )
                 if resample_dx > 0.0 and len(c_pts) >= 2:
                     c_pts, c_flags = self._resample_path(
                         c_pts, resample_dx, c_flags
                     )
+            else:
+                profile = (
+                    requested if requested != "auto"
+                    else self._classify_auto_profile(run_pts, threshold)
+                )
+                if profile == "segment":
+                    c_pts, c_flags = self._simplify_path_for_profile(
+                        run_pts, run_flags
+                    )
+                else:
+                    c_pts, c_flags = run_pts, run_flags
+                    if corner_r > 0.0 and len(c_pts) >= 3:
+                        c_pts, c_flags = self._smooth_corners(
+                            c_pts, corner_r, max(2, arc_pts), c_flags
+                        )
+                    if resample_dx > 0.0 and len(c_pts) >= 2:
+                        c_pts, c_flags = self._resample_path(
+                            c_pts, resample_dx, c_flags
+                        )
             runs.append({
                 "poses": self._build_poses(c_pts, c_flags, stamp, expected),
                 "flags": list(c_flags),

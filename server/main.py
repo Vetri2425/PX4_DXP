@@ -74,6 +74,7 @@ bridge_health: Optional["object"] = None
 rtk_manager: Optional["object"] = None
 mission_capture: Optional["object"] = None
 point_mission: Optional["object"] = None
+hold_owner: Optional["object"] = None
 
 # Bounded, thread-safe ring buffer (deque maxlen). All log appends are atomic
 # under the GIL; bounded eviction is built in. Replaces the racy list+trim.
@@ -99,7 +100,7 @@ socket_app = socketio.ASGIApp(sio)
 async def lifespan(app: FastAPI):
     global ros_node, offboard_ctrl, path_mgr, emergency_handler
     global _executor, _beacon, _listener, _telemetry_task, bridge_health, rtk_manager
-    global mission_capture, point_mission
+    global mission_capture, point_mission, hold_owner
 
     configure_logging()
     init_auth()
@@ -141,11 +142,15 @@ async def lifespan(app: FastAPI):
     from rtk_manager import AsyncRTKManager
     from mission_debug_capture import MissionDebugCoordinator
     from point_mission import PointMissionOrchestrator
+    from setpoint_hold import SetpointHoldOwner
 
     path_mgr = PathManager(MISSION_DIR)
     offboard_ctrl = OffboardController(ros_node, activity_log)
+    hold_owner = SetpointHoldOwner()
     point_mission = PointMissionOrchestrator()
     point_mission.set_logger(_record)
+    if ros_node is not None:
+        ros_node.set_obstacle_callback(point_mission.set_obstacle_clear)
     mission_capture = MissionDebugCoordinator()
     emergency_handler = EmergencyHandler(
         ros_node, offboard_ctrl, activity_log, mission_capture

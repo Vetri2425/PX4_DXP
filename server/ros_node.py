@@ -196,12 +196,14 @@ class RosBridgeNode(Node):
         "spraying": False,
         "spray_active": False,
         "spray_manual": False,
+        "obstacle_clear": True,
     }
 
     def __init__(self) -> None:
         super().__init__("fastapi_bridge")
         self._lock = threading.Lock()
         self._state: dict[str, Any] = dict(self._DEFAULT_STATE)
+        self._obstacle_callback: Callable[[bool], None] | None = None
         self._rpp_monitor = RppStatusMonitor()
         # Track last time /mavros/state was received.
         # TRANSIENT_LOCAL means a MAVROS process crash produces no new
@@ -300,6 +302,13 @@ class RosBridgeNode(Node):
             Bool,
             "/spray/manual_state",
             self._cb_spray_manual_state,
+            _qos_best_effort(),
+            callback_group=self._sub_group,
+        )
+        self.create_subscription(
+            Bool,
+            "/rover/obstacle_clear",
+            self._cb_obstacle_clear,
             _qos_best_effort(),
             callback_group=self._sub_group,
         )
@@ -1173,6 +1182,20 @@ class RosBridgeNode(Node):
             frame_id,
             sum(1 for f in flags if f),
         )
+
+    def set_obstacle_callback(self, cb: Callable[[bool], None] | None) -> None:
+        """Register orchestrator hook for ``/rover/obstacle_clear`` updates."""
+        self._obstacle_callback = cb
+
+    def _cb_obstacle_clear(self, msg: Bool) -> None:
+        clear = bool(msg.data)
+        with self._lock:
+            self._state["obstacle_clear"] = clear
+        if self._obstacle_callback is not None:
+            try:
+                self._obstacle_callback(clear)
+            except Exception:
+                log.exception("obstacle callback raised")
 
     def publish_stop_path(
         self, frame_id: str = "local_ned"

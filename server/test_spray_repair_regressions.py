@@ -80,6 +80,59 @@ async def test_dependent_modes_fail_503_before_controller_load(monkeypatch, tmp_
 
 
 @pytest.mark.anyio
+async def test_point_mode_load_succeeds_when_dependencies_ready(monkeypatch, tmp_path):
+    mission_id = "point_ok"
+    staged = {
+        "mission_id": mission_id,
+        "waypoints": [],
+        "spray_mode": "point",
+        "point_mission_points": [
+            {"north_m": 0.0, "east_m": 0.0, "dwell_s": 1.0, "source_index": 0, "mark": True}
+        ],
+        "point_source_frame": "LOCAL_NED",
+        "configuration_revision": 1,
+    }
+    path = tmp_path / f"{mission_id}.json"
+    path.write_text(json.dumps(staged), encoding="utf-8")
+
+    class Ros:
+        async def cancel_spray_dwell_async(self):
+            return True, "ok"
+
+        def publish_spray_manual(self, on: bool):
+            self.manual = on
+
+        async def set_spray_params_bulk_async(self, params):
+            return True, [True] * len(params), ""
+
+        async def trigger_spray_apply_mission_config_async(self):
+            return True, "ok"
+
+    class PointOrch:
+        loaded = None
+
+        async def replace_from_staged(self, staged_payload, spray_config, ros_node):
+            self.loaded = staged_payload["mission_id"]
+
+        async def cancel_and_drain(self, ros_node, reason="cancelled"):
+            return None
+
+    ctrl = _Controller()
+    ros = Ros()
+    orch = PointOrch()
+    monkeypatch.setattr(path_routes, "STAGING_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "offboard_ctrl", ctrl)
+    monkeypatch.setattr(main, "ros_node", ros)
+    monkeypatch.setattr(main, "point_mission", orch)
+
+    response = await path_routes.load_mission_to_controller(LoadMissionRequest(mission_id=mission_id))
+    assert response["status"] == "success"
+    assert orch.loaded == mission_id
+    assert ctrl.loaded is not None
+    assert ctrl.loaded[0] == [(0.0, 0.0), (0.0, 0.0)]
+
+
+@pytest.mark.anyio
 async def test_mission_config_apply_never_sets_operator_enable():
     class Ros:
         def __init__(self):

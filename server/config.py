@@ -54,7 +54,7 @@ RPP_STATE_NAMES = {
     RPP_JUMP_SKIP: "JUMP_SKIP",
 }
 
-# GPS Fix Type Names (from MAVROS sensor_msgs/NavSatStatus.msg fix_type)
+# GPS Fix Type Names (MAVLink GPS_FIX_TYPE via mavros_msgs/GPSRAW.fix_type)
 GPS_FIX_NAMES = {
     0: "NO_FIX",
     1: "GPS",

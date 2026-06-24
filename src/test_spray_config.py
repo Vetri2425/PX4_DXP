@@ -54,6 +54,36 @@ def test_staged_defaults_include_spray_mode():
     assert defaults["spray_mode"] == "continuous"
 
 
+def test_point_max_dwell_defaults():
+    cfg = validate_spray_configuration({})
+    assert cfg.point.max_dwell_s == 60.0
+
+
+def test_point_leg_trajectory_defaults():
+    cfg = validate_spray_configuration({})
+    assert cfg.point.leg_trajectory_mode == "two_point"
+    assert cfg.point.leg_spacing_m == 0.08
+    assert cfg.point.hold_drift_tolerance_m == 0.08
+    assert cfg.point.hold_drift_policy == "fail"
+
+
+def test_gps_safety_defaults():
+    cfg = validate_spray_configuration({})
+    assert cfg.gps_safety.required_fix_type == 6
+    assert cfg.gps_safety.runtime_policy == "pause"
+    assert cfg.gps_safety.resume_policy == "manual"
+
+
+def test_default_dwell_exceeding_max_rejected():
+    try:
+        validate_spray_configuration(
+            {"point_default_dwell_s": 70.0, "point_max_dwell_s": 60.0}
+        )
+        assert False
+    except ValueError as exc:
+        assert "point_default_dwell_s exceeds point_max_dwell_s" in str(exc)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

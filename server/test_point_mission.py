@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from point_ingest import SprayPoint
 from mission_placement import GPS_SURVEYED, LOCAL_NED, PlacementError
-from point_mission import PointMissionOrchestrator, PointMissionRun, PointMissionState
+from point_mission import PointExecutionMode, PointMissionOrchestrator, PointMissionRun, PointMissionState
 from spray_config import PointSprayParams, SprayConfiguration, SprayMode
 
 
@@ -29,6 +29,8 @@ class FakeRos:
             "pose_age_ms": 10.0,
             "rpp_state": 3,
             "spraying": False,
+            "connected": True,
+            "heading_ned_rad": 0.0,
         }
         self.paths = []
         self.dwells = []
@@ -139,7 +141,10 @@ def test_dwell_must_become_active_before_completion():
         orch._run_token = token
         ros.dwells.append({"command_id": 5})
         try:
-            await orch._wait_dwell_complete(token, ros, 0.01, 5)
+            point = SprayPoint(0, 0, 0.01, 0)
+            await orch._wait_dwell_complete(
+                token, ros, None, point, 0.01, 5, SprayConfiguration(mode=SprayMode.POINT).point
+            )
             assert False, "inactive default status passed as completion"
         except TimeoutError as exc:
             assert "never became active" in str(exc)
@@ -158,7 +163,10 @@ def test_dwell_identity_and_final_off_required():
             {**base, "dwell_command_id": 8, "active_dwell": True, "commanded_on": True, "confirmed_off": False},
         ]
         try:
-            await orch._wait_dwell_complete(token, ros, 0.1, 7)
+            point = SprayPoint(0, 0, 0.1, 0)
+            await orch._wait_dwell_complete(
+                token, ros, None, point, 0.1, 7, SprayConfiguration(mode=SprayMode.POINT).point
+            )
             assert False, "wrong command ID accepted"
         except RuntimeError as exc:
             assert "mismatch" in str(exc)
@@ -168,7 +176,9 @@ def test_dwell_identity_and_final_off_required():
             {**base, "dwell_command_id": 7, "active_dwell": False, "commanded_on": True, "confirmed_off": False},
         ]
         try:
-            await orch._wait_dwell_complete(token, ros, 0.1, 7)
+            await orch._wait_dwell_complete(
+                token, ros, None, point, 0.1, 7, SprayConfiguration(mode=SprayMode.POINT).point
+            )
             assert False, "unconfirmed OFF accepted"
         except TimeoutError as exc:
             assert "completion" in str(exc)
@@ -182,7 +192,7 @@ def test_generation_guard_blocks_old_status_write():
     old = PointMissionRun(orch.status.generation, "old", asyncio.Event())
     orch._run_token = old
     orch._task = None
-    orch._install("new", [SprayPoint(1, 2, 1, 0)], cfg, LOCAL_NED, None)
+    orch._install("new", [SprayPoint(1, 2, 1, 0)], cfg, LOCAL_NED, None, PointExecutionMode.AUTO)
     orch._write(old, state=PointMissionState.FAILED, last_error="late old failure")
     assert orch.status.mission_id == "new"
     assert orch.status.last_error == ""
@@ -191,12 +201,13 @@ def test_generation_guard_blocks_old_status_write():
 def test_coordinate_resolution_local_and_surveyed_translation():
     orch = PointMissionOrchestrator()
     cfg = SprayConfiguration(mode=SprayMode.POINT)
-    orch._install("local", [SprayPoint(3, 4, 1, 0)], cfg, LOCAL_NED, None)
+    orch._install("local", [SprayPoint(3, 4, 1, 0)], cfg, LOCAL_NED, None, PointExecutionMode.AUTO)
     assert orch._resolve_points({})[0].north_m == 3
     assert orch._resolve_points({})[0].east_m == 4
 
-    orch._install("gps", [SprayPoint(3, 4, 1, 0)], cfg, GPS_SURVEYED, (13.0, 80.0))
+    orch._install("gps", [SprayPoint(3, 4, 1, 0)], cfg, GPS_SURVEYED, (13.0, 80.0), PointExecutionMode.AUTO)
     state = {
+        "connected": True,
         "pose_received": True, "global_position_received": True, "gps_fix_received": True,
         "local_pose_age_ms": 10, "global_position_age_ms": 10, "gps_fix_age_ms": 10,
         "pose_global_skew_ms": 0, "gps_fix": 6, "pos_n": 100, "pos_e": 200,
@@ -218,6 +229,27 @@ def test_missing_point_frame_metadata_rejected():
         except PlacementError:
             pass
     asyncio.run(run())
+
+
+async def _run_clear_mission_resets_unloaded_state():
+    ros = FakeRos()
+    orch = PointMissionOrchestrator()
+    cfg = SprayConfiguration(mode=SprayMode.POINT)
+    orch.load(mission_id="m1", points=[SprayPoint(1.0, 2.0, 1.0, 0)], config=cfg)
+    orch._resolved_points = [SprayPoint(1.0, 2.0, 1.0, 0)]
+    orch._run_token = PointMissionRun(orch.status.generation, "m1", asyncio.Event())
+    await orch.clear_mission(ros, reason="cleared")
+    assert orch.status.state == PointMissionState.IDLE
+    assert orch.status.ready is False
+    assert orch._points == []
+    assert orch._resolved_points == []
+    assert orch._config is None
+    assert orch._run_token is None
+    assert orch._task is None
+
+
+def test_clear_mission_resets_unloaded_state():
+    asyncio.run(_run_clear_mission_resets_unloaded_state())
 
 
 def test_full_three_point_progression_observes_nonzero_dwells():
@@ -262,6 +294,7 @@ def main():
     test_generation_guard_blocks_old_status_write()
     test_coordinate_resolution_local_and_surveyed_translation()
     test_missing_point_frame_metadata_rejected()
+    test_clear_mission_resets_unloaded_state()
     test_full_three_point_progression_observes_nonzero_dwells()
     print("PASS")
 

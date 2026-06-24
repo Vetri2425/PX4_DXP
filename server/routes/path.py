@@ -666,10 +666,16 @@ async def parse_point_csv(file: UploadFile = File(...)):
     if str(src) not in sys.path:
         sys.path.insert(0, str(src))
     from point_ingest import parse_point_csv_text, points_to_staged_dict
+    from spray_config import staged_spray_defaults
 
     content = (await file.read()).decode("utf-8", errors="replace")
+    defaults = staged_spray_defaults()
     try:
-        points = parse_point_csv_text(content)
+        points = parse_point_csv_text(
+            content,
+            default_dwell_s=float(defaults["point_default_dwell_s"]),
+            max_dwell_s=float(defaults["point_max_dwell_s"]),
+        )
     except ValueError as exc:
         raise HTTPException(422, str(exc))
     return {
@@ -1016,14 +1022,28 @@ def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
         "dash_off_distance_m": req.dash_off_distance_m,
         "dash_phase_reset": req.dash_phase_reset,
         "point_default_dwell_s": req.point_default_dwell_s,
+        "point_max_dwell_s": req.point_max_dwell_s,
         "point_arrival_tolerance_m": req.point_arrival_tolerance_m,
         "point_settle_time_s": req.point_settle_time_s,
         "point_leg_timeout_s": req.point_leg_timeout_s,
         "point_settle_speed_mps": req.point_settle_speed_mps,
         "point_settle_yaw_rate_rad_s": req.point_settle_yaw_rate_rad_s,
+        "point_execution_mode": req.point_execution_mode,
+        "point_leg_trajectory_mode": req.point_leg_trajectory_mode,
+        "point_leg_spacing_m": req.point_leg_spacing_m,
+        "point_hold_drift_tolerance_m": req.point_hold_drift_tolerance_m,
+        "point_hold_drift_policy": req.point_hold_drift_policy,
         "point_mission_points": point_rows,
         "point_mission_points_original": original_point_rows,
         "point_source_frame": point_source_frame,
+        "gps_required_fix_type": req.gps_required_fix_type,
+        "gps_global_position_max_age_ms": req.gps_global_position_max_age_ms,
+        "gps_local_pose_max_age_ms": req.gps_local_pose_max_age_ms,
+        "gps_fix_max_age_ms": req.gps_fix_max_age_ms,
+        "gps_max_pose_global_skew_ms": req.gps_max_pose_global_skew_ms,
+        "gps_runtime_policy": req.gps_runtime_policy,
+        "gps_resume_policy": req.gps_resume_policy,
+        "gps_recovery_stable_s": req.gps_recovery_stable_s,
         "alignment_metadata": alignment_meta,
         "metadata": {
             "source": result["source"],
@@ -1143,8 +1163,9 @@ async def load_mission_to_controller(req: LoadMissionRequest):
         source_name = (staged.get("metadata") or {}).get("source") or safe_id
 
         if point_mode:
-            if point_mission is not None and spray_config is not None:
-                await point_mission.replace_from_staged(staged, spray_config, ros_node)
+            if point_mission is None:
+                raise HTTPException(503, "Point mission orchestrator unavailable")
+            await point_mission.replace_from_staged(staged, spray_config, ros_node)
             first = staged["point_mission_points"][0]
             load_points = [
                 (float(first["north_m"]), float(first["east_m"])),
@@ -1523,6 +1544,7 @@ async def get_staged_mission(mission_id: str):
         dash_off_distance_m=float(staged.get("dash_off_distance_m", spray_defaults["dash_off_distance_m"])),
         dash_phase_reset=staged.get("dash_phase_reset", spray_defaults["dash_phase_reset"]),
         point_default_dwell_s=float(staged.get("point_default_dwell_s", spray_defaults["point_default_dwell_s"])),
+        point_max_dwell_s=float(staged.get("point_max_dwell_s", spray_defaults["point_max_dwell_s"])),
         point_arrival_tolerance_m=float(
             staged.get("point_arrival_tolerance_m", spray_defaults["point_arrival_tolerance_m"])
         ),
@@ -1534,9 +1556,63 @@ async def get_staged_mission(mission_id: str):
         point_settle_yaw_rate_rad_s=float(
             staged.get("point_settle_yaw_rate_rad_s", spray_defaults["point_settle_yaw_rate_rad_s"])
         ),
+        point_execution_mode=str(
+            staged.get("point_execution_mode", spray_defaults["point_execution_mode"])
+        ),
+        point_leg_trajectory_mode=str(
+            staged.get(
+                "point_leg_trajectory_mode",
+                spray_defaults["point_leg_trajectory_mode"],
+            )
+        ),
+        point_leg_spacing_m=float(
+            staged.get("point_leg_spacing_m", spray_defaults["point_leg_spacing_m"])
+        ),
+        point_hold_drift_tolerance_m=float(
+            staged.get(
+                "point_hold_drift_tolerance_m",
+                spray_defaults["point_hold_drift_tolerance_m"],
+            )
+        ),
+        point_hold_drift_policy=str(
+            staged.get("point_hold_drift_policy", spray_defaults["point_hold_drift_policy"])
+        ),
         point_mission_points=list(staged.get("point_mission_points") or []),
         point_source_frame=str(staged.get("point_source_frame") or ""),
         point_mission_points_original=list(staged.get("point_mission_points_original") or []),
+        gps_required_fix_type=int(
+            staged.get("gps_required_fix_type", spray_defaults["gps_required_fix_type"])
+        ),
+        gps_global_position_max_age_ms=float(
+            staged.get(
+                "gps_global_position_max_age_ms",
+                spray_defaults["gps_global_position_max_age_ms"],
+            )
+        ),
+        gps_local_pose_max_age_ms=float(
+            staged.get(
+                "gps_local_pose_max_age_ms",
+                spray_defaults["gps_local_pose_max_age_ms"],
+            )
+        ),
+        gps_fix_max_age_ms=float(
+            staged.get("gps_fix_max_age_ms", spray_defaults["gps_fix_max_age_ms"])
+        ),
+        gps_max_pose_global_skew_ms=float(
+            staged.get(
+                "gps_max_pose_global_skew_ms",
+                spray_defaults["gps_max_pose_global_skew_ms"],
+            )
+        ),
+        gps_runtime_policy=str(
+            staged.get("gps_runtime_policy", spray_defaults["gps_runtime_policy"])
+        ),
+        gps_resume_policy=str(
+            staged.get("gps_resume_policy", spray_defaults["gps_resume_policy"])
+        ),
+        gps_recovery_stable_s=float(
+            staged.get("gps_recovery_stable_s", spray_defaults["gps_recovery_stable_s"])
+        ),
         configuration_revision=int(staged.get("configuration_revision", 0)),
         alignment_metadata=staged.get("alignment_metadata"),
         metadata=staged.get("metadata"),

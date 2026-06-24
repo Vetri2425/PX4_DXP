@@ -15,6 +15,7 @@ SOURCE = [(0.0, -0.035), (1.0, -0.035), (1.0, 0.965)]
 
 def healthy_state():
     return {
+        "connected": True,
         "pose_received": True,
         "global_position_received": True,
         "gps_fix_received": True,
@@ -71,7 +72,7 @@ def test_uniform_translation_preserves_all_waypoint_deltas():
             "GPS fix information is stale",
         ),
         (lambda s: s.update(pose_global_skew_ms=101.0), "not sufficiently aligned"),
-        (lambda s: s.update(gps_fix=5), "below RTK_FIXED"),
+        (lambda s: s.update(gps_fix=5), "below required"),
         (lambda s: s.update(pos_n=math.nan), "non-finite"),
         (lambda s: s.update(lat=math.inf), "non-finite"),
     ],

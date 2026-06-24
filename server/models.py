@@ -71,13 +71,29 @@ class SprayModeConfig(BaseModel):
     dash_off_distance_m: float = 0.30
     dash_phase_reset: Literal["per_mark_region", "continuous"] = "per_mark_region"
     point_default_dwell_s: float = 2.0
+    point_max_dwell_s: float = 60.0
     point_arrival_tolerance_m: float = 0.05
     point_settle_time_s: float = 0.10
     point_leg_timeout_s: float = 120.0
     point_settle_speed_mps: float = 0.05
     point_settle_yaw_rate_rad_s: float = 0.05
+    point_execution_mode: Literal["auto", "manual"] = "auto"
+    point_leg_trajectory_mode: Literal["two_point", "densified"] = "two_point"
+    point_leg_spacing_m: float = 0.08
+    point_hold_drift_tolerance_m: float = 0.08
+    point_hold_drift_policy: Literal["fail", "pause"] = "fail"
     point_mission_points: list[dict[str, Any]] = Field(default_factory=list)
     point_source_frame: Literal["LOCAL_NED", "GPS_SURVEYED", "DESIGN"] = "LOCAL_NED"
+    gps_required_fix_type: int = 6
+    gps_global_position_max_age_ms: float = 500.0
+    gps_local_pose_max_age_ms: float = 500.0
+    gps_fix_max_age_ms: float = 500.0
+    gps_max_pose_global_skew_ms: float = 100.0
+    gps_runtime_policy: Literal["pause", "fail"] = "pause"
+    gps_resume_policy: Literal["manual", "auto"] = "manual"
+    gps_recovery_stable_s: float = 2.0
+    obstacle_integration_enabled: bool = False
+    obstacle_signal_max_age_s: float = 2.0
 
 
 class ParamSetRequest(BaseModel):
@@ -151,6 +167,104 @@ class PathPreviewResponse(BaseModel):
     waypoints: list[PathPreviewPoint]
 
 
+class PointMissionStatusResponse(BaseModel):
+    """Documented Point Mode runtime diagnostics."""
+
+    point_mission_state: str = "idle"
+    point_mission_id: str = ""
+    point_mission_generation: int = 0
+    current_point_index: int = 0
+    total_points: int = 0
+    point_execution_mode: str = "auto"
+    waiting_for_continue: bool = False
+    last_completed_point_index: Optional[int] = None
+    next_point_index: Optional[int] = None
+    target_north_m: Optional[float] = None
+    target_east_m: Optional[float] = None
+    current_distance_m: Optional[float] = None
+    arrival_met: bool = False
+    settle_met: bool = False
+    mark_enabled: bool = True
+    active_dwell: bool = False
+    active_dwell_command_id: Optional[int] = None
+    dwell_remaining_s: float = 0.0
+    last_failure_reason: str = ""
+    last_transition: str = ""
+    ready: bool = False
+    source_frame: str = ""
+    resolved_runtime_frame: str = ""
+    run_active: bool = False
+    obstacle_clear: bool = True
+    obstacle_integration_enabled: bool = False
+    obstacle_signal_state: str = "not_configured"
+    obstacle_signal_age_ms: Optional[float] = None
+    terminal_safety_ok: bool = True
+    terminal_safety_reason: str = ""
+    pause_reason: str = ""
+    pre_pause_state: str = ""
+    paused_point_index: Optional[int] = None
+    resume_available: bool = False
+    dwell_cancelled: bool = False
+    setpoint_source: str = "rpp"
+    hold_active: bool = False
+    hold_north_m: Optional[float] = None
+    hold_east_m: Optional[float] = None
+    hold_heading_ned_rad: Optional[float] = None
+    hold_error_m: Optional[float] = None
+    gps_safety_state: str = "not_applicable"
+    gps_safety_ok: bool = True
+    gps_required_fix_type: Optional[int] = None
+    gps_current_fix_type: Optional[int] = None
+    gps_global_position_age_ms: Optional[float] = None
+    gps_local_pose_age_ms: Optional[float] = None
+    gps_fix_age_ms: Optional[float] = None
+    gps_pose_global_skew_ms: Optional[float] = None
+    gps_anchor_valid: Optional[bool] = None
+    gps_last_safety_reason: str = ""
+    gps_fault_count: int = 0
+    gps_last_fault_time_s: Optional[float] = None
+    gps_recovery_ready: bool = False
+    gps_runtime_policy: Optional[str] = None
+    gps_resume_policy: Optional[str] = None
+    point_leg_trajectory_mode: str = "two_point"
+    point_leg_spacing_m: float = 0.08
+    point_leg_published_count: Optional[int] = None
+    point_leg_conditioned_count: Optional[int] = None
+    active_trajectory_mode: Optional[str] = None
+    point_leg_length_m: Optional[float] = None
+
+
+class MissionResumeRequest(BaseModel):
+    expected_generation: Optional[int] = None
+
+
+class ObstacleStatusRequest(BaseModel):
+    clear: bool
+
+
+class PointPauseResponse(BaseModel):
+    paused: bool
+    message: str
+    status: PointMissionStatusResponse
+
+
+class PointResumeResponse(BaseModel):
+    resumed: bool
+    message: str
+    status: PointMissionStatusResponse
+
+
+class PointContinueResponse(BaseModel):
+    continued: bool
+    message: str
+    status: PointMissionStatusResponse
+
+
+class ObstacleStatusResponse(BaseModel):
+    obstacle_clear: bool
+    status: PointMissionStatusResponse
+
+
 class MissionStatus(BaseModel):
     state: MissionState
     rpp_state: Optional[int] = None
@@ -163,6 +277,7 @@ class MissionStatus(BaseModel):
     last_path_loaded: Optional[str] = None
     loaded_mission_id: Optional[str] = None
     running_mission_id: Optional[str] = None
+    point: Optional[PointMissionStatusResponse] = None
 
 
 class ActivityEntry(BaseModel):
@@ -436,13 +551,29 @@ class PathPlanRequest(BaseModel):
     dash_off_distance_m: float = Field(0.30, ge=0.0)
     dash_phase_reset: Literal["per_mark_region", "continuous"] = "per_mark_region"
     point_default_dwell_s: float = Field(2.0, gt=0.0)
+    point_max_dwell_s: float = Field(60.0, gt=0.0)
     point_arrival_tolerance_m: float = Field(0.05, gt=0.0)
     point_settle_time_s: float = Field(0.10, ge=0.0)
     point_leg_timeout_s: float = Field(120.0, gt=0.0)
     point_settle_speed_mps: float = Field(0.05, ge=0.0)
     point_settle_yaw_rate_rad_s: float = Field(0.05, ge=0.0)
+    point_execution_mode: Literal["auto", "manual"] = "auto"
+    point_leg_trajectory_mode: Literal["two_point", "densified"] = "two_point"
+    point_leg_spacing_m: float = Field(0.08, gt=0.0)
+    point_hold_drift_tolerance_m: float = Field(0.08, gt=0.0)
+    point_hold_drift_policy: Literal["fail", "pause"] = "fail"
     point_mission_points: list[dict[str, Any]] = Field(default_factory=list)
     point_source_frame: Literal["LOCAL_NED", "GPS_SURVEYED", "DESIGN"] = "LOCAL_NED"
+    gps_required_fix_type: int = Field(6, ge=0, le=8)
+    gps_global_position_max_age_ms: float = Field(500.0, gt=0.0)
+    gps_local_pose_max_age_ms: float = Field(500.0, gt=0.0)
+    gps_fix_max_age_ms: float = Field(500.0, gt=0.0)
+    gps_max_pose_global_skew_ms: float = Field(100.0, gt=0.0)
+    gps_runtime_policy: Literal["pause", "fail"] = "pause"
+    gps_resume_policy: Literal["manual", "auto"] = "manual"
+    gps_recovery_stable_s: float = Field(2.0, ge=0.0)
+    obstacle_integration_enabled: bool = False
+    obstacle_signal_max_age_s: float = Field(2.0, gt=0.0)
 
     @field_validator("compensate_spray")
     @classmethod
@@ -593,14 +724,30 @@ class StagedMissionResponse(BaseModel):
     dash_off_distance_m: float = 0.30
     dash_phase_reset: str = "per_mark_region"
     point_default_dwell_s: float = 2.0
+    point_max_dwell_s: float = 60.0
     point_arrival_tolerance_m: float = 0.05
     point_settle_time_s: float = 0.10
     point_leg_timeout_s: float = 120.0
     point_settle_speed_mps: float = 0.05
     point_settle_yaw_rate_rad_s: float = 0.05
+    point_execution_mode: str = "auto"
+    point_leg_trajectory_mode: str = "two_point"
+    point_leg_spacing_m: float = 0.08
+    point_hold_drift_tolerance_m: float = 0.08
+    point_hold_drift_policy: str = "fail"
     point_mission_points: list[dict[str, Any]] = Field(default_factory=list)
     point_source_frame: str = ""
     point_mission_points_original: list[dict[str, Any]] = Field(default_factory=list)
+    gps_required_fix_type: int = 6
+    gps_global_position_max_age_ms: float = 500.0
+    gps_local_pose_max_age_ms: float = 500.0
+    gps_fix_max_age_ms: float = 500.0
+    gps_max_pose_global_skew_ms: float = 100.0
+    gps_runtime_policy: str = "pause"
+    gps_resume_policy: str = "manual"
+    gps_recovery_stable_s: float = 2.0
+    obstacle_integration_enabled: bool = False
+    obstacle_signal_max_age_s: float = 2.0
     configuration_revision: int = 0
     alignment_metadata: Optional[dict] = None
     metadata: Optional[dict] = None

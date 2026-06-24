@@ -184,7 +184,11 @@ async def start_mission_for_controller(
             pre_publish_hook=_placement_hook if capture_id else None,
         )
         if ok and offboard_ctrl.spray_mode == "point":
-            started, why = await point_mission.start(ros_node, offboard_ctrl)
+            from main import hold_owner
+
+            started, why = await point_mission.start(
+                ros_node, offboard_ctrl, hold_owner
+            )
             if not started:
                 await offboard_ctrl.stop_async()
                 ok, message = False, why

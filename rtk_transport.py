@@ -103,7 +103,7 @@ def classify_ntrip_handshake(header: str) -> tuple[str, str | None]:
     """Classify caster handshake outcome.
 
     Returns (outcome, error_message). outcome is 'ok' or a lifecycle reason.
-    Only HTTP 401/403 map to auth_failed.
+    auth_failed covers HTTP 401/403 and plain-text caster rejections (e.g. Emlid).
     """
     line = sanitize_ntrip_response_line(header)
     code = ntrip_http_status_code(line)

@@ -159,21 +159,29 @@ def register_handlers(sio) -> None:
 
     @sio.on("mission_stop")
     async def on_mission_stop(sid, data=None):
-        from main import mission_capture, offboard_ctrl
+        from main import hold_owner, mission_capture, offboard_ctrl, point_mission, ros_node
+        from mission_stop import stop_active_mission
         if not _auth_ok(data):
             return await _emit_unauth(sio, sid)
-        result = await offboard_ctrl.stop_async()
-        if result.get("success") and mission_capture is not None:
-            mission_capture.record_terminal(
-                None, "operator_stop", state=offboard_ctrl.state.value, details=result
-            )
+        result = await stop_active_mission(
+            offboard_ctrl,
+            point_mission,
+            ros_node,
+            hold_owner,
+            mission_capture=mission_capture,
+            transport="socket",
+        )
         await sio.emit("mission_status_update", result, to=sid)
 
     @sio.on("mission_abort")
     async def on_mission_abort(sid, data=None):
-        from main import mission_capture, offboard_ctrl
+        from main import hold_owner, mission_capture, offboard_ctrl, point_mission, ros_node
         if not _auth_ok(data):
             return await _emit_unauth(sio, sid)
+        if hold_owner is not None:
+            hold_owner.deactivate(ros_node)
+        if point_mission is not None:
+            await point_mission.abort(ros_node)
         result = await offboard_ctrl.abort_async()
         if mission_capture is not None:
             mission_capture.record_terminal(

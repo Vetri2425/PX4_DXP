@@ -250,3 +250,54 @@ def test_stream_watchdog_idle_when_fresh():
     node._check_stream_health()
     assert not node._force_reconnect.is_set()
     node._close_active_socket.assert_not_called()
+
+
+def test_forced_reconnect_recv_oserror_not_transport_error():
+    """Watchdog-driven socket close must not log transport_error on recv() EBADF."""
+    node = _make_node()
+    node._stop_event = threading.Event()
+    node._force_reconnect = threading.Event()
+    node._reconnect_count = 0
+    node._reconnect_initial_s = 0.01
+    node._reconnect_max_s = 0.01
+    node._reconnect_jitter_frac = 0.0
+    node._handshake_complete_monotonic = time.monotonic()
+    node._clear_active_socket = MagicMock()
+    node._publish_frames = MagicMock()
+    node.get_logger = MagicMock(return_value=MagicMock())
+
+    fake_sock = MagicMock()
+    recv_calls = [0]
+
+    def on_recv(*_):
+        recv_calls[0] += 1
+        if recv_calls[0] == 1:
+            node._force_reconnect.set()
+            raise OSError(9, "Bad file descriptor")
+        node._stop_event.set()
+        return b""
+
+    fake_sock.recv.side_effect = on_recv
+
+    def fake_connect():
+        node._handshake_complete_monotonic = time.monotonic()
+        with node._stats_lock:
+            node._connected = True
+        return fake_sock, b""
+
+    node._connect = fake_connect
+    node._backoff_delay = lambda _attempt: 0.0
+    node._valid_rtcm_age_s = lambda _now, _stats: 0.0
+
+    thread = threading.Thread(target=node._run, daemon=True)
+    thread.start()
+    thread.join(timeout=2.0)
+    assert not thread.is_alive()
+
+    reasons = [
+        call.kwargs.get("reason")
+        for call in node._set_lifecycle.call_args_list
+        if call.kwargs
+    ]
+    assert "transport_error" not in reasons
+    node.get_logger.return_value.error.assert_not_called()
