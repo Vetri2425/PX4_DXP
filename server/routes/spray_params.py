@@ -384,6 +384,8 @@ SPRAY_PARAM_SCHEMA: dict[str, dict] = {
 # These values are captured into SprayConfiguration and intentionally remain
 # stable for a mission. Changing them requires staging/loading a replacement;
 # direct actuator/backend/manual-timeout values are read live by the node.
+# Mission-bound params cannot be changed here mid-mission. To reconfigure spray
+# mode between missions use PUT /api/path/{name}/spray-mode/{continuous|dash|point}.
 MISSION_BOUND_PARAMS = {
     "spray_mode",
     "dash_on_distance_m",

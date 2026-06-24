@@ -276,12 +276,14 @@ def create_app() -> FastAPI:
     from routes.rtk import router as rtk_router
     from routes.spray import router as spray_router
     from routes.spray_params import router as spray_par_router
+    from routes.spray_mode import router as spray_mode_router
 
     app.include_router(sys_router, prefix="/api")
     app.include_router(veh_router, prefix="/api")
     app.include_router(mis_router, prefix="/api")
     app.include_router(paths_router, prefix="/api")  # → /api/paths
     app.include_router(path_router, prefix="/api")  # → /api/path/*
+    app.include_router(spray_mode_router, prefix="/api")  # → /api/path/{name}/spray-mode/*
     app.include_router(par_router, prefix="/api")
     app.include_router(rpp_par_router, prefix="/api")
     app.include_router(tel_router, prefix="/api")

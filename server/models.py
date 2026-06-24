@@ -96,6 +96,53 @@ class SprayModeConfig(BaseModel):
     obstacle_signal_max_age_s: float = 2.0
 
 
+class ContinuousModeRequest(BaseModel):
+    """Continuous mode — timing and geometry compensation parameters."""
+
+    solenoid_open_delay_s: float = Field(0.10, ge=0.0)
+    solenoid_close_delay_s: float = Field(0.05, ge=0.0)
+    on_overspray_margin_m: float = Field(0.02, ge=0.0)
+    off_overspray_margin_m: float = Field(0.0, ge=0.0)
+    min_spray_speed_mps: float = Field(0.05, ge=0.0)
+    max_xtrack_error_m: float = Field(0.10, gt=0.0)
+    nozzle_forward_offset_m: float = 0.0
+    nozzle_lateral_offset_m: float = 0.0
+
+
+class DashModeRequest(BaseModel):
+    """Dash mode — on/off distance interval parameters."""
+
+    dash_on_distance_m: float = Field(0.30, ge=0.0)
+    dash_off_distance_m: float = Field(0.30, ge=0.0)
+    dash_phase_reset: Literal["per_mark_region", "continuous"] = "per_mark_region"
+
+
+class PointModeRequest(BaseModel):
+    """Point mode — navigation and dwell parameters."""
+
+    point_default_dwell_s: float = Field(2.0, gt=0.0)
+    point_max_dwell_s: float = Field(60.0, gt=0.0)
+    point_arrival_tolerance_m: float = Field(0.05, gt=0.0)
+    point_settle_time_s: float = Field(0.10, ge=0.0)
+    point_leg_timeout_s: float = Field(120.0, gt=0.0)
+    point_settle_speed_mps: float = Field(0.05, ge=0.0)
+    point_settle_yaw_rate_rad_s: float = Field(0.05, ge=0.0)
+    point_execution_mode: Literal["auto", "manual"] = "auto"
+    point_leg_trajectory_mode: Literal["two_point", "densified"] = "two_point"
+    point_leg_spacing_m: float = Field(0.08, gt=0.0)
+    point_hold_drift_tolerance_m: float = Field(0.08, gt=0.0)
+    point_hold_drift_policy: Literal["fail", "pause"] = "fail"
+
+
+class SprayModeResponse(BaseModel):
+    """Response for spray mode read/write endpoints."""
+
+    name: str
+    spray_mode: str
+    config: dict
+    has_sidecar: bool
+
+
 class ParamSetRequest(BaseModel):
     # PX4 has int (SYS_AUTOSTART), float (RO_YAW_RATE_P), and bool params.
     value: Union[bool, int, float, str]
@@ -546,7 +593,7 @@ class PathPlanRequest(BaseModel):
     max_waypoints: int = Field(10000, ge=100, le=500000)  # Hard publication guard
     max_segments: int = Field(2000, ge=1, le=100000)  # Hard segment-count guard
     include_waypoints: bool = True  # If False, return summary only (no waypoint arrays)
-    spray_mode: Literal["continuous", "dash", "point"] = "continuous"
+    spray_mode: Optional[Literal["continuous", "dash", "point"]] = None
     dash_on_distance_m: float = Field(0.30, ge=0.0)
     dash_off_distance_m: float = Field(0.30, ge=0.0)
     dash_phase_reset: Literal["per_mark_region", "continuous"] = "per_mark_region"
