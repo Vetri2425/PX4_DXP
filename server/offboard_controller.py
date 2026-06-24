@@ -51,6 +51,8 @@ ENTRY_COINCIDENT_TOLERANCE_M = 1e-6
 CLEAR_ALLOWED_STATES = {
     MissionState.IDLE,
     MissionState.COMPLETED,
+    MissionState.ABORTED,
+    MissionState.ERROR,
 }
 
 
