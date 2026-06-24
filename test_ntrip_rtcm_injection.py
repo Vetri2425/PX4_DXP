@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import json
+import time
 
 from rtcm3_parser import Rtcm3StreamParser, build_rtcm3_frame
 from rtk_transport import TransportRateTracker, configure_tcp_keepalive, redact_rtk_secrets
@@ -217,3 +218,35 @@ def test_destroy_node_reports_stopping_for_non_terminal(tmp_path):
     node.destroy_node()
 
     assert json.loads(status_path.read_text())["state"] == "stopping"
+
+
+def _make_health_node(age_s):
+    """Node fake configured for _check_stream_health with a given RTCM age."""
+    node = _make_node()
+    node._shutting_down = False
+    node._connected = True
+    node._no_rtcm_warn_s = 15.0
+    node._no_rtcm_reconnect_s = 45.0
+    node._no_rtcm_warned = False
+    node._handshake_complete_monotonic = time.monotonic() - age_s
+    node._force_reconnect = threading.Event()
+    node._close_active_socket = MagicMock()
+    return node
+
+
+def test_stream_watchdog_forces_reconnect_when_stale():
+    """No valid RTCM past the reconnect threshold must flag _force_reconnect and
+    close the socket (so the read thread treats it as an intentional reconnect,
+    not an [Errno 9] transport error)."""
+    node = _make_health_node(age_s=100.0)  # > no_rtcm_reconnect_s
+    node._check_stream_health()
+    assert node._force_reconnect.is_set()
+    node._close_active_socket.assert_called_once()
+
+
+def test_stream_watchdog_idle_when_fresh():
+    """A healthy stream must not force a reconnect."""
+    node = _make_health_node(age_s=1.0)  # < no_rtcm_warn_s
+    node._check_stream_health()
+    assert not node._force_reconnect.is_set()
+    node._close_active_socket.assert_not_called()

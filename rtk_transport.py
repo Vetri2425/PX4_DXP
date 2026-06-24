@@ -111,6 +111,18 @@ def classify_ntrip_handshake(header: str) -> tuple[str, str | None]:
 
     if code == 401 or code == 403:
         return "auth_failed", f"NTRIP authentication rejected (HTTP {code})"
+    # Some casters (e.g. Emlid) reject credentials with a plain-text NTRIP error
+    # line ("ERROR - Unauthorized NTRIP") instead of an HTTP 401/403. Classify
+    # those as auth_failed so the supervisor stops retrying rather than looping
+    # against the caster forever with bad credentials.
+    if code != 200 and (
+        "UNAUTHORIZED" in upper
+        or "BAD PASSWORD" in upper
+        or "INVALID PASSWORD" in upper
+        or "BAD USER" in upper
+        or "INVALID USER" in upper
+    ):
+        return "auth_failed", f"NTRIP authentication rejected: {line}"
     if code == 404:
         return "mount_not_found", f"NTRIP mountpoint not found (HTTP 404): {line}"
     if code is not None and 500 <= code <= 599:

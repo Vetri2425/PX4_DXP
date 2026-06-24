@@ -180,6 +180,10 @@ class NtripNode(Node):
         )
 
         self._stop_event = threading.Event()
+        # Set by the stream-health watchdog right before it closes the socket to
+        # force a reconnect, so the read thread treats the resulting recv()
+        # failure as an intentional reconnect rather than a transport error.
+        self._force_reconnect = threading.Event()
         self._gga_lock = threading.Lock()
         self._sock_lock = threading.Lock()
         self._active_sock = None
@@ -445,6 +449,7 @@ class NtripNode(Node):
                 f"No valid RTCM for {age:.0f}s — closing socket to reconnect"
             )
             self._set_lifecycle("no_valid_rtcm", reason="no_valid_rtcm")
+            self._force_reconnect.set()
             self._close_active_socket()
 
     def _connect(self) -> tuple[socket.socket, bytes]:
@@ -601,6 +606,7 @@ class NtripNode(Node):
 
         while not self._stop_event.is_set():
             sock = None
+            self._force_reconnect.clear()
             try:
                 self._set_lifecycle("connecting")
                 sock, buf = self._connect()
@@ -617,9 +623,19 @@ class NtripNode(Node):
                         chunk = sock.recv(4096)
                     except socket.timeout:
                         continue
+                    except OSError:
+                        # Socket closed under the blocked recv() — by the
+                        # stream-health watchdog forcing a reconnect, or by
+                        # request_stop(). Intentional, not a transport error:
+                        # break to the clean reconnect path instead of logging
+                        # an ERROR and tagging transport_reason=transport_error.
+                        if self._stop_event.is_set() or self._force_reconnect.is_set():
+                            break
+                        raise
 
                     if not chunk:
-                        self.get_logger().warn("NTRIP stream ended, reconnecting")
+                        if not self._force_reconnect.is_set():
+                            self.get_logger().warn("NTRIP stream ended, reconnecting")
                         break
 
                     frames = self._parser.feed(chunk)

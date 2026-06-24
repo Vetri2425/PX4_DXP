@@ -59,6 +59,7 @@ GPS_FIX_NAMES = {
     0: "NO_FIX",
     1: "GPS",
     2: "DGPS",
+    3: "3D_FIX",  # MAVLink GPS_FIX_TYPE 3 = 3D fix (was rendering as UNKNOWN)
     4: "DGPS",  # duplicate for compatibility
     5: "RTK_FLOAT",
     6: "RTK_FIXED",

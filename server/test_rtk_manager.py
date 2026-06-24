@@ -1226,3 +1226,10 @@ async def test_ntrip_start_route_maps_validation_to_422(monkeypatch):
     with pytest.raises(HTTPException) as excinfo:
         await start_ntrip(req)
     assert excinfo.value.status_code == 422
+
+
+def test_gps_fix_names_includes_3d_fix():
+    """MAVLink GPS_FIX_TYPE 3 (3D fix) must render as 3D_FIX, not UNKNOWN."""
+    from config import GPS_FIX_NAMES
+    assert GPS_FIX_NAMES.get(3) == "3D_FIX"
+    assert GPS_FIX_NAMES.get(6) == "RTK_FIXED"
