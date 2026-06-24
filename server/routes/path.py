@@ -999,8 +999,20 @@ def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
     if req.spray_mode is None:
         _spray = load_spray_mode(MISSION_DIR, req.source or "")
     else:
+        # Legacy plan body carries no continuous-mode timing fields, so the
+        # explicit-spray-mode flow keeps factory continuous params (unchanged
+        # behavior). Per-path continuous config is set via the /spray-mode
+        # sidecar endpoints and only takes effect through the sidecar branch.
         _spray = {
             "spray_mode": req.spray_mode,
+            "solenoid_open_delay_s": spray_defaults["solenoid_open_delay_s"],
+            "solenoid_close_delay_s": spray_defaults["solenoid_close_delay_s"],
+            "on_overspray_margin_m": spray_defaults["on_overspray_margin_m"],
+            "off_overspray_margin_m": spray_defaults["off_overspray_margin_m"],
+            "min_spray_speed_mps": spray_defaults["min_spray_speed_mps"],
+            "max_xtrack_error_m": spray_defaults["max_xtrack_error_m"],
+            "nozzle_forward_offset_m": spray_defaults["nozzle_forward_offset_m"],
+            "nozzle_lateral_offset_m": spray_defaults["nozzle_lateral_offset_m"],
             "dash_on_distance_m": req.dash_on_distance_m,
             "dash_off_distance_m": req.dash_off_distance_m,
             "dash_phase_reset": req.dash_phase_reset,
@@ -1055,6 +1067,14 @@ def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
         "spray_flags": result.get("spray_flags", []),
         "configuration_revision": configuration_revision,
         "spray_mode": _spray["spray_mode"],
+        "solenoid_open_delay_s": _spray.get("solenoid_open_delay_s", spray_defaults["solenoid_open_delay_s"]),
+        "solenoid_close_delay_s": _spray.get("solenoid_close_delay_s", spray_defaults["solenoid_close_delay_s"]),
+        "on_overspray_margin_m": _spray.get("on_overspray_margin_m", spray_defaults["on_overspray_margin_m"]),
+        "off_overspray_margin_m": _spray.get("off_overspray_margin_m", spray_defaults["off_overspray_margin_m"]),
+        "min_spray_speed_mps": _spray.get("min_spray_speed_mps", spray_defaults["min_spray_speed_mps"]),
+        "max_xtrack_error_m": _spray.get("max_xtrack_error_m", spray_defaults["max_xtrack_error_m"]),
+        "nozzle_forward_offset_m": _spray.get("nozzle_forward_offset_m", spray_defaults["nozzle_forward_offset_m"]),
+        "nozzle_lateral_offset_m": _spray.get("nozzle_lateral_offset_m", spray_defaults["nozzle_lateral_offset_m"]),
         "dash_on_distance_m": _spray["dash_on_distance_m"],
         "dash_off_distance_m": _spray["dash_off_distance_m"],
         "dash_phase_reset": _spray["dash_phase_reset"],

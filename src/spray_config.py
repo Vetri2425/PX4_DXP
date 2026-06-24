@@ -372,6 +372,14 @@ def staged_spray_defaults() -> dict[str, Any]:
     cfg = SprayConfiguration()
     return {
         "spray_mode": cfg.mode.value,
+        "solenoid_open_delay_s": cfg.continuous.solenoid_open_delay_s,
+        "solenoid_close_delay_s": cfg.continuous.solenoid_close_delay_s,
+        "on_overspray_margin_m": cfg.continuous.on_overspray_margin_m,
+        "off_overspray_margin_m": cfg.continuous.off_overspray_margin_m,
+        "min_spray_speed_mps": cfg.continuous.min_spray_speed_mps,
+        "max_xtrack_error_m": cfg.continuous.max_xtrack_error_m,
+        "nozzle_forward_offset_m": cfg.continuous.nozzle_forward_offset_m,
+        "nozzle_lateral_offset_m": cfg.continuous.nozzle_lateral_offset_m,
         "dash_on_distance_m": cfg.dash.on_distance_m,
         "dash_off_distance_m": cfg.dash.off_distance_m,
         "dash_phase_reset": cfg.dash.phase_reset.value,
