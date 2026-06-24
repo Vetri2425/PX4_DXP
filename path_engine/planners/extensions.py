@@ -27,7 +27,7 @@ Metadata survival chain:
     → densify_segment()           [straight_line.py — copies metadata]
     → optimize_segment_order()    [segment_order.py — swaps/negates on reversal]
     → split_mark_segment_with_extensions()   [this module — copies metadata]
-    → apply_spray_latency_compensation()     [spray.py — copies metadata]
+    → optional legacy offline compensation   [spray.py — copies metadata]
 """
 
 from __future__ import annotations
@@ -342,7 +342,7 @@ def split_mark_segment_with_extensions(
     1. **Metadata tangents** (ARC / CIRCLE from dxf_parser):
        ``metadata["start_tangent"]`` and ``metadata["end_tangent"]`` are used
        as-is (normalised defensively).  These survive densification, optimizer
-       reversal (with negation/swap), and spray compensation.
+       reversal (with negation/swap), and legacy offline compensation.
 
     2. **Line-like source_entity** (LINE / LWPOLYLINE / POLYLINE):
        Direction inferred from ``points[0]→points[1]`` (start) and

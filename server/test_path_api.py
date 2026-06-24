@@ -1378,11 +1378,10 @@ def test_load_path_executes_with_extension_config(tmp_path):
     _write_line_dxf(dxf)
     mgr = PathManager(str(tmp_path))
 
-    # Extensions OFF → no run-up; line starts at (0,0) (modulo a small spray
-    # lead-in of ~0.035 m from latency compensation).
+    # Extensions OFF → no run-up; line starts at exact CAD origin.
     mgr.save_extension_config("line.dxf", False, 0.5, 0.5)
     pts_off = mgr.load_path("line.dxf")
-    assert abs(pts_off[0][0]) < 0.1  # near drawing origin (spray lead-in only)
+    assert abs(pts_off[0][0]) < 0.1  # near drawing origin; no planner lead-in
 
     # Extensions ON → PRE leg prepended; path now starts 0.5 m before (0,0).
     mgr.save_extension_config("line.dxf", True, 0.5, 0.5)
@@ -1941,3 +1940,10 @@ def test_plan_and_stage_request_rejects_compensate_spray_true():
 
     with pytest.raises(ValidationError):
         PathPlanRequest(source="square_2x2.dxf", compensate_spray=True)
+
+
+def test_path_manager_plan_path_rejects_compensate_spray_true(tmp_path):
+    shutil.copy(_SQUARE_DXF, tmp_path / "square_2x2.dxf")
+    mgr = PathManager(str(tmp_path))
+    with pytest.raises(ValueError, match="compensate_spray=True is not permitted"):
+        mgr.plan_path("square_2x2.dxf", compensate_spray=True)

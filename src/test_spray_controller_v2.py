@@ -11,6 +11,7 @@ import types
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from test_spray_manual_override import _Cli, _Param, _bool_msg, make_node  # noqa: E402
+from spray_config import SprayConfiguration, UnsafeSpeedBehavior  # noqa: E402
 from spray_controller_node import (  # noqa: E402
     MARK_TO_TRANSIT,
     TRANSIT_TO_MARK,
@@ -19,6 +20,7 @@ from spray_controller_node import (  # noqa: E402
     _nozzle_position_ned,
     _project_onto_path,
 )
+from path_identity import path_geometry_fingerprint  # noqa: E402
 
 
 def _straight_mark_path():
@@ -64,6 +66,14 @@ def _make_distance_node(path_model=None, pose_n=1.0, pose_e=0.0, speed=1.0):
     return node
 
 
+def _path_msg(points, flags):
+    poses = []
+    for (n, e), flag in zip(points, flags):
+        pos = types.SimpleNamespace(x=n, y=e, z=1.0 if flag else 0.0)
+        poses.append(types.SimpleNamespace(pose=types.SimpleNamespace(position=pos)))
+    return types.SimpleNamespace(poses=poses)
+
+
 def test_path_boundary_extraction():
     model = _straight_mark_path()
     assert model.cumulative_s == [0.0, 1.0, 2.0, 3.0]
@@ -92,7 +102,7 @@ def test_transit_to_mark_anticipatory_on():
         nozzle_n=0.91,
         nozzle_e=0.0,
     )
-    assert decision.event == "on_early"
+    assert decision.event == "ON_EARLY"
     assert decision.desired is True
     assert decision.next_boundary is not None
     assert decision.next_boundary.kind == TRANSIT_TO_MARK
@@ -103,7 +113,7 @@ def test_mark_to_transit_anticipatory_off():
         nozzle_n=2.96,
         nozzle_e=0.0,
     )
-    assert decision.event == "off_early"
+    assert decision.event == "OFF_EARLY"
     assert decision.desired is False
     assert decision.next_boundary is not None
     assert decision.next_boundary.kind == MARK_TO_TRANSIT
@@ -111,7 +121,7 @@ def test_mark_to_transit_anticipatory_off():
 
 def test_off_margin_does_not_cut_mark_tail_short():
     decision = _decision(nozzle_n=2.94, nozzle_e=0.0)
-    assert decision.event == ""
+    assert decision.event == "FOLLOW_FLAG"
     assert decision.desired is True
 
 
@@ -122,7 +132,7 @@ def test_on_overspray_margin_extends_mark_start():
         nozzle_e=0.0,
         on_overspray_margin_m=0.0,
     )
-    assert with_margin.event == "on_early"
+    assert with_margin.event == "ON_EARLY"
     assert with_margin.desired is True
     assert without_margin.desired is False
 
@@ -258,11 +268,178 @@ def test_min_speed_end_to_end_forces_off():
     assert "below min spray speed" in node._last_safety_block_reason
 
 
+def test_above_max_speed_blocks_spray():
+    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=1.2)
+    node._params["max_spray_speed_mps"] = _Param(0.5)
+    node._active_config = node._configuration_from_node_parameters()
+
+    node._distance_aware_tick()
+
+    assert node._desired_debounced is False
+    assert "above max spray speed" in node._last_safety_block_reason
+
+
+def test_clamp_pwm_policy_allows_speed_outside_window():
+    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=1.2)
+    node._params["max_spray_speed_mps"] = _Param(0.5)
+    node._params["unsafe_speed_behavior"] = _Param(UnsafeSpeedBehavior.CLAMP_PWM.value)
+    node._active_config = node._configuration_from_node_parameters()
+
+    node._distance_aware_tick()
+
+    assert node._desired_debounced is True
+    assert node._current_pwm == 1800.0
+
+
+def test_dynamic_pwm_interpolation_reaches_actuator_request():
+    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=0.2)
+    node._params["speed_pwm_table"] = _Param(
+        '[{"speed_mps":0.1,"pwm":1200.0},{"speed_mps":0.3,"pwm":2000.0}]'
+    )
+    node._active_config = node._configuration_from_node_parameters()
+
+    node._distance_aware_tick()
+
+    assert node._current_pwm == 1600.0
+    assert node._command_cli.requests[-1].param1 != 1.0
+
+
+def test_conditioned_path_identity_mismatch_fails_closed():
+    node = make_node()
+    node._active_config = SprayConfiguration(
+        mission_id="stg_a",
+        path_fingerprint="expected",
+        revision=1,
+    )
+    node._conditioned_path_identity = {
+        "mission_id": "stg_a",
+        "path_fingerprint": "wrong",
+        "configuration_revision": 1,
+        "source": "rpp_conditioned_path",
+    }
+
+    node._path_cb(_path_msg([(0.0, 0.0), (1.0, 0.0)], [True, True]))
+
+    assert node._path_model is None
+    assert node._desired_debounced is False
+
+
+def test_conditioned_path_identity_match_loads_model():
+    points = [(0.0, 0.0), (1.0, 0.0)]
+    flags = [True, True]
+    fp = path_geometry_fingerprint(points, flags)
+    node = make_node()
+    node._active_config = SprayConfiguration(
+        mission_id="stg_a",
+        path_fingerprint=fp,
+        revision=1,
+    )
+    node._conditioned_path_identity = {
+        "mission_id": "stg_a",
+        "path_fingerprint": fp,
+        "configuration_revision": 1,
+        "source": "rpp_conditioned_path",
+    }
+
+    node._path_cb(_path_msg(points, flags))
+
+    assert node._path_model is not None
+
+
+def test_conditioned_path_configuration_revision_missing_fails_closed():
+    points = [(0.0, 0.0), (1.0, 0.0)]
+    flags = [True, True]
+    fp = path_geometry_fingerprint(points, flags)
+    node = make_node()
+    node._active_config = SprayConfiguration(
+        mission_id="stg_a",
+        path_fingerprint=fp,
+        revision=3,
+    )
+    node._conditioned_path_identity = {
+        "mission_id": "stg_a",
+        "path_fingerprint": fp,
+        "configuration_revision": 0,
+        "source": "rpp_conditioned_path",
+    }
+
+    node._path_cb(_path_msg(points, flags))
+
+    assert node._path_model is None
+    assert "configuration revision" in node._last_safety_block_reason
+
+
+def test_conditioned_path_configuration_revision_mismatch_fails_closed():
+    points = [(0.0, 0.0), (1.0, 0.0)]
+    flags = [True, True]
+    fp = path_geometry_fingerprint(points, flags)
+    node = make_node()
+    node._active_config = SprayConfiguration(
+        mission_id="stg_a",
+        path_fingerprint=fp,
+        revision=3,
+    )
+    node._conditioned_path_identity = {
+        "mission_id": "stg_a",
+        "path_fingerprint": fp,
+        "configuration_revision": 2,
+        "source": "rpp_conditioned_path",
+    }
+
+    node._path_cb(_path_msg(points, flags))
+
+    assert node._path_model is None
+    assert "configuration revision mismatch" in node._last_safety_block_reason
+
+
+def test_conditioned_path_clear_identity_clears_model_and_forces_off():
+    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=1.0)
+    msg = types.SimpleNamespace(
+        data='{"configuration_revision":0,"mission_id":"","path_fingerprint":"","source":"clear"}'
+    )
+
+    node._conditioned_path_identity_cb(msg)
+
+    assert node._path_model is None
+    assert node._desired_debounced is False
+    assert "cleared" in node._last_safety_block_reason
+
+
+def test_runtime_status_includes_task02_diagnostics():
+    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=0.2)
+    node._distance_aware_tick()
+
+    status = node.get_runtime_status()
+
+    assert "actual_speed_mps" in status
+    assert "target_flow" in status
+    assert "current_pwm" in status
+    assert "current_decision_event" in status
+    assert "conditioned_path_source" in status
+    assert "path_identity" in status
+    assert "actuator_failure_state" in status
+    assert status["target_speed_mps"] is None
+    assert status["target_speed_source"] == "unavailable"
+    assert status["physical_actuator_state"] == "UNAVAILABLE"
+    assert status["physical_confirmation_available"] is False
+
+
+def test_on_command_failure_fails_closed_and_retries_off():
+    node = make_node()
+    node._command_cli = _Cli(responses=[(False, 99), True])
+
+    node._send_command(True, reason="edge")
+
+    assert node._commanded is False
+    assert node._actuator_state.current_on is False
+    assert len(node._command_cli.requests) == 2
+
+
 def test_anticipation_lead_scales_with_fresh_speed():
     slow = _decision(nozzle_n=0.93, speed_mps=0.2)
     fast = _decision(nozzle_n=0.93, speed_mps=1.0)
     assert slow.desired is False
-    assert fast.event == "on_early"
+    assert fast.event == "ON_EARLY"
     assert fast.desired is True
 
 

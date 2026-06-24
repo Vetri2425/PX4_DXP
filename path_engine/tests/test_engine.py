@@ -16,6 +16,7 @@ def test_engine_defaults():
     assert engine.transit_spacing == 0.15
     assert engine.marking_speed == 0.35
     assert engine.transit_speed == 0.50
+    assert engine.compensate_spray is False
 
 
 def test_engine_plan_segments_single_mark():

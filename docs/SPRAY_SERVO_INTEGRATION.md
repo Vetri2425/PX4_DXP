@@ -12,15 +12,15 @@ QGC configuration are the remaining operator steps before field use.
 Planner spray_flags ─► /path (flag in pose.position.z)
                           │
         rpp_controller_node (50 Hz)
-          flags propagated through corner-smoothing/resampling,
-          MARK segment iff flags[i] AND flags[i+1]
+          exact PRE/MARK/AFT flags preserved through conditioning
                           │
-                          ├─► /rpp/debug[39]  (spray_active, telemetry)
-                          └─► /spray/active   (Bool, 50 Hz)
+                          ├─► /rpp/conditioned_path + identity
+                          ├─► /rpp/debug[39]  (spray_active telemetry)
+                          └─► /spray/active   (legacy fallback telemetry)
                           ▼
         spray_controller_node                ◄── /spray/manual  (server override)
-          debounce → edge-fire → 2 Hz re-assert
-          watchdog + fail-safes (see §5)
+          runtime timing compensation, speed/flow control,
+          debounce → edge-fire → 2 Hz re-assert, watchdog + fail-safes
                           │
                           ├─► /mavros/cmd/command  CommandLong 187 (DO_SET_ACTUATOR)
                           ├─► /spray/state         (actual commanded, → server "spraying")
@@ -166,11 +166,12 @@ Auto-off layers (all independent): server timer (≤10 s) → node
 4. **Mission-path check:** load a path with mixed MARK/TRANSIT flags, run it, and
    verify `marking_state` flips at segment boundaries; confirm
    `POST /spray/test {"on": true}` returns 409 while RUNNING.
-5. **Latency calibration:** `ros2 bag record /spray/active /spray/state
-   /mavros/local_position/pose`, measure boundary-cross → actuation (include the
-   production `debounce_samples` setting), feed the result into the planner's
-   spray-latency compensation (`apply_spray_latency_compensation`). Re-measure after
-   changing debounce or mission speed.
+5. **Latency calibration:** `ros2 bag record /rpp/conditioned_path /spray/state
+   /spray/runtime_status /mavros/local_position/pose`, measure boundary-cross →
+   actuation (include the production `debounce_samples` setting), and feed the
+   measured open/close delays plus margins into the spray controller calibration
+   profile. Planner geometry stays exact CAD PRE/MARK/AFT; do not enable planner
+   spray compensation in production.
 
 ---
 
@@ -180,14 +181,17 @@ Auto-off layers (all independent): server timer (≤10 s) → node
 |---|---|
 | **Firmware** | DISARMED/FAILSAFE PWM = OFF — disarm kills spray in every mode, no software needed |
 | **Node fail-safes** | Disarm or mode ≠ OFFBOARD (`require_offboard`, default true) → force OFF and **clear any manual override**; node shutdown sends a final OFF |
-| **Node watchdogs** | `/spray/active` stale > `active_timeout_s` (0.5 s) → auto desire OFF (manual has its own clock); manual expiry `manual_override_timeout_s` (10 s) — an override can never latch |
+| **Node watchdogs** | Production distance-aware mode requires fresh pose/velocity plus matching `/rpp/conditioned_path` identity; legacy `/spray/active` fallback is allowed only when distance-aware mode is disabled. Manual expiry `manual_override_timeout_s` (10 s) — an override can never latch |
 | **Server gates** | Manual ON refused while mission RUNNING or disarmed; duration clamped ≤ 10 s with auto-off task |
-| **Data fail-safe** | Unknown/legacy paths (no z-flags) read as all-OFF at the controller; flag length mismatches force OFF |
+| **Data fail-safe** | Missing, stale, cleared, mismatched path identity or configuration revision clears the spray model and commands OFF. Mission clear publishes empty `/path` and `/path/identity`; RPP relays an empty `/rpp/conditioned_path` and clear identity. Unknown/legacy paths can use timing-only compatibility only through explicit opt-in |
 
 `spray_controller_node` parameters (set via `rpp_start.sh` args if needed):
 `actuator_set_index` (1), `on_value` (1.0), `off_value` (−1.0), `debounce_samples` (3),
 `reassert_hz` (2.0), `require_offboard` (true), `active_timeout_s` (0.5),
 `manual_override_timeout_s` (10.0), `command_service` (`/mavros/cmd/command`).
+`unsafe_speed_behavior=BLOCK_SPRAY` is spray-only blocking; `CLAMP_PWM` is the only
+validated out-of-window flow policy. `PAUSE_MISSION` is rejected until a universal
+mission lifecycle pause exists for path, dash, survey, and point modes.
 
 ---
 
@@ -197,7 +201,7 @@ Auto-off layers (all independent): server timer (≤10 s) → node
 |---|---|
 | Pin never moves | Armed? AUX function = 301 in QGC? `pgrep -f spray_controller_node` on Jetson? `journalctl -u rpp-pipeline | grep spray` |
 | Moves on `ros2 service call` but not via endpoint | Mode gate: endpoint path enforces OFFBOARD unless `require_offboard:=false`; check node log "manual spray ON rejected" |
-| ON but drops after ~0.5 s during a mission | `/spray/active` stale — is `rpp_controller_node` alive? |
+| ON but drops during a mission | Check `/spray/runtime_status`: pose/velocity freshness, conditioned path identity, configuration revision, OFFBOARD state, and actuator failure fields |
 | ON but drops after 10 s on bench | Expected — node-side manual expiry; re-issue the test |
 | `manual_override` stays false after POST 200 | `/spray/manual_state` not reaching server — check both nodes share `ROS_DOMAIN_ID=0` |
 | Spray inverted | Swap MIN/MAX in QGC or set `on_value`/`off_value` to ∓1.0 |

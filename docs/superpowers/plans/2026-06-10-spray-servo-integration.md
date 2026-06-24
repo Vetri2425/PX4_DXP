@@ -1,6 +1,6 @@
 # Phase 3 — Spray / Marking Servo Integration (Pixhawk AUX)
 
-**Date:** 2026-06-10 (rev 3 — codebase audit on 2026-06-11; software implementation reconciled
+**Date:** 2026-06-10 (rev 4 — Task 02 architecture update; software implementation reconciled
 against current source)
 **Author:** Vetri
 **Scope:** Wire a marking servo/solenoid to a CubeOrangePlus AUX output, drive it from the
@@ -8,6 +8,10 @@ runtime MARK/TRANSIT state with low-latency `rclpy` commands, and surface a
 `marking / transit` status to the GCS frontend.
 **Layers touched:** PX4 firmware *config only* (QGC params), Jetson companion (ROS2/MAVROS),
 FastAPI server, frontend telemetry.
+
+> Task 02 supersedes older `/spray/active`-driven wording in historical sections below:
+> production spray uses `/rpp/conditioned_path` identity-bound geometry; `/spray/active`
+> is compatibility fallback/telemetry only when distance-aware spray is disabled.
 
 ---
 
@@ -24,15 +28,16 @@ implemented in the current repo; keep only hardware/field-validation items in th
 - `server/mission_loading.py`, `server/routes/mission.py`, `server/routes/path.py`,
   `server/sockets/events.py`, and `server/offboard_controller.py` forward `spray_flags`
   into controller-loaded/published paths.
-- `path_engine/core.py`, `path_engine/engine.py`, and `path_engine/spray.py` carry
-  `PlannedPath.spray_flags`, MARK/TRANSIT segments, entity overrides, and spray latency
-  compensation.
-- `src/rpp_controller_node.py` reads flags from `/path` z, propagates them through
-  `_smooth_corners()` and `_resample_path()`, applies the endpoint AND rule, publishes
-  `/spray/active`, and exposes `/rpp/debug[39]` through `[46]`.
-- `src/spray_controller_node.py` exists and drives `MAV_CMD_DO_SET_ACTUATOR` with
-  debounce, 2 Hz reassert, staleness watchdog, manual override, and fail-safe OFF on
-  disarm / non-OFFBOARD / shutdown.
+- `path_engine/core.py` and `path_engine/engine.py` carry `PlannedPath.spray_flags`,
+  MARK/TRANSIT segments, entity overrides, and exact CAD PRE/MARK/AFT geometry.
+  `path_engine/spray.py` is legacy offline compensation only.
+- `src/rpp_controller_node.py` reads exact CAD PRE/MARK/AFT flags from `/path` z,
+  preserves transition vertices through `_smooth_corners()` and `_resample_path()`,
+  publishes `/rpp/conditioned_path` plus identity for production spray timing, and
+  keeps `/spray/active` as telemetry/legacy fallback.
+- `src/spray_controller_node.py` consumes `/rpp/conditioned_path`, validates mission
+  identity/configuration revision, owns runtime timing, flow, speed safety, actuator
+  state, manual override, and fail-safe OFF on disarm / non-OFFBOARD / shutdown.
 - `src/launch/rpp_pipeline.launch.py` and `rpp_start.sh` both start
   `spray_controller_node.py`; systemd uses `rpp_start.sh`.
 - `server/routes/spray.py`, `server/models.py`, `server/routes/telemetry.py`, and
@@ -191,8 +196,9 @@ satisfies the "create a proper node for servo controller" requirement.
   `flags[i] AND flags[i+1]`** (both endpoints ON). Rationale: at a TRANSIT→MARK
   boundary the shared merged waypoint may carry either value depending on merge order;
   AND-ing makes the boundary deterministic and errs toward OFF (no paint outside the
-  mark). The lead-in point inserted by `apply_spray_latency_compensation()` belongs to
-  the MARK segment, so it is `True` and the early-ON still fires at the shifted point.
+  mark). Production no longer inserts planner lead-in points; exact CAD MARK
+  boundaries remain in the planned geometry, and runtime timing anticipation is
+  handled by the spray controller against RPP-conditioned geometry.
 - **Calibration invariant:** this convention shifts the effective ON boundary by at most
   one waypoint spacing; it is constant for a given path, so §4's measured-latency
   feedback absorbs it. Do not change the convention after latency calibration without
@@ -343,19 +349,22 @@ End-to-end ON/OFF latency from "rover crosses MARK boundary" to "solenoid actuat
 | PX4 mixer → AUX PWM update | ~2–5 ms | output rate |
 | Solenoid mechanical | device-specific | dominant, often 10–50 ms |
 
-**The plan already has spatial pre-compensation** (`apply_spray_latency_compensation`,
-`latency × speed`). Procedure:
+**Production ownership:** the planner preserves exact CAD PRE/MARK/AFT geometry,
+RPP owns motion tracking and path conditioning, and the spray controller owns
+runtime timing, flow, safety, and actuator state. Procedure:
 1. Measure real end-to-end latency on the bench (§5) **with the production
    `debounce_samples` value in place** — debounce is part of the latency being
    compensated (3 samples ≈ 60 ms ≈ 2.1 cm at 0.35 m/s).
-2. Feed the measured value into the existing `spray latency` planner param so the MARK
-   boundary is shifted by exactly `latency × mission_speed`.
+2. Feed measured open/close delays, margins, speed window, and speed-to-PWM table
+   into the spray controller calibration profile. Do not shift MARK geometry in
+   the planner.
 3. Keep `debounce_samples` as low as chatter allows — every debounce tick is added lag.
 4. **Re-measure** after changing `debounce_samples`, the flag boundary convention
    (§2.1), or mission speed — all three shift the effective boundary.
 
-This split (spatial compensation in planning + edge-fire at runtime) is what keeps the
-**marking start/stop accurate** without needing a high-rate streaming actuator command.
+This split (exact geometry in planning + distance-aware timing/flow at runtime) is
+what keeps the **marking start/stop accurate** without moving spray ownership into
+RPP or the planner.
 
 ---
 
@@ -402,7 +411,9 @@ This split (spatial compensation in planning + edge-fire at runtime) is what kee
 - `src/test_spray_flag_conditioning.py` covers resampling, smoothing, and endpoint AND
   behavior for propagated flags.
 - `server/test_spray_routes.py` covers `/api/spray/test` and `/api/spray/status`.
-- `path_engine/tests/test_spray.py` covers latency-compensation geometry.
+- `path_engine/tests/test_spray.py` covers the legacy offline compensation helper.
+  Production double-compensation guards live in production geometry and server
+  path tests.
 
 **Still needs hardware/integration validation:** real AUX output movement, solenoid
 latency, and fail-safe OFF behavior on the wired actuator.
@@ -421,7 +432,7 @@ latency, and fail-safe OFF behavior on the wired actuator.
 | `src/rpp_controller_node.py` | Implemented: reads z flags, conditions flags, computes `spray_active`, publishes `/spray/active` + `/rpp/debug[39]`, forces OFF when not tracking |
 | `src/spray_controller_node.py` | Implemented: edge-detect, debounce, staleness watchdog, manual override, `DO_SET_ACTUATOR`, ack-check + log, re-assert, fail-safe OFF, publish `/spray/state` |
 | `src/launch/rpp_pipeline.launch.py` / `rpp_start.sh` | Implemented: `spray_controller_node` included in launch and systemd startup path |
-| Tests | Implemented for spray flag conditioning, manual override, server routes, and path-engine compensation |
+| Tests | Implemented for spray flag conditioning, manual override, server routes, and controller-owned timing/flow guards |
 | Frontend (web + mobile) | External verification remains: MARKING / TRANSIT / OFF status pill bound to `marking_state` |
 
 ### Remaining validation order
@@ -431,7 +442,7 @@ latency, and fail-safe OFF behavior on the wired actuator.
 3. Mixed MARK/TRANSIT mission-path check with real actuator disconnected or safely benched.
 4. Hardware fail-safe validation: disarm, E-stop, mode exit, upstream staleness, shutdown.
 5. Frontend status verification in the GCS repo.
-6. Latency measurement + feed back into planner compensation.
+6. Latency measurement + feed back into the spray controller calibration profile.
 
 ---
 

@@ -46,6 +46,9 @@ class SprayDecision:
     distance_to_boundary_m: float
     event: str
     debug: list[float]
+    target_flow: float = 0.0
+    target_pwm: float = 0.0
+    actuator_value: float = 0.0
 
 
 def build_path_model(
@@ -191,7 +194,7 @@ def make_spray_decision(
     boundary: Optional[SprayBoundary] = None
     distance_to_boundary = float("inf")
     geometry_desired = False
-    event = ""
+    event = "WAITING_FOR_BOUNDARY"
 
     if model is not None and nozzle_n is not None and nozzle_e is not None:
         projection = project_onto_path(model, nozzle_n, nozzle_e)
@@ -217,14 +220,21 @@ def make_spray_decision(
                 and distance_to_boundary <= on_lead
             ):
                 geometry_desired = True
-                event = "on_early"
+                event = "ON_EARLY"
             elif (
                 projection.current_flag
                 and boundary.kind == MARK_TO_TRANSIT
                 and distance_to_boundary <= off_lead
             ):
                 geometry_desired = False
-                event = "off_early"
+                event = "OFF_EARLY"
+            else:
+                event = "FOLLOW_FLAG"
+        else:
+            event = "FOLLOW_FLAG"
+
+    if not safety_ok:
+        event = "SAFETY_BLOCKED"
 
     desired = bool(geometry_desired and safety_ok)
     debug = [

@@ -617,7 +617,7 @@ class PathManager:
                 origin != (0.0, 0.0) or start_position is not None
             ):
                 from path_engine import PathEngine
-                engine = PathEngine()
+                engine = PathEngine(compensate_spray=False)
                 plan = engine.plan_file(
                     fpath,
                     origin=origin,
@@ -855,6 +855,12 @@ class PathManager:
         # Production default: planner preserves CAD MARK endpoints exactly.
         # Runtime spray_controller owns latency anticipation.
         compensate_spray = kwargs.pop("compensate_spray", False)
+        if compensate_spray:
+            raise ValueError(
+                "compensate_spray=True is not permitted in production planning: "
+                "planner preserves exact CAD geometry and spray_controller "
+                "owns latency anticipation."
+            )
         extension_kwargs_provided = any(
             key in kwargs
             for key in ("enable_path_extensions", "pre_extension_m", "aft_extension_m")
@@ -1129,7 +1135,7 @@ class PathManager:
             return read_ned_csv(fpath)
         if ext == ".dxf":
             from path_engine import PathEngine
-            engine = PathEngine()
+            engine = PathEngine(compensate_spray=False)
             plan = engine.plan_file(fpath)
             return plan.merged_waypoints
         try:

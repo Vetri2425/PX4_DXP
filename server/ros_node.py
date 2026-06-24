@@ -45,6 +45,11 @@ from spray_runtime_protocol import (
     parse_dwell_response,
     serialize_dwell_command,
 )
+from path_identity import (
+    PATH_IDENTITY_TOPIC,
+    make_path_identity,
+    path_geometry_fingerprint,
+)
 
 from config import (
     SRV_RPP_GET_PARAMS,
@@ -315,6 +320,9 @@ class RosBridgeNode(Node):
 
         # ── Publishers ────────────────────────────────────────────────────────
         self._path_pub = self.create_publisher(Path, "/path", _qos_reliable_tl())
+        self._path_identity_pub = self.create_publisher(
+            String, PATH_IDENTITY_TOPIC, _qos_reliable_tl()
+        )
         # Manual spray override command — reliable VOLATILE (depth 1): must
         # arrive, but a stale override must never replay to a restarted node.
         self._spray_manual_pub = self.create_publisher(Bool, "/spray/manual", 1)
@@ -1144,6 +1152,9 @@ class RosBridgeNode(Node):
         frame_id: str = "local_ned",
         spray_flags: list[bool] | None = None,
         runtime_entry: bool = False,
+        mission_id: str = "",
+        configuration_revision: int = 0,
+        path_fingerprint: str = "",
     ) -> None:
         """Publish nav_msgs/Path. Empty list → see publish_stop_path()."""
         if spray_flags is None:
@@ -1175,13 +1186,46 @@ class RosBridgeNode(Node):
             else:
                 ps.pose.orientation.w = 1.0
             path.poses.append(ps)
+        fingerprint = (
+            path_fingerprint
+            if path_fingerprint
+            else (
+                path_geometry_fingerprint(points, flags)
+                if len(points) >= 2 else ""
+            )
+        )
+        ident = String()
+        ident.data = make_path_identity(
+            mission_id=mission_id,
+            path_fingerprint=fingerprint,
+            configuration_revision=configuration_revision,
+            source="raw_path",
+        )
+        self._path_identity_pub.publish(ident)
         self._path_pub.publish(path)
         log.info(
-            "published path: %d points → %s (spray_on=%d)",
+            "published path: %d points → %s (spray_on=%d, mission_id=%s)",
             len(points),
             frame_id,
             sum(1 for f in flags if f),
+            mission_id or "",
         )
+
+    def publish_path_clear(self, frame_id: str = "local_ned") -> None:
+        """Publish an explicit invalid path/identity reset for latched topics."""
+        ident = String()
+        ident.data = make_path_identity(
+            mission_id="",
+            path_fingerprint="",
+            configuration_revision=0,
+            source="clear",
+        )
+        path = Path()
+        path.header.stamp = self.get_clock().now().to_msg()
+        path.header.frame_id = frame_id
+        self._path_identity_pub.publish(ident)
+        self._path_pub.publish(path)
+        log.info("published latched path clear")
 
     def set_obstacle_callback(self, cb: Callable[[bool], None] | None) -> None:
         """Register orchestrator hook for ``/rover/obstacle_clear`` updates."""

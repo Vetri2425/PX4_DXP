@@ -94,19 +94,55 @@ class SprayModeConfig(BaseModel):
     gps_recovery_stable_s: float = 2.0
     obstacle_integration_enabled: bool = False
     obstacle_signal_max_age_s: float = 2.0
+    max_spray_speed_mps: float = 1.0
+    unsafe_speed_behavior: Literal["BLOCK_SPRAY", "CLAMP_PWM"] = "BLOCK_SPRAY"
+    calibration_profile_id: str = "factory_default"
+    calibration_profile_version: int = 1
+    target_paint_density: float = 1.0
+    speed_pwm_table: list[dict[str, float]] = Field(
+        default_factory=lambda: [
+            {"speed_mps": 0.05, "pwm": 1200.0},
+            {"speed_mps": 0.35, "pwm": 1800.0},
+        ]
+    )
+    actuator_min_pwm: float = 0.0
+    actuator_max_pwm: float = 2200.0
+    actuator_off_pwm: float = 0.0
+    actuator_min_value: float = -1.0
+    actuator_max_value: float = 1.0
+    actuator_off_value: float = -1.0
+    timing_only_compatibility: bool = False
 
 
 class ContinuousModeRequest(BaseModel):
-    """Continuous mode — timing and geometry compensation parameters."""
+    """Continuous mode — controller-owned timing, flow, and safety parameters."""
 
     solenoid_open_delay_s: float = Field(0.10, ge=0.0)
     solenoid_close_delay_s: float = Field(0.05, ge=0.0)
     on_overspray_margin_m: float = Field(0.02, ge=0.0)
     off_overspray_margin_m: float = Field(0.0, ge=0.0)
     min_spray_speed_mps: float = Field(0.05, ge=0.0)
+    max_spray_speed_mps: float = Field(1.0, gt=0.0)
+    unsafe_speed_behavior: Literal["BLOCK_SPRAY", "CLAMP_PWM"] = "BLOCK_SPRAY"
     max_xtrack_error_m: float = Field(0.10, gt=0.0)
     nozzle_forward_offset_m: float = 0.0
     nozzle_lateral_offset_m: float = 0.0
+    calibration_profile_id: str = "factory_default"
+    calibration_profile_version: int = Field(1, ge=1)
+    target_paint_density: float = Field(1.0, gt=0.0)
+    speed_pwm_table: list[dict[str, float]] = Field(
+        default_factory=lambda: [
+            {"speed_mps": 0.05, "pwm": 1200.0},
+            {"speed_mps": 0.35, "pwm": 1800.0},
+        ]
+    )
+    actuator_min_pwm: float = Field(0.0, ge=0.0)
+    actuator_max_pwm: float = Field(2200.0, gt=0.0)
+    actuator_off_pwm: float = Field(0.0, ge=0.0)
+    actuator_min_value: float = -1.0
+    actuator_max_value: float = 1.0
+    actuator_off_value: float = -1.0
+    timing_only_compatibility: bool = False
 
 
 class DashModeRequest(BaseModel):
@@ -800,6 +836,20 @@ class StagedMissionResponse(BaseModel):
     gps_recovery_stable_s: float = 2.0
     obstacle_integration_enabled: bool = False
     obstacle_signal_max_age_s: float = 2.0
+    path_fingerprint: str = ""
+    max_spray_speed_mps: float = 1.0
+    unsafe_speed_behavior: str = "BLOCK_SPRAY"
+    calibration_profile_id: str = "factory_default"
+    calibration_profile_version: int = 1
+    target_paint_density: float = 1.0
+    speed_pwm_table: list[dict[str, float]] = Field(default_factory=list)
+    actuator_min_pwm: float = 0.0
+    actuator_max_pwm: float = 2200.0
+    actuator_off_pwm: float = 0.0
+    actuator_min_value: float = -1.0
+    actuator_max_value: float = 1.0
+    actuator_off_value: float = -1.0
+    timing_only_compatibility: bool = False
     configuration_revision: int = 0
     alignment_metadata: Optional[dict] = None
     metadata: Optional[dict] = None

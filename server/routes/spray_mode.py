@@ -119,6 +119,7 @@ async def _apply_after_save(safe_name: str, config: dict) -> tuple[bool, str]:
     apply_cfg = {
         **config,
         "mission_id": getattr(offboard_ctrl, "loaded_mission_id", "") or "",
+        "path_fingerprint": getattr(offboard_ctrl, "_path_fingerprint", "") or "",
     }
     try:
         ok, why, _ = await apply_spray_mission_config(
@@ -172,9 +173,22 @@ async def set_continuous_mode(name: str, req: ContinuousModeRequest) -> SprayMod
     config["on_overspray_margin_m"] = req.on_overspray_margin_m
     config["off_overspray_margin_m"] = req.off_overspray_margin_m
     config["min_spray_speed_mps"] = req.min_spray_speed_mps
+    config["max_spray_speed_mps"] = req.max_spray_speed_mps
+    config["unsafe_speed_behavior"] = req.unsafe_speed_behavior
     config["max_xtrack_error_m"] = req.max_xtrack_error_m
     config["nozzle_forward_offset_m"] = req.nozzle_forward_offset_m
     config["nozzle_lateral_offset_m"] = req.nozzle_lateral_offset_m
+    config["calibration_profile_id"] = req.calibration_profile_id
+    config["calibration_profile_version"] = req.calibration_profile_version
+    config["target_paint_density"] = req.target_paint_density
+    config["speed_pwm_table"] = req.speed_pwm_table
+    config["actuator_min_pwm"] = req.actuator_min_pwm
+    config["actuator_max_pwm"] = req.actuator_max_pwm
+    config["actuator_off_pwm"] = req.actuator_off_pwm
+    config["actuator_min_value"] = req.actuator_min_value
+    config["actuator_max_value"] = req.actuator_max_value
+    config["actuator_off_value"] = req.actuator_off_value
+    config["timing_only_compatibility"] = req.timing_only_compatibility
 
     try:
         save_spray_mode(MISSION_DIR, safe, config)

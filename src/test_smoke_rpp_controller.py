@@ -12,10 +12,13 @@ Run:  python -X utf8 test_smoke_rpp_controller.py
 import sys
 import math
 
+import pytest
+
 # ---------------------------------------------------------------------------
 # Minimal rclpy bootstrap — no ROS master needed
 # ---------------------------------------------------------------------------
 import rclpy
+from rclpy.node import Node
 
 
 def _make_mavros_pose_from_ned(north, east, yaw_ned=0.0):
@@ -66,6 +69,8 @@ class _CapturePub:
 
 def test_smoke():
     """Instantiate RPPControllerNode, inject a path and pose, tick once, assert no crash."""
+    if Node is object or not hasattr(rclpy, "shutdown"):
+        pytest.skip("ROS2 rclpy runtime unavailable; only unit-test stubs are installed")
     rclpy.init(args=["--ros-args", "-p", "require_rtk_fix:=false"])
 
     try:

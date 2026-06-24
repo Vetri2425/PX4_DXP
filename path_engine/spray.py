@@ -1,4 +1,10 @@
-"""Spray latency compensation for marking solenoid.
+"""LEGACY — planner geometric spray latency compensation (offline/diagnostic only).
+
+Production ownership: PathEngine preserves exact CAD PRE/MARK/AFT geometry
+(compensate_spray=False). Runtime spray_controller owns distance-aware ON/OFF
+anticipation (use_distance_aware_spray). Do not enable planner compensation on
+production APIs, path_publisher_node, or mission staging — double compensation
+would shift MARK geometry and anticipate boundaries twice.
 
 When the solenoid opens, there's a delay before paint reaches the surface.
 When it closes, there's a shorter delay before paint stops.

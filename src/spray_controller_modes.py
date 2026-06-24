@@ -5,7 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
-from spray_config import DashPhaseReset, SprayConfiguration, SprayMode
+from spray_config import (
+    DashPhaseReset,
+    SprayConfiguration,
+    SprayMode,
+    UnsafeSpeedBehavior,
+    interpolate_speed_pwm,
+    pwm_to_normalized_value,
+)
 from spray_dash import apply_dash_pattern
 
 if TYPE_CHECKING:
@@ -60,7 +67,7 @@ def continuous_distance_decision(
             config.continuous.nozzle_forward_offset_m,
             config.continuous.nozzle_lateral_offset_m,
         )
-    return make_spray_decision(
+    decision = make_spray_decision(
         model=model,
         nozzle_n=nozzle_n,
         nozzle_e=nozzle_e,
@@ -72,6 +79,31 @@ def continuous_distance_decision(
         on_overspray_margin_m=config.continuous.on_overspray_margin_m,
         off_overspray_margin_m=config.continuous.off_overspray_margin_m,
         max_xtrack_error_m=config.continuous.max_xtrack_error_m,
+    )
+    target_flow = config.calibration.target_paint_density * max(0.0, float(speed_mps))
+    limits = config.calibration.actuator_limits
+    target_pwm = limits.off_pwm
+    actuator_value = limits.off_value
+    if decision.desired:
+        target_pwm = interpolate_speed_pwm(
+            speed_mps,
+            config.calibration.speed_pwm_table,
+            clamp=True,
+        )
+        actuator_value = pwm_to_normalized_value(target_pwm, limits)
+    return type(decision)(
+        desired=decision.desired,
+        geometry_desired=decision.geometry_desired,
+        safety_ok=decision.safety_ok,
+        safety_reason=decision.safety_reason,
+        projection=decision.projection,
+        next_boundary=decision.next_boundary,
+        distance_to_boundary_m=decision.distance_to_boundary_m,
+        event=decision.event,
+        debug=decision.debug,
+        target_flow=target_flow,
+        target_pwm=target_pwm,
+        actuator_value=actuator_value,
     )
 
 
@@ -111,6 +143,9 @@ def point_mode_decision(
         distance_to_boundary_m=float("inf"),
         event="dwell" if geometry_desired else "",
         debug=debug,
+        target_flow=0.0,
+        target_pwm=0.0,
+        actuator_value=0.0,
     )
 
 
@@ -136,9 +171,16 @@ def auto_safety_status(
     if not velocity_fresh:
         return False, "velocity stale"
     min_speed = config.continuous.min_spray_speed_mps
+    max_speed = config.continuous.max_spray_speed_mps
     bypass_min_speed = config.mode == SprayMode.POINT and dwell_active
     if not bypass_min_speed and speed < min_speed:
+        if config.continuous.unsafe_speed_behavior == UnsafeSpeedBehavior.CLAMP_PWM:
+            return True, ""
         return False, "below min spray speed"
+    if not bypass_min_speed and speed > max_speed:
+        if config.continuous.unsafe_speed_behavior == UnsafeSpeedBehavior.CLAMP_PWM:
+            return True, ""
+        return False, "above max spray speed"
     return True, ""
 
 

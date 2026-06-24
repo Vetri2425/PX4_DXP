@@ -3,7 +3,7 @@
 Usage:
     from path_engine import PathEngine
 
-    engine = PathEngine()
+    engine = PathEngine()  # compensate_spray=False — exact CAD geometry
     plan = engine.plan_file("soccer_field.dxf")
     print(f"Waypoints: {plan.num_waypoints}, Mark: {plan.total_mark_length:.1f}m")
 """
@@ -99,7 +99,7 @@ def _insert_transit_connectors_between_segments(
 def _align_extension_boundaries_to_compensated_marks(
     segments: list[PathSegment],
 ) -> list[PathSegment]:
-    """Keep PRE/MARK/AFT continuous after spray compensation shifts MARK ends."""
+    """Legacy helper: keep PRE/MARK/AFT continuous after offline compensation."""
     aligned = list(segments)
     for i in range(len(aligned) - 1):
         prev = aligned[i]
@@ -131,7 +131,13 @@ def _align_extension_boundaries_to_compensated_marks(
 class PathEngine:
     """Main orchestrator for the path planning pipeline.
 
-    Pipeline: parse → segments → densify → optimize → compensate → merge
+    Pipeline: parse → segments → densify → optimize → [legacy compensate] → merge
+
+    Production default: compensate_spray=False — planner preserves exact CAD
+    PRE/MARK/AFT geometry. Runtime spray_controller owns latency anticipation.
+    Legacy geometric compensation (path_engine/spray.py) is offline/diagnostic
+    only; enabling it on production paths would double-compensate with the
+    runtime spray controller.
 
     The engine is a pure-Python library with no ROS2 dependency.
     It produces PlannedPath objects that can be published to /path
@@ -147,7 +153,7 @@ class PathEngine:
         spray_on_latency: float = 0.10,
         spray_off_latency: float = 0.01,
         optimize_order: bool = True,
-        compensate_spray: bool = True,
+        compensate_spray: bool = False,
         enable_path_extensions: bool = False,
         pre_extension_m: float = 0.5,
         aft_extension_m: float = 0.5,
@@ -410,7 +416,7 @@ class PathEngine:
           3. Optimize segment order (nearest-neighbor TSP with endpoint reversal)
           4. Insert TRANSIT segments between disconnected MARK segments
           5. Apply drive extensions (PRE/AFT TRANSIT) to line-like MARK segments
-          6. Apply spray latency compensation to MARK segments only
+          6. Optionally apply legacy offline spray compensation (disabled in production)
           7. Merge into single polyline with spray flags (and de-duplicate junctions)
 
         Args:
@@ -736,8 +742,8 @@ class PathEngine:
         # Densification (Step 2) runs BEFORE ordering, so TRANSIT links inserted
         # by the optimizer, extension run-ups, and explicit extension-join
         # connectors can reach this point with only their two endpoints. Do this
-        # after spray compensation so PRE/AFT segments are sampled from their
-        # final, compensation-aligned endpoints.
+        # after optional legacy compensation so PRE/AFT segments are sampled
+        # from their final endpoints. Production leaves compensation disabled.
         redensified: list[PathSegment] = []
         for seg in ordered:
             if seg.segment_type == SegmentType.TRANSIT and len(seg.points) >= 2:

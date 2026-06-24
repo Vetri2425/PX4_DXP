@@ -69,7 +69,7 @@ Running log of all work. Each entry: what built, what fixed, what's next, time s
 
 ### Current source-of-truth updates
 - `/rpp/debug` is currently a 47-field append-only payload. Legacy consumers should keep reading stable indices `0..7`; spray/profile fields live at `39..46`.
-- Phase 3 spray software is implemented in this repo: path z-channel flags, RPP flag conditioning, `/spray/active`, `spray_controller_node.py`, launch/service wiring, `/api/spray/*`, and `marking_state` telemetry.
+- Phase 3 spray software is implemented in this repo: path z-channel flags, RPP conditioned geometry on `/rpp/conditioned_path`, spray-controller timing/flow/safety ownership, `/spray/active` as telemetry/legacy fallback, launch/service wiring, `/api/spray/*`, and `marking_state` telemetry.
 - Remaining spray blockers are hardware/QGC/bench validation: AUX function 301 config, solenoid/driver wiring, command 187 bench test, latency measurement, and real fail-safe validation.
 - Sensor fusion remains blocked by hardware and code: there is no `localization_node.py`, `robot_localization.yaml`, `/wheel_odom` bridge, or RPP `/odom` subscriber in the current codebase.
 

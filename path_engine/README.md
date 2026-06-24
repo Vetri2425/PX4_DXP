@@ -15,16 +15,16 @@ graph TD
     A[Input File: .dxf, .csv, .waypoints] --> B[1. Parse & Classify]
     B --> C[2. Densify & Discretize]
     C --> D[3. Optimize Traversal Order TSP]
-    D --> E[4. Solenoid Latency Compensation]
+    D --> E[4. Optional PRE/MARK/AFT Extensions]
     E --> F[5. Merge & Offset to Origin]
-    F --> G[Output: PlannedPath waypoints + spray flags]
+    F --> G[Output: Exact CAD geometry + spray flags]
 ```
 
 1. **Parse & Classify (`parsers/`)**: Loads geometric data from DXF, CSV, or QGC `.waypoints` files. Auto-detects layers or column properties to classify segments into `MARK` (spray ON) or `TRANSIT` (spray OFF).
 2. **Densify & Discretize (`planners/`)**: Interpolates points along lines and curves based on target spacing rules (denser for marking accuracy, coarser for rapid transit) and curvature limits (using chord-error/sagitta constraints).
 3. **Optimize Traversal Order (`optimizers/`)**: Solves a Traveling Salesperson Problem (TSP) using a nearest-neighbor heuristic with segment endpoint reversal to minimize total travel time (dead-heading) between spray segments.
-4. **Solenoid Latency Compensation (`spray.py`)**: Shifts the physical start and end locations of marking lines to compensate for fluidic / mechanical delays in the spraying solenoid.
-5. **Merge & Offset (`engine.py`)**: Combines all optimized segments into a single continuous polyline, offsets coordinates relative to a global coordinate origin (or rover startup point), and generates parallel binary spray command flags.
+4. **PRE/MARK/AFT Extensions (`planners/extensions.py`)**: Adds optional TRANSIT run-up/run-out geometry around exact CAD MARK geometry. PRE and AFT are spray OFF; MARK is the unshifted paint geometry.
+5. **Merge & Offset (`engine.py`)**: Combines all optimized segments into a single continuous polyline, offsets coordinates relative to a global coordinate origin (or rover startup point), and generates parallel binary spray command flags. Runtime spray timing, flow, safety, and actuator ownership live in `spray_controller_node.py`, not in the planner.
 
 ---
 
@@ -38,9 +38,9 @@ Here is a detailed breakdown of the purpose and behavior of each file in this di
 | :--- | :--- | :--- |
 | [`__init__.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/path_engine/__init__.py) | Module Entry | Exposes key public APIs (`PathEngine`, `SegmentType`, `PathSegment`, `PlannedPath`, `DXFEntity`) to external applications. |
 | [`core.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/path_engine/core.py) | Data Models | Defines the fundamental structural data models:<br>• `SegmentType`: Enum defining `MARK` (value 0, spray ON) and `TRANSIT` (value 1, spray OFF).<br>• `PathSegment`: Dataclass for a single contiguous line/curve segment (its points, target speed, type, and ID).<br>• `DXFEntity`: Intermediary representation of raw CAD entities before discretization.<br>• `PlannedPath`: The final package containing waypoints, spray command flags, and metrics. |
-| [`engine.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/path_engine/engine.py) | Engine Coordinator | Hosts the main `PathEngine` class. Implements `plan_file`, `plan_dxf_entities`, and `plan_segments` to run the coordinate scaling, segment sorting, densification, latency compensation, and final flattening pipeline. |
+| [`engine.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/path_engine/engine.py) | Engine Coordinator | Hosts the main `PathEngine` class. Implements `plan_file`, `plan_dxf_entities`, and `plan_segments` to run coordinate scaling, segment sorting, densification, optional PRE/MARK/AFT extension generation, and final flattening while preserving exact CAD MARK boundaries in production. |
 | [`ned.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/path_engine/ned.py) | Transforms | Handles geodesy and geometry transforms:<br>• `latlon_to_ned`: Uses Karney's geodesic method (`GeographicLib.Geodesic`) for highly accurate latitude/longitude-to-metres conversion on the WGS84 ellipsoid.<br>• `dxf_to_ned_affine`: Calculates a 2D affine scale, rotation, and translation transform between DXF coordinates and real-world NED coordinates via a least-squares fit over N ≥ 2 reference point pairs (also returns per-point residuals and RMSE).<br>• `apply_affine_transform`: Transforms drawing points into the real-world frame. |
-| [`spray.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/path_engine/spray.py) | Compensator | Compensates for solenoid latency. Delays in fluid flow require the rover to command the solenoid early (lead-in) and stop early (lead-out). At the default `0.35 m/s` marking speed, a `0.10s` opening latency shifts the start point forward by **3.5 cm**, and a `0.01s` closing latency trims the endpoint backward by **3.5 mm**. |
+| [`spray.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/path_engine/spray.py) | Legacy Offline Tool | Legacy geometric compensation kept for deliberate offline diagnostics only. Production constructs `PathEngine(compensate_spray=False)` and leaves latency anticipation to the spray controller to avoid double compensation. |
 | [`cli.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/path_engine/cli.py) | CLI Entry point | Command-line interface for testing the planning engine standalone. Run as `python -m path_engine.cli <command>`. |
 
 ### Parsers (`parsers/`)

@@ -37,6 +37,9 @@ class FakeNode:
     ):
         self.calls.append(("publish_path", list(points), spray_flags, runtime_entry))
 
+    def publish_path_clear(self):
+        self.calls.append(("publish_path_clear",))
+
     async def arm_async(self, arm):
         self.calls.append(("arm", arm))
         return True, ""
@@ -364,3 +367,23 @@ def test_missing_survey_anchor_fails_before_publish_or_arm():
         run(ctrl.start_async())
     assert node.calls == []
     assert ctrl.running_mission_id is None
+
+
+def test_clear_mission_publishes_latched_path_reset():
+    node = FakeNode([{"connected": True, "rpp_state": RPP_TRACKING}])
+    ctrl = OffboardController(node, deque())
+    ctrl.load_path(
+        [(0.0, 0.0), (1.0, 0.0)],
+        name="staged",
+        spray_flags=[False, True],
+        mission_id="stg_clear",
+        is_staged=True,
+        path_fingerprint="fp",
+        configuration_revision=9,
+    )
+
+    summary = run(ctrl.clear_mission_async())
+
+    assert summary["loaded"] is False
+    assert ctrl.loaded_mission_id is None
+    assert ("publish_path_clear",) in node.calls

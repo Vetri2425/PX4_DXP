@@ -183,9 +183,16 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 from geometry_msgs.msg import PoseStamped, Vector3Stamped
 from mavros_msgs.msg import GPSRAW          # P0.3 RTK fix gate
 from nav_msgs.msg import Path
-from std_msgs.msg import Bool, Float32MultiArray, MultiArrayDimension, Float32
+from std_msgs.msg import Bool, Float32MultiArray, MultiArrayDimension, Float32, String
 
 from point_leg_trajectory import is_collinear_straight_leg
+from path_identity import (
+    CONDITIONED_PATH_IDENTITY_TOPIC,
+    PATH_IDENTITY_TOPIC,
+    make_path_identity,
+    parse_path_identity,
+    path_geometry_fingerprint,
+)
 from rpp_path_conditioning import split_leading_entry_transit
 
 
@@ -490,6 +497,14 @@ class RPPControllerNode(Node):
         self._path_done = False
         self._path_travel_m: float = 0.0   # monotonic along-path progress on active run
         self._path_s: list[float] = []     # cumulative arc length for active run
+        self._raw_path_identity: dict[str, object] = {
+            "mission_id": "",
+            "path_fingerprint": "",
+            "configuration_revision": 0,
+            "source": "",
+        }
+        self._conditioned_path_fingerprint: str = ""
+        self._last_raw_path_fingerprint: str = ""
 
         # P1.4 — segment search hint: start projection from previous best seg
         self._closest_seg_hint: int = 0
@@ -557,6 +572,9 @@ class RPPControllerNode(Node):
         self._conditioned_path_pub = self.create_publisher(
             Path, "/rpp/conditioned_path", path_qos
         )
+        self._conditioned_path_identity_pub = self.create_publisher(
+            String, CONDITIONED_PATH_IDENTITY_TOPIC, path_qos
+        )
         # P3.1: optional yaw rate (body-rate mode) publisher
         self._yaw_rate_pub = self.create_publisher(
             Float32, "/rpp/yaw_rate_body", be_qos
@@ -569,6 +587,12 @@ class RPPControllerNode(Node):
         # Subscribers
         # ------------------------------------------------------------------
         self.create_subscription(Path, "/path", self._path_cb, path_qos)
+        self.create_subscription(
+            String,
+            PATH_IDENTITY_TOPIC,
+            self._path_identity_cb,
+            path_qos,
+        )
         self.create_subscription(
             PoseStamped, "/mavros/local_position/pose", self._pose_cb, be_qos
         )
@@ -614,7 +638,15 @@ class RPPControllerNode(Node):
     def _path_cb(self, msg: Path):
         """Validate frame, accept new path, reset state."""
         if len(msg.poses) == 0:
-            self.get_logger().warn("Received empty path — ignoring")
+            self.get_logger().warn("Received empty path clear — clearing RPP path state")
+            self._path = []
+            self._spray_flags = []
+            self._runs = []
+            self._path_s = []
+            self._path_done = False
+            self._last_raw_path_fingerprint = ""
+            self._conditioned_path_fingerprint = ""
+            self._publish_conditioned_clear(msg.header.stamp, msg.header.frame_id or "local_ned")
             return
 
         expected = self.get_parameter("path_frame_id").value
@@ -630,6 +662,10 @@ class RPPControllerNode(Node):
         # then converts back to PoseStamped at the end.
         raw_pts = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
         raw_flags = [p.pose.position.z > 0.5 for p in msg.poses]
+        self._last_raw_path_fingerprint = (
+            path_geometry_fingerprint(raw_pts, raw_flags)
+            if len(raw_pts) >= 2 else ""
+        )
         n_raw = len(raw_pts)
 
         resample_dx = float(self.get_parameter("path_resample_spacing_m").value)
@@ -762,6 +798,9 @@ class RPPControllerNode(Node):
             f"first=({first.x:.2f}N, {first.y:.2f}E), "
             f"last=({last.x:.2f}N, {last.y:.2f}E)"
         )
+
+    def _path_identity_cb(self, msg: String) -> None:
+        self._raw_path_identity = parse_path_identity(msg.data)
 
     def _pose_cb(self, msg: PoseStamped):
         """Store latest pose. Frame conversion happens at use-site."""
@@ -1843,10 +1882,59 @@ class RPPControllerNode(Node):
         for i in range(1, len(pts)):
             cum.append(cum[-1] + math.hypot(pts[i][0] - pts[i - 1][0],
                                             pts[i][1] - pts[i - 1][1]))
+
+        def _with_exact_flag_boundaries(
+            sampled_pts: list[tuple[float, float]],
+            sampled_flags: list[bool],
+        ) -> tuple[list[tuple[float, float]], list[bool]]:
+            samples: list[tuple[float, int, tuple[float, float], bool]] = []
+            for pt, flag in zip(sampled_pts, sampled_flags):
+                # Project sampled points back to arc length for stable ordering.
+                best_s = 0.0
+                best_d = float("inf")
+                for seg_i in range(len(pts) - 1):
+                    a = pts[seg_i]
+                    b = pts[seg_i + 1]
+                    dn = b[0] - a[0]
+                    de = b[1] - a[1]
+                    seg_len_sq = dn * dn + de * de
+                    if seg_len_sq <= 1e-12:
+                        cand_s = cum[seg_i]
+                        d = math.hypot(pt[0] - a[0], pt[1] - a[1])
+                    else:
+                        t = ((pt[0] - a[0]) * dn + (pt[1] - a[1]) * de) / seg_len_sq
+                        t = max(0.0, min(1.0, t))
+                        proj = (a[0] + t * dn, a[1] + t * de)
+                        d = math.hypot(pt[0] - proj[0], pt[1] - proj[1])
+                        cand_s = cum[seg_i] + t * math.sqrt(seg_len_sq)
+                    if d < best_d:
+                        best_d = d
+                        best_s = cand_s
+                samples.append((best_s, 10, pt, bool(flag)))
+            for i in range(1, len(pts)):
+                if bool(flags[i - 1]) == bool(flags[i]):
+                    continue
+                samples.append((cum[i], 0, pts[i], bool(flags[i - 1])))
+                samples.append((cum[i], 1, pts[i], bool(flags[i])))
+            samples.sort(key=lambda item: (item[0], item[1]))
+            out_pts2: list[tuple[float, float]] = []
+            out_flags2: list[bool] = []
+            for _s, _order, pt, flag in samples:
+                if (
+                    out_pts2
+                    and math.hypot(pt[0] - out_pts2[-1][0], pt[1] - out_pts2[-1][1]) < 1e-9
+                    and out_flags2[-1] == flag
+                ):
+                    continue
+                out_pts2.append(pt)
+                out_flags2.append(flag)
+            return out_pts2, out_flags2
+
         total = cum[-1]
         if total < spacing:
             out_pts = [pts[0], pts[-1]]
             out_flags = [bool(flags[0]), bool(flags[-1])]
+            out_pts, out_flags = _with_exact_flag_boundaries(out_pts, out_flags)
             return (out_pts, out_flags) if carry_flags else out_pts
 
         n_samples = max(2, int(math.ceil(total / spacing)) + 1)
@@ -1879,6 +1967,7 @@ class RPPControllerNode(Node):
         out[-1] = pts[-1]
         out_flags[0] = bool(flags[0])
         out_flags[-1] = bool(flags[-1])
+        out, out_flags = _with_exact_flag_boundaries(out, out_flags)
         return (out, out_flags) if carry_flags else out
 
     def _smooth_corners(self, pts: list[tuple[float, float]],
@@ -1916,6 +2005,24 @@ class RPPControllerNode(Node):
             ax, ay = pts[i - 1]
             px, py = pts[i]
             bx, by = pts[i + 1]
+            if bool(flags[i - 1]) != bool(flags[i]) or bool(flags[i]) != bool(flags[i + 1]):
+                boundary_flags = []
+                if bool(flags[i - 1]) != bool(flags[i]):
+                    boundary_flags.extend([bool(flags[i - 1]), bool(flags[i])])
+                else:
+                    boundary_flags.append(bool(flags[i]))
+                if bool(flags[i]) != bool(flags[i + 1]):
+                    boundary_flags.extend([bool(flags[i]), bool(flags[i + 1])])
+                for flag in boundary_flags:
+                    if (
+                        out
+                        and math.hypot(out[-1][0] - pts[i][0], out[-1][1] - pts[i][1]) < 1e-9
+                        and out_flags[-1] == flag
+                    ):
+                        continue
+                    out.append(pts[i])
+                    out_flags.append(flag)
+                continue
             v1n, v1e = ax - px, ay - py   # P→A direction (incoming reversed)
             v2n, v2e = bx - px, by - py   # P→B direction
             l1 = math.hypot(v1n, v1e)
@@ -3099,25 +3206,72 @@ class RPPControllerNode(Node):
     def _publish_conditioned_path(self, stamp, frame_id: str):
         """Publish the full conditioned mission (all runs concatenated).
 
-        Runs after the first share their boundary vertex with the previous
-        run, so the duplicate first pose is skipped to keep the published
-        geometry clean for bag-based comparison.
+        Runs may share the same boundary coordinate. Deduplicate only when
+        transition-relevant metadata is equivalent; keep duplicate coordinates
+        for exact spray ON/OFF transitions and profile-boundary semantics.
         """
         msg = Path()
         msg.header.stamp = stamp
         msg.header.frame_id = frame_id
         msg.poses = []
-        run_pose_lists = (
-            [run["poses"] for run in self._runs] if self._runs
-            else [self._path]
+        run_entries = (
+            [(run["poses"], str(run.get("profile", ""))) for run in self._runs]
+            if self._runs
+            else [(self._path, self._active_tracking_profile)]
         )
-        for k, poses in enumerate(run_pose_lists):
-            for src in (poses[1:] if k > 0 else poses):
+
+        previous_key: tuple[float, float, bool, str] | None = None
+        for poses, profile in run_entries:
+            for src in poses:
+                pos = src.pose.position
+                key = (float(pos.x), float(pos.y), bool(pos.z > 0.5), profile)
+                if previous_key is not None:
+                    same_xy = (
+                        math.hypot(key[0] - previous_key[0], key[1] - previous_key[1])
+                        < 1e-9
+                    )
+                    same_boundary_semantics = key[2:] == previous_key[2:]
+                    if same_xy and same_boundary_semantics:
+                        continue
                 ps = PoseStamped()
                 ps.header.stamp = stamp
                 ps.header.frame_id = frame_id
                 ps.pose = src.pose
                 msg.poses.append(ps)
+                previous_key = key
+        points = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
+        flags = [p.pose.position.z > 0.5 for p in msg.poses]
+        self._conditioned_path_fingerprint = (
+            path_geometry_fingerprint(points, flags)
+            if len(points) >= 2 else ""
+        )
+        raw_identity = dict(self._raw_path_identity or {})
+        raw_fingerprint = str(raw_identity.get("path_fingerprint", "") or "")
+        if not raw_fingerprint:
+            raw_fingerprint = self._last_raw_path_fingerprint
+        identity = String()
+        identity.data = make_path_identity(
+            mission_id=str(raw_identity.get("mission_id", "") or ""),
+            path_fingerprint=raw_fingerprint,
+            configuration_revision=int(raw_identity.get("configuration_revision", 0) or 0),
+            source="rpp_conditioned_path",
+        )
+        self._conditioned_path_identity_pub.publish(identity)
+        self._conditioned_path_pub.publish(msg)
+
+    def _publish_conditioned_clear(self, stamp, frame_id: str):
+        """Clear latched conditioned geometry for downstream spray consumers."""
+        identity = String()
+        identity.data = make_path_identity(
+            mission_id="",
+            path_fingerprint="",
+            configuration_revision=0,
+            source="clear",
+        )
+        msg = Path()
+        msg.header.stamp = stamp
+        msg.header.frame_id = frame_id
+        self._conditioned_path_identity_pub.publish(identity)
         self._conditioned_path_pub.publish(msg)
 
     def _publish_segment_debug(

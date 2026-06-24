@@ -131,6 +131,12 @@ def _load_entity_order_sidecar(filepath: str) -> list[str]:
     return [str(v) for v in raw if isinstance(v, str)]
 
 
+# Production planner contract: exact CAD geometry only. Runtime spray_controller
+# owns distance-aware boundary anticipation — never enable planner compensation
+# here (would double-compensate with spray_controller_node).
+_PRODUCTION_ENGINE_KWARGS = {"compensate_spray": False}
+
+
 def _plan_file_with_engine(
     filepath: str,
     *,
@@ -143,7 +149,7 @@ def _plan_file_with_engine(
 
     ext = os.path.splitext(filepath)[1].lower()
     if ext != ".dxf":
-        return _PathEngine().plan_file(
+        return _PathEngine(**_PRODUCTION_ENGINE_KWARGS).plan_file(
             filepath,
             origin=origin,
             start_position=start_position,
@@ -157,6 +163,7 @@ def _plan_file_with_engine(
         pre_extension_m=pre_m,
         aft_extension_m=aft_m,
         optimize_order=not bool(saved_order),
+        **_PRODUCTION_ENGINE_KWARGS,
     )
 
     if overrides or saved_order:
@@ -457,8 +464,8 @@ class PathPublisherNode(Node):
         self._origin_ned: tuple[float, float] | None = None  # (North, East)
         self._start_position: tuple[float, float] | None = None  # For TSP optimization
 
-        # Progress tracking state. Spray state is encoded in /path.pose.position.z
-        # and consumed by rpp_controller -> /spray/active.
+        # Progress tracking state. Spray state is encoded in /path.pose.position.z;
+        # RPP preserves it in /rpp/conditioned_path for the spray controller.
         self._spray_flags: list[bool] | None = None
         self._path_pts: list[tuple[float, float]] = []  # offset pts for pose lookup
         self._total_waypoints: int = 0

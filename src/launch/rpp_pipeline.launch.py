@@ -4,7 +4,7 @@
 Brings up:
   1. twist_to_setpoint_node   — streams /mavros/setpoint_raw/local at 50 Hz
   2. rpp_controller_node      — computes /rpp/velocity_ned at 50 Hz
-  3. spray_controller_node    — drives PX4 actuator-set AUX output from /spray/active
+  3. spray_controller_node    — drives PX4 actuator output from /rpp/conditioned_path timing
   4. xtrack_logger_node       — captures CSV for offline tuning analysis
   5. path_publisher_node      — optional requested test path publisher
   6. mission_runner_node      — drives OFFBOARD lifecycle (off by default)

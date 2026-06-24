@@ -184,6 +184,14 @@ def test_path_manager_plan_path_default_compensate_spray_false():
         source = fh.read()
     assert 'kwargs.pop("compensate_spray", False)' in source
     assert "compensate_spray=False" in source
+    assert "compensate_spray=True is not permitted" in source
+
+
+def test_path_engine_source_default_compensate_spray_false():
+    engine_path = os.path.join(_repo_root(), "path_engine", "engine.py")
+    with open(engine_path) as fh:
+        source = fh.read()
+    assert "compensate_spray: bool = False" in source
 
 
 # ── Test 7: controller distance-aware compensation remains enabled ───────────
@@ -193,3 +201,44 @@ def test_spray_controller_distance_aware_default_enabled():
     with open(sc_path) as fh:
         source = fh.read()
     assert 'declare_parameter("use_distance_aware_spray", True)' in source
+
+
+# ── Test 8: PathEngine production default ─────────────────────────────────────
+
+def test_path_engine_default_compensate_spray_false():
+    engine = PathEngine()
+    assert engine.compensate_spray is False
+
+
+# ── Test 9: path_publisher explicitly disables planner compensation ───────────
+
+def test_path_publisher_explicitly_disables_planner_compensation():
+    pp_path = os.path.join(_repo_root(), "src", "path_publisher_node.py")
+    with open(pp_path) as fh:
+        source = fh.read()
+    assert '_PRODUCTION_ENGINE_KWARGS = {"compensate_spray": False}' in source
+    assert "**_PRODUCTION_ENGINE_KWARGS" in source
+
+
+# ── Test 10: double compensation is impossible on production defaults ─────────
+
+def test_double_compensation_impossible_on_production_defaults():
+    """Production default + explicit False must match exact geometry; legacy True differs."""
+    seg = PathSegment(
+        segment_type=SegmentType.MARK,
+        points=[(0.0, 0.0), (2.0, 0.0)],
+        speed=0.35,
+    )
+    exact = PathEngine(optimize_order=False).plan_segments([seg])
+    explicit = PathEngine(optimize_order=False, compensate_spray=False).plan_segments([seg])
+    legacy = PathEngine(optimize_order=False, compensate_spray=True).plan_segments([seg])
+
+    exact_len = _endpoint_distance(_mark_segments(exact)[0].points)
+    explicit_len = _endpoint_distance(_mark_segments(explicit)[0].points)
+    legacy_len = _endpoint_distance(_mark_segments(legacy)[0].points)
+
+    assert abs(exact_len - 2.0) < _TOL
+    assert abs(explicit_len - 2.0) < _TOL
+    assert abs(exact_len - explicit_len) < _TOL
+    assert abs(legacy_len - (2.0 + 0.10 * 0.35 - 0.01 * 0.35)) < 1e-4
+    assert abs(legacy_len - exact_len) > 1e-3

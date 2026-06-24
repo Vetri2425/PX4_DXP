@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import inspect
 import math
 from collections import deque
 from typing import Any, Callable, Optional
@@ -108,6 +109,8 @@ class OffboardController:
         self._origin_gps: tuple[float, float] | None = None
         self._is_staged_mission = False
         self._spray_mode = "continuous"
+        self._path_fingerprint = ""
+        self._configuration_revision = 0
         # Serialises lifecycle calls. Created lazily on first use: on
         # Python 3.9 asyncio.Lock() binds an event loop at construction,
         # and the controller is built at server startup outside any loop.
@@ -210,6 +213,8 @@ class OffboardController:
         is_staged: bool = False,
         allow_replace_protected: bool = False,
         spray_mode: str = "continuous",
+        path_fingerprint: str = "",
+        configuration_revision: int = 0,
     ) -> None:
         reason = load_block_reason(self._state)
         if reason:
@@ -247,6 +252,8 @@ class OffboardController:
         self._placement_mode = placement_mode
         self._is_staged_mission = bool(is_staged)
         self._spray_mode = str(spray_mode or "continuous")
+        self._path_fingerprint = str(path_fingerprint or "")
+        self._configuration_revision = int(configuration_revision or 0)
         self._origin_gps = (
             (float(origin_gps[0]), float(origin_gps[1]))
             if origin_gps is not None else None
@@ -286,7 +293,11 @@ class OffboardController:
             self._origin_gps = None
             self._is_staged_mission = False
             self._spray_mode = "continuous"
+            self._path_fingerprint = ""
+            self._configuration_revision = 0
             self._state = MissionState.IDLE
+            if self._node is not None and hasattr(self._node, "publish_path_clear"):
+                self._node.publish_path_clear()
             self._log_entry(
                 "info",
                 f"Resident mission cleared: {cleared_name or 'none'}",
@@ -309,6 +320,19 @@ class OffboardController:
                 "retry in ~1 s once the estimator settles."
             )
         return f"start: RPP unhealthy (code={rpp_code})"
+
+    def _publish_path_to_node(self, points, **kwargs) -> None:
+        """Publish path while tolerating older test/helper node signatures."""
+        publish = self._node.publish_path
+        try:
+            sig = inspect.signature(publish)
+        except (TypeError, ValueError):
+            publish(points, **kwargs)
+            return
+        params = sig.parameters
+        if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            kwargs = {k: v for k, v in kwargs.items() if k in params}
+        publish(points, **kwargs)
 
     async def start_async(
         self,
@@ -513,10 +537,15 @@ class OffboardController:
                 # Publish the mission path before the OFFBOARD request so the
                 # 50 Hz setpoint stream carries mission setpoints, not just the
                 # streamer's zero-velocity bootstrap, when PX4 evaluates entry.
-                publish_kwargs = {"spray_flags": spray_flags_to_publish}
+                publish_kwargs = {
+                    "spray_flags": spray_flags_to_publish,
+                    "mission_id": self._loaded_mission_id or "",
+                    "configuration_revision": self._configuration_revision,
+                    "path_fingerprint": self._path_fingerprint,
+                }
                 if entry_evidence["entry_transit_added"]:
                     publish_kwargs["runtime_entry"] = True
-                self._node.publish_path(pts_to_publish, **publish_kwargs)
+                self._publish_path_to_node(pts_to_publish, **publish_kwargs)
 
                 # ── Arm ───────────────────────────────────────────────────────
                 self._state = MissionState.ARMING

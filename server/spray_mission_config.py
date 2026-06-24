@@ -19,6 +19,7 @@ from spray_config import (  # noqa: E402
     staged_spray_defaults,
     validate_spray_configuration,
 )
+from path_identity import path_geometry_fingerprint  # noqa: E402
 
 from logging_setup import get_logger
 
@@ -30,6 +31,7 @@ def spray_fields_from_staged(staged: dict[str, Any]) -> dict[str, Any]:
     defaults = staged_spray_defaults()
     out = {key: staged.get(key, defaults[key]) for key in defaults}
     out["mission_id"] = str(staged.get("mission_id", "") or "")
+    out["path_fingerprint"] = str(staged.get("path_fingerprint", "") or "")
     out["configuration_revision"] = int(staged.get("configuration_revision", 0))
     return out
 

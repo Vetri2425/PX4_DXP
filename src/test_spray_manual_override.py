@@ -14,10 +14,10 @@ import types
 
 
 def _install_ros_stubs() -> None:
-    if "rclpy" in sys.modules:
+    if "rclpy.callback_groups" in sys.modules:
         return
 
-    rclpy = types.ModuleType("rclpy")
+    rclpy = sys.modules.get("rclpy", types.ModuleType("rclpy"))
     rclpy.init = lambda *a, **k: None
     rclpy.spin = lambda *a, **k: None
     rclpy.try_shutdown = lambda *a, **k: None
@@ -188,7 +188,7 @@ class _Pub:
         self.msgs = []
 
     def publish(self, msg):
-        self.msgs.append(bool(msg.data))
+        self.msgs.append(getattr(msg, "data", msg))
 
 
 class _Future:
@@ -269,6 +269,8 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "on_overspray_margin_m": _Param(0.02),
         "off_overspray_margin_m": _Param(0.0),
         "min_spray_speed_mps": _Param(0.05),
+        "max_spray_speed_mps": _Param(1.0),
+        "unsafe_speed_behavior": _Param("BLOCK_SPRAY"),
         "max_xtrack_error_m": _Param(0.10),
         "pose_timeout_s": _Param(0.5),
         "velocity_timeout_s": _Param(0.5),
@@ -290,6 +292,22 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "point_settle_yaw_rate_rad_s": _Param(0.05),
         "configuration_revision": _Param(0),
         "mission_config_mission_id": _Param(""),
+        "mission_config_path_fingerprint": _Param(""),
+        "calibration_profile_id": _Param("factory_default"),
+        "calibration_profile_version": _Param(1),
+        "target_paint_density": _Param(1.0),
+        "speed_pwm_table": _Param('[{"speed_mps":0.05,"pwm":1200.0},{"speed_mps":0.35,"pwm":1800.0}]'),
+        "actuator_min_pwm": _Param(0.0),
+        "actuator_max_pwm": _Param(2200.0),
+        "actuator_off_pwm": _Param(0.0),
+        "actuator_min_value": _Param(-1.0),
+        "actuator_max_value": _Param(1.0),
+        "actuator_off_value": _Param(-1.0),
+        "timing_only_compatibility": _Param(False),
+        "pump_inertia_enabled": _Param(False),
+        "pwm_ramp_prediction_enabled": _Param(False),
+        "pressure_stabilization_enabled": _Param(False),
+        "temperature_viscosity_compensation_enabled": _Param(False),
         "pending_dwell_command_json": _Param(""),
         "dwell_cancel_revision": _Param(0),
     }
@@ -304,6 +322,7 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._commanded_pub = _Pub()
     node._debug_pub = _Pub()
     node._manual_state_pub = _Pub()
+    node._runtime_status_pub = _Pub()
     node._desired_raw = False
     node._candidate = None
     node._candidate_count = 0
@@ -319,7 +338,12 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._off_confirmed = True
     node._last_off_send_time_ns = None
     node._cmd_seq = 0
+    from spray_controller_node import ActuatorState
+    node._actuator_state = ActuatorState()
     node._path_model = None
+    node._conditioned_path_identity = {}
+    node._conditioned_path_source = "none"
+    node._last_conditioned_identity_time = None
     node._pose_ned = None
     node._pose_recv_time = None
     node._vel_ned = (0.0, 0.0)
@@ -327,6 +351,10 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._last_auto_source = ""
     node._last_distance_event = ""
     node._last_safety_block_reason = ""
+    node._last_decision = None
+    node._target_flow = 0.0
+    node._current_pwm = 0.0
+    node._current_value = -1.0
     node._pose_stale_logged = False
     node._velocity_stale_logged = False
     from spray_config import SprayConfiguration
