@@ -69,14 +69,67 @@ def _safe_name(name: str) -> str:
     return safe
 
 
-def _build_response(name: str) -> SprayModeResponse:
+def _build_response(
+    name: str, *, applied: bool = False, apply_detail: str = ""
+) -> SprayModeResponse:
     config = load_spray_mode(MISSION_DIR, name)
     return SprayModeResponse(
         name=name,
         spray_mode=str(config.get("spray_mode", "continuous")),
         config=config,
         has_sidecar=sidecar_exists(MISSION_DIR, name),
+        applied=applied,
+        apply_detail=apply_detail,
     )
+
+
+async def _apply_after_save(safe_name: str, config: dict) -> tuple[bool, str]:
+    """Push the just-saved sidecar config to the live spray controller, but only
+    when it is safe and unambiguous to do so:
+
+    - the spray controller (ros_node) is available,
+    - the edited path is the currently *loaded* mission (basename match), and
+    - no live mission is in progress (already enforced by `_guard_live`).
+
+    Point mode is never hot-applied here: the point orchestrator caches its own
+    revision-stamped config at load time, so it must be re-loaded to stay in
+    sync. In all deferred cases the sidecar is still saved and takes effect on
+    the next plan-and-stage + load of this path.
+    """
+    from main import offboard_ctrl, point_mission, ros_node
+
+    mode = str(config.get("spray_mode", "continuous")).lower()
+    if mode == "point":
+        return False, "saved; point mode applies on next mission load"
+    if ros_node is None:
+        return False, "saved; spray controller unavailable, applies on next mission load"
+    loaded = getattr(offboard_ctrl, "loaded_path_name", None)
+    if not loaded or os.path.basename(str(loaded)) != safe_name:
+        return False, "saved; applies when this path's mission is loaded"
+    if point_mission is not None and getattr(point_mission, "is_active", lambda: False)():
+        return False, "saved; a mission is active, applies on next mission load"
+
+    # Preserve the loaded mission identity; bump the revision so the controller
+    # sees a fresh config. apply_spray_mission_config force-OFFs spray first.
+    from spray_mission_config import (
+        apply_spray_mission_config,
+        next_configuration_revision,
+    )
+
+    apply_cfg = {
+        **config,
+        "mission_id": getattr(offboard_ctrl, "loaded_mission_id", "") or "",
+    }
+    try:
+        ok, why, _ = await apply_spray_mission_config(
+            ros_node, apply_cfg, revision=next_configuration_revision()
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        log.exception("live spray-mode apply raised for %s", safe_name)
+        return False, f"saved; live apply failed: {exc}"
+    if ok:
+        return True, "applied to live spray controller"
+    return False, f"saved; live apply rejected: {why}"
 
 
 # ── GET ───────────────────────────────────────────────────────────────────────
@@ -128,8 +181,9 @@ async def set_continuous_mode(name: str, req: ContinuousModeRequest) -> SprayMod
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
-    log.info("spray-mode set to continuous for %s", safe)
-    return _build_response(safe)
+    applied, detail = await _apply_after_save(safe, config)
+    log.info("spray-mode set to continuous for %s (applied=%s: %s)", safe, applied, detail)
+    return _build_response(safe, applied=applied, apply_detail=detail)
 
 
 # ── PUT /dash ─────────────────────────────────────────────────────────────────
@@ -151,13 +205,16 @@ async def set_dash_mode(name: str, req: DashModeRequest) -> SprayModeResponse:
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
+    applied, detail = await _apply_after_save(safe, config)
     log.info(
-        "spray-mode set to dash (on=%.2fm off=%.2fm) for %s",
+        "spray-mode set to dash (on=%.2fm off=%.2fm) for %s (applied=%s: %s)",
         req.dash_on_distance_m,
         req.dash_off_distance_m,
         safe,
+        applied,
+        detail,
     )
-    return _build_response(safe)
+    return _build_response(safe, applied=applied, apply_detail=detail)
 
 
 # ── PUT /point ────────────────────────────────────────────────────────────────
@@ -188,9 +245,12 @@ async def set_point_mode(name: str, req: PointModeRequest) -> SprayModeResponse:
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
+    applied, detail = await _apply_after_save(safe, config)
     log.info(
-        "spray-mode set to point (dwell=%.1fs) for %s",
+        "spray-mode set to point (dwell=%.1fs) for %s (applied=%s: %s)",
         req.point_default_dwell_s,
         safe,
+        applied,
+        detail,
     )
-    return _build_response(safe)
+    return _build_response(safe, applied=applied, apply_detail=detail)

@@ -140,6 +140,92 @@ def test_put_continuous_persists_and_round_trips(monkeypatch):
         assert resp.config["nozzle_lateral_offset_m"] == 0.07
 
 
+# ───────────────────────── Hot-apply gating (_apply_after_save) ───────────────
+
+class _FakeCtrl:
+    def __init__(self, loaded_path_name=None, loaded_mission_id="m1"):
+        self.loaded_path_name = loaded_path_name
+        self.loaded_mission_id = loaded_mission_id
+
+
+def _patch_main(monkeypatch, *, ros, ctrl, pm=None):
+    import main
+
+    monkeypatch.setattr(main, "ros_node", ros, raising=False)
+    monkeypatch.setattr(main, "offboard_ctrl", ctrl, raising=False)
+    monkeypatch.setattr(main, "point_mission", pm, raising=False)
+
+
+def test_apply_deferred_when_no_mission_loaded(monkeypatch):
+    _patch_main(monkeypatch, ros=object(), ctrl=_FakeCtrl(loaded_path_name=None))
+    applied, detail = asyncio.run(
+        spray_mode_route._apply_after_save("road.dxf", {"spray_mode": "dash"})
+    )
+    assert applied is False
+    assert "loaded" in detail
+
+
+def test_apply_deferred_when_ros_unavailable(monkeypatch):
+    _patch_main(monkeypatch, ros=None, ctrl=_FakeCtrl(loaded_path_name="road.dxf"))
+    applied, detail = asyncio.run(
+        spray_mode_route._apply_after_save("road.dxf", {"spray_mode": "dash"})
+    )
+    assert applied is False
+    assert "unavailable" in detail
+
+
+def test_point_mode_never_hot_applied(monkeypatch):
+    _patch_main(monkeypatch, ros=object(), ctrl=_FakeCtrl(loaded_path_name="pts.csv"))
+    applied, detail = asyncio.run(
+        spray_mode_route._apply_after_save("pts.csv", {"spray_mode": "point"})
+    )
+    assert applied is False
+    assert "point" in detail
+
+
+def test_dash_hot_applied_when_loaded_path_matches(monkeypatch):
+    import spray_mission_config
+
+    calls = {}
+
+    async def _fake_apply(ros_node, cfg, *, revision=None):
+        calls["cfg"] = cfg
+        calls["revision"] = revision
+        return True, "applied", None
+
+    monkeypatch.setattr(spray_mission_config, "apply_spray_mission_config", _fake_apply)
+    _patch_main(
+        monkeypatch,
+        ros=object(),
+        ctrl=_FakeCtrl(loaded_path_name="road.dxf", loaded_mission_id="m42"),
+    )
+    applied, detail = asyncio.run(
+        spray_mode_route._apply_after_save(
+            "road.dxf", {"spray_mode": "dash", "dash_on_distance_m": 0.5}
+        )
+    )
+    assert applied is True
+    assert "applied to live" in detail
+    # Loaded mission identity preserved; a fresh revision was stamped.
+    assert calls["cfg"]["mission_id"] == "m42"
+    assert calls["revision"] is not None
+
+
+def test_dash_apply_reports_rejection(monkeypatch):
+    import spray_mission_config
+
+    async def _fake_apply(ros_node, cfg, *, revision=None):
+        return False, "bulk set failed", None
+
+    monkeypatch.setattr(spray_mission_config, "apply_spray_mission_config", _fake_apply)
+    _patch_main(monkeypatch, ros=object(), ctrl=_FakeCtrl(loaded_path_name="road.dxf"))
+    applied, detail = asyncio.run(
+        spray_mode_route._apply_after_save("road.dxf", {"spray_mode": "dash"})
+    )
+    assert applied is False
+    assert "rejected" in detail
+
+
 def main():
     import inspect
 

@@ -141,6 +141,11 @@ class SprayModeResponse(BaseModel):
     spray_mode: str
     config: dict
     has_sidecar: bool
+    # Whether the saved config was pushed to the live spray controller now
+    # (true only when this path's mission is the loaded, idle one). When false,
+    # apply_detail explains when it will take effect (next mission load).
+    applied: bool = False
+    apply_detail: str = ""
 
 
 class ParamSetRequest(BaseModel):
