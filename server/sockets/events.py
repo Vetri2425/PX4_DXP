@@ -33,6 +33,9 @@ async def _emit_unauth(sio, sid):
 async def _emit_joystick_error(sio, sid, exc: Exception):
     code = getattr(exc, "code", "error")
     message = getattr(exc, "message", str(exc))
+    # Rejections were previously emitted only to the client and never logged,
+    # leaving no server-side trace when a joystick command stream is refused.
+    log.warning("joystick_error sid=%s code=%s msg=%s", sid, code, message)
     await sio.emit("joystick_error", {"type": "joystick_error", "code": code, "message": message}, to=sid)
 
 
