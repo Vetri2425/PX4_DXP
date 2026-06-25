@@ -1236,15 +1236,22 @@ class SprayControllerNode(Node):
                 throttle_duration_sec=5.0,
             )
             set_index = 1
-        value = (
-            float(
-                self._current_value
-                if self._last_decision is not None
-                else self.get_parameter("on_value").value
+        if on:
+            # Manual override is full configured ON — it must NOT reuse the
+            # autonomous decision value (self._current_value), which a latched
+            # continuous-mode path leaves at off_value whenever the rover is not
+            # in an active MARK zone. Using it silently turned manual /spray/on
+            # into a no-op (command accepted, actuator value = OFF).
+            if self._manual_active:
+                value = float(self.get_parameter("on_value").value)
+            elif self._last_decision is not None:
+                value = float(self._current_value)
+            else:
+                value = float(self.get_parameter("on_value").value)
+        else:
+            value = float(
+                self._get_config_snapshot().calibration.actuator_limits.off_value
             )
-            if on else
-            float(self._get_config_snapshot().calibration.actuator_limits.off_value)
-        )
         req.command = MAV_CMD_DO_SET_ACTUATOR
         params = [math.nan] * 6
         params[set_index - 1] = value

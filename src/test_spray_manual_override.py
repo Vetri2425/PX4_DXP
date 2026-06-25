@@ -394,6 +394,21 @@ def test_manual_on_commands_actuator_and_sets_deadline():
     assert node._manual_state_pub.msgs[-1] is True
 
 
+def test_manual_on_uses_on_value_despite_latched_stale_decision():
+    # Regression: a latched continuous-mode path leaves _last_decision non-None
+    # and _current_value at off_value (-1.0) whenever the rover is not in an
+    # active MARK zone. Manual /spray/on must still command the configured
+    # on_value (1.0); previously it reused _current_value and silently sent OFF
+    # (actuator value -1.0) while reporting commanded_on=True.
+    node = make_node()
+    node._last_decision = object()   # a decision exists (continuous mode running)
+    node._current_value = -1.0       # ...but its actuator value is OFF
+    node._manual_cb(_bool_msg(True))
+    assert node._manual_active is True
+    assert node._commanded is True
+    assert _last_param1(node) == 1.0, "manual ON must send on_value, not the stale decision value"
+
+
 def test_manual_on_rejected_when_disarmed():
     node = make_node(armed=False)
     node._manual_cb(_bool_msg(True))
