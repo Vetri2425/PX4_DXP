@@ -11,8 +11,14 @@
 #   - path_publisher_node.py      — server publishes /path directly
 #   - mission_runner_node.py      — server owns OFFBOARD lifecycle
 #
-# Watchdog: if any node dies, it is restarted. If all nodes die within
-# FAIL_WINDOW seconds, the script exits (systemd restarts the whole service).
+# Watchdog: if a node dies, it is restarted.
+#   - Heartbeat-CRITICAL nodes (twist_to_setpoint, rpp_controller): if these
+#     crash MAX_FAILS_IN_WINDOW times within FAIL_WINDOW seconds, the script
+#     exits and systemd restarts the whole service.
+#   - AUXILIARY nodes (spray_controller, xtrack_logger): restarted in isolation
+#     with backoff. They NEVER count toward the full-service-restart threshold,
+#     so a spray crash loop can never drop the OFFBOARD setpoint heartbeat.
+#     (A down spray node fails safe: no actuator command is sent → spray OFF.)
 
 set -euo pipefail
 
@@ -24,6 +30,23 @@ SRC_DIR="${SCRIPT_DIR}/src"
 NODE_RESTART_DELAY=2
 FAIL_WINDOW=30
 MAX_FAILS_IN_WINDOW=5
+
+# Auxiliary-node restart backoff (spray_controller, xtrack_logger). A persistent
+# crash loop backs off up to AUX_BACKOFF_MAX instead of thrashing every 2 s. A
+# node that stays up at least AUX_BACKOFF_RESET_S is considered recovered and
+# its backoff resets to the base delay.
+AUX_BACKOFF_BASE=2
+AUX_BACKOFF_MAX=30
+AUX_BACKOFF_RESET_S=60
+
+# Heartbeat-critical nodes whose death justifies a full-service restart. Every
+# other node is auxiliary and is restarted in isolation.
+is_critical_node() {
+    case "$1" in
+        twist_to_setpoint|rpp_controller) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 log() { echo "[rpp_pipeline] $(date '+%H:%M:%S') $*"; }
 
@@ -37,6 +60,8 @@ export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 declare -A NODE_PIDS=()
+declare -A NODE_LAST_START=()
+declare -A NODE_BACKOFF=()
 FAIL_TIMES=()
 
 SHUTTING_DOWN=0
@@ -85,6 +110,7 @@ start_node() {
     log "Starting $name..."
     python3 "$script" &
     NODE_PIDS["$name"]=$!
+    NODE_LAST_START["$name"]=$(date +%s)
     log "$name started (PID ${NODE_PIDS[$name]})"
 }
 
@@ -136,9 +162,31 @@ while true; do
     for name in "twist_to_setpoint" "rpp_controller" "spray_controller" "xtrack_logger"; do
         local_pid="${NODE_PIDS[$name]:-}"
         if [[ -z "$local_pid" ]] || ! kill -0 "$local_pid" 2>/dev/null; then
-            log "WARNING: $name died — restarting in ${NODE_RESTART_DELAY}s..."
-            record_fail
-            sleep "$NODE_RESTART_DELAY"
+            if is_critical_node "$name"; then
+                # Heartbeat-critical: a sustained crash loop here trips the
+                # global fail-threshold and restarts the whole service.
+                log "WARNING: critical node $name died — restarting in ${NODE_RESTART_DELAY}s..."
+                record_fail
+                restart_delay="$NODE_RESTART_DELAY"
+            else
+                # Auxiliary: isolated restart with backoff. Never calls
+                # record_fail, so spray/xtrack crashes cannot drop the OFFBOARD
+                # heartbeat by forcing a full-service restart.
+                now=$(date +%s)
+                last_start="${NODE_LAST_START[$name]:-0}"
+                alive_s=$(( now - last_start ))
+                if [[ "$alive_s" -ge "$AUX_BACKOFF_RESET_S" ]]; then
+                    NODE_BACKOFF["$name"]=$AUX_BACKOFF_BASE
+                else
+                    next=$(( ${NODE_BACKOFF[$name]:-$AUX_BACKOFF_BASE} * 2 ))
+                    [[ "$next" -gt "$AUX_BACKOFF_MAX" ]] && next=$AUX_BACKOFF_MAX
+                    NODE_BACKOFF["$name"]=$next
+                fi
+                restart_delay="${NODE_BACKOFF[$name]}"
+                log "WARNING: auxiliary node $name died — restarting in ${restart_delay}s (OFFBOARD heartbeat unaffected; spray fails safe OFF)..."
+            fi
+            sleep "$restart_delay"
+            [[ "$SHUTTING_DOWN" -eq 1 ]] && break
             case "$name" in
                 twist_to_setpoint) start_node "$name" "${SRC_DIR}/twist_to_setpoint_node.py" ;;
                 rpp_controller)    start_node "$name" "${SRC_DIR}/rpp_controller_node.py" ;;

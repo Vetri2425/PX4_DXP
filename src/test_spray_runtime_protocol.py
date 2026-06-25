@@ -41,6 +41,49 @@ def test_runtime_status_round_trip():
     assert deserialize_runtime_status(serialize_runtime_status(_status())) == _status()
 
 
+def test_runtime_status_sanitizes_non_finite_top_level():
+    # Regression: a continuous / all-spray-ON mission has no boundary ahead, so
+    # distance_to_next_boundary_m is float("inf"). allow_nan=False used to raise
+    # ("Out of range float values are not JSON compliant"), crashing the spray
+    # node in a restart loop that tore down the OFFBOARD heartbeat. inf/-inf/NaN
+    # must serialize as null and never raise.
+    for bad in (float("inf"), float("-inf"), float("nan")):
+        status = _status()
+        status["distance_to_next_boundary_m"] = bad
+        payload = serialize_runtime_status(status)
+        assert "Infinity" not in payload and "NaN" not in payload
+        assert json.loads(payload)["distance_to_next_boundary_m"] is None
+
+
+def test_runtime_status_sanitizes_nested_and_list_non_finite():
+    status = _status()
+    status["actuator"] = {
+        "current_pwm": float("inf"),
+        "last_on_timestamp_s": float("nan"),
+        "command_sequence": 4,
+        "nested": {"value": float("-inf")},
+    }
+    status["recent_distances_m"] = [1.0, float("inf"), 3.0]
+    raw = json.loads(serialize_runtime_status(status))
+    assert raw["actuator"]["current_pwm"] is None
+    assert raw["actuator"]["last_on_timestamp_s"] is None
+    assert raw["actuator"]["command_sequence"] == 4
+    assert raw["actuator"]["nested"]["value"] is None
+    assert raw["recent_distances_m"] == [1.0, None, 3.0]
+
+
+def test_runtime_status_zero_boundary_continuous_mission_serializes():
+    # End-to-end shape of the failing field: no boundary → inf → must round-trip.
+    status = _status()
+    status["spray_mode"] = "continuous"
+    status["distance_to_next_boundary_m"] = float("inf")
+    status["current_segment_index"] = None
+    # Should not raise, and the required identity fields survive intact.
+    restored = deserialize_runtime_status(serialize_runtime_status(status))
+    assert restored["spray_mode"] == "continuous"
+    assert restored["distance_to_next_boundary_m"] is None
+
+
 def test_runtime_status_rejects_missing_identity():
     broken = _status()
     del broken["dwell_command_id"]
