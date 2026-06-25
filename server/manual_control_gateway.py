@@ -125,13 +125,17 @@ class MavrosManualControlTransport:
     def send_frame(self, frame: ManualControlFrame) -> None:
         if self._publisher is None or self._msg_type is None:
             raise RuntimeError(self.health_reason())
-        msg = self._msg_type()
-        msg.x = int(frame.x)
-        msg.y = int(frame.y)
-        msg.z = int(frame.z)
-        msg.r = int(frame.r)
-        msg.buttons = int(frame.buttons)
         try:
+            msg = self._msg_type()
+            # mavros_msgs/msg/ManualControl declares x/y/z/r as float32; rclpy
+            # rejects an int assigned to a float field. Cast here. buttons is
+            # uint16 so it stays an int. Assignment is inside the try so a
+            # serialization failure also trips _publish_errors / is_healthy().
+            msg.x = float(frame.x)
+            msg.y = float(frame.y)
+            msg.z = float(frame.z)
+            msg.r = float(frame.r)
+            msg.buttons = int(frame.buttons)
             self._publisher.publish(msg)
         except Exception as exc:
             self._publish_errors += 1
