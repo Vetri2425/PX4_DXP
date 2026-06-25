@@ -240,12 +240,17 @@ async def pause_mission():
 async def resume_mission(req: MissionResumeRequest | None = None):
     """Resume a paused point mission from the current live pose."""
     from main import hold_owner, offboard_ctrl, point_mission, ros_node
+    from control_arbiter import ControlArbiterError, get_control_arbiter
 
     if point_mission is None:
         raise HTTPException(503, "Point mission orchestrator unavailable")
     if offboard_ctrl is None:
         raise HTTPException(503, "Controller not ready")
     _require_point_mode(offboard_ctrl)
+    try:
+        await get_control_arbiter().ensure_mission_motion_allowed(offboard_ctrl)
+    except ControlArbiterError as exc:
+        raise HTTPException(409, exc.message) from exc
     expected_generation = req.expected_generation if req else None
     ok, message, status_code = await point_mission.resume_mission(
         ros_node,
@@ -274,6 +279,7 @@ async def set_obstacle_status(req: ObstacleStatusRequest):
 async def point_mission_continue():
     """Advance a manual point mission after operator approval."""
     from main import offboard_ctrl, point_mission, ros_node
+    from control_arbiter import ControlArbiterError, get_control_arbiter
 
     if point_mission is None:
         raise HTTPException(503, "Point mission orchestrator unavailable")
@@ -281,6 +287,10 @@ async def point_mission_continue():
         raise HTTPException(503, "Controller not ready")
     if offboard_ctrl.spray_mode != "point":
         raise HTTPException(409, "loaded mission is not in point spray mode")
+    try:
+        await get_control_arbiter().ensure_mission_motion_allowed(offboard_ctrl)
+    except ControlArbiterError as exc:
+        raise HTTPException(409, exc.message) from exc
     ok, message, status_code = await point_mission.continue_point(ros_node)
     status = PointMissionStatusResponse(**_merge_point_status())
     if not ok:

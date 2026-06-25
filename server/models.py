@@ -55,6 +55,38 @@ class MissionLoadRequest(BaseModel):
     mission_file: Optional[str] = None
 
 
+class JoystickAcquireRequest(BaseModel):
+    type: Literal["joystick_acquire"] = "joystick_acquire"
+    session_id: str
+    client_monotonic_ms: int
+
+
+class JoystickCommandRequest(BaseModel):
+    type: Literal["joystick_command"] = "joystick_command"
+    session_id: str
+    lease_id: str
+    sequence: int
+    client_monotonic_ms: int
+    deadman: bool = False
+    throttle: float = Field(..., ge=-1.0, le=1.0)
+    steering: float = Field(..., ge=-1.0, le=1.0)
+
+    @field_validator("throttle", "steering")
+    @classmethod
+    def finite_axis(cls, value: float) -> float:
+        import math
+
+        if not math.isfinite(value):
+            raise ValueError("axis value must be finite")
+        return value
+
+
+class JoystickReleaseRequest(BaseModel):
+    type: Literal["joystick_release"] = "joystick_release"
+    session_id: str
+    lease_id: str
+
+
 class SprayTestRequest(BaseModel):
     on: bool
     # Seconds to hold manual spray ON before server-side auto-off.

@@ -14,6 +14,7 @@ TOPIC_MAVROS_SETPOINT = "/mavros/setpoint_raw/local"
 TOPIC_MAVROS_BATTERY = "/mavros/battery"
 TOPIC_MAVROS_GLOBAL_POS = "/mavros/global_position/global"
 TOPIC_MAVROS_GPS_RAW = "/mavros/gpsstatus/gps1/raw"
+TOPIC_MAVROS_MANUAL_CONTROL = "/mavros/manual_control/send"
 
 # ── ROS2 Service Names ────────────────────────────────────────────────────────
 SRV_ARMING = "/mavros/cmd/arming"
@@ -125,6 +126,75 @@ SAFETY_STALE_GRACE_S = 1.0  # auto-abort after this long in STALE
 DONE_SETTLE_S = 1.0  # require this much DONE before auto-completing
 SETPOINT_STREAM_GRACE_S = 0.5  # path/setpoint settle time before OFFBOARD request
 
+# ── Virtual joystick V2 ──────────────────────────────────────────────────────
+# Fail closed unless deployment explicitly enables manual control. This is the
+# minimal authorization guard that fits the current shared-token auth model; a
+# future operator-identity system can replace this without changing controllers.
+JOYSTICK_MANUAL_ENABLED = os.environ.get("ROVER_JOYSTICK_MANUAL_ENABLED", "0") == "1"
+JOYSTICK_MANUAL_TRANSPORT = os.environ.get("JOYSTICK_MANUAL_TRANSPORT", "mavros").strip().lower()
+JOYSTICK_ALLOWED_TRANSPORTS = {"mavros", "pymavlink"}
+JOYSTICK_COMMAND_RATE_HZ = float(os.environ.get("ROVER_JOYSTICK_COMMAND_RATE_HZ", "20.0"))
+JOYSTICK_GATEWAY_RATE_HZ = float(os.environ.get("ROVER_JOYSTICK_GATEWAY_RATE_HZ", "50.0"))
+JOYSTICK_SERVER_STOP_TIMEOUT_S = float(os.environ.get("ROVER_JOYSTICK_SERVER_STOP_TIMEOUT_S", "0.30"))
+JOYSTICK_GATEWAY_STALE_TIMEOUT_S = float(os.environ.get("ROVER_JOYSTICK_GATEWAY_STALE_TIMEOUT_S", "0.40"))
+JOYSTICK_PX4_RC_LOSS_S = float(os.environ.get("ROVER_JOYSTICK_PX4_RC_LOSS_S", "0.50"))
+JOYSTICK_LEASE_REVOKE_TIMEOUT_S = float(os.environ.get("ROVER_JOYSTICK_LEASE_REVOKE_TIMEOUT_S", "2.0"))
+JOYSTICK_LEASE_EXPIRY_S = float(os.environ.get("ROVER_JOYSTICK_LEASE_EXPIRY_S", "30.0"))
+JOYSTICK_NEUTRAL_PRESTREAM_S = float(os.environ.get("ROVER_JOYSTICK_NEUTRAL_PRESTREAM_S", "0.20"))
+JOYSTICK_MODE_CONFIRM_TIMEOUT_S = float(os.environ.get("ROVER_JOYSTICK_MODE_CONFIRM_TIMEOUT_S", "3.0"))
+JOYSTICK_MAX_ABS_THROTTLE = float(os.environ.get("ROVER_JOYSTICK_MAX_ABS_THROTTLE", "0.15"))
+JOYSTICK_MAX_ABS_STEERING = float(os.environ.get("ROVER_JOYSTICK_MAX_ABS_STEERING", "0.50"))
+JOYSTICK_MAVROS_REQUIRE_SUBSCRIBER = (
+    os.environ.get("ROVER_JOYSTICK_MAVROS_REQUIRE_SUBSCRIBER", "1") == "1"
+)
+JOYSTICK_MAVROS_PUBLISH_ERROR_LIMIT = int(
+    os.environ.get("ROVER_JOYSTICK_MAVROS_PUBLISH_ERROR_LIMIT", "3")
+)
+JOYSTICK_PYMAVLINK_ENDPOINT = os.environ.get(
+    "ROVER_JOYSTICK_PYMAVLINK_ENDPOINT",
+    "udpout:127.0.0.1:14550",
+)
+
+
+def _validate_joystick_config() -> None:
+    errors: list[str] = []
+    if JOYSTICK_MANUAL_TRANSPORT not in JOYSTICK_ALLOWED_TRANSPORTS:
+        errors.append(
+            "JOYSTICK_MANUAL_TRANSPORT must be one of "
+            + ", ".join(sorted(JOYSTICK_ALLOWED_TRANSPORTS))
+        )
+    if JOYSTICK_COMMAND_RATE_HZ <= 0:
+        errors.append("ROVER_JOYSTICK_COMMAND_RATE_HZ must be > 0")
+    if JOYSTICK_GATEWAY_RATE_HZ <= 0:
+        errors.append("ROVER_JOYSTICK_GATEWAY_RATE_HZ must be > 0")
+    if JOYSTICK_SERVER_STOP_TIMEOUT_S <= 0:
+        errors.append("ROVER_JOYSTICK_SERVER_STOP_TIMEOUT_S must be > 0")
+    if JOYSTICK_PX4_RC_LOSS_S <= 0:
+        errors.append("ROVER_JOYSTICK_PX4_RC_LOSS_S must be > 0")
+    if JOYSTICK_GATEWAY_STALE_TIMEOUT_S <= JOYSTICK_SERVER_STOP_TIMEOUT_S:
+        errors.append(
+            "ROVER_JOYSTICK_GATEWAY_STALE_TIMEOUT_S must be greater than "
+            "ROVER_JOYSTICK_SERVER_STOP_TIMEOUT_S"
+        )
+    if JOYSTICK_GATEWAY_STALE_TIMEOUT_S >= JOYSTICK_PX4_RC_LOSS_S:
+        errors.append(
+            "ROVER_JOYSTICK_GATEWAY_STALE_TIMEOUT_S must be less than "
+            "ROVER_JOYSTICK_PX4_RC_LOSS_S"
+        )
+    if JOYSTICK_LEASE_REVOKE_TIMEOUT_S <= JOYSTICK_GATEWAY_STALE_TIMEOUT_S:
+        errors.append(
+            "ROVER_JOYSTICK_LEASE_REVOKE_TIMEOUT_S must be greater than "
+            "ROVER_JOYSTICK_GATEWAY_STALE_TIMEOUT_S"
+        )
+    if JOYSTICK_MAVROS_PUBLISH_ERROR_LIMIT < 1:
+        errors.append("ROVER_JOYSTICK_MAVROS_PUBLISH_ERROR_LIMIT must be >= 1")
+    if not (0.0 < JOYSTICK_MAX_ABS_THROTTLE <= 1.0):
+        errors.append("ROVER_JOYSTICK_MAX_ABS_THROTTLE must be in (0, 1]")
+    if not (0.0 < JOYSTICK_MAX_ABS_STEERING <= 1.0):
+        errors.append("ROVER_JOYSTICK_MAX_ABS_STEERING must be in (0, 1]")
+    if errors:
+        raise ValueError("Invalid joystick configuration: " + "; ".join(errors))
+
 # ── Bridge health watchdog (Phase 3) ──────────────────────────────────────────
 BRIDGE_HEALTH_POLL_S = 1.0          # how often BridgeHealthManager checks
 BRIDGE_STATE_STALE_MS = 2500.0      # /mavros/state older than this => link frozen
@@ -201,6 +271,7 @@ def _validate_ntrip_config() -> None:
 
 
 _validate_ntrip_config()
+_validate_joystick_config()
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 TOKEN_FILE_DEFAULT = os.environ.get(

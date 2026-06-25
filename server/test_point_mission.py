@@ -7,12 +7,18 @@ import asyncio
 import os
 import sys
 import time
+from collections import deque
 
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from point_ingest import SprayPoint
+from control_arbiter import ControlOwner, reset_control_arbiter_for_tests
 from mission_placement import GPS_SURVEYED, LOCAL_NED, PlacementError
+from models import MissionState
+from joystick_controller import JoystickController
+from manual_control_gateway import ManualControlGateway
+from offboard_controller import OffboardController
 from point_mission import PointExecutionMode, PointMissionOrchestrator, PointMissionRun, PointMissionState
 from spray_config import PointSprayParams, SprayConfiguration, SprayMode
 
@@ -97,6 +103,37 @@ class FakeRos:
 class FakeOffboard:
     state = "running"
     _running_mission_id = "m1"
+
+
+class FakeTransport:
+    name = "fake"
+
+    def __init__(self):
+        self.frames = []
+
+    def is_healthy(self):
+        return True
+
+    def health_reason(self):
+        return ""
+
+    def send_frame(self, frame):
+        self.frames.append(frame)
+
+    def shutdown(self):
+        pass
+
+
+class FakeJoystickRos(FakeRos):
+    def __init__(self):
+        super().__init__()
+        self.state.update({"connected": True, "armed": True, "mode": "MANUAL"})
+        self.calls = []
+
+    async def set_mode_async(self, mode):
+        self.calls.append(("set_mode", mode))
+        self.state["mode"] = mode
+        return True, ""
 
 
 async def _run_cancel_during_nav():
@@ -286,6 +323,128 @@ def test_full_three_point_progression_observes_nonzero_dwells():
     asyncio.run(run())
 
 
+def test_point_completion_clears_mission_owner_and_allows_joystick_acquire():
+    async def run():
+        arbiter = reset_control_arbiter_for_tests()
+        ros = FakeRos()
+        ros.auto_arrive = True
+        offboard = OffboardController(ros, deque())
+        offboard.state = MissionState.RUNNING
+        offboard._running_mission_id = "m1"
+        async with arbiter.mission_start(offboard):
+            offboard.state = MissionState.RUNNING
+        assert arbiter.owner == ControlOwner.MISSION
+
+        orch = PointMissionOrchestrator()
+        cfg = SprayConfiguration(
+            mode=SprayMode.POINT,
+            point=PointSprayParams(
+                default_dwell_s=0.01,
+                arrival_tolerance_m=0.05,
+                settle_time_s=0.0,
+                leg_timeout_s=1.0,
+                settle_speed_mps=0.05,
+                settle_yaw_rate_rad_s=0.05,
+            ),
+        )
+        orch.load(
+            mission_id="m1",
+            points=[SprayPoint(0.0, 0.0, 0.01, 0)],
+            config=cfg,
+        )
+        started, message = await orch.start(ros, offboard)
+        assert started, message
+        await asyncio.wait_for(orch._task, timeout=2.0)
+
+        assert orch.status.state == PointMissionState.COMPLETED
+        assert offboard.state == MissionState.COMPLETED
+        assert arbiter.owner == ControlOwner.IDLE
+
+        joystick_ros = FakeJoystickRos()
+        transport = FakeTransport()
+        gateway = ManualControlGateway(transport, rate_hz=1000.0, stale_timeout_s=0.05)
+        joystick = JoystickController(
+            joystick_ros,
+            offboard,
+            gateway,
+            arbiter=arbiter,
+            manual_enabled=True,
+            neutral_prestream_s=0.0,
+        )
+        result = await joystick.acquire("sid", {"session_id": "operator"})
+        assert result["lease_id"]
+        await joystick.force_release(reason="test")
+
+    asyncio.run(run())
+
+
+def test_point_abort_failure_and_cancellation_clear_mission_owner():
+    async def seed_owner(offboard):
+        arbiter = reset_control_arbiter_for_tests()
+        async with arbiter.mission_start(offboard):
+            offboard.state = MissionState.RUNNING
+        assert arbiter.owner == ControlOwner.MISSION
+        return arbiter
+
+    async def start_long_point(ros, offboard):
+        orch = PointMissionOrchestrator()
+        cfg = SprayConfiguration(
+            mode=SprayMode.POINT,
+            point=PointSprayParams(default_dwell_s=0.01, leg_timeout_s=5.0),
+        )
+        orch.load(
+            mission_id="m1",
+            points=[SprayPoint(5.0, 0.0, 0.01, 0)],
+            config=cfg,
+        )
+        started, message = await orch.start(ros, offboard)
+        assert started, message
+        await asyncio.sleep(0.05)
+        return orch
+
+    async def run_abort():
+        ros = FakeRos()
+        offboard = OffboardController(ros, deque())
+        offboard.state = MissionState.RUNNING
+        arbiter = await seed_owner(offboard)
+        orch = await start_long_point(ros, offboard)
+        await orch.abort(ros)
+        assert offboard.state == MissionState.ABORTED
+        assert arbiter.owner == ControlOwner.IDLE
+
+    async def run_cancel():
+        ros = FakeRos()
+        offboard = OffboardController(ros, deque())
+        offboard.state = MissionState.RUNNING
+        arbiter = await seed_owner(offboard)
+        orch = await start_long_point(ros, offboard)
+        await orch.cancel_and_drain(ros, reason="cancelled")
+        assert offboard.state == MissionState.ABORTED
+        assert arbiter.owner == ControlOwner.IDLE
+
+    async def run_failure():
+        ros = FakeRos()
+        ros.state["pose_received"] = False
+        offboard = OffboardController(ros, deque())
+        offboard.state = MissionState.RUNNING
+        arbiter = await seed_owner(offboard)
+        orch = PointMissionOrchestrator()
+        orch.load(
+            mission_id="m1",
+            points=[SprayPoint(5.0, 0.0, 0.01, 0)],
+            config=SprayConfiguration(mode=SprayMode.POINT),
+        )
+        started, message = await orch.start(ros, offboard)
+        assert started, message
+        await asyncio.wait_for(orch._task, timeout=1.0)
+        assert offboard.state == MissionState.ERROR
+        assert arbiter.owner == ControlOwner.IDLE
+
+    asyncio.run(run_abort())
+    asyncio.run(run_cancel())
+    asyncio.run(run_failure())
+
+
 def main():
     test_arrival_requires_settle_conditions()
     test_cancel_during_navigation()
@@ -296,6 +455,8 @@ def main():
     test_missing_point_frame_metadata_rejected()
     test_clear_mission_resets_unloaded_state()
     test_full_three_point_progression_observes_nonzero_dwells()
+    test_point_completion_clears_mission_owner_and_allows_joystick_acquire()
+    test_point_abort_failure_and_cancellation_clear_mission_owner()
     print("PASS")
 
 

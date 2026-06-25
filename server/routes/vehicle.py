@@ -39,6 +39,8 @@ async def set_mode(req: ModeRequest):
     from main import ros_node
     if ros_node is None:
         raise HTTPException(503, "ROS node not ready")
+    if req.mode.value == "OFFBOARD":
+        raise HTTPException(409, "OFFBOARD transitions must use mission start")
     ok, why = await ros_node.set_mode_async(req.mode.value)
     msg = f"Mode {req.mode.value} {'set' if ok else f'FAILED: {why}'}"
     _record("info" if ok else "error", msg)

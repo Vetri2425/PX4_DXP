@@ -12,6 +12,7 @@ import main
 import offboard_controller as offboard_module
 import routes.path as path_routes
 import sockets.events as socket_events
+from control_arbiter import reset_control_arbiter_for_tests
 from mission_placement import GPS_SURVEYED
 from models import MissionLoadRequest, MissionStartRequest, MissionState, PathPublishRequest
 from offboard_controller import OffboardController
@@ -386,6 +387,28 @@ async def test_direct_publish_blocked_for_idle_protected_mission(monkeypatch):
     assert exc.value.status_code == 409
     assert mgr.loads == []
     assert node.calls == []
+
+
+@pytest.mark.anyio
+async def test_direct_publish_blocked_while_joystick_owns_control(monkeypatch):
+    arbiter = reset_control_arbiter_for_tests()
+    arbiter.mark_joystick_active("session", "lease")
+    node = FakeNode()
+    ctrl = OffboardController(node, deque())
+    ctrl.load_path([(0.0, 0.0), (1.0, 0.0)], name="local.csv")
+    mgr = FakePathManager()
+    monkeypatch.setattr(main, "offboard_ctrl", ctrl)
+    monkeypatch.setattr(main, "path_mgr", mgr)
+    monkeypatch.setattr(main, "ros_node", node)
+
+    with pytest.raises(HTTPException) as exc:
+        await path_routes.publish_path(PathPublishRequest(name="local.csv"))
+
+    assert exc.value.status_code == 409
+    assert "joystick owns manual control" in exc.value.detail
+    assert mgr.loads == []
+    assert node.calls == []
+    reset_control_arbiter_for_tests()
 
 
 @pytest.mark.anyio

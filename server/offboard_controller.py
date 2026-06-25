@@ -340,6 +340,27 @@ class OffboardController:
         expected_mission_id: str | None = None,
         pre_publish_hook: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[bool, str]:
+        from control_arbiter import ControlArbiterError, get_control_arbiter
+
+        try:
+            # RPP/RTK_WAIT start safety remains in _start_async_locked where
+            # rpp_code is checked immediately before OFFBOARD transition.
+            async with get_control_arbiter().mission_start(self):
+                return await self._start_async_locked(
+                    auto_origin=auto_origin,
+                    expected_mission_id=expected_mission_id,
+                    pre_publish_hook=pre_publish_hook,
+                )
+        except ControlArbiterError as exc:
+            self._log_entry("warning", exc.message)
+            return False, exc.message
+
+    async def _start_async_locked(
+        self,
+        auto_origin: bool = False,
+        expected_mission_id: str | None = None,
+        pre_publish_hook: Callable[[dict[str, Any]], None] | None = None,
+    ) -> tuple[bool, str]:
         async with self._lifecycle_lock():
             if self._node is None:
                 return False, "ROS node not available"
@@ -717,6 +738,7 @@ class OffboardController:
                 await asyncio.sleep(STOP_SETTLE_S)
                 self._state = MissionState.IDLE
                 self._running_mission_id = None
+                self._mark_control_idle()
                 s = self._node.get_state()
                 n, e = stop_position
                 msg = f"mission stopped at N={n:.3f}, E={e:.3f}"
@@ -814,6 +836,7 @@ class OffboardController:
 
             self._state = MissionState.ABORTED
             self._running_mission_id = None
+            self._mark_control_idle()
             try:
                 s = self._node.get_state()
                 armed = s.get("armed")
@@ -854,6 +877,7 @@ class OffboardController:
             ok, why = await self._node.arm_async(False)
             self._state = MissionState.IDLE
             self._running_mission_id = None
+            self._mark_control_idle()
             self._log_entry(
                 "info" if ok else "error",
                 f"disarm {'ok' if ok else f'failed: {why}'}",
@@ -865,9 +889,18 @@ class OffboardController:
         if self._state == MissionState.RUNNING:
             self._state = MissionState.COMPLETED
             self._running_mission_id = None
+            self._mark_control_idle()
             self._log_entry("info", f"mission completed: {self._path_name}")
 
     # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _mark_control_idle(self) -> None:
+        try:
+            from control_arbiter import get_control_arbiter
+
+            get_control_arbiter().mark_idle_if_not_joystick()
+        except Exception:
+            pass
 
     def _log_entry(self, level: str, message: str) -> None:
         ts = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"

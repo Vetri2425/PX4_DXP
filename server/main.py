@@ -75,6 +75,8 @@ rtk_manager: Optional["object"] = None
 mission_capture: Optional["object"] = None
 point_mission: Optional["object"] = None
 hold_owner: Optional["object"] = None
+manual_gateway: Optional["object"] = None
+joystick_ctrl: Optional["object"] = None
 
 # Bounded, thread-safe ring buffer (deque maxlen). All log appends are atomic
 # under the GIL; bounded eviction is built in. Replaces the racy list+trim.
@@ -100,7 +102,7 @@ socket_app = socketio.ASGIApp(sio)
 async def lifespan(app: FastAPI):
     global ros_node, offboard_ctrl, path_mgr, emergency_handler
     global _executor, _beacon, _listener, _telemetry_task, bridge_health, rtk_manager
-    global mission_capture, point_mission, hold_owner
+    global mission_capture, point_mission, hold_owner, manual_gateway, joystick_ctrl
 
     configure_logging()
     init_auth()
@@ -141,11 +143,17 @@ async def lifespan(app: FastAPI):
     from path_manager import PathManager
     from rtk_manager import AsyncRTKManager
     from mission_debug_capture import MissionDebugCoordinator
+    from manual_control_gateway import ManualControlGateway, build_manual_transport
     from point_mission import PointMissionOrchestrator
     from setpoint_hold import SetpointHoldOwner
 
     path_mgr = PathManager(MISSION_DIR)
     offboard_ctrl = OffboardController(ros_node, activity_log)
+    manual_gateway = ManualControlGateway(build_manual_transport(ros_node))
+    manual_gateway.start()
+    from joystick_controller import JoystickController
+
+    joystick_ctrl = JoystickController(ros_node, offboard_ctrl, manual_gateway)
     hold_owner = SetpointHoldOwner()
     point_mission = PointMissionOrchestrator()
     point_mission.set_logger(_record)
@@ -204,6 +212,12 @@ async def lifespan(app: FastAPI):
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
     log.info("shutting down…")
+
+    if joystick_ctrl is not None:
+        try:
+            await joystick_ctrl.shutdown()
+        except Exception:
+            log.exception("joystick shutdown raised")
 
     if rtk_manager is not None:
         try:
@@ -376,6 +390,8 @@ async def _telemetry_loop() -> None:
                     "lon": s.get("lon"),
                     "alt": s.get("alt"),
                 }
+                if joystick_ctrl is not None:
+                    telem.update(joystick_ctrl.snapshot())
                 await sio.emit("telemetry", _sanitize(telem))
 
                 mission_status = {
@@ -452,6 +468,18 @@ async def _telemetry_loop() -> None:
                         stale_since = None
                 else:
                     stale_since = None
+
+                # Joystick MANUAL mode has a 500 ms PX4 RC_LOSS fallback. On
+                # confirmed FCU/MAVROS disconnect, revoke ownership and run the
+                # established hard e-stop path.
+                if (
+                    joystick_ctrl is not None
+                    and joystick_ctrl.is_active
+                    and s.get("connected") is False
+                ):
+                    await joystick_ctrl.force_release(reason="fcu_disconnected")
+                    if emergency_handler is not None:
+                        await emergency_handler.estop_async()
 
                 # ── 4. Disconnect notification (transition: was connected) ─────
                 connected = bool(s.get("connected", False))

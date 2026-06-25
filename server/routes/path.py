@@ -727,6 +727,13 @@ async def publish_path(req: PathPublishRequest):
             "Cannot publish a diagnostic path while a protected mission is loaded "
             f"or controller is {offboard_ctrl.state.value}",
         )
+    if offboard_ctrl is not None:
+        try:
+            from control_arbiter import ControlArbiterError, get_control_arbiter
+
+            await get_control_arbiter().ensure_mission_motion_allowed(offboard_ctrl)
+        except ControlArbiterError as exc:
+            raise HTTPException(409, exc.message)
     try:
         pts = path_mgr.load_path(name)
     except FileNotFoundError as exc:

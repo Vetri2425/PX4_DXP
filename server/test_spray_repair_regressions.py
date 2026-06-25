@@ -34,6 +34,7 @@ def _write_staged(tmp_path, mode_marker, *, mode="continuous"):
         "waypoints": [[0.0, 0.0], [1.0, 0.0]],
         "spray_flags": [True, True],
         "configuration_revision": 1,
+        "path_fingerprint": "fp-" + mode_marker,
     }
     if mode is not None:
         staged["spray_mode"] = mode
@@ -91,6 +92,7 @@ async def test_point_mode_load_succeeds_when_dependencies_ready(monkeypatch, tmp
         ],
         "point_source_frame": "LOCAL_NED",
         "configuration_revision": 1,
+        "path_fingerprint": "fp-" + mission_id,
     }
     path = tmp_path / f"{mission_id}.json"
     path.write_text(json.dumps(staged), encoding="utf-8")
@@ -148,7 +150,7 @@ async def test_mission_config_apply_never_sets_operator_enable():
     ros = Ros()
     ok, _, _ = await apply_spray_mission_config(
         ros,
-        {"mission_id": "m", "spray_mode": "continuous", "configuration_revision": 4},
+        {"mission_id": "m", "spray_mode": "continuous", "configuration_revision": 4, "path_fingerprint": "fp-m"},
     )
     assert ok
     assert "spray_enabled" not in ros.params

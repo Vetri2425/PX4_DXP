@@ -42,6 +42,7 @@ from gps_safety import (
 )
 from logging_setup import get_logger
 from mission_placement import GPS_SURVEYED, LOCAL_NED, PlacementError, resolve_surveyed_points
+from models import MissionState
 
 log = get_logger("server.point_mission")
 
@@ -290,6 +291,22 @@ class PointMissionOrchestrator:
 
     def is_paused(self) -> bool:
         return self._status.state in PAUSED_STATES
+
+    def _mark_offboard_terminal(self, offboard_ctrl, state: MissionState) -> None:
+        if offboard_ctrl is None:
+            return
+        if state == MissionState.COMPLETED and hasattr(offboard_ctrl, "mark_completed"):
+            offboard_ctrl.mark_completed()
+            return
+        offboard_ctrl.state = state
+        if hasattr(offboard_ctrl, "_running_mission_id"):
+            offboard_ctrl._running_mission_id = None
+        try:
+            from control_arbiter import get_control_arbiter
+
+            get_control_arbiter().mark_idle_if_not_joystick()
+        except Exception:
+            log.exception("point mission terminal arbiter cleanup failed")
 
     def set_obstacle_clear(self, clear: bool) -> None:
         self._obstacle_clear = bool(clear)
@@ -1212,10 +1229,7 @@ class PointMissionOrchestrator:
                 terminal_safety_reason=terminal_safety_reason,
             )
             if self._is_current(run) and offboard_ctrl is not None:
-                from models import MissionState
-
-                offboard_ctrl.state = MissionState.COMPLETED
-                offboard_ctrl._running_mission_id = None
+                self._mark_offboard_terminal(offboard_ctrl, MissionState.COMPLETED)
         except asyncio.CancelledError:
             self._write(
                 run,
@@ -1227,6 +1241,8 @@ class PointMissionOrchestrator:
                 run_active=False,
                 waiting_for_continue=False,
             )
+            if self._is_current(run) and offboard_ctrl is not None:
+                self._mark_offboard_terminal(offboard_ctrl, MissionState.ABORTED)
             raise
         except Exception as exc:
             terminal = (
@@ -1244,6 +1260,8 @@ class PointMissionOrchestrator:
                 run_active=False,
                 waiting_for_continue=False,
             )
+            if self._is_current(run) and offboard_ctrl is not None:
+                self._mark_offboard_terminal(offboard_ctrl, MissionState.ERROR)
             self._record("error", f"point mission failed: {exc}")
         finally:
             # Terminal safety net. Must NOT escape as an unretrieved task
