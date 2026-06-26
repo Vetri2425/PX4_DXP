@@ -1281,6 +1281,15 @@ async def load_mission_to_controller(req: LoadMissionRequest):
         spray_flags = [bool(f) for f in staged.get("spray_flags", [])]
         if spray_config_degraded:
             spray_flags = [False] * len(waypoints)
+        # The staged fingerprint binds the staged geometry+flags. It is only valid
+        # to enforce when what we actually load is unchanged from staging. The
+        # degraded fallback zeroes spray_flags (and point-mode below synthesizes a
+        # 2-point hold), so in those cases the staged fingerprint legitimately does
+        # not match the loaded geometry — clear it and let load_path compute a fresh
+        # fingerprint for what is actually loaded instead of hard-failing the load.
+        load_fingerprint = str(staged.get("path_fingerprint", "") or "")
+        if spray_config_degraded:
+            load_fingerprint = ""
         origin_gps = None
         if anchor is not None:
             origin_gps = (anchor.get("lat"), anchor.get("lon"))
@@ -1296,6 +1305,9 @@ async def load_mission_to_controller(req: LoadMissionRequest):
                 (float(first["north_m"]), float(first["east_m"])),
             ]
             spray_flags = [False, False]
+            # Synthetic 2-point hold geometry — not the staged path — so the staged
+            # fingerprint cannot apply.
+            load_fingerprint = ""
         else:
             if point_mission is not None:
                 await point_mission.cancel_and_drain(ros_node, reason="non_point_load")
@@ -1312,7 +1324,7 @@ async def load_mission_to_controller(req: LoadMissionRequest):
             is_staged=True,
             allow_replace_protected=True,
             spray_mode=staged.get("spray_mode", "continuous"),
-            path_fingerprint=str(staged.get("path_fingerprint", "") or ""),
+            path_fingerprint=load_fingerprint,
             configuration_revision=int(staged.get("configuration_revision", 0)),
         )
     except HTTPException:

@@ -186,6 +186,25 @@ class SprayControllerNode(Node):
         self.declare_parameter("point_leg_timeout_s", 120.0)
         self.declare_parameter("point_settle_speed_mps", 0.05)
         self.declare_parameter("point_settle_yaw_rate_rad_s", 0.05)
+        self.declare_parameter("point_max_dwell_s", 60.0)
+        self.declare_parameter("point_leg_trajectory_mode", "two_point")
+        self.declare_parameter("point_leg_spacing_m", 0.08)
+        self.declare_parameter("point_hold_drift_tolerance_m", 0.08)
+        self.declare_parameter("point_hold_drift_policy", "fail")
+        # GPS-safety and obstacle gating fields are part of the mission spray
+        # configuration contract (configuration_to_param_dict). They are declared
+        # here so the runtime bulk-set is accepted; enforcement of this gating
+        # inside the node is not yet implemented (params currently unused).
+        self.declare_parameter("gps_required_fix_type", 6)
+        self.declare_parameter("gps_global_position_max_age_ms", 500.0)
+        self.declare_parameter("gps_local_pose_max_age_ms", 500.0)
+        self.declare_parameter("gps_fix_max_age_ms", 500.0)
+        self.declare_parameter("gps_max_pose_global_skew_ms", 100.0)
+        self.declare_parameter("gps_runtime_policy", "pause")
+        self.declare_parameter("gps_resume_policy", "manual")
+        self.declare_parameter("gps_recovery_stable_s", 2.0)
+        self.declare_parameter("obstacle_integration_enabled", False)
+        self.declare_parameter("obstacle_signal_max_age_s", 2.0)
         self.declare_parameter("configuration_revision", 0)
         self.declare_parameter("mission_config_mission_id", "")
         self.declare_parameter("mission_config_path_fingerprint", "")

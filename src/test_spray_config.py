@@ -209,6 +209,31 @@ def test_staged_calibration_propagates_to_ros_params():
     assert params["unsafe_speed_behavior"] == "CLAMP_PWM"
 
 
+def test_all_param_keys_declared_in_spray_node():
+    """Every configuration_to_param_dict key must be declared by the spray node.
+
+    The runtime bulk-set targets /spray_controller/set_parameters; any key the
+    node does not declare is rejected as 'undeclared parameter(s)', which then
+    degrades the mission. This guard prevents the serializer and node from
+    drifting apart again.
+    """
+    import re
+
+    from spray_config import SprayConfiguration
+
+    sent = set(configuration_to_param_dict(SprayConfiguration()).keys())
+    node_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "spray_controller_node.py"
+    )
+    with open(node_path) as f:
+        node_src = f.read()
+    declared = set(
+        re.findall(r'declare_parameter\(\s*["\']([a-z_][a-z0-9_]+)["\']', node_src)
+    )
+    missing = sorted(sent - declared)
+    assert not missing, f"spray node missing declare_parameter for: {missing}"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

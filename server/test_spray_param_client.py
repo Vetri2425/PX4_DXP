@@ -466,6 +466,106 @@ def test_list_paths_offloaded_from_event_loop():
     assert "path_mgr.list_paths" in source
 
 
+class _FingerprintController:
+    """Controller stub that enforces the path fingerprint like the real one."""
+
+    state = MissionState.IDLE
+
+    def __init__(self):
+        self.loaded = None
+
+    def load_path(self, points, *, spray_flags=None, path_fingerprint="", **kwargs):
+        from path_validation import normalize_path_points, verified_path_fingerprint
+
+        pts = normalize_path_points(points, label="mission path")
+        flags = [bool(f) for f in (spray_flags or [])]
+        if len(flags) != len(pts):
+            flags = [False] * len(pts)
+        # Raises ValueError on supplied/computed mismatch — the real 409 source.
+        verified_path_fingerprint(pts, flags, path_fingerprint)
+        self.loaded = (pts, {"spray_flags": flags, "path_fingerprint": path_fingerprint, **kwargs})
+
+
+def _write_staged_real_fp(tmp_path, mission_id, *, flags):
+    """Stage a continuous mission whose fingerprint is computed over real flags."""
+    from path_identity import path_geometry_fingerprint
+
+    waypoints = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]
+    fp = path_geometry_fingerprint(
+        [(float(p[0]), float(p[1])) for p in waypoints], [bool(f) for f in flags]
+    )
+    staged = {
+        "mission_id": mission_id,
+        "waypoints": waypoints,
+        "spray_flags": flags,
+        "spray_mode": "continuous",
+        "configuration_revision": 1,
+        "path_fingerprint": fp,
+    }
+    (tmp_path / f"{mission_id}.json").write_text(json.dumps(staged), encoding="utf-8")
+    return fp
+
+
+@pytest.mark.anyio
+async def test_degraded_continuous_load_does_not_409_on_fingerprint(
+    monkeypatch, tmp_path
+):
+    """Regression: spray-degraded continuous load must still load with spray OFF.
+
+    The staged fingerprint is computed over real (all-True) flags; the degraded
+    fallback zeroes flags. Passing the original fingerprint would force a 409 —
+    the load must clear it and let the controller compute a fresh one instead.
+    """
+    mission_id = "degraded_fp"
+    _write_staged_real_fp(tmp_path, mission_id, flags=[True, True, True])
+    ctrl = _FingerprintController()
+    monkeypatch.setattr(path_routes, "STAGING_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "offboard_ctrl", ctrl)
+    monkeypatch.setattr(
+        main,
+        "ros_node",
+        _FailingRos("Spray parameter response timed out after 8.0s"),
+    )
+    monkeypatch.setattr(main, "point_mission", None)
+
+    response = await path_routes.load_mission_to_controller(
+        LoadMissionRequest(mission_id=mission_id)
+    )
+    assert response["spray_config_applied"] is False
+    assert ctrl.loaded is not None
+    assert ctrl.loaded[1]["spray_flags"] == [False, False, False]
+    # Fingerprint cleared for the degraded load so the controller recomputes it.
+    assert ctrl.loaded[1]["path_fingerprint"] == ""
+
+
+@pytest.mark.anyio
+async def test_healthy_continuous_load_preserves_fingerprint(monkeypatch, tmp_path):
+    """When spray applies cleanly, real flags + staged fingerprint pass through."""
+    mission_id = "healthy_fp"
+    fp = _write_staged_real_fp(tmp_path, mission_id, flags=[True, True, True])
+    ctrl = _FingerprintController()
+
+    class _OkRos:
+        async def set_spray_params_bulk_async(self, params):
+            return True, [True] * len(params), ""
+
+        async def trigger_spray_apply_mission_config_async(self):
+            return True, "ok"
+
+    monkeypatch.setattr(path_routes, "STAGING_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "offboard_ctrl", ctrl)
+    monkeypatch.setattr(main, "ros_node", _OkRos())
+    monkeypatch.setattr(main, "point_mission", None)
+
+    response = await path_routes.load_mission_to_controller(
+        LoadMissionRequest(mission_id=mission_id)
+    )
+    assert response["spray_config_applied"] is True
+    assert ctrl.loaded is not None
+    assert ctrl.loaded[1]["spray_flags"] == [True, True, True]
+    assert ctrl.loaded[1]["path_fingerprint"] == fp
+
+
 @pytest.mark.anyio
 async def test_apply_spray_mission_config_success(monkeypatch):
     class Ros:
