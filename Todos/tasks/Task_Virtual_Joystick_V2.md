@@ -1,8 +1,29 @@
 # Virtual Joystick — Second-Stage Architecture Audit
 
+> **STATUS: ✅ COMPLETED & PRODUCTION-VALIDATED — 26 June 2026.**
+> Full path field-validated end-to-end (Acquire → arm → forward/reverse/left/right
+> → release/disarm) on the Jetson with wheels off-ground; lease stays alive, rover
+> drives correctly. Two bugs fixed to get here:
+> - **Backend** `server/manual_control_gateway.py`: published `int` to
+>   `mavros_msgs/msg/ManualControl` (float32 x/y/z/r) → AssertionError swallowed →
+>   zero MANUAL_CONTROL frames ever sent. Fixed by casting to `float()` + moving
+>   assignments inside the try so health honestly trips. Commit `8cbc071`
+>   (+ `3cad3b8` server-side rejection logging). Deployed; topic streams ~47 Hz.
+> - **Frontend** (`Three_Wheel_v2` `src/hooks/useVirtualJoystick.ts`): the *real*
+>   `lease_timeout` cause was heartbeat-timer starvation — `setIntent` called
+>   `scheduleCommandLoop(0)` on every ~60–120 Hz gesture frame, cancelling/restarting
+>   the self-perpetuating ~18 Hz command heartbeat so its `setTimeout(0)` got starved
+>   and never fired → backend saw silence → revoked the lease. Fixed by guarding the
+>   kick behind `!commandLoopRunningRef.current` in `setIntent`/`setDeadman`.
+>
+> **Deferred (non-blocking):** backend `_validate_rate` zero-tolerance gate (rejects
+> sporadic compliant 20 Hz cmds — send ≤~18 Hz); pin `ROVER_JOYSTICK_MANUAL_ENABLED=1`
+> via systemd drop-in (currently rides on an uncommitted `config.py` default on the
+> Jetson). The gate checklist below is retained as historical planning context.
+
 **Date:** 2026-06-25  
 **Status tags:** CONFIRMED (traced to exact code), INFERRED (logical derivation from code), PROPOSED (design decision), UNRESOLVED (requires Jetson verification)  
-**Hardware:** NO-GO until Jetson bench + controlled field gates pass.
+**Hardware:** ✅ Validated on bench (wheels off-ground); originally NO-GO until Jetson bench + controlled field gates passed.
 
 ---
 
