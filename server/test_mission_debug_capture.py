@@ -244,6 +244,7 @@ class HookNode:
 
     def get_state(self):
         return {"connected": True, "rpp_state": RPP_TRACKING,
+                "rpp_debug_fresh": True,
                 "pose_received": True, "pos_n": 2.0, "pos_e": 3.0}
 
     def get_rpp_monitor(self):
@@ -425,3 +426,46 @@ def test_stale_request_is_rejected_fresh_is_returned(monkeypatch, tmp_path):
     })
     nxt = daemon._next_request()
     assert nxt is not None and nxt["capture_id"] == fresh_id
+
+
+def test_mandatory_topic_list_captures_conditioned_path_and_spray_runtime():
+    required = {
+        "/path/identity",
+        "/rpp/conditioned_path",
+        "/rpp/conditioned_path_identity",
+        "/spray/desired",
+        "/spray/commanded",
+        "/spray/debug",
+        "/spray/runtime_status",
+    }
+    assert required.issubset(set(recorder.TOPICS))
+
+
+def test_qos_overrides_include_transient_local_identity_topics():
+    qos_path = Path(__file__).resolve().parents[1] / "config" / "rosbag_qos_overrides.yaml"
+    text = qos_path.read_text(encoding="utf-8")
+    for topic in ("/path/identity", "/rpp/conditioned_path", "/rpp/conditioned_path_identity"):
+        assert f"{topic}:" in text
+    assert text.count("durability: transient_local") >= 4
+
+
+def test_fcu_param_snapshot_is_read_only_command_bundle(monkeypatch, tmp_path):
+    _configure_recorder(monkeypatch, tmp_path)
+    session = recorder.CaptureSession({
+        "capture_id": "cap-fcu",
+        "requested_at_utc": recorder.utc_now(),
+    })
+    session.prepare()
+    calls = []
+
+    def fake_run(command, timeout=10.0):
+        calls.append((command, timeout))
+        return {"command": command, "returncode": 0, "stdout": "ok", "stderr": ""}
+
+    monkeypatch.setattr(recorder, "_run_text", fake_run)
+    session._snapshot_fcu_params()
+
+    payload = recorder.read_json(session.bundle / "config" / "fcu_params.json")
+    assert "COM_OF_LOSS_T" in payload["params"]
+    assert any("/mavros/param/pull" in call[0] for call in calls)
+    assert all("/mavros/param/set" not in call[0] for call in calls)

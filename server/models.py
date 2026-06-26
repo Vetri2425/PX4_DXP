@@ -239,6 +239,9 @@ class TelemetryData(BaseModel):
     pose_age_ms: Optional[float] = None
     rpp_state: Optional[Literal[-1, 0, 1, 2, 3, 4, 5]] = None
     rpp_state_name: Optional[str] = None
+    rpp_debug_age_ms: Optional[float] = None
+    rpp_debug_fresh: Optional[bool] = None
+    measured_speed_m_s: Optional[float] = None
     spraying: Optional[bool] = None
     marking_state: Optional[Literal["marking", "transit", "off"]] = None
     # FCU
@@ -393,6 +396,9 @@ class MissionStatus(BaseModel):
     speed: Optional[float] = None
     xtrack: Optional[float] = None
     pose_age_ms: Optional[float] = None
+    rpp_debug_age_ms: Optional[float] = None
+    rpp_debug_fresh: Optional[bool] = None
+    measured_speed_m_s: Optional[float] = None
     fcu_connected: Optional[bool] = None
     last_path_loaded: Optional[str] = None
     loaded_mission_id: Optional[str] = None

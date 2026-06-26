@@ -401,6 +401,9 @@ async def _telemetry_loop() -> None:
                     "dist_to_goal": s.get("dist_to_goal_m"),
                     "speed": s.get("speed_m_s"),
                     "xtrack": s.get("xtrack_m"),
+                    "rpp_debug_age_ms": s.get("rpp_debug_age_ms"),
+                    "rpp_debug_fresh": s.get("rpp_debug_fresh"),
+                    "measured_speed_m_s": s.get("measured_speed_m_s"),
                 }
                 await sio.emit("mission_status", _sanitize(mission_status))
 
@@ -410,18 +413,25 @@ async def _telemetry_loop() -> None:
                     and offboard_ctrl.state == MissionState.RUNNING
                     and ros_node.get_rpp_monitor().is_done()
                 ):
-                    offboard_ctrl.mark_completed()
+                    completion = await offboard_ctrl.complete_async()
+                    completion_ok = bool(completion.get("success"))
+                    terminal_reason = (
+                        "mission_completed"
+                        if completion_ok else "mission_completion_degraded"
+                    )
                     if mission_capture is not None:
                         mission_capture.record_terminal(
                             None,
-                            "mission_completed",
+                            terminal_reason,
                             state=offboard_ctrl.state.value,
+                            details=completion,
                         )
                     await sio.emit(
-                        "mission_completed",
+                        terminal_reason,
                         {
                             "state": offboard_ctrl.state.value,
                             "name": offboard_ctrl.loaded_path_name,
+                            "terminal": completion,
                         },
                     )
 
@@ -438,6 +448,7 @@ async def _telemetry_loop() -> None:
                     code in RPP_UNHEALTHY_CODES
                     or pose_age > POSE_STALE_MS
                     or s.get("connected") is False
+                    or s.get("rpp_debug_fresh") is not True
                 )
                 if running and unhealthy:
                     if stale_since is None:

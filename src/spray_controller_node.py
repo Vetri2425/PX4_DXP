@@ -65,6 +65,7 @@ from path_identity import (
 MAV_CMD_DO_SET_ACTUATOR = 187
 MAV_CMD_DO_SET_SERVO = 183
 _SERVO_PWM_MAX_US = 2200
+_VALID_ACTUATOR_BACKENDS = {"mavlink_servo_pwm", "mavlink_actuator"}
 from spray_path_model import (  # noqa: E402
     MARK_TO_TRANSIT,
     TRANSIT_TO_MARK,
@@ -210,6 +211,7 @@ class SprayControllerNode(Node):
         # validates its revision; cancellation invalidates prepared envelopes.
         self.declare_parameter("pending_dwell_command_json", "")
         self.declare_parameter("dwell_cancel_revision", 0)
+        self._validate_actuator_backend()
 
         self._state_group = MutuallyExclusiveCallbackGroup()
         self._latency_group = self._state_group
@@ -1216,17 +1218,21 @@ class SprayControllerNode(Node):
         req = CommandLong.Request()
         req.broadcast = False
         req.confirmation = 0
-        backend = str(self.get_parameter("actuator_backend").value)
+        backend = self._validate_actuator_backend()
         if backend == "mavlink_servo_pwm":
             return self._build_servo_pwm_request(req, on)
-        elif backend == "mavlink_actuator":
+        if backend == "mavlink_actuator":
             return self._build_actuator_request(req, on)
-        else:
-            self.get_logger().error(
-                f"Unknown actuator_backend={backend!r}; sending OFF via mavlink_servo_pwm",
-                throttle_duration_sec=5.0,
+        raise RuntimeError(f"unreachable actuator_backend={backend!r}")
+
+    def _validate_actuator_backend(self) -> str:
+        backend = str(self.get_parameter("actuator_backend").value)
+        if backend not in _VALID_ACTUATOR_BACKENDS:
+            raise ValueError(
+                "Unknown actuator_backend="
+                f"{backend!r}; expected one of {sorted(_VALID_ACTUATOR_BACKENDS)}"
             )
-            return self._build_servo_pwm_request(req, False)
+        return backend
 
     def _build_actuator_request(self, req: CommandLong.Request, on: bool) -> CommandLong.Request:
         set_index = int(self.get_parameter("actuator_set_index").value)

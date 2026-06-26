@@ -192,15 +192,19 @@ def read_ned_csv(filepath: str) -> list[tuple[float, float]]:
     """Simple CSV: north_m,east_m  (no header; '#' = comment)."""
     pts: list[tuple[float, float]] = []
     with open(filepath, encoding="utf-8", errors="replace") as f:
-        for row in csv.reader(f):
+        for line_no, row in enumerate(csv.reader(f), 1):
             if not row or row[0].strip().startswith("#"):
                 continue
+            if len(row) < 2:
+                raise ValueError(f"CSV line {line_no}: expected north_m,east_m")
             try:
                 n = float(row[0].strip())
-                e = float(row[1].strip()) if len(row) > 1 else 0.0
-                pts.append((n, e))
-            except ValueError:
-                continue
+                e = float(row[1].strip())
+            except ValueError as exc:
+                raise ValueError(f"CSV line {line_no}: malformed coordinate: {exc}") from exc
+            if not math.isfinite(n) or not math.isfinite(e):
+                raise ValueError(f"CSV line {line_no}: coordinates must be finite")
+            pts.append((n, e))
     return pts
 
 

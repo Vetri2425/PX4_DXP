@@ -48,7 +48,6 @@ from spray_runtime_protocol import (
 from path_identity import (
     PATH_IDENTITY_TOPIC,
     make_path_identity,
-    path_geometry_fingerprint,
 )
 
 from config import (
@@ -62,6 +61,11 @@ from config import (
     SRV_SPRAY_START_DWELL,
 )
 from logging_setup import get_logger
+from path_validation import (
+    normalize_path_points,
+    normalize_spray_flags,
+    verified_path_fingerprint,
+)
 from rpp_status import RppStatusMonitor
 
 log = get_logger("server.ros")
@@ -201,6 +205,9 @@ class RosBridgeNode(Node):
         "spraying": False,
         "spray_active": False,
         "spray_manual": False,
+        "measured_speed_m_s": None,
+        "rpp_debug_age_ms": None,
+        "rpp_debug_fresh": False,
         "obstacle_clear": True,
     }
 
@@ -511,6 +518,9 @@ class RosBridgeNode(Node):
         # MAVROS velocity_local is ENU; yaw rate CCW+ → NED CW+ via negation.
         with self._lock:
             self._velocity_recv_time = time.monotonic()
+            self._state["measured_speed_m_s"] = math.hypot(
+                float(msg.twist.linear.x), float(msg.twist.linear.y)
+            )
             self._state["yaw_rate_rad_s"] = -float(msg.twist.angular.z)
 
     def _cb_spray_runtime_status(self, msg: String) -> None:
@@ -585,6 +595,11 @@ class RosBridgeNode(Node):
             age = time.monotonic() - self._state_recv_time
             if age > self._MAVROS_STATE_TIMEOUT_S:
                 state["connected"] = False
+        rpp_age_s = self._rpp_monitor.snapshot_age_s()
+        state["rpp_debug_age_ms"] = (
+            rpp_age_s * 1000.0 if rpp_age_s is not None else None
+        )
+        state["rpp_debug_fresh"] = self._rpp_monitor.is_fresh()
         return state
 
     def get_bridge_snapshot(self) -> dict[str, Any]:
@@ -1155,8 +1170,10 @@ class RosBridgeNode(Node):
         mission_id: str = "",
         configuration_revision: int = 0,
         path_fingerprint: str = "",
+        verify_supplied_fingerprint: bool = True,
     ) -> None:
         """Publish nav_msgs/Path. Empty list → see publish_stop_path()."""
+        points = normalize_path_points(points, label="ROS path")
         if spray_flags is None:
             flags = [False] * len(points)
         elif len(spray_flags) != len(points):
@@ -1167,7 +1184,11 @@ class RosBridgeNode(Node):
             )
             flags = [False] * len(points)
         else:
-            flags = [bool(f) for f in spray_flags]
+            flags = normalize_spray_flags(spray_flags, len(points), default=False)
+        if path_fingerprint and not verify_supplied_fingerprint:
+            fingerprint = str(path_fingerprint)
+        else:
+            fingerprint = verified_path_fingerprint(points, flags, path_fingerprint)
 
         path = Path()
         path.header.stamp = self.get_clock().now().to_msg()
@@ -1186,14 +1207,6 @@ class RosBridgeNode(Node):
             else:
                 ps.pose.orientation.w = 1.0
             path.poses.append(ps)
-        fingerprint = (
-            path_fingerprint
-            if path_fingerprint
-            else (
-                path_geometry_fingerprint(points, flags)
-                if len(points) >= 2 else ""
-            )
-        )
         ident = String()
         ident.data = make_path_identity(
             mission_id=mission_id,

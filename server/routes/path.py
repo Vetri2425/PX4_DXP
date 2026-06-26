@@ -1236,6 +1236,19 @@ async def load_mission_to_controller(req: LoadMissionRequest):
         raise HTTPException(422, "Staged mission has no waypoints.")
     if point_mode and not staged.get("point_mission_points"):
         raise HTTPException(422, "Point-mode staged mission has no point_mission_points.")
+    try:
+        from path_validation import normalize_path_points
+
+        if point_mode:
+            first = staged["point_mission_points"][0]
+            normalize_path_points(
+                [(first["north_m"], first["east_m"])],
+                label="point-mode staged mission",
+            )
+        else:
+            waypoints = normalize_path_points(waypoints, label="staged mission")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(422, f"Invalid staged geometry: {exc}") from exc
 
     anchor = staged.get("anchor")
     if anchor:

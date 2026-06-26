@@ -122,9 +122,26 @@ POSE_STALE_MS = 500.0  # consider pose stale above this
 GLOBAL_POSITION_STALE_MS = float(os.environ.get("ROVER_GLOBAL_POS_STALE_MS", "500"))
 GPS_FIX_STALE_MS = float(os.environ.get("ROVER_GPS_FIX_STALE_MS", "500"))
 POSE_GLOBAL_MAX_SKEW_MS = float(os.environ.get("ROVER_POSE_GPS_MAX_SKEW_MS", "100"))
+RPP_DEBUG_STALE_MS = float(os.environ.get("ROVER_RPP_DEBUG_STALE_MS", "500"))
 SAFETY_STALE_GRACE_S = 1.0  # auto-abort after this long in STALE
 DONE_SETTLE_S = 1.0  # require this much DONE before auto-completing
 SETPOINT_STREAM_GRACE_S = 0.5  # path/setpoint settle time before OFFBOARD request
+
+MISSION_COMPLETE_REST_SPEED_M_S = float(
+    os.environ.get("ROVER_MISSION_COMPLETE_REST_SPEED_M_S", "0.03")
+)
+MISSION_COMPLETE_REST_TIMEOUT_S = float(
+    os.environ.get("ROVER_MISSION_COMPLETE_REST_TIMEOUT_S", "2.0")
+)
+MISSION_COMPLETE_SPRAY_TIMEOUT_S = float(
+    os.environ.get("ROVER_MISSION_COMPLETE_SPRAY_TIMEOUT_S", "2.0")
+)
+MISSION_COMPLETE_SET_MANUAL = os.environ.get(
+    "ROVER_MISSION_COMPLETE_SET_MANUAL", "1"
+) == "1"
+MISSION_COMPLETE_DISARM = os.environ.get(
+    "ROVER_MISSION_COMPLETE_DISARM", "1"
+) == "1"
 
 # ── Virtual joystick V2 ──────────────────────────────────────────────────────
 # Fail closed unless deployment explicitly enables manual control. This is the

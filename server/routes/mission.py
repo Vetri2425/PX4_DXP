@@ -325,16 +325,26 @@ async def mission_status():
     speed = None
     xtrack = None
     pose_age_ms = s.get("pose_age_ms")
+    rpp_debug_age_ms = s.get("rpp_debug_age_ms")
+    rpp_debug_fresh = s.get("rpp_debug_fresh")
+    measured_speed_m_s = s.get("measured_speed_m_s")
     if ros_node is not None:
         try:
             monitor = ros_node.get_rpp_monitor()
-            if monitor.has_snapshot():
+            if monitor.has_snapshot(fresh=True):
                 rpp = monitor.get_snapshot()
                 code = rpp.state_code
                 dist_to_goal = rpp.dist_to_goal_m
                 speed = rpp.speed_m_s
                 xtrack = rpp.xtrack_m
                 pose_age_ms = rpp.pose_age_ms
+                age_s = monitor.snapshot_age_s()
+                rpp_debug_age_ms = age_s * 1000.0 if age_s is not None else None
+                rpp_debug_fresh = True
+            elif monitor.has_snapshot():
+                age_s = monitor.snapshot_age_s()
+                rpp_debug_age_ms = age_s * 1000.0 if age_s is not None else None
+                rpp_debug_fresh = False
         except Exception:
             code = s.get("rpp_state", RPP_STALE)
             dist_to_goal = s.get("dist_to_goal_m")
@@ -350,6 +360,9 @@ async def mission_status():
         speed          = speed,
         xtrack         = xtrack,
         pose_age_ms    = pose_age_ms,
+        rpp_debug_age_ms = rpp_debug_age_ms,
+        rpp_debug_fresh = rpp_debug_fresh,
+        measured_speed_m_s = measured_speed_m_s,
         fcu_connected  = s.get("connected"),
         last_path_loaded = last_path_loaded,
         loaded_mission_id = loaded_mission_id,

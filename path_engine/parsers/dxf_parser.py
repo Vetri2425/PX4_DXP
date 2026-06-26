@@ -23,7 +23,7 @@ Layer-to-SegmentType mapping:
 Unit handling:
   ezdxf provides $INSUNITS header variable. Common values:
     1 = inches, 2 = feet, 4 = mm, 5 = cm, 6 = m
-  If $INSUNITS is missing or 0, the unit_scale parameter is used (default 0.01 = cm).
+  If $INSUNITS is missing or 0, production callers must pass unit_scale explicitly.
 """
 
 from __future__ import annotations
@@ -69,7 +69,7 @@ _INSUNITS_TO_METRES = {
 }
 
 
-def _get_unit_scale(filepath: str, fallback: float = 0.01) -> float:
+def _get_unit_scale(filepath: str, fallback: float | None = None) -> float:
     """Read $INSUNITS from DXF file and return metres-per-unit scale.
 
     If $INSUNITS is missing or 0, returns the fallback value.
@@ -83,13 +83,19 @@ def _get_unit_scale(filepath: str, fallback: float = 0.01) -> float:
         scale = _INSUNITS_TO_METRES.get(insunits)
         if scale is not None and scale > 0:
             return scale
+        if fallback is None:
+            if insunits == 0:
+                raise ValueError("$INSUNITS is 0/unspecified; pass unit_scale explicitly")
+            raise ValueError(f"Unsupported DXF $INSUNITS value: {insunits!r}")
         if insunits == 0:
-            log.warning("$INSUNITS is 0 (unspecified) — using fallback scale %.4f", fallback)
+            log.warning("$INSUNITS is 0 (unspecified) — using explicit fallback scale %.4f", fallback)
     except (FileNotFoundError, PermissionError):
         raise
     except Exception as exc:
-        log.warning("Failed to read $INSUNITS from %s: %s — using fallback %.4f",
-                     filepath, exc, fallback)
+        if fallback is None:
+            raise ValueError(f"Failed to read $INSUNITS from {filepath}: {exc}") from exc
+        log.warning("Failed to read $INSUNITS from %s: %s — using explicit fallback %.4f",
+                    filepath, exc, fallback)
     return fallback
 
 
@@ -97,6 +103,7 @@ def parse_dxf(
     filepath: str,
     unit_scale: float | None = None,
     layer_mapping: dict[str, str] | None = None,
+    allow_unsupported_entities: bool = False,
 ) -> list[DXFEntity]:
     """Parse a DXF file and extract geometric entities.
 
@@ -104,9 +111,12 @@ def parse_dxf(
         filepath: Path to the .dxf file.
         unit_scale: Metres per DXF unit. If None, auto-detected from $INSUNITS.
                     Common values: 0.01 (cm), 0.001 (mm), 1.0 (m).
+                    Required when $INSUNITS is 0 or missing.
         layer_mapping: Dict mapping layer name patterns to segment types.
                        Values: "mark", "transit", "ignore".
                        Example: {"TRANSIT": "transit", "DRAW": "mark"}
+        allow_unsupported_entities: If False, any unsupported DXF entity raises
+                                    instead of being silently skipped.
 
     Returns:
         List of DXFEntity objects with geometry dicts populated.
@@ -131,13 +141,14 @@ def parse_dxf(
             unit_scale = scale
         else:
             if insunits == 0:
-                log.warning("$INSUNITS is 0 (unspecified) — using fallback scale 0.01")
-            unit_scale = 0.01
+                raise ValueError("$INSUNITS is 0/unspecified; pass unit_scale explicitly")
+            raise ValueError(f"Unsupported DXF $INSUNITS value: {insunits!r}")
 
-    if unit_scale <= 0:
+    if unit_scale <= 0 or not math.isfinite(float(unit_scale)):
         raise ValueError(f"Invalid unit_scale: {unit_scale}")
 
     entities: list[DXFEntity] = []
+    unsupported: list[str] = []
 
     for entity in msp:
         etype = entity.dxftype()
@@ -450,6 +461,7 @@ def parse_dxf(
                                 handle, sub_etype, sub_id, sub_exc)
 
                     else:
+                        unsupported.append(f"INSERT {handle} sub-entity {sub_etype} layer={layer}")
                         log.warning(
                             "INSERT %s: skipping unsupported sub-entity type %s "
                             "(layer=%s)", handle, sub_etype, layer)
@@ -458,8 +470,15 @@ def parse_dxf(
                             handle, layer, exc)
 
         else:
+            unsupported.append(f"{etype} layer={layer} handle={handle}")
             log.warning("Skipping unsupported DXF entity type: %s (layer=%s, handle=%s)",
                        etype, layer, handle)
+
+    if unsupported and not allow_unsupported_entities:
+        raise ValueError("Unsupported DXF entities: " + "; ".join(unsupported[:20]))
+
+    if not entities:
+        raise ValueError("DXF produced no supported geometry")
 
     return entities
 

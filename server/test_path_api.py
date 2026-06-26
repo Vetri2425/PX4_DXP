@@ -1,5 +1,6 @@
 import math
 import os
+import json
 import shutil
 import sys
 
@@ -1315,6 +1316,42 @@ async def test_load_to_controller_rejects_while_running(monkeypatch, tmp_path):
             LoadMissionRequest(mission_id="stg_anything")
         )
     assert exc.value.status_code == 409
+
+
+@pytest.mark.anyio
+async def test_load_to_controller_rejects_non_finite_staged_geometry(monkeypatch, tmp_path):
+    import routes.path as path_routes
+    from models import LoadMissionRequest
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    monkeypatch.setattr(path_routes, "STAGING_DIR", str(staging))
+    mission_id = "stg_bad_geometry"
+    (staging / f"{mission_id}.json").write_text(
+        json.dumps({
+            "mission_id": mission_id,
+            "waypoints": [[0.0, 0.0], [float("nan"), 1.0]],
+            "spray_flags": [True, True],
+            "configuration_revision": 1,
+            "path_fingerprint": "corrupt",
+        }),
+        encoding="utf-8",
+    )
+
+    class FakeController:
+        state = MissionState.IDLE
+
+        def load_path(self, *args, **kwargs):
+            raise AssertionError("invalid staged geometry must not reach controller")
+
+    monkeypatch.setattr(main, "offboard_ctrl", FakeController())
+
+    with pytest.raises(HTTPException) as exc:
+        await path_routes.load_mission_to_controller(
+            LoadMissionRequest(mission_id=mission_id)
+        )
+    assert exc.value.status_code == 422
+    assert "Invalid staged geometry" in str(exc.value.detail)
 
 
 # ── Extension-aware auto-origin (server flow) ───────────────────────────────

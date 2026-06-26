@@ -41,7 +41,12 @@ class PathValidator:
         warnings: list[str] = []
         errors: list[str] = []
         if not plan.merged_waypoints:
-            return ["Path contains no waypoints."], errors
+            errors.append("Path contains no waypoints.")
+            return warnings, errors
+
+        self._check_finite(plan.merged_waypoints, errors)
+        if errors:
+            return warnings, errors
 
         # 1. Publication size checks
         self._check_counts(plan, warnings, errors)
@@ -89,6 +94,18 @@ class PathValidator:
                 f"High waypoint count: {n_waypoints}/{self.max_waypoints}. "
                 f"Large /path messages can slow ROS2 and mobile clients."
             )
+
+    def _check_finite(self, pts: list[tuple[float, float]], errors: list[str]) -> None:
+        for index, point in enumerate(pts):
+            try:
+                n, e = point
+                n = float(n)
+                e = float(e)
+            except (TypeError, ValueError) as exc:
+                errors.append(f"Waypoint {index} must contain numeric north/east: {exc}")
+                continue
+            if not math.isfinite(n) or not math.isfinite(e):
+                errors.append(f"Waypoint {index} contains non-finite coordinates: {point}")
 
     def _check_bounding_box(self, pts: list[tuple[float, float]], warnings: list[str]) -> None:
         norths = [p[0] for p in pts]

@@ -35,6 +35,7 @@ class FakeNode:
         self.state = {
             "connected": True,
             "rpp_state": 1,
+            "rpp_debug_fresh": True,
             "pose_received": True,
             "global_position_received": True,
             "gps_fix_received": True,
@@ -185,15 +186,9 @@ async def test_surveyed_telemetry_failures_return_422(monkeypatch, override):
 async def test_invalid_survey_anchor_returns_422(monkeypatch):
     node = FakeNode()
     ctrl = OffboardController(node, deque())
-    load_protected(ctrl, origin_gps=(float("nan"), 80.261956))
-    monkeypatch.setattr(main, "offboard_ctrl", ctrl)
-    monkeypatch.setattr(main, "path_mgr", FakePathManager())
-    monkeypatch.setattr(main, "ros_node", node)
 
-    with pytest.raises(HTTPException) as exc:
-        await start_mission(MissionStartRequest(mission_id="stg_field"))
-
-    assert exc.value.status_code == 422
+    with pytest.raises(ValueError, match="origin_gps"):
+        load_protected(ctrl, origin_gps=(float("nan"), 80.261956))
     assert node.calls == []
     assert ctrl.running_mission_id is None
 

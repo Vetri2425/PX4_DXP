@@ -180,20 +180,19 @@ def test_actuator_bad_index_clamps():
     print("PASS test_actuator_bad_index_clamps")
 
 
-# ── unknown backend fail-safe ─────────────────────────────────────────────────
+# ── unknown backend validation ────────────────────────────────────────────────
 
-def test_unknown_backend_fails_safe():
-    """Unknown backend must not raise and must produce an OFF-equivalent command."""
+def test_unknown_backend_is_configuration_error():
+    """Unknown backend must fail closed before any command is built."""
     node = make_node()
     node._params["actuator_backend"] = _Param("bogus_backend")
-    node._params["servo_instance"] = _Param(1)
-    node._params["off_pwm_us"] = _Param(0)
-    node._params["on_pwm_us"] = _Param(1800)
-    # Requesting ON with an unknown backend must degrade to OFF (safe)
-    req = _req(node, on=True)
-    assert req.command == MAV_CMD_DO_SET_SERVO, "unknown backend should fall back to servo cmd"
-    assert req.param2 == 0.0, "unknown backend should fall back to OFF (PWM 0)"
-    print("PASS test_unknown_backend_fails_safe")
+    try:
+        _req(node, on=True)
+    except ValueError as exc:
+        assert "Unknown actuator_backend" in str(exc)
+    else:
+        raise AssertionError("unknown actuator_backend should raise ValueError")
+    print("PASS test_unknown_backend_is_configuration_error")
 
 
 # ── run all ───────────────────────────────────────────────────────────────────
@@ -212,5 +211,5 @@ if __name__ == "__main__":
     test_actuator_on_command()
     test_actuator_set_index_2()
     test_actuator_bad_index_clamps()
-    test_unknown_backend_fails_safe()
+    test_unknown_backend_is_configuration_error()
     print("\nAll backend tests PASSED")

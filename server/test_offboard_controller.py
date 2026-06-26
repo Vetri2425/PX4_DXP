@@ -15,22 +15,40 @@ from offboard_controller import OffboardController
 
 
 class FakeRppMonitor:
+    def __init__(self, done=True):
+        self.done = done
+
     def reset(self):
         pass
 
+    def is_done(self):
+        return self.done
+
 
 class FakeNode:
-    def __init__(self, states):
+    def __init__(self, states, *, default_rpp_fresh=True):
         self._states = list(states)
         self.calls = []
+        self.default_rpp_fresh = default_rpp_fresh
+        self.rpp_monitor = FakeRppMonitor()
+        self.spray_runtime_status = {
+            "status_stale": False,
+            "commanded_on": False,
+            "confirmed_off": True,
+        }
 
     def get_state(self):
         if len(self._states) > 1:
-            return self._states.pop(0)
-        return self._states[0]
+            state = self._states.pop(0)
+        else:
+            state = self._states[0]
+        state = dict(state)
+        if self.default_rpp_fresh is not None and "rpp_state" in state:
+            state.setdefault("rpp_debug_fresh", self.default_rpp_fresh)
+        return state
 
     def get_rpp_monitor(self):
-        return FakeRppMonitor()
+        return self.rpp_monitor
 
     def publish_path(
         self, points, frame_id="local_ned", spray_flags=None, runtime_entry=False
@@ -39,6 +57,20 @@ class FakeNode:
 
     def publish_path_clear(self):
         self.calls.append(("publish_path_clear",))
+
+    def publish_stop_path(self):
+        self.calls.append(("publish_stop_path",))
+        return (1.0, 2.0)
+
+    def publish_spray_manual(self, on: bool):
+        self.calls.append(("spray_manual", on))
+
+    async def set_spray_param_async(self, name, value):
+        self.calls.append(("spray_param", name, value))
+        return True, ""
+
+    def get_spray_runtime_status(self):
+        return dict(self.spray_runtime_status)
 
     async def arm_async(self, arm):
         self.calls.append(("arm", arm))
@@ -134,6 +166,131 @@ def test_start_disarms_if_rpp_stays_idle_after_path_publish():
         ]
     finally:
         offboard_module.SETPOINT_STREAM_GRACE_S = old_grace
+
+
+def test_start_rejects_stale_rpp_debug_before_publish():
+    node = FakeNode([
+        {"connected": True, "rpp_state": RPP_TRACKING, "rpp_debug_fresh": False},
+    ])
+    ctrl = OffboardController(node, deque())
+    ctrl.load_path([(1.0, 2.0), (3.0, 4.0)], name="test")
+
+    ok, msg = run(ctrl.start_async())
+
+    assert ok is False
+    assert "RPP debug stale" in msg
+    assert ctrl.state == MissionState.ERROR
+    assert node.calls == []
+
+
+def test_start_rejects_missing_rpp_debug_fresh_before_publish():
+    node = FakeNode(
+        [{"connected": True, "rpp_state": RPP_TRACKING}],
+        default_rpp_fresh=None,
+    )
+    ctrl = OffboardController(node, deque())
+    ctrl.load_path([(1.0, 2.0), (3.0, 4.0)], name="test")
+
+    ok, msg = run(ctrl.start_async())
+
+    assert ok is False
+    assert "RPP debug stale" in msg
+    assert ctrl.state == MissionState.ERROR
+    assert node.calls == []
+
+
+def test_start_disarms_if_rpp_debug_stale_after_path_publish():
+    old_grace = offboard_module.SETPOINT_STREAM_GRACE_S
+    offboard_module.SETPOINT_STREAM_GRACE_S = 0.0
+    try:
+        node = FakeNode([
+            {"connected": True, "rpp_state": RPP_TRACKING, "rpp_debug_fresh": True},
+            {"connected": True, "rpp_state": RPP_TRACKING, "rpp_debug_fresh": False},
+        ])
+        ctrl = OffboardController(node, deque())
+        ctrl.load_path([(1.0, 2.0), (3.0, 4.0)], name="test")
+
+        ok, msg = run(ctrl.start_async())
+
+        assert ok is False
+        assert "RPP debug stale after path publish" in msg
+        assert ctrl.state == MissionState.ERROR
+        assert node.calls == [
+            ("publish_path", [(1.0, 2.0), (3.0, 4.0)], None, False),
+            ("arm", True),
+            ("arm", False),
+        ]
+    finally:
+        offboard_module.SETPOINT_STREAM_GRACE_S = old_grace
+
+
+def test_complete_terminalizes_before_marking_completed():
+    node = FakeNode([
+        {
+            "connected": True,
+            "rpp_state": RPP_TRACKING,
+            "pose_received": True,
+            "measured_speed_m_s": 0.0,
+            "spraying": False,
+        }
+    ])
+    ctrl = OffboardController(node, deque())
+    ctrl.load_path([(1.0, 2.0), (3.0, 4.0)], name="test")
+    ctrl.state = MissionState.RUNNING
+
+    result = run(ctrl.complete_async())
+
+    assert result["success"] is True
+    assert ctrl.state == MissionState.COMPLETED
+    assert node.calls == [
+        ("spray_manual", False),
+        ("spray_param", "spray_enabled", False),
+        ("publish_stop_path",),
+        ("set_mode", "MANUAL"),
+        ("arm", False),
+    ]
+
+
+def test_complete_reports_degraded_when_done_snapshot_is_stale():
+    node = FakeNode([
+        {
+            "connected": True,
+            "rpp_state": RPP_TRACKING,
+            "pose_received": True,
+            "measured_speed_m_s": 0.0,
+            "spraying": False,
+        }
+    ])
+    node.rpp_monitor.done = False
+    ctrl = OffboardController(node, deque())
+    ctrl.load_path([(1.0, 2.0), (3.0, 4.0)], name="test")
+    ctrl.state = MissionState.RUNNING
+
+    result = run(ctrl.complete_async())
+
+    assert result["success"] is False
+    assert result["fresh_done"] is False
+    assert result["action"] == "completion_degraded"
+    assert ctrl.state == MissionState.ERROR
+
+
+def test_load_path_rejects_non_finite_controller_bound_geometry():
+    ctrl = OffboardController(None, deque())
+
+    with pytest.raises(ValueError, match="finite coordinates"):
+        ctrl.load_path([(0.0, 0.0), (float("nan"), 1.0)], name="bad")
+
+
+def test_load_path_rejects_supplied_fingerprint_mismatch():
+    ctrl = OffboardController(None, deque())
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        ctrl.load_path(
+            [(0.0, 0.0), (1.0, 0.0)],
+            name="bad-fp",
+            spray_flags=[False, True],
+            path_fingerprint="not-the-real-fingerprint",
+        )
 
 
 def test_surveyed_start_preserves_spray_flags_and_does_not_accumulate_translation():
@@ -378,7 +535,6 @@ def test_clear_mission_publishes_latched_path_reset():
         spray_flags=[False, True],
         mission_id="stg_clear",
         is_staged=True,
-        path_fingerprint="fp",
         configuration_revision=9,
     )
 

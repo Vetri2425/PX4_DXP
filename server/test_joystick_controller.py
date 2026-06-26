@@ -253,8 +253,15 @@ def test_estop_clears_mission_arbiter_owner():
     arbiter._owner = ControlOwner.MISSION
 
     class FakeOffboard:
-        _lock = asyncio.Lock()
         state = MissionState.RUNNING
+
+        def __init__(self):
+            self._lock = None
+
+        def _lifecycle_lock(self):
+            if self._lock is None:
+                self._lock = asyncio.Lock()
+            return self._lock
 
     class FakeRos:
         def publish_stop_path(self):
@@ -416,8 +423,15 @@ def test_estop_starts_physical_action_while_acquire_waits_for_manual(monkeypatch
             return True, ""
 
     class FakeOffboard:
-        _lock = asyncio.Lock()
         state = MissionState.RUNNING
+
+        def __init__(self):
+            self._lock = None
+
+        def _lifecycle_lock(self):
+            if self._lock is None:
+                self._lock = asyncio.Lock()
+            return self._lock
 
     async def scenario():
         ros = BlockingRos()

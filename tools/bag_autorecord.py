@@ -46,6 +46,7 @@ FINALIZE_TIMEOUT_S = float(os.environ.get("BAG_FINALIZE_TIMEOUT_S", "15"))
 TERMINAL = {"idle", "completed", "aborted", "error", "none", ""}
 TOPICS = [
     "/path",
+    "/path/identity",
     "/mavros/local_position/pose",
     "/mavros/local_position/velocity_local",
     "/mavros/setpoint_raw/local",
@@ -58,11 +59,30 @@ TOPICS = [
     "/rpp/segment_debug",
     "/rpp/velocity_ned",
     "/rpp/yaw_rate_body",
+    "/rpp/conditioned_path",
+    "/rpp/conditioned_path_identity",
     "/spray/active",
+    "/spray/desired",
+    "/spray/commanded",
     "/spray/state",
+    "/spray/debug",
+    "/spray/runtime_status",
 ]
 
 SERVICES = ("rover-server", "rpp-pipeline", "px4-dxp", "bag-autorecord")
+FCU_PARAM_IDS = (
+    "COM_OF_LOSS_T",
+    "COM_OBL_RC_ACT",
+    "RO_YAW_P",
+    "RO_YAW_RATE_LIM",
+    "RD_TRANS_DRV_TRN",
+    "RD_TRANS_TRN_DRV",
+    "EKF2_WENC_CTRL",
+    "RBCLW_COUNTS_REV",
+    "PWM_AUX_MIN1",
+    "PWM_AUX_MAX1",
+    "PWM_AUX_DIS1",
+)
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(authorization\s*[:=]\s*)(\S.*)"),
     re.compile(r"(?i)((?:token|password|passwd|secret)\s*[:=]\s*)([^\s,;]+)"),
@@ -536,16 +556,37 @@ class CaptureSession:
             ]),
         })
 
-        for node, filename in (("/rpp_controller", "rpp_controller.yaml"),
-                               ("/spray_controller", "spray_controller.yaml")):
+        for node, filename in (
+            ("/rpp_controller", "rpp_controller.yaml"),
+            ("/spray_controller", "spray_controller.yaml"),
+            ("/mavros", "mavros.yaml"),
+        ):
             result = _run_text(["ros2", "param", "dump", node])
             output = result.get("stdout", "")
             if result.get("returncode") == 0 and output:
                 (self.bundle / "config" / filename).write_text(output, encoding="utf-8")
             else:
                 self.manifest["outcome"]["warnings"].append(f"parameter dump failed for {node}")
+        self._snapshot_fcu_params()
         self._copy_sidecars()
         self._write_manifest()
+
+    def _snapshot_fcu_params(self) -> None:
+        assert self.bundle is not None
+        evidence: dict[str, Any] = {
+            "pulled_at_utc": utc_now(),
+            "param_pull": _run_text([
+                "ros2", "service", "call", "/mavros/param/pull",
+                "mavros_msgs/srv/ParamPull", "{force_pull: true}",
+            ], timeout=8.0),
+            "params": {},
+        }
+        for param_id in FCU_PARAM_IDS:
+            evidence["params"][param_id] = _run_text([
+                "ros2", "service", "call", "/mavros/param/get",
+                "mavros_msgs/srv/ParamGet", f"{{param_id: {param_id}}}",
+            ], timeout=4.0)
+        atomic_json(self.bundle / "config" / "fcu_params.json", evidence)
 
     def _copy_sidecars(self) -> None:
         assert self.bundle is not None

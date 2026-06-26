@@ -19,6 +19,7 @@ Lines starting with # are ignored.
 from __future__ import annotations
 
 import csv
+import math
 
 from ..core import PathSegment, SegmentType
 
@@ -35,15 +36,19 @@ def read_ned_csv(filepath: str) -> list[tuple[float, float]]:
     pts: list[tuple[float, float]] = []
     with open(filepath, "r", encoding="utf-8", errors="replace") as f:
         reader = csv.reader(f)
-        for row in reader:
+        for line_no, row in enumerate(reader, 1):
             if not row or row[0].strip().startswith("#"):
                 continue
+            if len(row) < 2:
+                raise ValueError(f"CSV line {line_no}: expected north_m,east_m")
             try:
                 n = float(row[0].strip())
-                e = float(row[1].strip()) if len(row) > 1 else 0.0
-                pts.append((n, e))
-            except (ValueError, IndexError):
-                continue
+                e = float(row[1].strip())
+            except ValueError as exc:
+                raise ValueError(f"CSV line {line_no}: malformed coordinate: {exc}") from exc
+            if not math.isfinite(n) or not math.isfinite(e):
+                raise ValueError(f"CSV line {line_no}: coordinates must be finite")
+            pts.append((n, e))
     return pts
 
 
@@ -74,6 +79,10 @@ def read_ned_csv_enhanced(filepath: str) -> list[PathSegment]:
             n_cols = len(row)
             if expected_cols is None:
                 expected_cols = n_cols
+                if expected_cols not in (2, 6):
+                    raise ValueError(
+                        f"CSV line {line_no}: expected 2 or 6 columns, got {expected_cols}"
+                    )
             elif n_cols != expected_cols:
                 raise ValueError(
                     f"CSV column count mismatch at line {line_no}: "
@@ -81,27 +90,30 @@ def read_ned_csv_enhanced(filepath: str) -> list[PathSegment]:
                 )
             try:
                 n = float(row[0].strip())
-                e = float(row[1].strip()) if len(row) > 1 else 0.0
+                e = float(row[1].strip())
                 if expected_cols >= 6:
                     spray_on = int(float(row[2].strip()))
                     speed = float(row[3].strip())
                     seg_id = int(float(row[4].strip()))
                     yaw = float(row[5].strip())
                 else:
-                    # Old format: 2 or 3 columns
                     spray_on = 1
                     speed = 0.35
                     seg_id = 0
                     yaw = 0.0
-                rows.append({
-                    "n": n, "e": e,
-                    "spray_on": spray_on,
-                    "speed": speed,
-                    "segment_id": seg_id,
-                    "yaw": yaw,
-                })
-            except (ValueError, IndexError):
-                continue
+            except ValueError as exc:
+                raise ValueError(f"CSV line {line_no}: malformed numeric field: {exc}") from exc
+            if not all(math.isfinite(v) for v in (n, e, speed, yaw)):
+                raise ValueError(f"CSV line {line_no}: numeric fields must be finite")
+            if spray_on not in (0, 1):
+                raise ValueError(f"CSV line {line_no}: spray_on must be 0 or 1")
+            rows.append({
+                "n": n, "e": e,
+                "spray_on": spray_on,
+                "speed": speed,
+                "segment_id": seg_id,
+                "yaw": yaw,
+            })
 
     if not rows:
         return []

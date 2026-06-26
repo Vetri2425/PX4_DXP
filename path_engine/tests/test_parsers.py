@@ -4,6 +4,8 @@ import os
 import tempfile
 import math
 
+import pytest
+
 from path_engine.parsers.csv_parser import read_ned_csv, read_ned_csv_enhanced
 from path_engine.parsers.waypoints_parser import read_qgc_waypoints
 from path_engine.parsers.dxf_parser import parse_dxf, entities_to_segments, _HAS_EZDXF
@@ -58,6 +60,22 @@ def test_csv_comment_lines():
         pts = read_ned_csv(f.name)
     os.unlink(f.name)
     assert len(pts) == 2
+
+
+def test_csv_rejects_missing_or_malformed_coordinates():
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+        f.write("0.0\n")
+        f.flush()
+        with pytest.raises(ValueError, match="expected north_m,east_m"):
+            read_ned_csv(f.name)
+    os.unlink(f.name)
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+        f.write("0.0,NaN\n")
+        f.flush()
+        with pytest.raises(ValueError, match="finite"):
+            read_ned_csv_enhanced(f.name)
+    os.unlink(f.name)
 
 
 def test_csv_mixed_format_detection():
@@ -378,5 +396,41 @@ def test_dxf_corrupt_file_raises_value_error():
         with pytest.raises(ValueError) as excinfo:
             parse_dxf(fpath)
         assert "Corrupt DXF file" in str(excinfo.value)
+    finally:
+        os.unlink(fpath)
+
+
+def test_dxf_unspecified_units_require_explicit_scale():
+    if not _HAS_EZDXF:
+        return
+
+    import ezdxf
+    doc = ezdxf.new("R2010")
+    doc.header["$INSUNITS"] = 0
+    doc.modelspace().add_line(start=(0, 0), end=(0, 1))
+
+    fpath = _write_dxf(doc)
+    try:
+        with pytest.raises(ValueError, match="INSUNITS"):
+            parse_dxf(fpath)
+        entities = parse_dxf(fpath, unit_scale=1.0)
+        assert len(entities) == 1
+    finally:
+        os.unlink(fpath)
+
+
+def test_dxf_unsupported_entities_are_hard_errors():
+    if not _HAS_EZDXF:
+        return
+
+    import ezdxf
+    doc = ezdxf.new("R2010")
+    doc.header["$INSUNITS"] = 6
+    doc.modelspace().add_text("not geometry")
+
+    fpath = _write_dxf(doc)
+    try:
+        with pytest.raises(ValueError, match="Unsupported DXF entities"):
+            parse_dxf(fpath)
     finally:
         os.unlink(fpath)

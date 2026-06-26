@@ -9,9 +9,12 @@ from path_engine.validator import PathValidationError, PathValidator
 def test_validator_empty_path():
     validator = PathValidator()
     plan = PlannedPath()
-    warnings = validator.validate(plan)
-    assert len(warnings) == 1
-    assert "no waypoints" in warnings[0]
+    warnings, errors = validator.validate_detailed(plan)
+    assert warnings == []
+    assert len(errors) == 1
+    assert "no waypoints" in errors[0]
+    with pytest.raises(PathValidationError, match="no waypoints"):
+        validator.validate_or_raise(plan)
 
 
 def test_validator_safe_path():
@@ -73,6 +76,18 @@ def test_validator_hard_fails_waypoint_explosion():
     assert "Too many waypoints" in errors[0]
 
     with pytest.raises(PathValidationError):
+        validator.validate_or_raise(plan)
+
+
+def test_validator_hard_fails_non_finite_waypoint():
+    validator = PathValidator()
+    plan = PlannedPath(merged_waypoints=[(0.0, 0.0), (float("nan"), 1.0)])
+
+    warnings, errors = validator.validate_detailed(plan)
+    assert warnings == []
+    assert any("non-finite" in error for error in errors)
+
+    with pytest.raises(PathValidationError, match="non-finite"):
         validator.validate_or_raise(plan)
 
 

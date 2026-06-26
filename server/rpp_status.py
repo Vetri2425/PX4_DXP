@@ -5,7 +5,7 @@ import math
 import time
 from dataclasses import dataclass, field
 
-from config import DONE_SETTLE_S, RPP_DONE, RPP_STATE_NAMES
+from config import DONE_SETTLE_S, RPP_DEBUG_STALE_MS, RPP_DONE, RPP_STATE_NAMES
 
 
 @dataclass
@@ -19,7 +19,7 @@ class RppSnapshot:
     pose_age_ms:     float = 0.0
     state_code:      int   = 0
     state_name:      str   = "IDLE"
-    timestamp:       float = field(default_factory=time.time)
+    timestamp:       float = field(default_factory=time.monotonic)
 
     @classmethod
     def from_debug_array(cls, data: list[float]) -> "RppSnapshot":
@@ -34,7 +34,7 @@ class RppSnapshot:
             pose_age_ms     = data[6],
             state_code      = code,
             state_name      = RPP_STATE_NAMES.get(code, "UNKNOWN"),
-            timestamp       = time.time(),
+            timestamp       = time.monotonic(),
         )
 
 
@@ -57,7 +57,7 @@ class RppStatusMonitor:
             self._has_snapshot = True
             if self._snapshot.state_code == RPP_DONE:
                 if self._done_since is None:
-                    self._done_since = time.time()
+                    self._done_since = time.monotonic()
             else:
                 self._done_since = None
 
@@ -70,14 +70,30 @@ class RppStatusMonitor:
     def get_snapshot(self) -> RppSnapshot:
         return self._snapshot
 
-    def has_snapshot(self) -> bool:
-        return self._has_snapshot
+    def snapshot_age_s(self) -> float | None:
+        if not self._has_snapshot:
+            return None
+        return max(0.0, time.monotonic() - self._snapshot.timestamp)
+
+    def is_fresh(self, max_age_s: float | None = None) -> bool:
+        if not self._has_snapshot:
+            return False
+        limit = RPP_DEBUG_STALE_MS / 1000.0 if max_age_s is None else max_age_s
+        age = self.snapshot_age_s()
+        return age is not None and age <= limit
+
+    def has_snapshot(self, *, fresh: bool = False) -> bool:
+        if not self._has_snapshot:
+            return False
+        return self.is_fresh() if fresh else True
 
     def is_done(self) -> bool:
         """True only after DONE state has been held for `done_settle_s`."""
         if self._done_since is None:
             return False
-        return (time.time() - self._done_since) >= self._done_settle_s
+        if not self.is_fresh():
+            return False
+        return (time.monotonic() - self._done_since) >= self._done_settle_s
 
     def is_tracking(self) -> bool:
-        return self._snapshot.state_code in (1, 2)
+        return self.is_fresh() and self._snapshot.state_code in (1, 2)

@@ -88,7 +88,7 @@ class EmergencyHandler:
 
         # 4. Update mission state (hold lock only for the write, not around awaits)
         if self._controller is not None:
-            async with self._controller._lock:
+            async with self._controller._lifecycle_lock():
                 self._controller.state = MissionState.ABORTED
 
         try:
