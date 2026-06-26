@@ -60,20 +60,48 @@ async def apply_spray_mission_config(
 
     # Mission configuration never changes the operator-owned master enable.
     params = configuration_to_param_dict(config)
+    mission_id = config.mission_id
+    spray_mode = config.mode.value
 
+    bulk_t0 = time.monotonic()
     ok, flags, why = await ros_node.set_spray_params_bulk_async(params)
+    bulk_latency_s = time.monotonic() - bulk_t0
     if not ok or not all(flags):
-        return False, why or "spray parameter bulk set failed", None
+        reason = why or "spray parameter bulk set failed"
+        log.warning(
+            "spray mission config bulk-set failed mission_id=%s spray_mode=%s "
+            "latency_s=%.3f reason=%s",
+            mission_id,
+            spray_mode,
+            bulk_latency_s,
+            reason,
+        )
+        return False, reason, None
 
+    apply_t0 = time.monotonic()
     ok, why = await ros_node.trigger_spray_apply_mission_config_async()
+    apply_latency_s = time.monotonic() - apply_t0
     if not ok:
-        return False, why or "spray apply_mission_config failed", None
+        reason = why or "spray apply_mission_config failed"
+        log.warning(
+            "spray mission config apply failed mission_id=%s spray_mode=%s "
+            "bulk_latency_s=%.3f apply_latency_s=%.3f reason=%s",
+            mission_id,
+            spray_mode,
+            bulk_latency_s,
+            apply_latency_s,
+            reason,
+        )
+        return False, reason, None
 
     log.info(
-        "applied spray mission config mode=%s revision=%s mission_id=%s",
-        config.mode.value,
+        "applied spray mission config mission_id=%s spray_mode=%s revision=%s "
+        "bulk_latency_s=%.3f apply_latency_s=%.3f",
+        mission_id,
+        spray_mode,
         config.revision,
-        config.mission_id,
+        bulk_latency_s,
+        apply_latency_s,
     )
     return True, "applied", config
 

@@ -960,32 +960,32 @@ class RosBridgeNode(Node):
         return True, values, ""
 
     async def set_spray_param_async(
-        self, name: str, value: float | int | bool | str, timeout: float = 5.0
+        self, name: str, value: float | int | bool | str, timeout: float = 8.0
     ) -> tuple[bool, str]:
         """Set a single spray_controller parameter at runtime."""
-        if self._spray_param_set_cli is None:
-            return False, "Spray param service not available"
         req = SetParameters.Request()
         param = Parameter()
         param.name = name
         param.value = _python_to_param_value(value)
         req.parameters = [param]
-        ok, _, msg = await self._call_spray_set_param(req, timeout)
+        ok, _, msg = await self._call_spray_set_param(
+            req, response_timeout_s=timeout
+        )
         return ok, msg
 
     async def set_spray_params_bulk_async(
-        self, params: dict[str, float | int | bool | str], timeout: float = 5.0
+        self, params: dict[str, float | int | bool | str], timeout: float = 8.0
     ) -> tuple[bool, list[bool], str]:
         """Set multiple spray_controller params atomically."""
-        if self._spray_param_set_cli is None:
-            return False, [], "Spray param service not available"
         req = SetParameters.Request()
         for name, value in params.items():
             param = Parameter()
             param.name = name
             param.value = _python_to_param_value(value)
             req.parameters.append(param)
-        ok, results, msg = await self._call_spray_set_param(req, timeout)
+        ok, results, msg = await self._call_spray_set_param(
+            req, response_timeout_s=timeout
+        )
         flags = [r.successful for r in results] if results else []
         return ok, flags, msg
 
@@ -1111,25 +1111,91 @@ class RosBridgeNode(Node):
             self._spray_runtime_status = dict(status)
             self._spray_runtime_status_recv_time = time.monotonic()
 
-    async def _call_spray_set_param(self, req, timeout: float) -> tuple[bool, list, str]:
+    async def _call_spray_set_param(
+        self,
+        req,
+        service_wait_timeout_s: float = 2.0,
+        response_timeout_s: float = 8.0,
+    ) -> tuple[bool, list, str]:
         """Shared rcl SetParameters call wrapper for spray_controller."""
-        if not await self._service_ready_async(
-            self._spray_param_set_cli, timeout_sec=0.5
-        ):
-            return False, [], "spray_controller not running"
+        client = self._spray_param_set_cli
+        if client is None:
+            return False, [], "Spray parameter client is not initialized"
+
         try:
-            result = await self._await_ros_future(
-                self._spray_param_set_cli.call_async(req), timeout=timeout
+            service_ready = await asyncio.to_thread(
+                lambda: client.wait_for_service(timeout_sec=service_wait_timeout_s)
+            )
+        except Exception as exc:
+            log.warning(
+                "spray parameter service check failed: %s", exc, exc_info=True
+            )
+            return False, [], f"Spray parameter service check failed: {exc}"
+
+        if not service_ready:
+            log.warning(
+                "spray parameter service unavailable after %.1fs",
+                service_wait_timeout_s,
+            )
+            return (
+                False,
+                [],
+                f"Spray parameter service unavailable after "
+                f"{service_wait_timeout_s:.1f}s",
+            )
+
+        t0 = time.monotonic()
+        try:
+            ros_future = client.call_async(req)
+            response = await self._await_ros_future(
+                ros_future, timeout=response_timeout_s
             )
         except asyncio.TimeoutError:
-            return False, [], "Spray param set timed out"
+            latency_s = time.monotonic() - t0
+            log.warning(
+                "spray parameter response timed out after %.1fs (latency_s=%.3f)",
+                response_timeout_s,
+                latency_s,
+            )
+            return (
+                False,
+                [],
+                f"Spray parameter response timed out after "
+                f"{response_timeout_s:.1f}s",
+            )
         except Exception as exc:
-            return False, [], f"Spray param set failed: {exc}"
-        if result is None:
-            return False, [], "Spray param set returned None"
-        results = list(result.results)
-        if results and not results[0].successful:
-            return False, results, results[0].reason or "Spray param set rejected"
+            latency_s = time.monotonic() - t0
+            log.warning(
+                "spray parameter call failed after %.3fs: %s",
+                latency_s,
+                exc,
+                exc_info=True,
+            )
+            return False, [], f"Spray parameter call failed: {exc}"
+
+        latency_s = time.monotonic() - t0
+        if response is None:
+            log.warning(
+                "spray parameter service returned no response (latency_s=%.3f)",
+                latency_s,
+            )
+            return False, [], "Spray parameter service returned no response"
+
+        results = list(response.results)
+        failed_reasons = [
+            result.reason or "parameter rejected"
+            for result in results
+            if not result.successful
+        ]
+        if failed_reasons:
+            log.warning(
+                "spray parameter rejected (latency_s=%.3f): %s",
+                latency_s,
+                "; ".join(failed_reasons),
+            )
+            return False, results, "; ".join(failed_reasons)
+
+        log.debug("spray parameter set succeeded (latency_s=%.3f)", latency_s)
         return True, results, ""
 
     async def list_rpp_params_async(
