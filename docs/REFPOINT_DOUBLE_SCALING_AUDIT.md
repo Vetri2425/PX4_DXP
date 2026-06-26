@@ -132,8 +132,8 @@ elif scale_error > SCALE_WARN_LIMIT:    # e.g. 0.10 → warn outside [0.90, 1.10
 ```
 Limits live in `config.py`.
 
-**Step 5 — Frontend rename.** [`pathApi.ts`](../DXF_Three_Wheel/src/api/pathApi.ts) `RefPoint` type
-→ `local_north_m` / `local_east_m`; update [`App.tsx`](../DXF_Three_Wheel/App.tsx) call sites. No
+**Step 5 — Frontend rename.** [`pathApi.ts`](../Three_Wheel_v2/src/api/pathApi.ts) `RefPoint` type
+→ `local_north_m` / `local_east_m`; update [`App.tsx`](../Three_Wheel_v2/App.tsx) call sites. No
 arithmetic change.
 
 **Step 6 — Pipeline regression test.** New test calling the route (or `plan_path`) with cm / mm /

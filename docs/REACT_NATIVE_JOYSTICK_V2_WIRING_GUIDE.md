@@ -3,7 +3,7 @@
 **Status:** Implementation-ready. All fields and events verified against backend commit
 `e0e3debef91726309b6bac02570aa8208b78fd9f` and current React Native frontend code.
 
-**Target frontend:** `DXF_Three_Wheel` (Expo SDK 54, TypeScript, React Navigation)
+**Target frontend:** `Three_Wheel_v2` (Expo SDK 54, TypeScript, React Navigation)
 **Backend:** `PX4_DXP/server` (FastAPI + Socket.IO + asyncio)
 **Jetson IP:** `192.168.1.102:5001`
 
@@ -267,7 +267,7 @@ From `server/config.py:129-156` (all configurable via environment variables):
 
 ### 2.1 Current State
 
-The React Native frontend (`DXF_Three_Wheel`) is a single-component monolith in
+The React Native frontend (`Three_Wheel_v2`) is a single-component monolith in
 `App.tsx` (~10K lines) with:
 
 - **Socket.IO client:** `socket.io-client` v4.8.3, connected as a single shared connection
@@ -433,7 +433,7 @@ in the joystick HUD (e.g. "Throttle range: ±15%", "Steering range: ±50%").
 ### Current Project Structure
 
 ```
-DXF_Three_Wheel/
+Three_Wheel_v2/
 ├── App.tsx                          (monolith, ~10K lines)
 ├── src/
 │   ├── api/
