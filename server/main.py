@@ -369,6 +369,7 @@ async def _telemetry_loop() -> None:
                     "heading_err_deg": s.get("heading_err_deg"),
                     "lookahead_m": s.get("lookahead_m"),
                     "speed_m_s": s.get("speed_m_s"),
+                    "measured_speed_m_s": s.get("measured_speed_m_s"),
                     "kappa": s.get("kappa"),
                     "dist_to_goal_m": s.get("dist_to_goal_m"),
                     "pose_age_ms": s.get("pose_age_ms"),
