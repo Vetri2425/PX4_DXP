@@ -244,6 +244,13 @@ class TelemetryData(BaseModel):
     measured_speed_m_s: Optional[float] = None
     spraying: Optional[bool] = None
     marking_state: Optional[Literal["marking", "transit", "off"]] = None
+    # Spray actuator truth (F-05): `spraying` is the commanded belief only —
+    # these report what the spray node actually confirmed and why it is gated.
+    commanded_on: Optional[bool] = None
+    confirmed_off: Optional[bool] = None
+    spray_safety_reason: Optional[str] = None
+    gps_safety_ok: Optional[bool] = None
+    manual_resume_required: Optional[bool] = None
     # FCU
     armed: Optional[bool] = None
     mode: Optional[str] = None

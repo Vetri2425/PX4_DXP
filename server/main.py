@@ -49,6 +49,7 @@ from config import (
     SAFETY_STALE_GRACE_S,
     TELEMETRY_HZ,
 )
+from gps_safety import GpsSurveyedSafetyParams, evaluate_gps_surveyed_safety
 from logging_setup import configure_logging, get_logger
 from models import MissionState
 
@@ -334,6 +335,10 @@ async def _telemetry_loop() -> None:
     stale_since: Optional[float] = None
     consecutive_errors = 0
     _watchdog_counter = 0
+    # F-02: GPS_SURVEYED continuous/dash runtime gate state
+    gps_gate_seq = 0
+    gps_gate_fault_count = 0
+    gps_gate_last_fault_time: Optional[float] = None
     _WATCHDOG_EVERY_N = TELEMETRY_HZ * 3  # ping systemd every ~3s
 
     log.info("telemetry loop started @ %d Hz", TELEMETRY_HZ)
@@ -348,6 +353,7 @@ async def _telemetry_loop() -> None:
                 code = s.get("rpp_state", 0)
                 now = time.time()
                 spraying = bool(s.get("spraying", False))
+                spray_rt = ros_node.get_spray_runtime_status()
                 mission_running = (
                     offboard_ctrl is not None
                     and offboard_ctrl.state == MissionState.RUNNING
@@ -377,6 +383,14 @@ async def _telemetry_loop() -> None:
                     "rpp_state_name": RPP_STATE_NAMES.get(code, "UNKNOWN"),
                     "spraying": spraying,
                     "marking_state": marking_state,
+                    "commanded_on": spray_rt.get("commanded_on"),
+                    "confirmed_off": spray_rt.get("confirmed_off"),
+                    "spray_safety_reason": (
+                        spray_rt.get("gps_safety_reason")
+                        or spray_rt.get("safety_reason")
+                    ),
+                    "gps_safety_ok": spray_rt.get("gps_safety_ok"),
+                    "manual_resume_required": spray_rt.get("manual_resume_required"),
                     "armed": s.get("armed"),
                     "mode": s.get("mode"),
                     "connected": s.get("connected"),
@@ -492,6 +506,74 @@ async def _telemetry_loop() -> None:
                     await joystick_ctrl.force_release(reason="fcu_disconnected")
                     if emergency_handler is not None:
                         await emergency_handler.estop_async()
+
+                # ── 3b. GPS_SURVEYED continuous/dash runtime gate (F-01/F-02) ──
+                # Point missions self-gate in the orchestrator; LOCAL_NED is
+                # never RTK-gated. For a RUNNING surveyed line/dash mission we
+                # re-evaluate GPS safety each tick, feed the result to the spray
+                # node's independent gate, and on fault force spray OFF + e-stop
+                # (the rover must not keep driving on degraded localization).
+                gps_gate_seq += 1
+                gctx = (
+                    offboard_ctrl.gps_surveyed_runtime_context()
+                    if offboard_ctrl is not None else None
+                )
+                if gctx is not None:
+                    verdict = evaluate_gps_surveyed_safety(
+                        s,
+                        gctx["origin_gps"],
+                        gctx["source_points"],
+                        GpsSurveyedSafetyParams(),
+                        recovery_since=None,
+                        fault_count=gps_gate_fault_count,
+                        last_fault_time_s=gps_gate_last_fault_time,
+                    )
+                    if not verdict.ok:
+                        gps_gate_fault_count += 1
+                        gps_gate_last_fault_time = now
+                        ros_node.publish_gps_gate(
+                            active=True, ok=False,
+                            reason=verdict.reason, seq=gps_gate_seq,
+                        )
+                        log.warning(
+                            "GPS_SURVEYED runtime fault (%s mission): %s",
+                            gctx["spray_mode"], verdict.reason,
+                        )
+                        try:
+                            ros_node.publish_spray_manual(False)
+                            await ros_node.cancel_spray_dwell_async()
+                        except Exception:
+                            log.exception("force spray OFF during GPS fault failed")
+                        if emergency_handler is not None:
+                            await emergency_handler.estop_async()
+                        if mission_capture is not None:
+                            mission_capture.record_terminal(
+                                None, "gps_safety_abort",
+                                state=offboard_ctrl.state.value,
+                                details={
+                                    "reason": verdict.reason,
+                                    "spray_mode": gctx["spray_mode"],
+                                },
+                            )
+                        await sio.emit(
+                            "gps_safety_abort",
+                            {
+                                "reason": verdict.reason,
+                                "spray_mode": gctx["spray_mode"],
+                                "gps_fix": verdict.current_fix_type,
+                                "manual_resume_required": True,
+                            },
+                        )
+                    else:
+                        gps_gate_fault_count = 0
+                        ros_node.publish_gps_gate(
+                            active=True, ok=True, reason="", seq=gps_gate_seq,
+                        )
+                else:
+                    gps_gate_fault_count = 0
+                    ros_node.publish_gps_gate(
+                        active=False, ok=True, reason="", seq=gps_gate_seq,
+                    )
 
                 # ── 4. Disconnect notification (transition: was connected) ─────
                 connected = bool(s.get("connected", False))

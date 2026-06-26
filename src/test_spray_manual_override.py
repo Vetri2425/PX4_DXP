@@ -310,6 +310,7 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "temperature_viscosity_compensation_enabled": _Param(False),
         "pending_dwell_command_json": _Param(""),
         "dwell_cancel_revision": _Param(0),
+        "gps_runtime_gate_max_age_s": _Param(3.0),
     }
     node.get_parameter = lambda name: node._params[name]
     node._clock = _Clock()
@@ -357,6 +358,11 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._current_value = -1.0
     node._pose_stale_logged = False
     node._velocity_stale_logged = False
+    node._gps_gate_active = False
+    node._gps_gate_ok = True
+    node._gps_gate_reason = ""
+    node._gps_gate_seq = 0
+    node._gps_gate_recv_time = None
     from spray_config import SprayConfiguration
 
     node._config_lock = __import__("threading").Lock()

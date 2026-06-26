@@ -18,6 +18,7 @@ shim if ever needed) but **must not** be called from the asyncio loop.
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import threading
 import time
@@ -333,6 +334,8 @@ class RosBridgeNode(Node):
         # Manual spray override command — reliable VOLATILE (depth 1): must
         # arrive, but a stale override must never replay to a restarted node.
         self._spray_manual_pub = self.create_publisher(Bool, "/spray/manual", 1)
+        # F-01/F-02: feed the spray node's independent GPS_SURVEYED runtime gate.
+        self._gps_gate_pub = self.create_publisher(String, "/spray/gps_gate", 1)
 
         # ── Service clients (reentrant group, can be called from any thread) ──
         self._arming_cli = None
@@ -549,6 +552,26 @@ class RosBridgeNode(Node):
         msg.data = bool(on)
         self._spray_manual_pub.publish(msg)
         log.info("published /spray/manual: %s", "ON" if on else "OFF")
+
+    def publish_gps_gate(
+        self, *, active: bool, ok: bool, reason: str, seq: int
+    ) -> None:
+        """Feed the spray node's independent GPS_SURVEYED runtime gate (F-01/F-02).
+
+        Published every telemetry tick while a mission is RUNNING so the node can
+        detect feed loss (server death) and fail-closed. `active` is True only for
+        a GPS_SURVEYED continuous/dash mission; the node ignores the gate when
+        active is False, so LOCAL_NED missions are never RTK-gated."""
+        msg = String()
+        msg.data = json.dumps(
+            {
+                "active": bool(active),
+                "ok": bool(ok),
+                "reason": str(reason or ""),
+                "seq": int(seq),
+            }
+        )
+        self._gps_gate_pub.publish(msg)
 
     # ── Public API: state ─────────────────────────────────────────────────────
 

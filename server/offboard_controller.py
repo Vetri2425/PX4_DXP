@@ -170,6 +170,27 @@ class OffboardController:
     def spray_mode(self) -> str:
         return self._spray_mode
 
+    def gps_surveyed_runtime_context(self) -> dict[str, Any] | None:
+        """Context for the continuous/dash GPS_SURVEYED runtime watchdog (F-02).
+
+        Returns None unless a GPS_SURVEYED **continuous or dash** mission is
+        RUNNING — point missions carry their own runtime GPS gate in the point
+        orchestrator, and LOCAL_NED missions are never RTK-gated. When non-None,
+        the server watchdog evaluates GPS safety each tick and feeds the result
+        to the spray node's independent gate."""
+        if self._state != MissionState.RUNNING:
+            return None
+        if self._placement_mode != GPS_SURVEYED:
+            return None
+        if self._spray_mode not in ("continuous", "dash"):
+            return None
+        return {
+            "origin_gps": self._origin_gps,
+            "source_points": tuple(self._loaded_source_pts),
+            "spray_mode": self._spray_mode,
+            "mission_id": self._running_mission_id or self._loaded_mission_id,
+        }
+
     def loaded_path_summary(self, sample: int = 20) -> dict:
         """Read-only snapshot of the path currently resident in the controller.
 
@@ -325,7 +346,37 @@ class OffboardController:
                 "info",
                 f"Resident mission cleared: {cleared_name or 'none'}",
             )
-            return self.loaded_path_summary()
+            summary = self.loaded_path_summary()
+        # F-04: reset the live spray-controller config outside the lifecycle lock
+        # (it issues node service calls). Clears mission_id/fingerprint/revision +
+        # dash transform + dwell state on the node so the next load cannot inherit
+        # a stale mission-bound identity. Best-effort: a node that is down is logged
+        # but does not fail the clear.
+        await self._reset_spray_config_on_clear()
+        return summary
+
+    async def _reset_spray_config_on_clear(self) -> None:
+        if self._node is None:
+            return
+        try:
+            from spray_mission_config import (
+                apply_spray_mission_config,
+                default_backward_compatible_staged_fields,
+            )
+
+            defaults = default_backward_compatible_staged_fields()
+            defaults["spray_mode"] = "continuous"
+            defaults["mission_id"] = ""
+            defaults["path_fingerprint"] = ""
+            ok, why, _ = await apply_spray_mission_config(
+                self._node, defaults, revision=0
+            )
+            if not ok:
+                self._log_entry(
+                    "warning", f"spray config reset on clear not applied: {why}"
+                )
+        except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+            self._log_entry("warning", f"spray config reset on clear raised: {exc}")
 
     # ── Lifecycle (async) ─────────────────────────────────────────────────────
 

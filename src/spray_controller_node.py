@@ -203,6 +203,11 @@ class SprayControllerNode(Node):
         self.declare_parameter("gps_runtime_policy", "pause")
         self.declare_parameter("gps_resume_policy", "manual")
         self.declare_parameter("gps_recovery_stable_s", 2.0)
+        # F-01 (hybrid): the server feeds GPS_SURVEYED runtime safety to this
+        # node over /spray/gps_gate. This is the maximum age of that feed before
+        # the node treats it as stale and fail-closed blocks spray ON on its own
+        # (independent of the server watchdog — see _evaluate_gps_surveyed_runtime_safety).
+        self.declare_parameter("gps_runtime_gate_max_age_s", 3.0)
         self.declare_parameter("obstacle_integration_enabled", False)
         self.declare_parameter("obstacle_signal_max_age_s", 2.0)
         self.declare_parameter("configuration_revision", 0)
@@ -286,6 +291,15 @@ class SprayControllerNode(Node):
         self._current_value = float(self.get_parameter("off_value").value)
         self._pose_stale_logged = False
         self._velocity_stale_logged = False
+        # F-01 (hybrid): GPS_SURVEYED runtime gate fed by the server watchdog.
+        # active=False (default) means the gate is disengaged — LOCAL_NED and
+        # non-surveyed missions are never RTK-gated here. _gps_gate_recv_time is
+        # the monotonic receive time used for the fail-closed staleness fallback.
+        self._gps_gate_active = False
+        self._gps_gate_ok = True
+        self._gps_gate_reason = ""
+        self._gps_gate_seq = 0
+        self._gps_gate_recv_time: Optional[float] = None
 
         command_service = str(self.get_parameter("command_service").value)
         self._command_cli = self.create_client(
@@ -364,6 +378,14 @@ class SprayControllerNode(Node):
             "/mavros/state",
             self._state_cb,
             _state_qos(),
+            callback_group=self._latency_group,
+        )
+        # F-01 (hybrid): GPS_SURVEYED runtime safety feed from the server.
+        self.create_subscription(
+            String,
+            "/spray/gps_gate",
+            self._gps_gate_cb,
+            _best_effort_qos(),
             callback_group=self._latency_group,
         )
 
@@ -664,6 +686,8 @@ class SprayControllerNode(Node):
                 if active_dwell and dwell is not None
                 else 0.0
             )
+            gps_gate_active = self._gps_gate_active
+            gps_gate_seq = self._gps_gate_seq
             snapshot = {
                 "model_revision": self._model_revision,
                 "commanded_on": self._commanded,
@@ -677,6 +701,7 @@ class SprayControllerNode(Node):
                 "current_value": self._current_value,
                 "actuator": self._actuator_state,
             }
+        gps_eval_ok, gps_eval_reason = self._evaluate_gps_surveyed_runtime_safety()
         return {
             "timestamp_monotonic_s": now_ns * 1e-9,
             "spray_mode": config.mode.value,
@@ -733,6 +758,12 @@ class SprayControllerNode(Node):
             "path_identity": snapshot["path_identity"],
             "mission_id": config.mission_id,
             "path_fingerprint": config.path_fingerprint,
+            # F-01/F-05: surveyed runtime-safety gate visibility
+            "gps_surveyed_active": gps_gate_active,
+            "gps_safety_ok": gps_eval_ok,
+            "gps_safety_reason": gps_eval_reason,
+            "gps_gate_seq": gps_gate_seq,
+            "manual_resume_required": bool(gps_gate_active and not gps_eval_ok),
             "actuator_failure_state": snapshot["actuator"].last_command_failure,
             "actuator": {
                 "commanded_on": snapshot["actuator"].commanded_on,
@@ -1108,6 +1139,61 @@ class SprayControllerNode(Node):
             timeout_s = config.safety.velocity_timeout_s
         return age_s <= timeout_s, age_s
 
+    def _gps_gate_cb(self, msg: String) -> None:
+        """Receive the server's GPS_SURVEYED runtime-safety feed (F-01 hybrid).
+
+        The server publishes {active, ok, reason, seq} on /spray/gps_gate. We
+        record it plus a monotonic receive time so the node can independently
+        fail-closed if the feed goes stale (server watchdog death)."""
+        try:
+            data = json.loads(msg.data)
+        except (TypeError, ValueError):
+            self.get_logger().warn("invalid /spray/gps_gate payload ignored")
+            return
+        active = bool(data.get("active", False))
+        ok = bool(data.get("ok", False))
+        reason = str(data.get("reason", ""))
+        try:
+            seq = int(data.get("seq", 0))
+        except (TypeError, ValueError):
+            seq = 0
+        with self._state_lock:
+            self._gps_gate_active = active
+            self._gps_gate_ok = ok
+            self._gps_gate_reason = reason
+            self._gps_gate_seq = seq
+            self._gps_gate_recv_time = time.monotonic()
+        # Drop spray immediately on a fault edge rather than waiting for the next
+        # decision tick — but only when spray is (or might be) ON, to avoid
+        # re-issuing OFF on every heartbeat while already safely off.
+        if active and not ok and (self._commanded or not self._off_confirmed):
+            self._force_off(f"GPS_SURVEYED safety: {reason or 'not ok'}", force=True)
+
+    def _evaluate_gps_surveyed_runtime_safety(self) -> tuple[bool, str]:
+        """Independent node-side GPS_SURVEYED gate (hybrid fallback for F-01).
+
+        Engages only when the server feeds an active surveyed gate, so ordinary
+        LOCAL_NED missions are never RTK-gated. Returns (False, reason) when the
+        server reports unsafe OR when the gate feed is stale/absent — the latter
+        keeps spray OFF even if the server watchdog dies (regression case #7)."""
+        with self._state_lock:
+            active = self._gps_gate_active
+            ok = self._gps_gate_ok
+            reason = self._gps_gate_reason
+            recv_time = self._gps_gate_recv_time
+        if not active:
+            return True, ""
+        max_age = float(self.get_parameter("gps_runtime_gate_max_age_s").value)
+        now = time.monotonic()
+        if recv_time is None or (now - recv_time) > max_age:
+            age = float("inf") if recv_time is None else (now - recv_time)
+            return False, (
+                f"GPS_SURVEYED gate feed stale/absent ({age:.1f}s > {max_age:.1f}s)"
+            )
+        if not ok:
+            return False, reason or "GPS_SURVEYED safety not satisfied"
+        return True, ""
+
     def _auto_safety_status(
         self,
         pose_fresh: bool,
@@ -1118,7 +1204,7 @@ class SprayControllerNode(Node):
         config = self._get_config_snapshot()
         if not self._config_ready:
             return False, self._config_error or "spray configuration not ready"
-        return auto_safety_status(
+        ok, reason = auto_safety_status(
             config=config,
             armed=self._armed,
             mode=self._mode,
@@ -1128,6 +1214,14 @@ class SprayControllerNode(Node):
             velocity_fresh=velocity_fresh,
             dwell_active=dwell_active,
         )
+        if not ok:
+            return ok, reason
+        # F-01 (hybrid): AND-in the independent GPS_SURVEYED gate last so a
+        # surveyed RTK fault/feed-loss blocks spray ON regardless of geometry.
+        gps_ok, gps_reason = self._evaluate_gps_surveyed_runtime_safety()
+        if not gps_ok:
+            return False, gps_reason
+        return True, reason
 
     def _reassert_tick(self) -> None:
         if self._effective_desired() and self._commanded and self._safety_allows_on():
