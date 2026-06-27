@@ -140,10 +140,10 @@ def test_valid_command_clamps_to_configured_manual_limits():
     ctrl, gateway, _, _, _ = make_controller()
     lease = run(acquire(ctrl))["lease_id"]
     result = ctrl.handle_command("sid", command(lease))
-    assert result["throttle"] == 0.15
-    assert result["steering"] == -0.5
-    assert gateway.snapshot()["gateway_last_frame"]["z"] == 575
-    assert gateway.snapshot()["gateway_last_frame"]["y"] == -500
+    assert result["throttle"] == 0.35
+    assert result["steering"] == -0.2
+    assert gateway.snapshot()["gateway_last_frame"]["z"] == 675
+    assert gateway.snapshot()["gateway_last_frame"]["y"] == -200
 
 
 def test_rejected_command_does_not_refresh_watchdogs_or_last_command():
@@ -157,7 +157,7 @@ def test_rejected_command_does_not_refresh_watchdogs_or_last_command():
     assert exc.value.code == "out_of_range"
     assert after["joystick_commanded_throttle"] == before["joystick_commanded_throttle"]
     assert after["joystick_commanded_steering"] == before["joystick_commanded_steering"]
-    assert gateway.snapshot()["gateway_last_frame"]["z"] == 575
+    assert gateway.snapshot()["gateway_last_frame"]["z"] == 675
 
 
 def test_duplicate_sequence_rejected_before_refresh():

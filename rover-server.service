@@ -50,6 +50,8 @@ Environment=MISSION_CAPTURE_ACK_TIMEOUT_S=3.0
 # Auth disabled during dev bring-up. Remove this line to enforce X-Rover-Token
 # (token auto-generated at the ROVER_TOKEN_FILE path above on first boot).
 Environment=ROVER_DISABLE_AUTH=1
+Environment=ROVER_JOYSTICK_MAX_ABS_THROTTLE=0.35
+Environment=ROVER_JOYSTICK_MAX_ABS_STEERING=0.20
 
 # Output
 StandardOutput=journal
