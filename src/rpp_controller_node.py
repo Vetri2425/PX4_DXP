@@ -495,6 +495,8 @@ class RPPControllerNode(Node):
         self._pose: PoseStamped | None = None
         self._pose_recv_time: RclTime | None = None
         self._path_done = False
+        self._completion_settle_entered: RclTime | None = None
+        self._completion_settle_since: RclTime | None = None
         self._path_travel_m: float = 0.0   # monotonic along-path progress on active run
         self._path_s: list[float] = []     # cumulative arc length for active run
         self._raw_path_identity: dict[str, object] = {
@@ -644,6 +646,7 @@ class RPPControllerNode(Node):
             self._runs = []
             self._path_s = []
             self._path_done = False
+            self._reset_completion_settle_state()
             self._last_raw_path_fingerprint = ""
             self._conditioned_path_fingerprint = ""
             self._publish_conditioned_clear(msg.header.stamp, msg.header.frame_id or "local_ned")
@@ -1442,6 +1445,7 @@ class RPPControllerNode(Node):
             else SegmentStateCode.INACTIVE
         )
         self._path_done = False
+        self._reset_completion_settle_state()
         self._path_travel_m = 0.0   # reset along-path progress per run
         # P1.4 — reset hint so search starts from beginning of the run
         self._closest_seg_hint = 0
@@ -2435,6 +2439,14 @@ class RPPControllerNode(Node):
                     pos_n, pos_e, yaw_ned, pose_age_s, dist_to_corner
                 )
                 return
+            if not self._completion_settle_satisfied():
+                self._segment_state = SegmentStateCode.PRE_CORNER_SLOWDOWN
+                self._publish_zero(
+                    StateCode.APPROACH,
+                    pose_age_ms=pose_age_s * 1000.0,
+                    dist_to_goal=dist_to_corner,
+                )
+                return
             self.get_logger().info(
                 f"Segment path complete — within {dist_to_corner * 100:.1f} cm "
                 f"of final point (tol={goal_tol * 100:.1f} cm)"
@@ -2451,6 +2463,7 @@ class RPPControllerNode(Node):
                 corner_angle, float("nan"), float("nan"), 0.0,
             )
             return
+        self._reset_completion_settle_state()
 
         acceptance = float(self.get_parameter("segment_corner_acceptance_radius").value)
         heading_tol = math.radians(
@@ -2964,6 +2977,13 @@ class RPPControllerNode(Node):
                     pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
                 )
                 return
+            if not self._completion_settle_satisfied():
+                self._publish_zero(
+                    StateCode.APPROACH,
+                    pose_age_ms=pose_age_s * 1000.0,
+                    dist_to_goal=dist_to_goal,
+                )
+                return
             self.get_logger().info(
                 f"Path complete — within {dist_to_goal * 100:.1f} cm of goal "
                 f"(tol={goal_tol * 100:.1f} cm)"
@@ -2972,6 +2992,7 @@ class RPPControllerNode(Node):
             self._publish_zero(StateCode.DONE, pose_age_ms=pose_age_s * 1000,
                                dist_to_goal=dist_to_goal)
             return
+        self._reset_completion_settle_state()
 
         if self._active_tracking_profile == "segment":
             self._control_segment_profile(
@@ -3429,6 +3450,52 @@ class RPPControllerNode(Node):
         self._pivot_timeout_warned = False
         self._pivot_turn_angle_rad = 0.0
         self._align_settle_since = None
+
+    def _reset_completion_settle_state(self):
+        self._completion_settle_entered = None
+        self._completion_settle_since = None
+
+    def _completion_settle_satisfied(self) -> bool:
+        """True once final mission completion is physically settled.
+
+        DONE is a terminal signal consumed by the server. Do not emit it from a
+        position-only check while the rover is still coasting; require measured
+        linear speed below segment_stop_speed_threshold for segment_stop_dwell_s.
+        The stale-velocity cap is bounded like CORNER_STOP, but fresh telemetry
+        that says the rover is moving never times out into DONE.
+        """
+        now = self.get_clock().now()
+        if self._completion_settle_entered is None:
+            self._completion_settle_entered = now
+
+        fresh = self._vel_is_fresh()
+        held = (now - self._completion_settle_entered).nanoseconds * 1e-9
+        if not fresh:
+            self._completion_settle_since = None
+            if held >= self._CORNER_STOP_MAX_HOLD_S:
+                self.get_logger().warn(
+                    "Completion settle cap reached with STALE velocity — allowing DONE",
+                    throttle_duration_sec=5.0,
+                )
+                return True
+            return False
+
+        v_n, v_e = self._latest_vel_ned
+        speed_ok = math.hypot(v_n, v_e) < float(
+            self.get_parameter("segment_stop_speed_threshold").value
+        )
+        if speed_ok:
+            dwell = float(self.get_parameter("segment_stop_dwell_s").value)
+            if dwell <= 0.0:
+                return True
+            if self._completion_settle_since is None:
+                self._completion_settle_since = now
+            elif (now - self._completion_settle_since).nanoseconds * 1e-9 >= dwell:
+                return True
+        else:
+            self._completion_settle_since = None
+
+        return False
 
     def _corner_stop_satisfied(self) -> bool:
         """True once the rover is confirmed physically stopped at the corner.

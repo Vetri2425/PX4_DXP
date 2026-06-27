@@ -95,6 +95,35 @@ class CornerStopDwell:
         return False
 
 
+class CompletionSettleDwell:
+    """Mirror of rpp_controller_node._completion_settle_satisfied."""
+
+    THRESH = 0.02   # segment_stop_speed_threshold
+    DWELL = 0.30    # segment_stop_dwell_s
+    STALE_CAP = 2.0 # _CORNER_STOP_MAX_HOLD_S
+
+    def __init__(self):
+        self.entered = None
+        self.low_since = None
+
+    def step(self, now, speed, fresh=True):
+        if self.entered is None:
+            self.entered = now
+
+        if not fresh:
+            self.low_since = None
+            return now - self.entered >= self.STALE_CAP
+
+        if speed < self.THRESH:
+            if self.low_since is None:
+                self.low_since = now
+            elif now - self.low_since >= self.DWELL:
+                return True
+        else:
+            self.low_since = None
+        return False
+
+
 class TestCornerStopDwell(unittest.TestCase):
     """CORNER_STOP must hold until the rover is physically stopped — and must
     never deadlock if velocity data is missing or noisy."""
@@ -158,6 +187,70 @@ class TestCornerStopDwell(unittest.TestCase):
             t += 0.05
         self.assertIsNotNone(released)
         self.assertAlmostEqual(released, d.MAX_HOLD, delta=0.06)
+
+
+class TestCompletionSettleDwell(unittest.TestCase):
+    """Final DONE must wait for physical coast-down, not just position."""
+
+    def test_holds_zero_without_done_while_fresh_moving(self):
+        d = CompletionSettleDwell()
+        t = 0.0
+        released = None
+        for _ in range(120):  # 6 s above threshold must still not complete
+            if d.step(t, 0.117, fresh=True):
+                released = t
+                break
+            t += 0.05
+        self.assertIsNone(released)
+
+    def test_done_after_measured_speed_dwell(self):
+        d = CompletionSettleDwell()
+        t = 0.0
+        for _ in range(20):  # coasting after position reached
+            self.assertFalse(d.step(t, 0.117, fresh=True))
+            t += 0.05
+
+        released = None
+        for _ in range(20):
+            if d.step(t, 0.005, fresh=True):
+                released = t
+                break
+            t += 0.05
+
+        self.assertIsNotNone(released)
+        self.assertGreaterEqual(released, 1.0 + d.DWELL - 0.06)
+
+    def test_motion_blip_restarts_completion_dwell(self):
+        d = CompletionSettleDwell()
+        t = 0.0
+        for _ in range(4):
+            self.assertFalse(d.step(t, 0.005, fresh=True))
+            t += 0.05
+        self.assertFalse(d.step(t, 0.05, fresh=True))
+        t += 0.05
+
+        released = None
+        for _ in range(20):
+            if d.step(t, 0.005, fresh=True):
+                released = t
+                break
+            t += 0.05
+
+        self.assertIsNotNone(released)
+        self.assertGreaterEqual(released, 0.20 + d.DWELL - 0.06)
+
+    def test_stale_velocity_uses_bounded_fallback(self):
+        d = CompletionSettleDwell()
+        t = 0.0
+        released = None
+        for _ in range(100):
+            if d.step(t, 0.117, fresh=False):
+                released = t
+                break
+            t += 0.05
+
+        self.assertIsNotNone(released)
+        self.assertAlmostEqual(released, d.STALE_CAP, delta=0.06)
 
 
 if __name__ == "__main__":
