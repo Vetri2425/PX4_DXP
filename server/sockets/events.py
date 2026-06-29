@@ -271,37 +271,205 @@ def register_handlers(sio) -> None:
                         "message": msg,
                         "status": status}, to=sid)
 
-    @sio.on("mission_stop")
-    async def on_mission_stop(sid, data=None):
-        from main import hold_owner, mission_capture, offboard_ctrl, point_mission, ros_node
-        from mission_stop import stop_active_mission
-        if not _auth_ok(sid):
-            return await _emit_unauth(sio, sid)
-        result = await stop_active_mission(
+    def _socket_service_context():
+        from main import (
+            hold_owner,
+            mission_capture,
             offboard_ctrl,
+            operation_coordinator,
+            path_mgr,
             point_mission,
             ros_node,
-            hold_owner,
-            mission_capture=mission_capture,
-            transport="socket",
         )
+        from mission_ops import MissionOperationCoordinator
+        from mission_services import build_service_context
+
+        coordinator = operation_coordinator or MissionOperationCoordinator()
+        return build_service_context(
+            offboard_ctrl=offboard_ctrl,
+            point_mission=point_mission,
+            ros_node=ros_node,
+            hold_owner=hold_owner,
+            path_mgr=path_mgr,
+            mission_capture=mission_capture,
+            transport="socketio",
+            operation_coordinator=coordinator,
+        )
+
+    def _command_error_payload(exc):
+        from mission_services import MissionServiceError
+
+        if isinstance(exc, MissionServiceError):
+            return {
+                "success": False,
+                "status": exc.status_code,
+                "code": exc.code or "service_error",
+                "message": exc.message,
+            }
+        return {"success": False, "status": 500, "code": "error", "message": str(exc)}
+
+    async def _emit_service_error(sid, exc):
+        payload = _command_error_payload(exc)
+        await sio.emit("mission_error", payload, to=sid)
+        return payload
+
+    @sio.on("mission_stop")
+    async def on_mission_stop(sid, data=None):
+        from mission_services import stop_mission_service
+        if not _auth_ok(sid):
+            return await _emit_unauth(sio, sid)
+        try:
+            result = await stop_mission_service(_socket_service_context())
+        except Exception as exc:
+            payload = await _emit_service_error(sid, exc)
+            await sio.emit("mission_stop_result", payload, to=sid)
+            return
         await sio.emit("mission_status_update", result, to=sid)
+        await sio.emit("mission_stop_result", {"status": 200, **result}, to=sid)
 
     @sio.on("mission_abort")
     async def on_mission_abort(sid, data=None):
-        from main import hold_owner, mission_capture, offboard_ctrl, point_mission, ros_node
+        from mission_services import abort_mission_service
         if not _auth_ok(sid):
             return await _emit_unauth(sio, sid)
-        if hold_owner is not None:
-            hold_owner.deactivate(ros_node)
-        if point_mission is not None:
-            await point_mission.abort(ros_node, offboard_ctrl=offboard_ctrl)
-        result = await offboard_ctrl.abort_async()
-        if mission_capture is not None:
-            mission_capture.record_terminal(
-                None, "operator_abort", state=offboard_ctrl.state.value, details=result
-            )
+        try:
+            result = await abort_mission_service(_socket_service_context())
+        except Exception as exc:
+            payload = await _emit_service_error(sid, exc)
+            await sio.emit("mission_abort_result", payload, to=sid)
+            return
         await sio.emit("mission_status_update", result, to=sid)
+        await sio.emit("mission_abort_result", {"status": 200, **result}, to=sid)
+
+    @sio.on("mission_pause")
+    async def on_mission_pause(sid, data=None):
+        from mission_services import pause_point_service
+        if not _auth_ok(sid):
+            return await _emit_unauth(sio, sid)
+        try:
+            result = await pause_point_service(_socket_service_context())
+            await sio.emit(
+                "mission_pause_result",
+                {"success": True, "status": 200, **result.model_dump()},
+                to=sid,
+            )
+        except Exception as exc:
+            payload = await _emit_service_error(sid, exc)
+            await sio.emit("mission_pause_result", payload, to=sid)
+
+    @sio.on("mission_resume")
+    async def on_mission_resume(sid, data=None):
+        from mission_services import resume_point_service
+        from models import MissionResumeRequest
+
+        if not _auth_ok(sid):
+            return await _emit_unauth(sio, sid)
+        payload = data if isinstance(data, dict) else {}
+        req = MissionResumeRequest(
+            expected_generation=payload.get("expected_generation")
+        )
+        try:
+            result = await resume_point_service(_socket_service_context(), req)
+            await sio.emit(
+                "mission_resume_result",
+                {"success": True, "status": 200, **result.model_dump()},
+                to=sid,
+            )
+        except Exception as exc:
+            payload = await _emit_service_error(sid, exc)
+            await sio.emit("mission_resume_result", payload, to=sid)
+
+    @sio.on("point_continue")
+    async def on_point_continue(sid, data=None):
+        from mission_services import continue_point_service
+
+        if not _auth_ok(sid):
+            return await _emit_unauth(sio, sid)
+        try:
+            result = await continue_point_service(_socket_service_context())
+            await sio.emit(
+                "point_continue_result",
+                {"success": True, "status": 200, **result.model_dump()},
+                to=sid,
+            )
+        except Exception as exc:
+            payload = await _emit_service_error(sid, exc)
+            await sio.emit("point_continue_result", payload, to=sid)
+
+    @sio.on("mission_obstacle")
+    async def on_mission_obstacle(sid, data=None):
+        from mission_services import set_point_obstacle_service
+        from models import ObstacleStatusRequest
+
+        if not _auth_ok(sid):
+            return await _emit_unauth(sio, sid)
+        payload = data if isinstance(data, dict) else {}
+        try:
+            result = await set_point_obstacle_service(
+                _socket_service_context(),
+                ObstacleStatusRequest(clear=bool(payload.get("clear", True))),
+            )
+            await sio.emit(
+                "mission_obstacle_result",
+                {"success": True, "status": 200, **result.model_dump()},
+                to=sid,
+            )
+        except Exception as exc:
+            payload = await _emit_service_error(sid, exc)
+            await sio.emit("mission_obstacle_result", payload, to=sid)
+
+    @sio.on("point_skip")
+    async def on_point_skip(sid, data=None):
+        from mission_services import skip_point_service
+        from models import PointSkipRequest
+
+        if not _auth_ok(sid):
+            return await _emit_unauth(sio, sid)
+        payload = data if isinstance(data, dict) else {}
+        try:
+            result = await skip_point_service(
+                _socket_service_context(),
+                PointSkipRequest(
+                    point_index=int(payload.get("point_index", 0)),
+                    expected_generation=payload.get("expected_generation"),
+                    reason=str(payload.get("reason") or "operator_skip"),
+                ),
+            )
+            await sio.emit(
+                "point_skip_result",
+                {"success": True, "status": 200, **result.model_dump()},
+                to=sid,
+            )
+        except Exception as exc:
+            payload = await _emit_service_error(sid, exc)
+            await sio.emit("point_skip_result", payload, to=sid)
+
+    @sio.on("mission_restart")
+    async def on_mission_restart(sid, data=None):
+        from mission_services import restart_mission_service
+        from models import MissionRestartRequest
+
+        if not _auth_ok(sid):
+            return await _emit_unauth(sio, sid)
+        payload = data if isinstance(data, dict) else {}
+        try:
+            result = await restart_mission_service(
+                _socket_service_context(),
+                MissionRestartRequest(
+                    mission_id=str(payload.get("mission_id", "")),
+                    stop_first=bool(payload.get("stop_first", False)),
+                    start_after_reset=bool(payload.get("start_after_reset", False)),
+                    auto_origin=bool(payload.get("auto_origin", False)),
+                ),
+            )
+            await sio.emit(
+                "mission_restart_result",
+                {"success": True, "status": 200, **result.model_dump()},
+                to=sid,
+            )
+        except Exception as exc:
+            payload = await _emit_service_error(sid, exc)
+            await sio.emit("mission_restart_result", payload, to=sid)
 
     @sio.on("request_params")
     async def on_request_params(sid, data):

@@ -278,6 +278,53 @@ def test_estop_clears_mission_arbiter_owner():
     assert arbiter.owner == ControlOwner.IDLE
 
 
+def test_estop_releases_operation_token_after_physical_actions(monkeypatch):
+    import main
+    from mission_ops import MissionOperation, MissionOperationCoordinator
+
+    class FakeOffboard:
+        state = MissionState.RUNNING
+
+        def __init__(self):
+            self._lock = None
+
+        def _lifecycle_lock(self):
+            if self._lock is None:
+                self._lock = asyncio.Lock()
+            return self._lock
+
+    class FakeRos:
+        def __init__(self):
+            self.calls = []
+
+        def publish_stop_path(self):
+            self.calls.append("stop_path")
+            return (0.0, 0.0)
+
+        async def set_mode_async(self, mode):
+            self.calls.append(("mode", mode))
+            return True, ""
+
+        async def arm_async(self, arm):
+            self.calls.append(("arm", arm))
+            return True, ""
+
+    async def scenario():
+        coordinator = MissionOperationCoordinator()
+        monkeypatch.setattr(main, "operation_coordinator", coordinator, raising=False)
+        monkeypatch.setattr(main, "point_mission", None, raising=False)
+        monkeypatch.setattr(main, "hold_owner", None, raising=False)
+        ros = FakeRos()
+        handler = EmergencyHandler(ros, FakeOffboard(), deque())
+        result = await handler.estop_async()
+        assert result["success"] is True
+        assert ros.calls[:3] == ["stop_path", ("mode", "MANUAL"), ("arm", False)]
+        token = await coordinator.begin(MissionOperation.RESTART, timeout_s=0.05)
+        await coordinator.finish(token)
+
+    run(scenario())
+
+
 def test_acquire_rejects_if_interrupted_before_lease():
     ctrl, gateway, transport, _, _ = make_controller(ros=FakeRos(mode="POSCTL"))
 

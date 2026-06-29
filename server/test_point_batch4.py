@@ -220,6 +220,23 @@ async def test_fail_policy_enters_failed_gps_safety():
 
 
 @pytest.mark.anyio
+async def test_failed_gps_safety_terminal_cleanup_preserves_hold():
+    ros = DegradingSurveyedRos(degrade_after=2, gps_fix=5)
+    ros.auto_arrive = False
+    hold = SetpointHoldOwner()
+    orch = PointMissionOrchestrator()
+    _load_surveyed(orch, _gps_cfg(runtime_policy="fail"))
+    orch.prepare(healthy_state())
+    await orch.start(ros, FakeOffboard(), hold)
+    await asyncio.wait_for(orch._task, timeout=3.0)
+
+    assert orch.status.state == PointMissionState.FAILED_GPS_SAFETY
+    assert hold.active is True
+    assert orch.status.hold_active is True
+    assert orch.status.resume_available is False
+
+
+@pytest.mark.anyio
 async def test_runtime_gps_fault_during_manual_wait():
     ros = SurveyedRos()
     ros.auto_arrive = True

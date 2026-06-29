@@ -172,6 +172,14 @@ class OffboardController:
     def spray_mode(self) -> str:
         return self._spray_mode
 
+    @property
+    def uses_global_rpp_completion(self) -> bool:
+        return self._spray_mode in {"continuous", "dash"}
+
+    @property
+    def completion_owner(self) -> str:
+        return "telemetry_rpp" if self.uses_global_rpp_completion else "point_orchestrator"
+
     def gps_surveyed_runtime_context(self) -> dict[str, Any] | None:
         """Context for the continuous/dash GPS_SURVEYED runtime watchdog (F-02).
 
@@ -1188,6 +1196,21 @@ class OffboardController:
             + (f" (last speed {last_speed:.3f} m/s)" if last_speed is not None else "")
         )
         return False
+
+    def reset_progress_for_restart(self, expected_mission_id: str) -> None:
+        """Clear runtime progress for continuous/dash restart without mutating geometry."""
+        if expected_mission_id != self._loaded_mission_id:
+            raise ValueError(
+                f"restart rejected: mission identity mismatch "
+                f"(expected {expected_mission_id!r}, loaded {self._loaded_mission_id!r})"
+            )
+        self._running_mission_id = None
+        if self._state in {
+            MissionState.COMPLETED,
+            MissionState.ABORTED,
+            MissionState.ERROR,
+        }:
+            self._state = MissionState.IDLE
 
     # Called from telemetry loop or complete_async. State-only, no service calls.
     def mark_completed(self) -> None:

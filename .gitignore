@@ -57,6 +57,9 @@ tools/scp_tool.md
 nul
 .grok/
 
+# Old source archive (local reference only, not tracked)
+old source/
+
 # Mac dev-flow virtualenv (no-hardware testing — see docs/SESSION_STARTUP_MAC_NO_HARDWARE.md)
 .venv-dev/
 

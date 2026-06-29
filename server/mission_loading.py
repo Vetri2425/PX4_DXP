@@ -230,6 +230,32 @@ async def start_mission_for_controller(
     finally:
         if needs_point_cleanup and ros_node is not None:
             try:
+                from main import hold_owner, operation_coordinator, point_mission
+                from mission_ops import MissionOperation, MissionOperationCoordinator
+                from point_mission import PointMissionState
+
+                coordinator = operation_coordinator or MissionOperationCoordinator()
+                token = await coordinator.begin(MissionOperation.ABORT, timeout_s=0.25)
+                try:
+                    cleanup_fn = (
+                        getattr(point_mission, "terminal_cleanup", None)
+                        if point_mission is not None
+                        else None
+                    )
+                    if callable(cleanup_fn):
+                        cleanup_result = cleanup_fn(
+                            ros_node,
+                            hold_owner,
+                            reason="start_failure",
+                            terminal_state=PointMissionState.FAILED,
+                            operation_token=token,
+                            offboard_ctrl=offboard_ctrl,
+                            require_spray_confirm=True,
+                        )
+                        if asyncio.iscoroutine(cleanup_result):
+                            await cleanup_result
+                finally:
+                    await coordinator.finish(token)
                 spray_off_result = await cleanup_mission_start_failure(
                     ros_node, offboard_ctrl
                 )

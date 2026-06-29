@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
 _ROOT = Path(__file__).resolve().parents[1]
@@ -42,10 +43,32 @@ from gps_safety import (
 )
 from logging_setup import get_logger
 from mission_placement import GPS_SURVEYED, LOCAL_NED, PlacementError, resolve_surveyed_points
-from models import MissionState
+from models import MissionState, PointMissionEvent, PointTerminalCleanupResult
+from point_events import get_point_event_journal, utc_ts
 from spray_safety import force_spray_off_confirmed
 
+try:
+    from mission_ops import MissionOperationToken
+except ImportError:  # pragma: no cover
+    MissionOperationToken = Any  # type: ignore[misc,assignment]
+
 log = get_logger("server.point_mission")
+
+
+class PointMissionRunFailure(RuntimeError):
+    """Run-loop failure that must route through terminal_cleanup()."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        cleanup_reason: Literal["dwell_fault", "start_failure", "completion_degraded"] = "dwell_fault",
+        terminal_state: "PointMissionState | None" = None,
+    ) -> None:
+        super().__init__(message)
+        self.cleanup_reason = cleanup_reason
+        self.terminal_state = terminal_state
+
 
 _PARENT_ABORT_REASONS = frozenset(
     {
@@ -112,6 +135,37 @@ PAUSED_STATES = frozenset(
         PointMissionState.OBSTACLE_DURING_DWELL,
         PointMissionState.PAUSED_GPS_SAFETY,
         PointMissionState.GPS_DURING_DWELL,
+    }
+)
+
+TERMINAL_POINT_STATES = frozenset(
+    {
+        PointMissionState.COMPLETED,
+        PointMissionState.FAILED,
+        PointMissionState.ABORTING,
+    }
+)
+
+_TERMINAL_REASON_PRIORITY = {
+    "emergency_stop": 100,
+    "operator_abort": 90,
+    "restart_stop_first": 85,
+    "operator_stop": 80,
+    "dwell_fault": 75,
+    "completion_degraded": 70,
+    "start_failure": 65,
+    "normal_completion": 60,
+}
+
+_SKIP_ACCEPTED_STATES = frozenset(
+    {
+        PointMissionState.PREPARING_LEG,
+        PointMissionState.NAVIGATING,
+        PointMissionState.SETTLING,
+        PointMissionState.DWELLING,
+        PointMissionState.PAUSED_HOLD,
+        PointMissionState.PAUSED_OBSTACLE,
+        PointMissionState.OBSTACLE_DURING_DWELL,
     }
 )
 
@@ -208,6 +262,9 @@ class PointMissionStatus:
     point_leg_conditioned_count: int | None = None
     active_trajectory_mode: str | None = None
     point_leg_length_m: float | None = None
+    last_skipped_point_index: int | None = None
+    skipped_point_indices: list[int] = field(default_factory=list)
+    skip_pending: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -287,6 +344,9 @@ class PointMissionStatus:
             "point_leg_conditioned_count": self.point_leg_conditioned_count,
             "active_trajectory_mode": self.active_trajectory_mode,
             "point_leg_length_m": self.point_leg_length_m,
+            "last_skipped_point_index": self.last_skipped_point_index,
+            "skipped_point_indices": list(self.skipped_point_indices),
+            "skip_pending": self.skip_pending,
         }
 
     def as_spray_status_dict(self) -> dict[str, Any]:
@@ -330,6 +390,12 @@ class PointMissionRun:
     active_dwell_source_index: int | None = None
     dwell_revision_invalid: bool = False
     spray_runtime_fingerprint: tuple[int, int, float] | None = None
+    operation_generation: int = 0
+    terminal_cleanup_started: bool = False
+    terminal_event_emitted: bool = False
+    skip_requested: bool = False
+    skip_request_id: int | None = None
+    skip_reason: str = ""
 
 
 class PointMissionOrchestrator:
@@ -359,6 +425,9 @@ class PointMissionOrchestrator:
         self._gps_fault_count = 0
         self._gps_last_fault_time: float | None = None
         self._log_cb: Callable[[str, str], None] | None = None
+        self._command_lock = asyncio.Lock()
+        self._event_lock = threading.RLock()
+        self._terminal_cleanup_reason: str | None = None
 
     def set_logger(self, cb: Callable[[str, str], None]) -> None:
         self._log_cb = cb
@@ -597,52 +666,43 @@ class PointMissionOrchestrator:
                 )
             return {"success": False, "message": str(exc)}
 
-    async def _fail_point_with_cleanup(
+    async def _terminal_cleanup_run_failure(
         self,
         run: PointMissionRun,
         ros_node,
+        hold_owner,
         offboard_ctrl,
         *,
-        reason: str,
-        terminal_reason: str,
-        state: PointMissionState = PointMissionState.FAILED,
+        cleanup_reason: Literal[
+            "dwell_fault", "start_failure", "completion_degraded"
+        ],
+        terminal_state: PointMissionState,
+        error_message: str,
+        abort_parent: bool = True,
     ) -> None:
-        self._invalidate_dwell_identity(run)
-        dwell_cancel = await self._cancel_dwell_service(ros_node)
-        spray_off = await self._force_spray_off_with_result(
-            ros_node,
-            check_cancel=lambda: self._check_cancel(run),
-            require_confirm=True,
-            timeout_s=1.0,
-        )
-        recovery = bool(
-            spray_off.get("recovery_required")
-            or not spray_off.get("success", False)
-        )
-        if not dwell_cancel.get("success", False):
-            recovery = True
-        parent = await self._parent_abort_terminal(
-            offboard_ctrl, run, reason=terminal_reason
-        )
-        if parent is not None and not parent.get("success", False):
-            recovery = True
-        self._write(
-            run,
-            state=state,
-            last_error=reason,
-            last_failure_reason=reason,
-            last_transition=terminal_reason,
-            ready=False,
-            run_active=False,
-            waiting_for_continue=False,
-            active_dwell=False,
-            dwell_remaining_s=0.0,
-            dwell_cancel_result=dwell_cancel,
-            spray_off_result=spray_off,
-            recovery_required=recovery,
-            terminal_safety_ok=not recovery,
-            terminal_failure_reason=reason if recovery else "",
-        )
+        from mission_ops import MissionOperation, MissionOperationCoordinator
+
+        coordinator = self._operation_coordinator() or MissionOperationCoordinator()
+        token = await coordinator.begin(MissionOperation.ABORT, timeout_s=0.25)
+        try:
+            if not run.terminal_cleanup_started:
+                await self.terminal_cleanup(
+                    ros_node,
+                    hold_owner,
+                    reason=cleanup_reason,
+                    terminal_state=terminal_state,
+                    operation_token=token,
+                    offboard_ctrl=offboard_ctrl,
+                    require_spray_confirm=True,
+                )
+            if abort_parent and offboard_ctrl is not None:
+                await offboard_ctrl.abort_async()
+            self._status.last_error = error_message
+            self._status.last_failure_reason = error_message
+            self._status.terminal_failure_reason = error_message
+            self._status.ready = False
+        finally:
+            await coordinator.finish(token)
 
     def set_obstacle_clear(self, clear: bool) -> None:
         self._obstacle_clear = bool(clear)
@@ -858,6 +918,91 @@ class PointMissionOrchestrator:
 
     def _is_current(self, run: PointMissionRun) -> bool:
         return self._run_token is run and self._generation == run.generation
+
+    def _operation_coordinator(self):
+        try:
+            from main import operation_coordinator
+
+            return operation_coordinator
+        except Exception:
+            return None
+
+    def _check_operation_generation(self, run: PointMissionRun) -> None:
+        coordinator = self._operation_coordinator()
+        if coordinator is None:
+            return
+        current = coordinator.current_generation()
+        if run.operation_generation == 0:
+            run.operation_generation = current
+            return
+        if run.operation_generation != current:
+            raise asyncio.CancelledError()
+
+    def _is_terminal_state(self) -> bool:
+        return self._status.state in TERMINAL_POINT_STATES
+
+    def _terminal_reject(self) -> tuple[bool, str, int] | None:
+        if self._is_terminal_state():
+            return False, f"point mission is terminal: {self._status.state.value}", 409
+        return None
+
+    def _terminal_reason_priority(self, reason: str) -> int:
+        return _TERMINAL_REASON_PRIORITY.get(reason, 0)
+
+    def _build_event(
+        self,
+        event_type: str,
+        *,
+        point_index: int | None = None,
+        source_index: int | None = None,
+        terminal: bool = False,
+        reason: str = "",
+        mark: bool | None = None,
+        dwell_command_id: int | None = None,
+        dwell_remaining_s: float | None = None,
+    ) -> PointMissionEvent:
+        status = self._status
+        return PointMissionEvent(
+            event_id=0,
+            ts=utc_ts(),
+            event_type=event_type,  # type: ignore[arg-type]
+            mission_id=status.mission_id,
+            parent_mission_id=status.parent_mission_id or status.mission_id,
+            point_mission_generation=status.generation,
+            point_index=point_index if point_index is not None else status.current_point_index,
+            source_index=source_index,
+            point_mission_state=status.state.value,
+            mark=mark if mark is not None else status.mark_enabled,
+            dwell_command_id=dwell_command_id if dwell_command_id is not None else status.active_dwell_command_id,
+            dwell_remaining_s=(
+                dwell_remaining_s
+                if dwell_remaining_s is not None
+                else status.dwell_remaining_s
+            ),
+            hold_active=status.hold_active,
+            obstacle_signal_state=status.obstacle_signal_state,
+            gps_safety_state=status.gps_safety_state,
+            terminal=terminal,
+            reason=reason,
+            status=status.as_dict(),
+        )
+
+    def _emit_point_event(
+        self,
+        run: PointMissionRun | None,
+        event_type: str,
+        *,
+        terminal: bool = False,
+        reason: str = "",
+        **kwargs: Any,
+    ) -> None:
+        if run is not None and run.terminal_event_emitted and terminal:
+            return
+        with self._event_lock:
+            event = self._build_event(event_type, terminal=terminal, reason=reason, **kwargs)
+            get_point_event_journal().append(event)
+        if run is not None and terminal:
+            run.terminal_event_emitted = True
 
     def _write(self, run: PointMissionRun | None, **changes: Any) -> None:
         if run is not None and not self._is_current(run):
@@ -1147,18 +1292,365 @@ class PointMissionOrchestrator:
         reason: str = "stopped",
         offboard_ctrl=None,
     ) -> None:
-        """Non-resumable stop — drain task and release hold."""
+        """Legacy stop entry — prefer terminal_cleanup via mission services."""
         if hold_owner is not None:
             hold_owner.deactivate(ros_node)
         await self.cancel_and_drain(
             ros_node, reason=reason, offboard_ctrl=offboard_ctrl
         )
 
+    async def terminal_cleanup(
+        self,
+        ros_node,
+        hold_owner,
+        *,
+        reason: Literal[
+            "normal_completion",
+            "operator_stop",
+            "operator_abort",
+            "emergency_stop",
+            "start_failure",
+            "restart_stop_first",
+            "completion_degraded",
+            "dwell_fault",
+        ],
+        terminal_state: PointMissionState,
+        operation_token: MissionOperationToken,
+        offboard_ctrl=None,
+        require_spray_confirm: bool = True,
+    ) -> PointTerminalCleanupResult:
+        async with self._command_lock:
+            coordinator = self._operation_coordinator()
+            if coordinator is not None:
+                try:
+                    operation_token.raise_if_stale(coordinator.current_generation())
+                except Exception:
+                    if operation_token.is_preempted():
+                        return PointTerminalCleanupResult(
+                            success=False,
+                            idempotent=False,
+                            reason=reason,
+                            point_mission_state=self._status.state.value,
+                            hold_deactivated=False,
+                            terminal_event_emitted=False,
+                            recovery_required=False,
+                            message="terminal cleanup preempted",
+                        )
+            prior = self._terminal_cleanup_reason
+            if prior is not None and self._terminal_reason_priority(
+                prior
+            ) >= self._terminal_reason_priority(reason):
+                return PointTerminalCleanupResult(
+                    success=True,
+                    idempotent=True,
+                    reason=reason,
+                    point_mission_state=self._status.state.value,
+                    hold_deactivated=False,
+                    terminal_event_emitted=bool(
+                        self._run_token and self._run_token.terminal_event_emitted
+                    ),
+                    recovery_required=self._status.recovery_required,
+                    message="terminal cleanup already completed",
+                )
+            run, task = self._run_token, self._task
+            current_task = asyncio.current_task()
+            cleanup_from_run_task = task is not None and task is current_task
+            if run is not None:
+                run.terminal_cleanup_started = True
+                run.cancel_event.set()
+                run.pause_requested = False
+                run.skip_requested = False
+                if run.continue_gate is not None and not run.continue_gate.done():
+                    run.continue_gate.cancel()
+                if run.resume_gate is not None and not run.resume_gate.done():
+                    run.resume_gate.cancel()
+                run.continue_gate = None
+                run.resume_gate = None
+            self._invalidate_dwell_identity(run)
+            dwell_cancel_result: dict[str, Any] | None = None
+            spray_off_result: dict[str, Any] | None = None
+            hold_deactivated = False
+            recovery_required = False
+            terminal_failure = ""
+            if task is not None and not task.done() and not cleanup_from_run_task:
+                task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(task), timeout=self._DRAIN_TIMEOUT_S
+                    )
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
+            if ros_node is not None:
+                dwell_cancel_result = await self._cancel_dwell_service(ros_node)
+                spray_off_result = await self._force_spray_off_with_result(
+                    ros_node, require_confirm=require_spray_confirm, timeout_s=1.0
+                )
+            preserve_hold = terminal_state == PointMissionState.FAILED_GPS_SAFETY
+            if hold_owner is not None and reason != "normal_completion" and not preserve_hold:
+                hold_owner.deactivate(ros_node)
+                hold_deactivated = True
+            if dwell_cancel_result is not None and not dwell_cancel_result.get(
+                "success", False
+            ):
+                recovery_required = True
+                terminal_failure = dwell_cancel_result.get("message") or "dwell cancel failed"
+            if spray_off_result is not None and (
+                spray_off_result.get("recovery_required")
+                or not spray_off_result.get("success", False)
+            ):
+                recovery_required = True
+                terminal_failure = (
+                    spray_off_result.get("failure_reason")
+                    or spray_off_result.get("message")
+                    or terminal_failure
+                    or "spray OFF not confirmed"
+                )
+            last_error = ""
+            if reason != "normal_completion":
+                last_error = terminal_failure or reason
+            if run is not None:
+                self._write(
+                    run,
+                    state=terminal_state,
+                    run_active=False,
+                    waiting_for_continue=False,
+                    resume_available=False,
+                    active_dwell=False,
+                    dwell_remaining_s=0.0,
+                    active_dwell_command_id=None,
+                    terminal_failure_reason=terminal_failure or reason,
+                    last_transition=reason,
+                    last_error=last_error,
+                    dwell_cancel_result=dwell_cancel_result,
+                    spray_off_result=spray_off_result,
+                    recovery_required=recovery_required,
+                    skip_pending=False,
+                )
+            else:
+                self._status.state = terminal_state
+                self._status.run_active = False
+                self._status.waiting_for_continue = False
+                self._status.resume_available = False
+                self._status.active_dwell = False
+                self._status.dwell_remaining_s = 0.0
+                self._status.active_dwell_command_id = None
+                self._status.terminal_failure_reason = terminal_failure or reason
+                self._status.last_transition = reason
+                self._status.last_error = last_error
+                self._status.dwell_cancel_result = dwell_cancel_result
+                self._status.spray_off_result = spray_off_result
+                self._status.recovery_required = recovery_required
+                self._status.skip_pending = False
+            self._run_token = None
+            self._terminal_cleanup_reason = reason
+            event_map = {
+                "normal_completion": "point_completed",
+                "operator_stop": "point_aborted",
+                "operator_abort": "point_aborted",
+                "emergency_stop": "point_aborted",
+                "restart_stop_first": "point_aborted",
+                "start_failure": "point_failed",
+                "completion_degraded": "point_failed",
+                "dwell_fault": "point_failed",
+            }
+            event_type = event_map.get(reason, "point_aborted")
+            terminal_event_emitted = False
+            if run is None or not run.terminal_event_emitted:
+                self._emit_point_event(
+                    run,
+                    event_type,
+                    terminal=True,
+                    reason=reason,
+                )
+                terminal_event_emitted = True
+                if run is not None:
+                    run.terminal_event_emitted = True
+            return PointTerminalCleanupResult(
+                success=not recovery_required,
+                idempotent=False,
+                reason=reason,
+                point_mission_state=terminal_state.value,
+                dwell_cancel_result=dwell_cancel_result,
+                spray_off_result=spray_off_result,
+                hold_deactivated=hold_deactivated,
+                terminal_event_emitted=terminal_event_emitted,
+                recovery_required=recovery_required,
+                message="terminal cleanup completed"
+                if not recovery_required
+                else terminal_failure or "terminal cleanup degraded",
+            )
+
+    def reset_for_restart(self, expected_mission_id: str) -> int:
+        if self._status.mission_id and self._status.mission_id != expected_mission_id:
+            raise ValueError("restart rejected: mission identity mismatch")
+        self._generation += 1
+        self._terminal_cleanup_reason = None
+        self._resolved_points = []
+        self._spray_ever_on = False
+        self._run_token = None
+        self._task = None
+        self._status = PointMissionStatus(
+            state=PointMissionState.IDLE,
+            mission_id=expected_mission_id or self._status.mission_id,
+            generation=self._generation,
+            total_points=len(self._points),
+            ready=bool(self._points),
+            last_transition="restart_reset",
+            source_frame=self._source_frame,
+            point_execution_mode=self._execution_mode.value,
+            parent_mission_id=expected_mission_id or self._status.mission_id,
+            point_mission_generation=self._generation,
+        )
+        return self._generation
+
+    async def skip_point(
+        self,
+        ros_node,
+        hold_owner,
+        *,
+        point_index: int,
+        expected_generation: int | None,
+        reason: str,
+        operation_token: MissionOperationToken,
+    ) -> tuple[bool, str, int]:
+        coordinator = self._operation_coordinator()
+        if coordinator is not None:
+            try:
+                operation_token.raise_if_stale(coordinator.current_generation())
+            except Exception:
+                return False, "mission operation token is stale", 409
+            if operation_token.is_preempted():
+                return False, "skip preempted by higher-priority operation", 409
+        reject = self._terminal_reject()
+        if reject is not None:
+            return reject
+        if self._config is None or not self._points:
+            return False, "no point mission loaded", 409
+        if not self.is_active():
+            return False, "point mission is not active", 409
+        if expected_generation is not None and expected_generation != self._generation:
+            return False, "stale point mission generation", 409
+        if point_index != self._status.current_point_index:
+            return False, "skip point_index does not match active point", 409
+        if self._status.state == PointMissionState.WAITING_FOR_CONTINUE:
+            return False, "point already completed; use continue", 409
+        if self._status.state == PointMissionState.COMPLETED:
+            return False, "point mission already completed", 409
+        if self._status.state == PointMissionState.PAUSED_GPS_SAFETY:
+            return False, "GPS safety blocks skip until recovery", 409
+        if self._status.state not in _SKIP_ACCEPTED_STATES:
+            return (
+                False,
+                f"point mission is {self._status.state.value}, skip not accepted",
+                409,
+            )
+        if self._status.skip_pending:
+            return False, "skip already pending", 409
+        if self._status.state in {
+            PointMissionState.PAUSED_OBSTACLE,
+            PointMissionState.OBSTACLE_DURING_DWELL,
+        }:
+            blocked, obstacle_state = self._write_obstacle_status(self._run_token)
+            if blocked:
+                return False, f"obstacle {obstacle_state} - cannot skip while blocked", 409
+        run = self._run_token
+        if run is None:
+            return False, "point mission is not active", 409
+        if coordinator is not None:
+            run.operation_generation = coordinator.current_generation()
+        async with self._command_lock:
+            run.skip_requested = True
+            run.skip_request_id = point_index
+            run.skip_reason = reason
+            self._write(run, skip_pending=True)
+            if self._status.state in PAUSED_STATES:
+                is_last = self._status.current_point_index >= len(self._resolved_points) - 1
+                ok, msg = await self._skip_cycle(
+                    run, ros_node, hold_owner, self._status.current_point_index, is_last
+                )
+                if not ok:
+                    return False, msg, 503
+        return True, "skip accepted", 200
+
+    async def _skip_cycle(
+        self,
+        run: PointMissionRun,
+        ros_node,
+        hold_owner,
+        index: int,
+        is_last: bool,
+    ) -> tuple[bool, str]:
+        if run.terminal_cleanup_started or not self._is_current(run):
+            return False, "skip aborted: run is stale"
+        coordinator = self._operation_coordinator()
+        if coordinator is not None:
+            try:
+                self._check_operation_generation(run)
+            except asyncio.CancelledError:
+                return False, "skip preempted"
+        point = self._resolved_points[index]
+        during_dwell = self._status.state in {
+            PointMissionState.DWELLING,
+            PointMissionState.OBSTACLE_DURING_DWELL,
+            PointMissionState.GPS_DURING_DWELL,
+        } or bool(self._status.active_dwell)
+        if hold_owner is not None and hold_owner.active:
+            hold_owner.deactivate(ros_node)
+            self._merge_hold_status(run, hold_owner, ros_node)
+        if during_dwell:
+            await self._cancel_dwell_service(ros_node)
+            spray_off = await self._force_spray_off_with_result(
+                ros_node, require_confirm=True
+            )
+            if spray_off.get("recovery_required") or not spray_off.get("success", False):
+                run.skip_requested = False
+                self._write(run, skip_pending=False)
+                return False, "skip failed: spray OFF not confirmed"
+        elif point.mark or self._spray_ever_on:
+            await self._force_spray_off_with_result(ros_node, require_confirm=False)
+        else:
+            await self._force_spray_off_with_result(ros_node, require_confirm=False)
+        self._invalidate_dwell_identity(run)
+        if run.continue_gate is not None and not run.continue_gate.done():
+            run.continue_gate.cancel()
+        if run.resume_gate is not None and not run.resume_gate.done():
+            run.resume_gate.set_result("skip")
+        run.continue_gate = None
+        skipped = list(self._status.skipped_point_indices)
+        skipped.append(index)
+        self._emit_point_event(
+            run,
+            "point_skipped",
+            point_index=index,
+            source_index=point.source_index,
+            reason=run.skip_reason or "operator_skip",
+        )
+        run.skip_requested = False
+        self._write(
+            run,
+            skip_pending=False,
+            last_skipped_point_index=index,
+            skipped_point_indices=skipped,
+            last_completed_point_index=index,
+            active_dwell=False,
+            dwell_remaining_s=0.0,
+            active_dwell_command_id=None,
+            arrival_met=True,
+            settle_met=True,
+            state=PointMissionState.ADVANCING if not is_last else PointMissionState.ADVANCING,
+            last_transition=f"skipped:{index}",
+            next_point_index=None if is_last else index + 1,
+        )
+        return True, "skipped"
+
     async def pause_mission(self, ros_node, hold_owner) -> tuple[bool, str, int]:
+        reject = self._terminal_reject()
+        if reject is not None:
+            return reject
         if self._config is None or not self._points:
             return False, "no point mission loaded", 409
         if self._status.state in {PointMissionState.COMPLETED, PointMissionState.FAILED, PointMissionState.ABORTING}:
-            return False, f"point mission is {self._status.state.value}", 409
+            return False, f"point mission is terminal: {self._status.state.value}", 409
         if self.is_paused():
             return False, "point mission already paused", 409
         if not self.is_active():
@@ -1177,6 +1669,9 @@ class PointMissionOrchestrator:
         *,
         expected_generation: int | None = None,
     ) -> tuple[bool, str, int]:
+        reject = self._terminal_reject()
+        if reject is not None:
+            return reject
         if self._config is None or not self._points:
             return False, "no point mission loaded", 409
         if expected_generation is not None and expected_generation != self._generation:
@@ -1227,6 +1722,9 @@ class PointMissionOrchestrator:
 
     async def continue_point(self, ros_node=None) -> tuple[bool, str, int]:
         """Wake the active manual-continue wait for the current run generation."""
+        reject = self._terminal_reject()
+        if reject is not None:
+            return reject
         if self._config is None or not self._points:
             return False, "no point mission loaded", 409
         if self.is_paused():
@@ -1237,7 +1735,7 @@ class PointMissionOrchestrator:
         if self._status.state == PointMissionState.COMPLETED:
             return False, "point mission already completed", 409
         if self._status.state in {PointMissionState.FAILED, PointMissionState.ABORTING}:
-            return False, f"point mission is {self._status.state.value}", 409
+            return False, f"point mission is terminal: {self._status.state.value}", 409
         if self._status.state != PointMissionState.WAITING_FOR_CONTINUE:
             return False, (
                 f"point mission is {self._status.state.value}, not waiting for continue"
@@ -1286,13 +1784,17 @@ class PointMissionOrchestrator:
             or getattr(offboard_ctrl, "loaded_mission_id", None)
             or self._status.mission_id
         )
+        coordinator = self._operation_coordinator()
+        op_gen = coordinator.current_generation() if coordinator is not None else 0
         run = PointMissionRun(
             self._generation,
             self._status.mission_id,
             asyncio.Event(),
             parent_mission_id=str(parent_id or ""),
+            operation_generation=op_gen,
         )
         self._run_token = run
+        self._terminal_cleanup_reason = None
         self._spray_ever_on = False
         self._write(
             run,
@@ -1469,6 +1971,13 @@ class PointMissionOrchestrator:
             resume_available=True,
             last_transition=f"paused:{phase}",
         )
+        self._emit_point_event(
+            run,
+            "point_paused",
+            point_index=self._status.current_point_index,
+            source_index=point.source_index,
+            reason=pause_reason,
+        )
         params = self._gps_safety_params()
         try:
             while not run.resume_gate.done():
@@ -1514,6 +2023,13 @@ class PointMissionOrchestrator:
             f"{self._status.current_point_index}",
         )
         self._write(run, state=PointMissionState.RESUMING, last_transition="resuming", resume_available=False)
+        self._emit_point_event(
+            run,
+            "point_resumed",
+            point_index=self._status.current_point_index,
+            source_index=point.source_index,
+            reason=pause_reason,
+        )
         if hold_owner is not None:
             hold_owner.deactivate(ros_node)
             self._merge_hold_status(run, hold_owner, ros_node)
@@ -1554,6 +2070,15 @@ class PointMissionOrchestrator:
                 run, ros_node, hold_owner, point, phase, pause_reason="obstacle"
             )
             return self._resume_phase_after_pause(phase)
+        if run.skip_requested:
+            ok, _ = await self._skip_cycle(
+                run,
+                ros_node,
+                hold_owner,
+                self._status.current_point_index,
+                self._status.current_point_index >= len(self._resolved_points) - 1,
+            )
+            return "skip" if ok else None
         if run.pause_requested:
             run.pause_requested = False
             await self._pause_cycle(
@@ -1566,7 +2091,9 @@ class PointMissionOrchestrator:
         try:
             params = self._config.point if self._config else PointSprayParams()
             total = len(self._resolved_points)
-            for index, point in enumerate(self._resolved_points):
+            index = 0
+            while index < total:
+                point = self._resolved_points[index]
                 self._check_cancel(run)
                 self._write(
                     run,
@@ -1579,7 +2106,7 @@ class PointMissionOrchestrator:
                 )
                 self._update_live_diagnostics(run, ros_node, point, params)
                 is_last = index >= total - 1
-                await self._execute_point(
+                skipped = await self._execute_point(
                     run,
                     ros_node,
                     hold_owner,
@@ -1589,6 +2116,11 @@ class PointMissionOrchestrator:
                     index,
                     is_last=is_last,
                 )
+                if skipped:
+                    if is_last:
+                        break
+                    index += 1
+                    continue
                 # Pure mark=false legs never engage spray, so a stale spray node
                 # must not fail navigation. Marked legs require confirmed OFF.
                 await self._confirm_spray_off(
@@ -1614,6 +2146,7 @@ class PointMissionOrchestrator:
                         state=PointMissionState.ADVANCING,
                         last_transition=f"advanced:{index}",
                     )
+                index += 1
             await self._confirm_spray_off(
                 run, ros_node, require_confirm=self._spray_ever_on
             )
@@ -1632,13 +2165,24 @@ class PointMissionOrchestrator:
                 warnings = "; ".join((completion or {}).get("warnings") or [])
                 if warnings:
                     reason = f"{reason}: {warnings}"
-                await self._fail_point_with_cleanup(
-                    run,
-                    ros_node,
-                    offboard_ctrl,
-                    reason=reason,
-                    terminal_reason="completion_degraded",
+                from mission_ops import MissionOperation, MissionOperationCoordinator
+
+                coordinator = self._operation_coordinator() or MissionOperationCoordinator()
+                token = await coordinator.begin(
+                    MissionOperation.COMPLETION, timeout_s=0.25
                 )
+                try:
+                    await self.terminal_cleanup(
+                        ros_node,
+                        hold_owner,
+                        reason="completion_degraded",
+                        terminal_state=PointMissionState.FAILED,
+                        operation_token=token,
+                        offboard_ctrl=offboard_ctrl,
+                        require_spray_confirm=True,
+                    )
+                finally:
+                    await coordinator.finish(token)
                 return
             terminal_safety_ok = True
             terminal_failure_reason = ""
@@ -1660,27 +2204,41 @@ class PointMissionOrchestrator:
                     )
                 else:
                     hold_owner.refresh(ros_node)
-            self._write(
-                run,
-                state=PointMissionState.COMPLETED,
-                last_transition="completed",
-                ready=False,
-                run_active=False,
-                waiting_for_continue=False,
-                next_point_index=None,
-                target_north_m=None,
-                target_east_m=None,
-                current_distance_m=None,
-                mark_enabled=False,
-                resume_available=False,
-                terminal_safety_ok=terminal_safety_ok,
-                terminal_safety_reason=terminal_failure_reason,
-                terminal_failure_reason=terminal_failure_reason,
-                recovery_required=not terminal_safety_ok,
-                spray_off_result=(completion or {}).get("spray_off_result"),
-            )
+            from mission_ops import MissionOperation, MissionOperationCoordinator
+
+            coordinator = self._operation_coordinator() or MissionOperationCoordinator()
+            token = await coordinator.begin(MissionOperation.COMPLETION, timeout_s=0.25)
+            try:
+                if not coordinator.is_current(token):
+                    return
+                await self.terminal_cleanup(
+                    ros_node,
+                    hold_owner,
+                    reason="normal_completion",
+                    terminal_state=PointMissionState.COMPLETED,
+                    operation_token=token,
+                    offboard_ctrl=offboard_ctrl,
+                    require_spray_confirm=True,
+                )
+            finally:
+                await coordinator.finish(token)
+            if self._run_token is run:
+                self._write(
+                    run,
+                    ready=False,
+                    next_point_index=None,
+                    target_north_m=None,
+                    target_east_m=None,
+                    current_distance_m=None,
+                    mark_enabled=False,
+                    terminal_safety_ok=terminal_safety_ok,
+                    terminal_safety_reason=terminal_failure_reason,
+                    terminal_failure_reason=terminal_failure_reason,
+                    recovery_required=not terminal_safety_ok,
+                    spray_off_result=(completion or {}).get("spray_off_result"),
+                )
         except asyncio.CancelledError:
-            if self._is_current(run):
+            if not run.terminal_cleanup_started and self._is_current(run):
                 self._write(
                     run,
                     state=PointMissionState.FAILED,
@@ -1692,13 +2250,31 @@ class PointMissionOrchestrator:
                     waiting_for_continue=False,
                 )
             raise
-        except SprayRuntimeSchemaError as exc:
-            await self._fail_point_with_cleanup(
+        except PointMissionRunFailure as exc:
+            terminal = exc.terminal_state or (
+                PointMissionState.FAILED_GPS_SAFETY
+                if self._status.state == PointMissionState.FAILED_GPS_SAFETY
+                else PointMissionState.FAILED
+            )
+            await self._terminal_cleanup_run_failure(
                 run,
                 ros_node,
+                hold_owner,
                 offboard_ctrl,
-                reason=str(exc),
-                terminal_reason="schema_fault",
+                cleanup_reason=exc.cleanup_reason,
+                terminal_state=terminal,
+                error_message=str(exc),
+            )
+            self._record("error", f"point mission failed: {exc}")
+        except SprayRuntimeSchemaError as exc:
+            await self._terminal_cleanup_run_failure(
+                run,
+                ros_node,
+                hold_owner,
+                offboard_ctrl,
+                cleanup_reason="dwell_fault",
+                terminal_state=PointMissionState.FAILED,
+                error_message=str(exc),
             )
             self._record("error", f"point mission spray schema fault: {exc}")
         except Exception as exc:
@@ -1707,53 +2283,60 @@ class PointMissionOrchestrator:
                 if self._status.state == PointMissionState.FAILED_GPS_SAFETY
                 else PointMissionState.FAILED
             )
-            await self._fail_point_with_cleanup(
+            await self._terminal_cleanup_run_failure(
                 run,
                 ros_node,
+                hold_owner,
                 offboard_ctrl,
-                reason=str(exc),
-                terminal_reason="failed",
-                state=terminal,
+                cleanup_reason="dwell_fault",
+                terminal_state=terminal,
+                error_message=str(exc),
             )
             self._record("error", f"point mission failed: {exc}")
         finally:
-            cancelled = run.cancel_event.is_set()
-            if cancelled:
-                self._write(run, run_active=False, waiting_for_continue=False)
-            elif ros_node is not None:
-                # Terminal safety net. Must NOT escape as an unretrieved task
-                # exception (success path is not awaited). Always command OFF;
-                # record honest degraded diagnostics if a sprayed run can't confirm.
-                try:
-                    confirmed = await self._force_spray_off_confirmed(
-                        ros_node, require_confirm=False
-                    )
-                    if self._spray_ever_on and not confirmed:
-                        self._record(
-                            "error",
-                            "terminal cleanup: spray OFF not confirmed after spraying run",
+            if not run.terminal_cleanup_started:
+                cancelled = run.cancel_event.is_set()
+                if cancelled:
+                    self._write(run, run_active=False, waiting_for_continue=False)
+                elif ros_node is not None:
+                    # Terminal safety net. Must NOT escape as an unretrieved task
+                    # exception (success path is not awaited). Always command OFF;
+                    # record honest degraded diagnostics if a sprayed run can't confirm.
+                    try:
+                        confirmed = await self._force_spray_off_confirmed(
+                            ros_node, require_confirm=False
                         )
+                        if self._spray_ever_on and not confirmed:
+                            self._record(
+                                "error",
+                                "terminal cleanup: spray OFF not confirmed after spraying run",
+                            )
+                            self._write(
+                                run,
+                                terminal_safety_ok=False,
+                                terminal_safety_reason=(
+                                    "spray OFF not confirmed during terminal cleanup"
+                                ),
+                            )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # pragma: no cover - defensive
+                        self._record("error", f"terminal cleanup spray-off error: {exc}")
                         self._write(
                             run,
                             terminal_safety_ok=False,
-                            terminal_safety_reason=(
-                                "spray OFF not confirmed during terminal cleanup"
-                            ),
+                            terminal_safety_reason=str(exc),
                         )
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # pragma: no cover - defensive
-                    self._record("error", f"terminal cleanup spray-off error: {exc}")
-                    self._write(
-                        run,
-                        terminal_safety_ok=False,
-                        terminal_safety_reason=str(exc),
-                    )
-            self._write(run, run_active=False, waiting_for_continue=False)
+                self._write(run, run_active=False, waiting_for_continue=False)
 
     def _check_cancel(self, run: PointMissionRun) -> None:
-        if run.cancel_event.is_set() or not self._is_current(run):
+        if (
+            run.cancel_event.is_set()
+            or run.terminal_cleanup_started
+            or not self._is_current(run)
+        ):
             raise asyncio.CancelledError()
+        self._check_operation_generation(run)
 
     async def _wait_for_continue(
         self, run: PointMissionRun, ros_node, hold_owner, point: SprayPoint, completed_index: int
@@ -1772,6 +2355,12 @@ class PointMissionOrchestrator:
             state=PointMissionState.WAITING_FOR_CONTINUE,
             waiting_for_continue=True,
             last_transition=f"waiting_for_continue:{completed_index}",
+        )
+        self._emit_point_event(
+            run,
+            "point_waiting_for_continue",
+            point_index=completed_index,
+            source_index=point.source_index,
         )
         try:
             params = self._point_params()
@@ -1818,6 +2407,15 @@ class PointMissionOrchestrator:
     async def _publish_fresh_leg(
         self, run, ros_node, point, params: PointSprayParams
     ) -> None:
+        if (
+            run.cancel_event.is_set()
+            or run.terminal_cleanup_started
+            or not self._is_current(run)
+        ):
+            raise asyncio.CancelledError()
+        coordinator = self._operation_coordinator()
+        if coordinator is not None and run.operation_generation != coordinator.current_generation():
+            raise asyncio.CancelledError()
         state = ros_node.get_state()
         if not state.get("pose_received", False):
             raise RuntimeError("no rover pose for point leg")
@@ -1827,6 +2425,13 @@ class PointMissionOrchestrator:
             published,
             spray_flags=[False] * len(published),
             runtime_entry=True,
+        )
+        self._emit_point_event(
+            run,
+            "point_leg_started",
+            point_index=self._status.current_point_index,
+            source_index=point.source_index,
+            mark=point.mark,
         )
 
     async def _execute_point(
@@ -1840,7 +2445,7 @@ class PointMissionOrchestrator:
         index,
         *,
         is_last: bool = False,
-    ) -> None:
+    ) -> bool:
         phase = "navigating"
         started = time.monotonic()
         while phase != "done":
@@ -1856,7 +2461,9 @@ class PointMissionOrchestrator:
                 if next_phase == "navigating":
                     continue
                 if next_phase == "waiting_for_continue":
-                    return
+                    return False
+                if next_phase == "skip":
+                    return True
                 phase = "settling"
             elif phase == "settling":
                 self._write(run, state=PointMissionState.SETTLING, last_transition=f"settling:{index}")
@@ -1867,7 +2474,9 @@ class PointMissionOrchestrator:
                     phase = "navigating"
                     continue
                 if next_phase == "waiting_for_continue":
-                    return
+                    return False
+                if next_phase == "skip":
+                    return True
                 phase = "dwelling" if point.mark else "done"
             elif phase == "dwelling":
                 if hold_owner is not None:
@@ -1911,6 +2520,14 @@ class PointMissionOrchestrator:
                 # Spray has now been engaged this run → terminal/cancel cleanup
                 # must require confirmed OFF.
                 self._spray_ever_on = True
+                self._emit_point_event(
+                    run,
+                    "point_dwell_started",
+                    point_index=index,
+                    source_index=point.source_index,
+                    dwell_command_id=command_id,
+                    dwell_remaining_s=dwell_s,
+                )
                 next_phase = await self._wait_dwell_complete(
                     run,
                     ros_node,
@@ -1928,7 +2545,10 @@ class PointMissionOrchestrator:
                 if next_phase == "navigating":
                     phase = "navigating"
                     continue
+                if next_phase == "skip":
+                    return True
                 phase = "done"
+        return False
 
     def _telemetry_stale(self, state: dict[str, Any]) -> bool:
         pose_age = float(state.get("pose_age_ms", float("inf")))
@@ -1969,6 +2589,12 @@ class PointMissionOrchestrator:
                 hold_owner.refresh(ros_node)
                 self._merge_hold_status(run, hold_owner, ros_node)
             if arrival_met:
+                self._emit_point_event(
+                    run,
+                    "point_arrived",
+                    point_index=self._status.current_point_index,
+                    source_index=point.source_index,
+                )
                 return "settling"
             await asyncio.sleep(0.05)
 
@@ -2049,24 +2675,7 @@ class PointMissionOrchestrator:
         *,
         reason: str,
     ) -> None:
-        self._invalidate_dwell_identity(run)
-        dwell_cancel = await self._cancel_dwell_service(ros_node)
-        spray_off = await self._force_spray_off_with_result(
-            ros_node, check_cancel=lambda: self._check_cancel(run), require_confirm=True
-        )
-        recovery = bool(
-            spray_off.get("recovery_required") or not spray_off.get("success", False)
-        )
-        await self._parent_abort_terminal(offboard_ctrl, run, reason="dwell_fault")
-        self._write(
-            run,
-            dwell_cancel_result=dwell_cancel,
-            spray_off_result=spray_off,
-            recovery_required=recovery,
-            terminal_safety_ok=not recovery,
-            terminal_failure_reason=reason,
-        )
-        raise RuntimeError(reason)
+        raise PointMissionRunFailure(reason, cleanup_reason="dwell_fault")
 
     async def _wait_dwell_complete(
         self,
@@ -2144,6 +2753,13 @@ class PointMissionOrchestrator:
                     and status["off_acknowledged"]
                 ):
                     self._invalidate_dwell_identity(run)
+                    self._emit_point_event(
+                        run,
+                        "point_marked",
+                        point_index=self._status.current_point_index,
+                        source_index=point.source_index,
+                        dwell_command_id=command_id,
+                    )
                     return "done"
             await asyncio.sleep(0.05)
         raise TimeoutError(

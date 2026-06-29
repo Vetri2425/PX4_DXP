@@ -152,6 +152,35 @@ async def test_marked_mission_does_not_complete_without_spray_confirmation():
 
 
 @pytest.mark.anyio
+async def test_marked_dwell_failure_cleans_up_and_emits_one_terminal_event():
+    from point_events import get_point_event_journal
+
+    ros = StaleSprayRos()
+    ros.auto_arrive = True
+    orch = PointMissionOrchestrator()
+    orch.load(
+        mission_id="marked_cleanup",
+        points=[SprayPoint(1.0, 0.0, 0.05, 0, mark=True)],
+        config=_cfg(),
+    )
+    await orch.start(ros, FakeOffboard())
+    task = orch._task
+    await asyncio.wait_for(task, timeout=4.0)
+
+    assert orch.status.state == PointMissionState.FAILED
+    assert orch.status.run_active is False
+    assert orch.status.active_dwell is False
+    assert orch.status.spray_off_result is not None
+    assert orch.status.recovery_required is True
+    assert task.exception() is None
+    terminal = [
+        e for e in get_point_event_journal().history()["events"] if e.terminal
+    ]
+    assert len(terminal) == 1
+    assert terminal[0].event_type == "point_failed"
+
+
+@pytest.mark.anyio
 async def test_force_spray_off_raises_when_confirmation_required():
     ros = StaleSprayRos()
     orch = PointMissionOrchestrator()

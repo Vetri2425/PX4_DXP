@@ -34,6 +34,24 @@ class EmergencyHandler:
 
     async def estop_async(self) -> dict:
         """Execute emergency stop. Returns {success, message}."""
+        from mission_ops import MissionOperationCoordinator
+
+        coordinator = MissionOperationCoordinator()
+        try:
+            from main import operation_coordinator
+
+            if operation_coordinator is not None:
+                coordinator = operation_coordinator
+        except Exception:
+            pass
+        estop_token = coordinator.begin_estop_nowait()
+
+        try:
+            return await self._estop_async_with_token(estop_token)
+        finally:
+            await coordinator.finish(estop_token)
+
+    async def _estop_async_with_token(self, estop_token) -> dict:
         # Guard: if ROS node is unavailable, short-circuit cleanly
         if self._node is None:
             msg = "ROS node not available — e-stop cannot reach FCU"
@@ -108,6 +126,31 @@ class EmergencyHandler:
         except Exception as exc:
             errors.append(f"control_arbiter: {exc}")
             log.exception("control arbiter reset during estop failed")
+
+        try:
+            import asyncio
+
+            from main import hold_owner, point_mission
+            from point_mission import PointMissionState
+
+            if point_mission is not None:
+                try:
+                    await asyncio.wait_for(
+                        point_mission.terminal_cleanup(
+                            self._node,
+                            hold_owner,
+                            reason="emergency_stop",
+                            terminal_state=PointMissionState.ABORTING,
+                            operation_token=estop_token,
+                            require_spray_confirm=False,
+                        ),
+                        timeout=0.5,
+                    )
+                except asyncio.TimeoutError:
+                    errors.append("point terminal cleanup bookkeeping timed out")
+        except Exception as exc:
+            errors.append(f"point terminal cleanup: {exc}")
+            log.exception("point terminal cleanup during estop failed")
 
         msg = "EMERGENCY STOP executed"
         if errors:

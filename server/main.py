@@ -76,6 +76,7 @@ rtk_manager: Optional["object"] = None
 mission_capture: Optional["object"] = None
 point_mission: Optional["object"] = None
 hold_owner: Optional["object"] = None
+operation_coordinator: Optional["object"] = None
 manual_gateway: Optional["object"] = None
 joystick_ctrl: Optional["object"] = None
 spray_startup_reconciliation: Optional["object"] = None
@@ -105,7 +106,7 @@ async def lifespan(app: FastAPI):
     global ros_node, offboard_ctrl, path_mgr, emergency_handler
     global _executor, _beacon, _listener, _telemetry_task, bridge_health, rtk_manager
     global mission_capture, point_mission, hold_owner, manual_gateway, joystick_ctrl
-    global spray_startup_reconciliation
+    global spray_startup_reconciliation, operation_coordinator
 
     configure_logging()
     init_auth()
@@ -147,9 +148,12 @@ async def lifespan(app: FastAPI):
     from rtk_manager import AsyncRTKManager
     from mission_debug_capture import MissionDebugCoordinator
     from manual_control_gateway import ManualControlGateway, build_manual_transport
+    from mission_ops import MissionOperationCoordinator
+    from point_events import get_point_event_journal
     from point_mission import PointMissionOrchestrator
     from setpoint_hold import SetpointHoldOwner
 
+    operation_coordinator = MissionOperationCoordinator()
     path_mgr = PathManager(MISSION_DIR)
     offboard_ctrl = OffboardController(ros_node, activity_log)
     manual_gateway = ManualControlGateway(build_manual_transport(ros_node))
@@ -160,6 +164,8 @@ async def lifespan(app: FastAPI):
     hold_owner = SetpointHoldOwner()
     point_mission = PointMissionOrchestrator()
     point_mission.set_logger(_record)
+    loop = asyncio.get_running_loop()
+    get_point_event_journal().configure_emit(loop, _emit_authenticated)
     if ros_node is not None:
         ros_node.set_obstacle_callback(point_mission.set_obstacle_clear)
 
@@ -332,6 +338,16 @@ async def _emit_authenticated(event: str, data: dict) -> None:
         await sio.emit(event, data, to=sid)
 
 
+def _should_global_rpp_complete(offboard_ctrl, point_mission, ros_node) -> bool:
+    if offboard_ctrl is None or ros_node is None:
+        return False
+    if offboard_ctrl.state != MissionState.RUNNING:
+        return False
+    if not getattr(offboard_ctrl, "uses_global_rpp_completion", False):
+        return False
+    return bool(ros_node.get_rpp_monitor().is_done())
+
+
 # ── Telemetry loop with watchdog and auto-completion ──────────────────────────
 
 
@@ -457,33 +473,48 @@ async def _telemetry_loop() -> None:
                 }
                 await _emit_authenticated("mission_status", _sanitize(mission_status))
 
-                # ── 2. Auto-completion: RUNNING + DONE settled → COMPLETED ─────
-                if (
-                    offboard_ctrl is not None
-                    and offboard_ctrl.state == MissionState.RUNNING
-                    and ros_node.get_rpp_monitor().is_done()
-                ):
-                    completion = await offboard_ctrl.complete_async()
-                    completion_ok = bool(completion.get("success"))
-                    terminal_reason = (
-                        "mission_completed"
-                        if completion_ok else "mission_completion_degraded"
-                    )
-                    if mission_capture is not None:
-                        mission_capture.record_terminal(
-                            None,
-                            terminal_reason,
-                            state=offboard_ctrl.state.value,
-                            details=completion,
+                # ── 2. Auto-completion: continuous/dash only (Point owns completion) ─
+                if _should_global_rpp_complete(offboard_ctrl, point_mission, ros_node):
+                    from mission_ops import MissionOperation, MissionOperationConflict
+
+                    coordinator = operation_coordinator
+                    if coordinator is None:
+                        from mission_ops import MissionOperationCoordinator
+
+                        coordinator = MissionOperationCoordinator()
+                    try:
+                        token = await coordinator.begin(
+                            MissionOperation.COMPLETION, timeout_s=0.25
                         )
-                    await _emit_authenticated(
-                        terminal_reason,
-                        {
-                            "state": offboard_ctrl.state.value,
-                            "name": offboard_ctrl.loaded_path_name,
-                            "terminal": completion,
-                        },
-                    )
+                    except MissionOperationConflict:
+                        token = None
+                    if token is not None and not token.is_preempted():
+                        try:
+                            if coordinator.is_current(token):
+                                completion = await offboard_ctrl.complete_async()
+                                completion_ok = bool(completion.get("success"))
+                                terminal_reason = (
+                                    "mission_completed"
+                                    if completion_ok
+                                    else "mission_completion_degraded"
+                                )
+                                if mission_capture is not None:
+                                    mission_capture.record_terminal(
+                                        None,
+                                        terminal_reason,
+                                        state=offboard_ctrl.state.value,
+                                        details=completion,
+                                    )
+                                await _emit_authenticated(
+                                    terminal_reason,
+                                    {
+                                        "state": offboard_ctrl.state.value,
+                                        "name": offboard_ctrl.loaded_path_name,
+                                        "terminal": completion,
+                                    },
+                                )
+                        finally:
+                            await coordinator.finish(token)
 
                 # ── 3. Watchdog: RUNNING + unhealthy/disconnected → estop ──────
                 # B2: RPP_UNHEALTHY_CODES covers STALE (-1), RTK_WAIT (4),

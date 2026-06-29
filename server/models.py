@@ -466,6 +466,9 @@ class PointMissionStatusResponse(BaseModel):
     point_leg_conditioned_count: Optional[int] = None
     active_trajectory_mode: Optional[str] = None
     point_leg_length_m: Optional[float] = None
+    last_skipped_point_index: Optional[int] = None
+    skipped_point_indices: list[int] = Field(default_factory=list)
+    skip_pending: bool = False
 
 
 class MissionResumeRequest(BaseModel):
@@ -497,6 +500,91 @@ class PointContinueResponse(BaseModel):
 class ObstacleStatusResponse(BaseModel):
     obstacle_clear: bool
     status: PointMissionStatusResponse
+
+
+class PointSkipRequest(BaseModel):
+    point_index: int
+    expected_generation: Optional[int] = None
+    reason: str = "operator_skip"
+
+
+class PointSkipResponse(BaseModel):
+    skipped: bool
+    message: str
+    status: PointMissionStatusResponse
+
+
+class MissionRestartRequest(BaseModel):
+    mission_id: str
+    stop_first: bool = False
+    start_after_reset: bool = False
+    auto_origin: bool = False
+
+
+class MissionRestartResponse(BaseModel):
+    success: bool
+    restarted: bool
+    reset: bool
+    started: bool
+    state: str
+    mission_id: str
+    point_mission_generation: Optional[int] = None
+    message: str
+    stop_result: Optional[dict] = None
+    start_result: Optional[dict] = None
+
+
+class PointMissionEvent(BaseModel):
+    event_id: int = 0
+    ts: str
+    event_type: Literal[
+        "point_leg_started",
+        "point_arrived",
+        "point_dwell_started",
+        "point_marked",
+        "point_waiting_for_continue",
+        "point_paused",
+        "point_resumed",
+        "point_skipped",
+        "point_completed",
+        "point_failed",
+        "point_aborted",
+    ]
+    mission_id: str
+    parent_mission_id: str
+    point_mission_generation: int
+    point_index: Optional[int] = None
+    source_index: Optional[int] = None
+    point_mission_state: str
+    mark: Optional[bool] = None
+    dwell_command_id: Optional[int] = None
+    dwell_remaining_s: Optional[float] = None
+    hold_active: bool
+    obstacle_signal_state: str
+    gps_safety_state: str
+    terminal: bool
+    reason: str
+    status: dict
+
+
+class PointEventHistoryResponse(BaseModel):
+    events: list[PointMissionEvent]
+    latest_event_id: int
+    history_evicted: bool
+    oldest_available_event_id: Optional[int] = None
+
+
+class PointTerminalCleanupResult(BaseModel):
+    success: bool
+    idempotent: bool
+    reason: str
+    point_mission_state: str
+    dwell_cancel_result: Optional[dict] = None
+    spray_off_result: Optional[dict] = None
+    hold_deactivated: bool
+    terminal_event_emitted: bool
+    recovery_required: bool
+    message: str
 
 
 class MissionStatus(BaseModel):

@@ -9,12 +9,15 @@ POST /api/mission/pause   — resumable OFFBOARD hold (point missions)
 POST /api/mission/resume  — resume paused point mission from live pose
 POST /api/mission/obstacle — set obstacle clear/blocked hook state
 POST /api/mission/point/continue — advance manual point mission after operator approval
+POST /api/mission/point/skip     — skip the active point leg
+POST /api/mission/restart        — reset resident mission (optional stop-first / start)
 GET  /api/mission/point/status   — Point Mode runtime diagnostics
+GET  /api/mission/point/events   — bounded Point event journal
 GET  /api/mission/status  — current state + RPP snapshot
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from auth import require_operator_or_machine, require_token
 from config import RPP_STALE, RPP_STATE_NAMES
@@ -24,22 +27,69 @@ from mission_loading import (
     start_mission_for_controller,
 )
 from mission_placement import PlacementError
+from mission_services import (
+    MissionServiceError,
+    build_service_context,
+    continue_point_service,
+    pause_point_service,
+    restart_mission_service,
+    resume_point_service,
+    set_point_obstacle_service,
+    skip_point_service,
+    abort_mission_service,
+    stop_mission_service,
+)
 from models import (
     LoadedPathResponse,
     MissionClearResponse,
     MissionLoadRequest,
+    MissionRestartRequest,
+    MissionRestartResponse,
     MissionResumeRequest,
     MissionStartRequest,
     MissionStatus,
     ObstacleStatusRequest,
     ObstacleStatusResponse,
     PointContinueResponse,
+    PointEventHistoryResponse,
+    PointMissionEvent,
     PointMissionStatusResponse,
     PointPauseResponse,
     PointResumeResponse,
+    PointSkipRequest,
+    PointSkipResponse,
 )
 
 router = APIRouter(prefix="/mission", tags=["mission"])
+
+
+def _service_context(transport: str = "rest"):
+    from main import (
+        hold_owner,
+        mission_capture,
+        offboard_ctrl,
+        operation_coordinator,
+        path_mgr,
+        point_mission,
+        ros_node,
+    )
+    from mission_ops import MissionOperationCoordinator
+
+    coordinator = operation_coordinator or MissionOperationCoordinator()
+    return build_service_context(
+        offboard_ctrl=offboard_ctrl,
+        point_mission=point_mission,
+        ros_node=ros_node,
+        hold_owner=hold_owner,
+        path_mgr=path_mgr,
+        mission_capture=mission_capture,
+        transport=transport,  # type: ignore[arg-type]
+        operation_coordinator=coordinator,
+    )
+
+
+def _http_from_service_error(exc: MissionServiceError) -> HTTPException:
+    return HTTPException(exc.status_code, exc.message)
 
 
 @router.get(
@@ -74,11 +124,6 @@ def _merge_point_status() -> dict:
             }
         )
     return payload
-
-
-def _require_point_mode(offboard_ctrl) -> None:
-    if offboard_ctrl.spray_mode != "point":
-        raise HTTPException(409, "loaded mission is not in point spray mode")
 
 
 @router.post("/clear", response_model=MissionClearResponse, dependencies=[Depends(require_token)])
@@ -174,36 +219,18 @@ async def start_mission(req: MissionStartRequest | None = None):
 
 @router.post("/stop", dependencies=[Depends(require_token)])
 async def stop_mission():
-    from main import hold_owner, mission_capture, offboard_ctrl, point_mission, ros_node
-    from mission_stop import stop_active_mission
-
-    if offboard_ctrl is None:
-        raise HTTPException(503, "Controller not ready")
-    return await stop_active_mission(
-        offboard_ctrl,
-        point_mission,
-        ros_node,
-        hold_owner,
-        mission_capture=mission_capture,
-        transport="rest",
-    )
+    try:
+        return await stop_mission_service(_service_context("rest"))
+    except MissionServiceError as exc:
+        raise _http_from_service_error(exc)
 
 
 @router.post("/abort", dependencies=[Depends(require_token)])
 async def abort_mission():
-    from main import hold_owner, mission_capture, offboard_ctrl, point_mission, ros_node
-    if offboard_ctrl is None:
-        raise HTTPException(503, "Controller not ready")
-    if hold_owner is not None:
-        hold_owner.deactivate(ros_node)
-    if point_mission is not None:
-        await point_mission.abort(ros_node, offboard_ctrl=offboard_ctrl)
-    result = await offboard_ctrl.abort_async()
-    if mission_capture is not None:
-        mission_capture.record_terminal(
-            None, "operator_abort", state=offboard_ctrl.state.value, details=result
-        )
-    return result
+    try:
+        return await abort_mission_service(_service_context("rest"))
+    except MissionServiceError as exc:
+        raise _http_from_service_error(exc)
 
 
 def _point_status_payload() -> PointMissionStatusResponse | None:
@@ -224,83 +251,71 @@ async def point_mission_status():
     return PointMissionStatusResponse(**_merge_point_status())
 
 
+@router.get(
+    "/point/events",
+    response_model=PointEventHistoryResponse,
+    dependencies=[Depends(require_token)],
+)
+async def point_mission_events(
+    since_event_id: int | None = Query(default=None),
+):
+    from point_events import get_point_event_journal
+
+    payload = get_point_event_journal().history(since_event_id)
+    return PointEventHistoryResponse(
+        events=payload["events"],
+        latest_event_id=payload["latest_event_id"],
+        history_evicted=payload["history_evicted"],
+        oldest_available_event_id=payload["oldest_available_event_id"],
+    )
+
+
 @router.post("/pause", response_model=PointPauseResponse, dependencies=[Depends(require_token)])
 async def pause_mission():
-    """Request a resumable OFFBOARD hold for the active point mission."""
-    from main import hold_owner, offboard_ctrl, point_mission, ros_node
-
-    if point_mission is None:
-        raise HTTPException(503, "Point mission orchestrator unavailable")
-    if offboard_ctrl is None:
-        raise HTTPException(503, "Controller not ready")
-    _require_point_mode(offboard_ctrl)
-    ok, message, status_code = await point_mission.pause_mission(ros_node, hold_owner)
-    status = PointMissionStatusResponse(**_merge_point_status())
-    if not ok:
-        raise HTTPException(status_code, message)
-    return PointPauseResponse(paused=True, message=message, status=status)
+    try:
+        return await pause_point_service(_service_context("rest"))
+    except MissionServiceError as exc:
+        raise _http_from_service_error(exc)
 
 
 @router.post("/resume", response_model=PointResumeResponse, dependencies=[Depends(require_token)])
 async def resume_mission(req: MissionResumeRequest | None = None):
-    """Resume a paused point mission from the current live pose."""
-    from main import hold_owner, offboard_ctrl, point_mission, ros_node
-    from control_arbiter import ControlArbiterError, get_control_arbiter
-
-    if point_mission is None:
-        raise HTTPException(503, "Point mission orchestrator unavailable")
-    if offboard_ctrl is None:
-        raise HTTPException(503, "Controller not ready")
-    _require_point_mode(offboard_ctrl)
     try:
-        await get_control_arbiter().ensure_mission_motion_allowed(offboard_ctrl)
-    except ControlArbiterError as exc:
-        raise HTTPException(409, exc.message) from exc
-    expected_generation = req.expected_generation if req else None
-    ok, message, status_code = await point_mission.resume_mission(
-        ros_node,
-        hold_owner,
-        expected_generation=expected_generation,
-    )
-    status = PointMissionStatusResponse(**_merge_point_status())
-    if not ok:
-        raise HTTPException(status_code, message)
-    return PointResumeResponse(resumed=True, message=message, status=status)
+        return await resume_point_service(_service_context("rest"), req)
+    except MissionServiceError as exc:
+        raise _http_from_service_error(exc)
 
 
 @router.post("/obstacle", response_model=ObstacleStatusResponse, dependencies=[Depends(require_token)])
 async def set_obstacle_status(req: ObstacleStatusRequest):
-    """Set obstacle clear/blocked hook state for point mission pause/resume."""
-    from main import point_mission
-
-    if point_mission is None:
-        raise HTTPException(503, "Point mission orchestrator unavailable")
-    point_mission.set_obstacle_clear(req.clear)
-    status = PointMissionStatusResponse(**_merge_point_status())
-    return ObstacleStatusResponse(obstacle_clear=req.clear, status=status)
+    try:
+        return await set_point_obstacle_service(_service_context("rest"), req)
+    except MissionServiceError as exc:
+        raise _http_from_service_error(exc)
 
 
 @router.post("/point/continue", response_model=PointContinueResponse, dependencies=[Depends(require_token)])
 async def point_mission_continue():
-    """Advance a manual point mission after operator approval."""
-    from main import offboard_ctrl, point_mission, ros_node
-    from control_arbiter import ControlArbiterError, get_control_arbiter
-
-    if point_mission is None:
-        raise HTTPException(503, "Point mission orchestrator unavailable")
-    if offboard_ctrl is None:
-        raise HTTPException(503, "Controller not ready")
-    if offboard_ctrl.spray_mode != "point":
-        raise HTTPException(409, "loaded mission is not in point spray mode")
     try:
-        await get_control_arbiter().ensure_mission_motion_allowed(offboard_ctrl)
-    except ControlArbiterError as exc:
-        raise HTTPException(409, exc.message) from exc
-    ok, message, status_code = await point_mission.continue_point(ros_node)
-    status = PointMissionStatusResponse(**_merge_point_status())
-    if not ok:
-        raise HTTPException(status_code, message)
-    return PointContinueResponse(continued=True, message=message, status=status)
+        return await continue_point_service(_service_context("rest"))
+    except MissionServiceError as exc:
+        raise _http_from_service_error(exc)
+
+
+@router.post("/point/skip", response_model=PointSkipResponse, dependencies=[Depends(require_token)])
+async def point_mission_skip(req: PointSkipRequest):
+    try:
+        return await skip_point_service(_service_context("rest"), req)
+    except MissionServiceError as exc:
+        raise _http_from_service_error(exc)
+
+
+@router.post("/restart", response_model=MissionRestartResponse, dependencies=[Depends(require_token)])
+async def mission_restart(req: MissionRestartRequest):
+    try:
+        return await restart_mission_service(_service_context("rest"), req)
+    except MissionServiceError as exc:
+        raise _http_from_service_error(exc)
 
 
 @router.get("/debug-capture/status", dependencies=[Depends(require_token)])
