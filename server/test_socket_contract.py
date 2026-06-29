@@ -11,6 +11,10 @@ from socket_contract import (
     build_asyncapi_document,
 )
 
+# Resolve source paths relative to this test file so the suite passes
+# regardless of the pytest invocation cwd (repo root or server/).
+_SERVER = Path(__file__).resolve().parent
+
 
 def setup_function():
     auth.reset_for_tests()
@@ -36,7 +40,7 @@ def test_asyncapi_route_exposes_documented_socket_events():
 
 
 def test_socket_contract_matches_registered_client_event_names():
-    tree = ast.parse(Path("server/sockets/events.py").read_text(encoding="utf-8"))
+    tree = ast.parse((_SERVER / "sockets/events.py").read_text(encoding="utf-8"))
     registered = {"connect", "disconnect"}
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -56,10 +60,10 @@ def test_socket_contract_matches_registered_client_event_names():
 
 def test_socket_contract_covers_current_server_emit_literals():
     files = [
-        Path("server/sockets/events.py"),
-        Path("server/routes/auth.py"),
-        Path("server/main.py"),
-        Path("server/bridge_health.py"),
+        _SERVER / "sockets/events.py",
+        _SERVER / "routes/auth.py",
+        _SERVER / "main.py",
+        _SERVER / "bridge_health.py",
     ]
     emitted = set()
     for path in files:

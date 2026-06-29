@@ -1,6 +1,7 @@
 """System routes: ping, healthz, activity log, monitoring docs."""
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import time
@@ -110,7 +111,9 @@ async def nodes():
     from main import ros_node
     from monitoring import collect_nodes_status
 
-    return collect_nodes_status(ros_node)
+    # Collectors shell out via subprocess.run; keep them off the event loop so
+    # the telemetry/safety watchdog loop is never stalled by a slow probe.
+    return await asyncio.to_thread(collect_nodes_status, ros_node)
 
 
 @router.get(
@@ -122,7 +125,8 @@ async def network():
     """Read-only network and Wi-Fi telemetry for GCS monitoring."""
     from monitoring import collect_network_telemetry
 
-    return collect_network_telemetry()
+    # subprocess.run probes (ip/iw) — run off the event loop (see /nodes).
+    return await asyncio.to_thread(collect_network_telemetry)
 
 
 @router.get(
