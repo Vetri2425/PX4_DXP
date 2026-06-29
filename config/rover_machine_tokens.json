@@ -1,0 +1,16 @@
+{
+  "tokens": [
+    {
+      "created_at_utc": "2026-06-29T12:58:07Z",
+      "name": "bag-autorecord",
+      "revoked": false,
+      "scopes": [
+        "activity:read",
+        "mission:loaded-path",
+        "mission:status"
+      ],
+      "token_id": "ac42f973690bd51738d6485080dbececb87645e5479a174436d73b93eb251089"
+    }
+  ],
+  "version": 1
+}
