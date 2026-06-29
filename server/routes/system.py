@@ -1,4 +1,4 @@
-"""System routes: ping, healthz, activity log."""
+"""System routes: ping, healthz, activity log, monitoring docs."""
 from __future__ import annotations
 
 import csv
@@ -8,7 +8,7 @@ import time
 from fastapi import APIRouter, Depends
 from fastapi.responses import Response
 
-from auth import require_operator_or_machine
+from auth import require_operator_or_machine, require_token
 from config import MAX_ACTIVITY_LOG
 
 router = APIRouter(tags=["system"])
@@ -97,6 +97,17 @@ async def activity_csv():
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="rover-activity.csv"'},
     )
+
+
+@router.get(
+    "/docs/asyncapi",
+    dependencies=[Depends(require_token)],
+)
+async def asyncapi_doc():
+    """AsyncAPI document for current Socket.IO events."""
+    from socket_contract import build_asyncapi_document
+
+    return build_asyncapi_document()
 
 
 @router.post("/discover")
