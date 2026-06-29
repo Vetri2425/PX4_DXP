@@ -1,9 +1,12 @@
 """System routes: ping, healthz, activity log."""
 from __future__ import annotations
 
+import csv
+import io
 import time
 
 from fastapi import APIRouter, Depends
+from fastapi.responses import Response
 
 from auth import require_operator_or_machine
 from config import MAX_ACTIVITY_LOG
@@ -68,6 +71,33 @@ async def activity():
     from main import activity_log
     # activity_log is a deque(maxlen=MAX_ACTIVITY_LOG); slice as a list
     return list(activity_log)[-MAX_ACTIVITY_LOG:]
+
+
+@router.get(
+    "/activity.csv",
+    dependencies=[Depends(require_operator_or_machine("activity:read"))],
+)
+async def activity_csv():
+    """Export the bounded in-memory activity log as CSV."""
+    from main import activity_log
+
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=["timestamp", "level", "message"])
+    writer.writeheader()
+    for item in list(activity_log)[-MAX_ACTIVITY_LOG:]:
+        writer.writerow(
+            {
+                "timestamp": item.get("timestamp", ""),
+                "level": item.get("level", ""),
+                "message": item.get("message", ""),
+            }
+        )
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="rover-activity.csv"'},
+    )
+
 
 @router.post("/discover")
 async def discover():
