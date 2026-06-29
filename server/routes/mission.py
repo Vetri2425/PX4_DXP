@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from auth import require_token
+from auth import require_operator_or_machine, require_token
 from config import RPP_STALE, RPP_STATE_NAMES
 from mission_loading import (
     MissionLoadConflict,
@@ -39,11 +39,14 @@ from models import (
     PointResumeResponse,
 )
 
-router = APIRouter(prefix="/mission", tags=["mission"],
-                   dependencies=[Depends(require_token)])
+router = APIRouter(prefix="/mission", tags=["mission"])
 
 
-@router.get("/loaded-path", response_model=LoadedPathResponse)
+@router.get(
+    "/loaded-path",
+    response_model=LoadedPathResponse,
+    dependencies=[Depends(require_operator_or_machine("mission:loaded-path"))],
+)
 async def loaded_path():
     """Stage 10 — confirm the coordinates currently resident in the controller."""
     from main import offboard_ctrl
@@ -78,7 +81,7 @@ def _require_point_mode(offboard_ctrl) -> None:
         raise HTTPException(409, "loaded mission is not in point spray mode")
 
 
-@router.post("/clear", response_model=MissionClearResponse)
+@router.post("/clear", response_model=MissionClearResponse, dependencies=[Depends(require_token)])
 async def clear_mission():
     """Clear an idle/completed resident mission without deleting artifacts."""
     from main import hold_owner, offboard_ctrl, point_mission, ros_node
@@ -102,7 +105,7 @@ async def clear_mission():
     )
 
 
-@router.post("/load")
+@router.post("/load", dependencies=[Depends(require_token)])
 async def load_mission(req: MissionLoadRequest):
     from main import offboard_ctrl, path_mgr
     if offboard_ctrl is None:
@@ -127,7 +130,7 @@ async def load_mission(req: MissionLoadRequest):
     }
 
 
-@router.post("/start")
+@router.post("/start", dependencies=[Depends(require_token)])
 async def start_mission(req: MissionStartRequest | None = None):
     from main import mission_capture, offboard_ctrl, path_mgr, ros_node
     from mission_debug_capture import CaptureUnavailable
@@ -169,7 +172,7 @@ async def start_mission(req: MissionStartRequest | None = None):
     return {"state": offboard_ctrl.state.value, "message": msg}
 
 
-@router.post("/stop")
+@router.post("/stop", dependencies=[Depends(require_token)])
 async def stop_mission():
     from main import hold_owner, mission_capture, offboard_ctrl, point_mission, ros_node
     from mission_stop import stop_active_mission
@@ -186,7 +189,7 @@ async def stop_mission():
     )
 
 
-@router.post("/abort")
+@router.post("/abort", dependencies=[Depends(require_token)])
 async def abort_mission():
     from main import hold_owner, mission_capture, offboard_ctrl, point_mission, ros_node
     if offboard_ctrl is None:
@@ -211,7 +214,7 @@ def _point_status_payload() -> PointMissionStatusResponse | None:
     return PointMissionStatusResponse(**_merge_point_status())
 
 
-@router.get("/point/status", response_model=PointMissionStatusResponse)
+@router.get("/point/status", response_model=PointMissionStatusResponse, dependencies=[Depends(require_token)])
 async def point_mission_status():
     """Point Mode runtime diagnostics for the loaded/active point mission."""
     from main import point_mission
@@ -221,7 +224,7 @@ async def point_mission_status():
     return PointMissionStatusResponse(**_merge_point_status())
 
 
-@router.post("/pause", response_model=PointPauseResponse)
+@router.post("/pause", response_model=PointPauseResponse, dependencies=[Depends(require_token)])
 async def pause_mission():
     """Request a resumable OFFBOARD hold for the active point mission."""
     from main import hold_owner, offboard_ctrl, point_mission, ros_node
@@ -238,7 +241,7 @@ async def pause_mission():
     return PointPauseResponse(paused=True, message=message, status=status)
 
 
-@router.post("/resume", response_model=PointResumeResponse)
+@router.post("/resume", response_model=PointResumeResponse, dependencies=[Depends(require_token)])
 async def resume_mission(req: MissionResumeRequest | None = None):
     """Resume a paused point mission from the current live pose."""
     from main import hold_owner, offboard_ctrl, point_mission, ros_node
@@ -265,7 +268,7 @@ async def resume_mission(req: MissionResumeRequest | None = None):
     return PointResumeResponse(resumed=True, message=message, status=status)
 
 
-@router.post("/obstacle", response_model=ObstacleStatusResponse)
+@router.post("/obstacle", response_model=ObstacleStatusResponse, dependencies=[Depends(require_token)])
 async def set_obstacle_status(req: ObstacleStatusRequest):
     """Set obstacle clear/blocked hook state for point mission pause/resume."""
     from main import point_mission
@@ -277,7 +280,7 @@ async def set_obstacle_status(req: ObstacleStatusRequest):
     return ObstacleStatusResponse(obstacle_clear=req.clear, status=status)
 
 
-@router.post("/point/continue", response_model=PointContinueResponse)
+@router.post("/point/continue", response_model=PointContinueResponse, dependencies=[Depends(require_token)])
 async def point_mission_continue():
     """Advance a manual point mission after operator approval."""
     from main import offboard_ctrl, point_mission, ros_node
@@ -300,7 +303,7 @@ async def point_mission_continue():
     return PointContinueResponse(continued=True, message=message, status=status)
 
 
-@router.get("/debug-capture/status")
+@router.get("/debug-capture/status", dependencies=[Depends(require_token)])
 async def debug_capture_status():
     from main import mission_capture
     if mission_capture is None:
@@ -308,7 +311,11 @@ async def debug_capture_status():
     return mission_capture.get_status()
 
 
-@router.get("/status", response_model=MissionStatus)
+@router.get(
+    "/status",
+    response_model=MissionStatus,
+    dependencies=[Depends(require_operator_or_machine("mission:status"))],
+)
 async def mission_status():
     from main import offboard_ctrl, ros_node
     state = offboard_ctrl.state if offboard_ctrl else "idle"

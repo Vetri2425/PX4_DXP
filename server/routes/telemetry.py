@@ -4,13 +4,14 @@ Read-only; not auth-protected so dashboards / health checks can poll cheaply.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
+from auth import require_token
 from config import GPS_FIX_NAMES, RPP_STATE_NAMES
 from models import MissionState, TelemetryData
 from spray_safety import build_spray_telemetry_fields
 
-router = APIRouter(prefix="/telemetry", tags=["telemetry"])
+router = APIRouter(prefix="/telemetry", tags=["telemetry"], dependencies=[Depends(require_token)])
 
 
 @router.get("/latest", response_model=TelemetryData)

@@ -2,6 +2,10 @@
 
 The FastAPI backend server for the DYX Autonomous 3WD Marking Rover. It bridges the web interface (React/Vue GCS app) to the ROS2 Humble / MAVROS node ecosystem running locally on the companion computer (Jetson Orin).
 
+Local operator password setup, reset, session-token behavior, and the
+bag-autorecord machine token are documented in
+[`../docs/ROVER_LOCAL_AUTH.md`](../docs/ROVER_LOCAL_AUTH.md).
+
 ---
 
 ## 🏗 Architecture & Threading Model
@@ -46,7 +50,7 @@ Here is the functional map of the server files:
 | [`main.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/server/main.py) | **App Entry Point & Lifespan Handler**:<br>• Configures logging, mounts REST routes, and binds the ASGI Socket.IO server.<br>• Orchestrates startup (rclpy initialization, daemon executor start, systemd notifications) and clean shutdown.<br>• Hosts the high-frequency (`10Hz`) telemetry broadcast loop, pose watchdogs, and completion monitors. |
 | [`config.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/server/config.py) | **Central Configuration Constants**:<br>• Declares topics (`/path`, `/rpp/debug`, `/mavros/state`, etc.) and service identifiers.<br>• Houses watchdog limits, safety state filters, LAN UDP port assignments, upload thresholds, and CORS settings. |
 | [`models.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/server/models.py) | **Pydantic Data Schemas**:<br>• Houses all request and response structures for REST endpoints, WebSockets, and path-planning payloads. |
-| [`auth.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/server/auth.py) | **Token-Based Authentication Security**:<br>• Generates and reads a secure client token stored at `~/.rover_token` (mode `0600`).<br>• Enforces `X-Rover-Token` verification header checks on REST routes and connection-handshake validation on Socket.IO events. Can be bypassed using `ROVER_DISABLE_AUTH=1`. |
+| [`auth.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/server/auth.py) | **Local Password Authentication**:<br>• Verifies the operator password from a PBKDF2-HMAC-SHA256 hash stored in `config/rover_password.json` (mode `0600`).<br>• Issues expiring in-memory operator session tokens for `X-Rover-Token` and Socket.IO auth, and supports a separate scoped bag-autorecord machine token. |
 | [`logging_setup.py`](file:///Users/dyx_a1/Vetri/PX4_DXP/server/logging_setup.py) | Sets up standard unified formatting and console outputs for loggers. |
 | [`run.sh`](file:///Users/dyx_a1/Vetri/PX4_DXP/server/run.sh) | Launcher script that sources the ROS2 Humble install folder and boots uvicorn on port `5001`. |
 
@@ -102,8 +106,6 @@ Run the server locally using the shell wrapper:
 ./run.sh
 ```
 
-To run the backend with token authentication bypassed for local testing:
-
-```bash
-ROVER_DISABLE_AUTH=1 ./run.sh
-```
+Before operator login, configure the local password with
+`python3 server/rover_auth_cli.py setup`; see
+[`../docs/ROVER_LOCAL_AUTH.md`](../docs/ROVER_LOCAL_AUTH.md).

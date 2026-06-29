@@ -43,13 +43,11 @@ Environment=ROS_LOCALHOST_ONLY=0
 Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/home/flash/PX4_DXP/config/fastdds_no_shm.xml
 Environment=HOME=/home/flash
 Environment=FASTAPI_PORT=5001
-Environment=ROVER_TOKEN_FILE=/home/flash/PX4_DXP/config/rover_token
+Environment=ROVER_PASSWORD_FILE=/home/flash/PX4_DXP/config/rover_password.json
+Environment=ROVER_MACHINE_TOKENS_FILE=/home/flash/PX4_DXP/config/rover_machine_tokens.json
 Environment=MISSION_CAPTURE_REQUIRED=1
 Environment=MISSION_DEBUG_CONTROL_DIR=/home/flash/PX4_DXP/runtime/mission-debug
 Environment=MISSION_CAPTURE_ACK_TIMEOUT_S=3.0
-# Auth disabled during dev bring-up. Remove this line to enforce X-Rover-Token
-# (token auto-generated at the ROVER_TOKEN_FILE path above on first boot).
-Environment=ROVER_DISABLE_AUTH=1
 Environment=ROVER_JOYSTICK_MAX_ABS_THROTTLE=0.35
 Environment=ROVER_JOYSTICK_MAX_ABS_STEERING=0.20
 

@@ -81,6 +81,7 @@ log "bags: ${HOME}/bags_jet ready"
 # Make startup scripts executable
 chmod +x "${SCRIPT_DIR}/rpp_start.sh" 2>/dev/null || true
 chmod +x "${SCRIPT_DIR}/server/run.sh" 2>/dev/null || true
+chmod +x "${SCRIPT_DIR}/server/rover_auth_cli.py" 2>/dev/null || true
 chmod +x "${SCRIPT_DIR}/tools/bag_autorecord.sh" 2>/dev/null || true
 
 # ── 2. Keep manual ROS shells on the same Fast DDS profile ─────────

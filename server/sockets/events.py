@@ -1,14 +1,14 @@
 """Socket.IO event handlers — client → server commands.
 
-All control events require an `auth` field with a valid token. Telemetry is
-broadcast to all connected sids unconditionally; control commands are
-rejected with a `socket_error` event when auth fails.
+Socket.IO authenticates once at connect with the operator session token. After
+that, control events trust the authenticated SID state rather than passwords or
+per-event secrets.
 """
 from __future__ import annotations
 
 import datetime
 
-from auth import check_socket_token
+from auth import bind_socket_sid, socket_authenticated, unbind_socket_sid
 from control_arbiter import ControlArbiterError
 from joystick_controller import JoystickError
 from logging_setup import get_logger
@@ -20,10 +20,8 @@ def _now() -> str:
     return datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 
-def _auth_ok(data) -> bool:
-    if not isinstance(data, dict):
-        return check_socket_token(None)
-    return check_socket_token(data.get("auth"))
+def _auth_ok(sid: str) -> bool:
+    return socket_authenticated(sid)
 
 
 async def _emit_unauth(sio, sid):
@@ -45,18 +43,27 @@ def register_handlers(sio) -> None:
     @sio.event
     async def connect(sid, environ, auth=None):
         from main import activity_log
+        token = None
+        if isinstance(auth, dict):
+            token = auth.get("token") or auth.get("auth")
+        elif isinstance(auth, str):
+            token = auth
+        if bind_socket_sid(sid, token) is None:
+            raise ConnectionRefusedError("unauthorised")
         activity_log.append({"timestamp": _now(), "level": "info",
                               "message": f"Socket connected: {sid}"})
 
     @sio.event
     async def disconnect(sid):
         from main import activity_log, joystick_ctrl
+        unbind_socket_sid(sid)
         activity_log.append({"timestamp": _now(), "level": "info",
                               "message": f"Socket disconnected: {sid}"})
         if joystick_ctrl is not None and joystick_ctrl.owner_sid == sid:
             try:
                 result = await joystick_ctrl.release(sid, reason="disconnect")
-                await sio.emit("joystick_released", result)
+                from main import _emit_authenticated
+                await _emit_authenticated("joystick_released", result)
             except Exception as exc:
                 log.warning("joystick release on disconnect failed: %s", exc)
 
@@ -66,7 +73,7 @@ def register_handlers(sio) -> None:
     async def on_arm(sid, data):
         from main import ros_node, activity_log
         from spray_safety import disarm_with_spray_safety
-        if not _auth_ok(data):
+        if not _auth_ok(sid):
             return await _emit_unauth(sio, sid)
         if ros_node is None:
             return
@@ -99,7 +106,7 @@ def register_handlers(sio) -> None:
     async def on_set_mode(sid, data):
         from main import ros_node, activity_log
         from spray_safety import set_mode_with_spray_safety
-        if not _auth_ok(data):
+        if not _auth_ok(sid):
             return await _emit_unauth(sio, sid)
         if ros_node is None:
             return
@@ -136,7 +143,7 @@ def register_handlers(sio) -> None:
     @sio.on("emergency_stop")
     async def on_estop(sid, data=None):
         from main import emergency_handler
-        if not _auth_ok(data):
+        if not _auth_ok(sid):
             return await _emit_unauth(sio, sid)
         if emergency_handler is None:
             return
@@ -148,7 +155,7 @@ def register_handlers(sio) -> None:
     @sio.on("joystick_acquire")
     async def on_joystick_acquire(sid, data):
         from main import joystick_ctrl
-        if not _auth_ok(data):
+        if not _auth_ok(sid):
             return await _emit_unauth(sio, sid)
         if joystick_ctrl is None:
             return await _emit_joystick_error(
@@ -163,7 +170,7 @@ def register_handlers(sio) -> None:
     @sio.on("joystick_command")
     async def on_joystick_command(sid, data):
         from main import joystick_ctrl
-        if not _auth_ok(data):
+        if not _auth_ok(sid):
             return await _emit_unauth(sio, sid)
         if joystick_ctrl is None:
             return await _emit_joystick_error(
@@ -177,7 +184,7 @@ def register_handlers(sio) -> None:
     @sio.on("joystick_release")
     async def on_joystick_release(sid, data):
         from main import joystick_ctrl
-        if not _auth_ok(data):
+        if not _auth_ok(sid):
             return await _emit_unauth(sio, sid)
         if joystick_ctrl is None:
             return await _emit_joystick_error(
@@ -201,7 +208,7 @@ def register_handlers(sio) -> None:
     async def on_mission_load(sid, data):
         from main import offboard_ctrl, path_mgr
         from mission_loading import MissionLoadConflict, load_path_for_controller
-        if not _auth_ok(data):
+        if not _auth_ok(sid):
             return await _emit_unauth(sio, sid)
         name = (data.get("path_name") or data.get("mission_file")
                 if isinstance(data, dict) else None)
@@ -227,7 +234,7 @@ def register_handlers(sio) -> None:
         from mission_debug_capture import CaptureUnavailable
         from mission_loading import MissionLoadConflict, start_mission_for_controller
         from mission_placement import PlacementError
-        if not _auth_ok(data):
+        if not _auth_ok(sid):
             return await _emit_unauth(sio, sid)
         payload = data if isinstance(data, dict) else {}
         name = payload.get("path_name") or payload.get("mission_file")
@@ -268,7 +275,7 @@ def register_handlers(sio) -> None:
     async def on_mission_stop(sid, data=None):
         from main import hold_owner, mission_capture, offboard_ctrl, point_mission, ros_node
         from mission_stop import stop_active_mission
-        if not _auth_ok(data):
+        if not _auth_ok(sid):
             return await _emit_unauth(sio, sid)
         result = await stop_active_mission(
             offboard_ctrl,
@@ -283,7 +290,7 @@ def register_handlers(sio) -> None:
     @sio.on("mission_abort")
     async def on_mission_abort(sid, data=None):
         from main import hold_owner, mission_capture, offboard_ctrl, point_mission, ros_node
-        if not _auth_ok(data):
+        if not _auth_ok(sid):
             return await _emit_unauth(sio, sid)
         if hold_owner is not None:
             hold_owner.deactivate(ros_node)
@@ -299,7 +306,7 @@ def register_handlers(sio) -> None:
     @sio.on("request_params")
     async def on_request_params(sid, data):
         from main import ros_node
-        if not _auth_ok(data):
+        if not _auth_ok(sid):
             return await _emit_unauth(sio, sid)
         if ros_node is None:
             return

@@ -39,7 +39,7 @@ Environment=BAGS_DIR=/home/flash/bags_jet
 Environment=PX4_DXP_DIR=/home/flash/PX4_DXP
 Environment=MISSION_DEBUG_CONTROL_DIR=/home/flash/PX4_DXP/runtime/mission-debug
 Environment=BAG_QOS_OVERRIDES=/home/flash/PX4_DXP/config/rosbag_qos_overrides.yaml
-Environment=ROVER_TOKEN_FILE=/home/flash/PX4_DXP/config/rover_token
+Environment=ROVER_MACHINE_TOKEN_FILE=/home/flash/PX4_DXP/config/bag_autorecord.token
 Environment=BAG_POST_TAIL_S=2.0
 # Storage limits are site-configurable via a systemd drop-in.
 Environment=BAG_MIN_FREE_BYTES=5368709120

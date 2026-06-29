@@ -72,7 +72,7 @@ GPS_FIX_NAMES = {
 RPP_UNHEALTHY_CODES = {RPP_STALE, RPP_RTK_WAIT, RPP_JUMP_SKIP}
 
 # ── Server Defaults ───────────────────────────────────────────────────────────
-DEFAULT_HOST = "0.0.0.0"  # overridden below when ROVER_DISABLE_AUTH is set
+DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = int(os.environ.get("FASTAPI_PORT", "5001"))
 TELEMETRY_HZ = 10  # Socket.IO push rate
 MAX_ACTIVITY_LOG = 500
@@ -291,31 +291,33 @@ _validate_ntrip_config()
 _validate_joystick_config()
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
-TOKEN_FILE_DEFAULT = os.environ.get(
-    "ROVER_TOKEN_FILE",
-    os.path.expanduser("~/.rover_token"),
-)
 TOKEN_HEADER_NAME = "X-Rover-Token"
+AUTH_PASSWORD_FILE = os.environ.get(
+    "ROVER_PASSWORD_FILE",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "config", "rover_password.json"),
+)
+AUTH_MACHINE_TOKENS_FILE = os.environ.get(
+    "ROVER_MACHINE_TOKENS_FILE",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "config", "rover_machine_tokens.json"),
+)
+AUTH_SESSION_TTL_S = float(os.environ.get("ROVER_SESSION_TTL_S", str(12 * 3600)))
+AUTH_PBKDF2_ITERATIONS = int(os.environ.get("ROVER_AUTH_PBKDF2_ITERATIONS", "260000"))
+# Backward-compatible name for older local tooling; not used for operator auth.
+TOKEN_FILE_DEFAULT = os.environ.get("ROVER_TOKEN_FILE", AUTH_MACHINE_TOKENS_FILE)
 
 # ── File upload limits ────────────────────────────────────────────────────────
 ALLOWED_UPLOAD_EXTENSIONS = {".waypoints", ".csv", ".dxf"}
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MiB (DXF files can be large)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-if os.environ.get("ROVER_DISABLE_AUTH"):
-    CORS_ALLOW_ORIGINS = [
-        "http://localhost:3000", "http://127.0.0.1:3000",
-        "http://localhost:5001", "http://127.0.0.1:5001",
-    ]
-    DEFAULT_HOST = "127.0.0.1"
-else:
-    CORS_ALLOW_ORIGINS = ["*"]
-    DEFAULT_HOST = "0.0.0.0"
+CORS_ALLOW_ORIGINS = ["*"]
+DEFAULT_HOST = "0.0.0.0"
 
 # Explicit override (deployment-specific, set via systemd drop-in). Comma-
 # separated list of allowed origins, or "*" for any. Lets a trusted/isolated
-# LAN serve the browser/mobile frontend (whose origin is an arbitrary LAN IP)
-# even with auth disabled, without baking an open policy into the repo.
+# LAN serve the browser/mobile frontend (whose origin is an arbitrary LAN IP).
 _cors_env = os.environ.get("ROVER_CORS_ORIGINS")
 if _cors_env:
     CORS_ALLOW_ORIGINS = [o.strip() for o in _cors_env.split(",") if o.strip()]

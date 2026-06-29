@@ -9,8 +9,9 @@ For entity-level DXF selection, per-entity spray toggles, and PRE/AFT extension
 configuration, see `docs/DXF_ENTITY_FRONTEND_GUIDE.md`.
 
 - Base URL: `http://<jetson>:5001` (default `192.168.1.102`).
-- Auth: send header `X-Rover-Token: <token>` unless the server runs with
-  `ROVER_DISABLE_AUTH` set.
+- Auth: login with `POST /api/auth/login`, then send
+  `X-Rover-Token: <operator-session-token>` on protected REST calls. Socket.IO
+  connects with `auth: { token }`.
 - Content type for JSON bodies: `application/json`.
 
 ---

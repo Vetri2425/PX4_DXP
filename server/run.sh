@@ -10,13 +10,9 @@ export FASTAPI_PORT=${FASTAPI_PORT:-5001}
 
 cd "$(dirname "$0")"
 
-# Default: bind all interfaces, but fall back to loopback when auth is
-# disabled so an unauthenticated API isn't exposed to the network by accident.
-HOST=0.0.0.0
-if [ "${ROVER_DISABLE_AUTH:-0}" = "1" ]; then HOST=127.0.0.1; fi
-# Explicit override always wins (e.g. FASTAPI_HOST=0.0.0.0 to expose on a
-# trusted/isolated LAN even with auth disabled). Set via systemd drop-in.
-HOST="${FASTAPI_HOST:-$HOST}"
+# Default: bind all interfaces for the LAN operator UI. Protected REST and
+# Socket.IO paths require local-password operator sessions.
+HOST="${FASTAPI_HOST:-0.0.0.0}"
 
 # Install pip dependencies if missing (first run after deploy)
 if ! python3 -c "import fastapi" 2>/dev/null; then

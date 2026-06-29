@@ -18,8 +18,12 @@ from pathlib import Path
 from typing import Any
 
 API_BASE = os.environ.get("ROVER_API_BASE", "http://127.0.0.1:5001").rstrip("/")
-TOKEN_FILE = os.environ.get("ROVER_TOKEN_FILE", os.path.expanduser("~/.rover_token"))
-AUTH_OFF = os.environ.get("ROVER_DISABLE_AUTH", "0") == "1"
+MACHINE_TOKEN = os.environ.get("ROVER_MACHINE_TOKEN")
+MACHINE_TOKEN_FILE = os.environ.get(
+    "ROVER_MACHINE_TOKEN_FILE",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "config", "bag_autorecord.token"),
+)
 REPO_DIR = Path(os.environ.get("PX4_DXP_DIR", Path(__file__).resolve().parents[1]))
 BUNDLES_DIR = Path(os.environ.get("BAGS_DIR", os.path.expanduser("~/bags_jet")))
 CONTROL_DIR = Path(os.environ.get("MISSION_DEBUG_CONTROL_DIR", REPO_DIR / "runtime" / "mission-debug"))
@@ -181,10 +185,10 @@ def redact(text: str, known_token: str | None = None) -> tuple[str, int]:
 
 
 def _token() -> str | None:
-    if AUTH_OFF:
-        return None
+    if MACHINE_TOKEN:
+        return MACHINE_TOKEN.strip() or None
     try:
-        return Path(TOKEN_FILE).read_text(encoding="utf-8").strip() or None
+        return Path(MACHINE_TOKEN_FILE).read_text(encoding="utf-8").strip() or None
     except OSError:
         return None
 

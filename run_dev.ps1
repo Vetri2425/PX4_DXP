@@ -13,7 +13,8 @@ Write-Host ""
 Write-Host "[1/2] Starting FastAPI backend on http://localhost:5001 ..." -ForegroundColor Green
 $backendJob = Start-Job -ScriptBlock {
     Set-Location "D:\Vetri\3WD_GCS\PX4_DXP\server"
-    $env:ROVER_DISABLE_AUTH = "1"
+    # First run: configure the local operator password with
+    # python .\rover_auth_cli.py setup
     # Adjust Python path if needed; assumes uvicorn is in PATH
     uvicorn main:app --reload --host 0.0.0.0 --port 5001
 }
