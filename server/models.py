@@ -611,6 +611,66 @@ class ActivityEntry(BaseModel):
     message: str
 
 
+class RosNodeInfo(BaseModel):
+    name: str
+    namespace: str = "/"
+    fully_qualified_name: str
+    expected: bool = False
+    status: Literal["present", "missing", "unknown"] = "present"
+
+
+class NodesStatusResponse(BaseModel):
+    ok: bool
+    source: Literal["ros_graph", "ros2_cli", "unavailable"]
+    nodes: list[RosNodeInfo] = Field(default_factory=list)
+    expected_nodes: list[RosNodeInfo] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+
+class NetworkAddress(BaseModel):
+    family: str
+    address: str
+    prefixlen: Optional[int] = None
+
+
+class NetworkInterfaceInfo(BaseModel):
+    name: str
+    operstate: Optional[str] = None
+    mac: Optional[str] = None
+    addresses: list[NetworkAddress] = Field(default_factory=list)
+
+
+class NetworkRouteInfo(BaseModel):
+    interface: Optional[str] = None
+    gateway: Optional[str] = None
+    destination: str = "default"
+
+
+class WifiLinkInfo(BaseModel):
+    interface: str
+    connected: Optional[bool] = None
+    ssid: Optional[str] = None
+    signal_dbm: Optional[float] = None
+    frequency_mhz: Optional[int] = None
+    tx_bitrate: Optional[str] = None
+
+
+class WifiTelemetry(BaseModel):
+    available: bool
+    interfaces: list[WifiLinkInfo] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+
+class NetworkTelemetryResponse(BaseModel):
+    timestamp: str
+    hostname: str
+    source: Literal["iproute2", "sysfs", "unavailable"]
+    interfaces: list[NetworkInterfaceInfo] = Field(default_factory=list)
+    default_routes: list[NetworkRouteInfo] = Field(default_factory=list)
+    wifi: WifiTelemetry
+    errors: list[str] = Field(default_factory=list)
+
+
 class RppParamSetRequest(BaseModel):
     """Set a single RPP controller parameter."""
 

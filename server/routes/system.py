@@ -10,6 +10,7 @@ from fastapi.responses import Response
 
 from auth import require_operator_or_machine, require_token
 from config import MAX_ACTIVITY_LOG
+from models import NetworkTelemetryResponse, NodesStatusResponse
 
 router = APIRouter(tags=["system"])
 
@@ -97,6 +98,31 @@ async def activity_csv():
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="rover-activity.csv"'},
     )
+
+
+@router.get(
+    "/nodes",
+    response_model=NodesStatusResponse,
+    dependencies=[Depends(require_token)],
+)
+async def nodes():
+    """Read-only ROS node inventory for GCS monitoring."""
+    from main import ros_node
+    from monitoring import collect_nodes_status
+
+    return collect_nodes_status(ros_node)
+
+
+@router.get(
+    "/network",
+    response_model=NetworkTelemetryResponse,
+    dependencies=[Depends(require_token)],
+)
+async def network():
+    """Read-only network and Wi-Fi telemetry for GCS monitoring."""
+    from monitoring import collect_network_telemetry
+
+    return collect_network_telemetry()
 
 
 @router.get(
