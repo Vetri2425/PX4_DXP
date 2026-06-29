@@ -8,6 +8,7 @@ from fastapi import APIRouter
 
 from config import GPS_FIX_NAMES, RPP_STATE_NAMES
 from models import MissionState, TelemetryData
+from spray_safety import build_spray_telemetry_fields
 
 router = APIRouter(prefix="/telemetry", tags=["telemetry"])
 
@@ -19,19 +20,33 @@ async def telemetry_latest():
         return TelemetryData()
     s = ros_node.get_state()
     code = s.get("rpp_state", 0)
-    spraying = bool(s.get("spraying", False))
+    legacy_spraying = bool(s.get("spraying", False))
     spray_rt = ros_node.get_spray_runtime_status()
     mission_running = (
         offboard_ctrl is not None
         and offboard_ctrl.state == MissionState.RUNNING
         and bool(s.get("armed", False))
     )
-    if not mission_running:
-        marking_state = "off"
-    elif spraying:
-        marking_state = "marking"
-    else:
-        marking_state = "transit"
+    mission_dash = None
+    if offboard_ctrl is not None and hasattr(offboard_ctrl, "loaded_path_summary"):
+        summary = offboard_ctrl.loaded_path_summary()
+        mission_dash = {
+            "dash_feasible": summary.get("dash_feasible"),
+            "dash_feasibility_reason": summary.get("dash_feasibility_reason"),
+            "shortest_dash_on_run_m": summary.get("shortest_dash_on_run_m"),
+            "shortest_dash_off_gap_m": summary.get("shortest_dash_off_gap_m"),
+            "dash_phase_reset": summary.get("dash_phase_reset"),
+            "dash_expected_speed_mps": summary.get("dash_expected_speed_mps"),
+            "dash_feasibility_speed_source": summary.get(
+                "dash_feasibility_speed_source"
+            ),
+        }
+    spray_fields = build_spray_telemetry_fields(
+        legacy_spraying=legacy_spraying,
+        spray_rt=spray_rt,
+        mission_running=mission_running,
+        mission_dash=mission_dash,
+    )
     return TelemetryData(
         pos_n           = s.get("pos_n"),
         pos_e           = s.get("pos_e"),
@@ -48,15 +63,6 @@ async def telemetry_latest():
         rpp_debug_age_ms = s.get("rpp_debug_age_ms"),
         rpp_debug_fresh = s.get("rpp_debug_fresh"),
         measured_speed_m_s = s.get("measured_speed_m_s"),
-        spraying        = spraying,
-        marking_state   = marking_state,
-        commanded_on    = spray_rt.get("commanded_on"),
-        confirmed_off   = spray_rt.get("confirmed_off"),
-        spray_safety_reason = (
-            spray_rt.get("gps_safety_reason") or spray_rt.get("safety_reason")
-        ),
-        gps_safety_ok   = spray_rt.get("gps_safety_ok"),
-        manual_resume_required = spray_rt.get("manual_resume_required"),
         armed           = s.get("armed"),
         mode            = s.get("mode"),
         connected       = s.get("connected"),
@@ -70,4 +76,5 @@ async def telemetry_latest():
         lat             = s.get("lat"),
         lon             = s.get("lon"),
         alt             = s.get("alt"),
+        **spray_fields,
     )

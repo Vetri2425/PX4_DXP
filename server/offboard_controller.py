@@ -44,6 +44,7 @@ from path_validation import (
     normalize_spray_flags,
     verified_path_fingerprint,
 )
+from spray_safety import force_spray_off_confirmed
 
 log = get_logger("server.offboard")
 
@@ -121,6 +122,7 @@ class OffboardController:
         self._spray_mode = "continuous"
         self._path_fingerprint = ""
         self._configuration_revision = 0
+        self._dash_feasibility: dict[str, Any] | None = None
         # Serialises lifecycle calls. Created lazily on first use: on
         # Python 3.9 asyncio.Lock() binds an event loop at construction,
         # and the controller is built at server startup outside any loop.
@@ -227,6 +229,52 @@ class OffboardController:
             "has_spray_flags": flags is not None,
             "sample_coords": sample_coords,
             "sample_truncated": sample_truncated,
+            "dash": self._dash_feasibility,
+            "dash_feasible": (
+                bool(self._dash_feasibility.get("dash_feasible"))
+                if self._dash_feasibility is not None
+                else None
+            ),
+            "dash_feasibility_reason": (
+                self._dash_feasibility.get("dash_feasibility_reason", "")
+                if self._dash_feasibility is not None
+                else ""
+            ),
+            "shortest_dash_on_run_m": (
+                self._dash_feasibility.get("shortest_dash_on_run_m")
+                if self._dash_feasibility is not None
+                else None
+            ),
+            "shortest_dash_off_gap_m": (
+                self._dash_feasibility.get("shortest_dash_off_gap_m")
+                if self._dash_feasibility is not None
+                else None
+            ),
+            "expected_on_lead_m": (
+                self._dash_feasibility.get("expected_on_lead_m")
+                if self._dash_feasibility is not None
+                else None
+            ),
+            "expected_off_lead_m": (
+                self._dash_feasibility.get("expected_off_lead_m")
+                if self._dash_feasibility is not None
+                else None
+            ),
+            "dash_phase_reset": (
+                self._dash_feasibility.get("dash_phase_reset")
+                if self._dash_feasibility is not None
+                else None
+            ),
+            "dash_expected_speed_mps": (
+                self._dash_feasibility.get("dash_expected_speed_mps")
+                if self._dash_feasibility is not None
+                else None
+            ),
+            "dash_feasibility_speed_source": (
+                self._dash_feasibility.get("dash_feasibility_speed_source")
+                if self._dash_feasibility is not None
+                else None
+            ),
         }
 
     # ── Path management ───────────────────────────────────────────────────────
@@ -246,6 +294,7 @@ class OffboardController:
         spray_mode: str = "continuous",
         path_fingerprint: str = "",
         configuration_revision: int = 0,
+        dash_feasibility: dict[str, Any] | None = None,
     ) -> None:
         reason = load_block_reason(self._state)
         if reason:
@@ -294,6 +343,7 @@ class OffboardController:
         self._spray_mode = str(spray_mode or "continuous")
         self._path_fingerprint = verified_fingerprint
         self._configuration_revision = int(configuration_revision or 0)
+        self._dash_feasibility = dict(dash_feasibility) if dash_feasibility else None
         if origin_gps is not None:
             lat = float(origin_gps[0])
             lon = float(origin_gps[1])
@@ -339,6 +389,7 @@ class OffboardController:
             self._spray_mode = "continuous"
             self._path_fingerprint = ""
             self._configuration_revision = 0
+            self._dash_feasibility = None
             self._state = MissionState.IDLE
             if self._node is not None and hasattr(self._node, "publish_path_clear"):
                 self._node.publish_path_clear()
@@ -909,6 +960,12 @@ class OffboardController:
                 errors.append(f"publish_stop_path raised: {exc}")
                 log.exception("abort publish_stop_path raised")
 
+            spray_off = await force_spray_off_confirmed(
+                self._node, timeout_s=MISSION_COMPLETE_SPRAY_TIMEOUT_S
+            )
+            if not spray_off.success and spray_off.live:
+                errors.append(f"spray OFF: {spray_off.message}")
+
             try:
                 ok, why = await self._node.set_mode_async("MANUAL")
                 manual_mode = bool(ok)
@@ -960,6 +1017,7 @@ class OffboardController:
             if stop_position is not None:
                 n, e = stop_position
                 result["stop_position"] = {"n": n, "e": e}
+            result["spray_off_result"] = spray_off.as_dict()
             return result
 
     async def disarm_async(self) -> bool:
@@ -1088,10 +1146,9 @@ class OffboardController:
             }
 
     async def _terminalize_spray(self, warnings: list[str]) -> bool:
-        try:
-            self._node.publish_spray_manual(False)
-        except Exception as exc:
-            warnings.append(f"spray manual OFF publish failed: {exc}")
+        result = await force_spray_off_confirmed(
+            self._node, timeout_s=MISSION_COMPLETE_SPRAY_TIMEOUT_S
+        )
         try:
             ok, why = await self._node.set_spray_param_async("spray_enabled", False)
             if not ok:
@@ -1101,31 +1158,14 @@ class OffboardController:
         except Exception as exc:
             warnings.append(f"spray_enabled=False raised: {exc}")
 
-        deadline = asyncio.get_running_loop().time() + MISSION_COMPLETE_SPRAY_TIMEOUT_S
-        observed_runtime = False
-        last_status: dict[str, Any] = {}
-        while asyncio.get_running_loop().time() <= deadline:
-            try:
-                last_status = self._node.get_spray_runtime_status()
-                observed_runtime = True
-            except AttributeError:
-                break
-            except Exception as exc:
-                warnings.append(f"spray runtime status failed: {exc}")
-                break
-            if (
-                not bool(last_status.get("status_stale", True))
-                and not bool(last_status.get("commanded_on", False))
-                and bool(last_status.get("confirmed_off", False))
-            ):
-                return True
-            await asyncio.sleep(0.05)
-        if not observed_runtime:
+        if result.success:
+            return True
+        if not result.live:
             s = self._node.get_state()
             if not bool(s.get("spraying", False)):
                 warnings.append("spray runtime status unavailable; used /spray/state fallback")
                 return False
-        warnings.append(f"spray OFF not confirmed: {last_status}")
+        warnings.append(f"spray OFF not confirmed: {result.as_dict()}")
         return False
 
     async def _wait_until_rest(self, warnings: list[str]) -> bool:

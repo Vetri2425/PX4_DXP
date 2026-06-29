@@ -2,50 +2,26 @@
 
 from __future__ import annotations
 
-import asyncio
-import time
 from typing import Any
 
 from logging_setup import get_logger
+from spray_safety import force_spray_off_confirmed
 
 log = get_logger("server.mission_stop")
 
 
 async def _force_spray_off_confirmed(
     ros_node, *, timeout_s: float = 1.5
-) -> tuple[bool, bool]:
+) -> tuple[bool, bool, dict[str, Any]]:
     """Command spray OFF and wait for the node to confirm (F-03).
 
     Returns (attempted, confirmed). ``attempted`` is False when there is no live
     spray node to confirm against (node absent/stale) — a non-spray or offline
     mission must not be reported as a degraded stop. ``confirmed`` is True only
     when the spray node reports ``confirmed_off`` with no commanded ON."""
-    if ros_node is None or not hasattr(ros_node, "get_spray_runtime_status"):
-        return False, False
-    status = ros_node.get_spray_runtime_status()
-    node_live = not status.get("status_stale", True)
-    # Issue OFF unconditionally (idempotent, immediate) regardless of liveness.
-    try:
-        if hasattr(ros_node, "publish_spray_manual"):
-            ros_node.publish_spray_manual(False)
-        if hasattr(ros_node, "cancel_spray_dwell_async"):
-            await ros_node.cancel_spray_dwell_async()
-    except Exception:
-        log.exception("force spray OFF during stop failed")
-        return node_live, False
-    if not node_live:
-        return False, False
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        status = ros_node.get_spray_runtime_status()
-        if (
-            not status.get("status_stale", True)
-            and status.get("confirmed_off", False)
-            and not status.get("commanded_on", True)
-        ):
-            return True, True
-        await asyncio.sleep(0.05)
-    return True, False
+    result = await force_spray_off_confirmed(ros_node, timeout_s=timeout_s)
+    attempted = bool(result.attempted and result.live)
+    return attempted, bool(result.success), result.as_dict()
 
 
 async def stop_active_mission(
@@ -64,14 +40,17 @@ async def stop_active_mission(
         await point_mission.stop_mission(ros_node, hold_owner, reason="operator_stop")
     if hold_owner is not None:
         hold_owner.deactivate(ros_node)
-    result = await offboard_ctrl.stop_async()
     # F-03: continuous/dash stop reuses the point-mode confirmed-OFF guarantee.
     # The point branch above already confirms OFF; this covers line/dash stops
     # (and is idempotent for point). A live spray node that cannot confirm OFF
     # downgrades the stop to a non-success degraded result.
-    spray_attempted, spray_confirmed = await _force_spray_off_confirmed(ros_node)
+    spray_attempted, spray_confirmed, spray_off_result = await _force_spray_off_confirmed(
+        ros_node
+    )
+    result = await offboard_ctrl.stop_async()
     result["spray_off_attempted"] = spray_attempted
     result["spray_confirmed_off"] = spray_confirmed
+    result["spray_off_result"] = spray_off_result
     if spray_attempted and not spray_confirmed:
         result["spray_off_degraded"] = True
         result["success"] = False

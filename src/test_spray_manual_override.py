@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import types
 
 
@@ -274,7 +275,25 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "max_xtrack_error_m": _Param(0.10),
         "pose_timeout_s": _Param(0.5),
         "velocity_timeout_s": _Param(0.5),
-        "allow_legacy_spray_active_fallback": _Param(True),
+        "vehicle_state_timeout_s": _Param(2.0),
+        "allow_legacy_spray_active_fallback": _Param(False),
+        "diagnostic_profile": _Param(False),
+        "diagnostic_lease_active": _Param(False),
+        "max_along_track_heading_error_deg": _Param(30.0),
+        "max_cross_track_speed_mps": _Param(0.10),
+        "max_reverse_speed_tolerance_mps": _Param(0.03),
+        "max_projection_jump_m": _Param(0.50),
+        "max_backward_projection_jump_m": _Param(0.10),
+        "projection_ambiguity_distance_m": _Param(0.03),
+        "max_lead_distance_m": _Param(0.50),
+        "min_on_distance_m": _Param(0.05),
+        "min_off_distance_m": _Param(0.05),
+        "flow_mode": _Param("mapped"),
+        "min_target_flow": _Param(0.0),
+        "max_target_flow": _Param(1.0),
+        "max_pwm_change_per_s": _Param(500.0),
+        "low_speed_anti_puddle_behavior": _Param("block"),
+        "high_speed_underflow_behavior": _Param("block"),
         "actuator_backend": _Param("mavlink_actuator"),
         "servo_instance": _Param(1),
         "off_pwm_us": _Param(0),
@@ -335,12 +354,18 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._manual_deadline_ns = None
     node._armed = armed
     node._mode = mode
+    node._state_recv_monotonic_s = time.monotonic()
     node._service_ready = True
-    node._off_confirmed = True
     node._last_off_send_time_ns = None
     node._cmd_seq = 0
     from spray_controller_node import ActuatorState
     node._actuator_state = ActuatorState()
+    node._actuator_state.commanded_on = False
+    node._actuator_state.accepted_on = False
+    node._actuator_state.current_on = False
+    node._off_confirmed = True
+    node._actuator_state.off_confirmation_source = "command_ack"
+    node._actuator_state.current_value = -1.0
     node._path_model = None
     node._conditioned_path_identity = {}
     node._conditioned_path_source = "none"
@@ -375,6 +400,21 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._last_dwell_revision = 0
     node._invalidated_dwell_revision = 0
     node._last_transition = "test"
+    from spray_controller_modes import ContinuousSprayRuntimeState
+    from spray_path_model import SprayProjectionState
+
+    node._projection_state = SprayProjectionState()
+    node._continuous_runtime = ContinuousSprayRuntimeState(
+        projection=node._projection_state
+    )
+    node._geometry_hash = ""
+    node._runtime_spray_geometry_hash = ""
+    node._waypoint_count = 0
+    node._spray_flag_count = 0
+    node._mark_waypoint_count = 0
+    node._boundary_count = 0
+    node._legacy_fallback_block_reason = ""
+    node._last_safety_allows_on = None
     return node
 
 

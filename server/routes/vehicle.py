@@ -9,6 +9,10 @@ from auth import require_token
 from models import (
     ArmRequest, ArmResponse, EstopResponse, ModeRequest, ModeResponse,
 )
+from spray_safety import (
+    disarm_with_spray_safety,
+    set_mode_with_spray_safety,
+)
 
 router = APIRouter(tags=["vehicle"], dependencies=[Depends(require_token)])
 
@@ -27,11 +31,22 @@ async def arm_vehicle(req: ArmRequest):
     from main import ros_node
     if ros_node is None:
         raise HTTPException(503, "ROS node not ready")
-    ok, why = await ros_node.arm_async(req.arm)
-    verb = "Armed" if req.arm else "Disarmed"
-    msg  = f"{verb} {'OK' if ok else f'FAILED: {why}'}"
-    _record("info" if ok else "error", msg)
-    return ArmResponse(success=ok, message=msg)
+
+    if req.arm:
+        ok, why = await ros_node.arm_async(True)
+        msg = f"Armed {'OK' if ok else f'FAILED: {why}'}"
+        _record("info" if ok else "error", msg)
+        return ArmResponse(success=ok, message=msg)
+
+    result = await disarm_with_spray_safety(ros_node)
+    _record("info" if result.success else "warning", result.message)
+    return ArmResponse(
+        success=result.success,
+        message=result.message,
+        spray_off_confirmed=result.spray_off_confirmed,
+        spray_off_result=result.spray_off_result,
+        disarmed=result.transition_ok,
+    )
 
 
 @router.post("/set_mode", response_model=ModeResponse)
@@ -41,10 +56,21 @@ async def set_mode(req: ModeRequest):
         raise HTTPException(503, "ROS node not ready")
     if req.mode.value == "OFFBOARD":
         raise HTTPException(409, "OFFBOARD transitions must use mission start")
-    ok, why = await ros_node.set_mode_async(req.mode.value)
-    msg = f"Mode {req.mode.value} {'set' if ok else f'FAILED: {why}'}"
-    _record("info" if ok else "error", msg)
-    return ModeResponse(success=ok, message=msg)
+
+    state = ros_node.get_state()
+    current_mode = str(state.get("mode", "UNKNOWN"))
+    result = await set_mode_with_spray_safety(
+        ros_node,
+        target_mode=req.mode.value,
+        current_mode=current_mode,
+    )
+    _record("info" if result.success else "warning", result.message)
+    return ModeResponse(
+        success=result.success,
+        message=result.message,
+        spray_off_confirmed=result.spray_off_confirmed,
+        spray_off_result=result.spray_off_result,
+    )
 
 
 @router.post("/estop", response_model=EstopResponse)

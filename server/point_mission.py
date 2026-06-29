@@ -43,8 +43,38 @@ from gps_safety import (
 from logging_setup import get_logger
 from mission_placement import GPS_SURVEYED, LOCAL_NED, PlacementError, resolve_surveyed_points
 from models import MissionState
+from spray_safety import force_spray_off_confirmed
 
 log = get_logger("server.point_mission")
+
+_PARENT_ABORT_REASONS = frozenset(
+    {
+        "abort",
+        "cancelled",
+        "non_point_load",
+        "failed",
+        "gps_fail",
+        "dwell_fault",
+        "schema_fault",
+        "runtime_restart",
+        "completion_degraded",
+    }
+)
+
+_DWELL_POLL_REQUIRED_FIELDS = (
+    "dwell_command_id",
+    "dwell_mission_id",
+    "dwell_point_index",
+    "commanded_on",
+    "confirmed_off",
+    "off_acknowledged",
+    "active_dwell",
+    "status_stale",
+)
+
+
+class SprayRuntimeSchemaError(RuntimeError):
+    """Raised when spray runtime status is missing required dwell fields."""
 
 
 class PointMissionState(str, Enum):
@@ -127,6 +157,16 @@ class PointMissionStatus:
     settle_met: bool = False
     mark_enabled: bool = True
     active_dwell_command_id: int | None = None
+    parent_mission_id: str = ""
+    point_mission_generation: int = 0
+    active_dwell_command_revision: int | None = None
+    active_dwell_configuration_revision: int | None = None
+    active_dwell_point_index: int | None = None
+    active_dwell_source_index: int | None = None
+    recovery_required: bool = False
+    terminal_failure_reason: str = ""
+    dwell_cancel_result: dict[str, Any] | None = None
+    spray_off_result: dict[str, Any] | None = None
     last_failure_reason: str = ""
     run_active: bool = False
     obstacle_clear: bool = True
@@ -140,6 +180,7 @@ class PointMissionStatus:
     paused_point_index: int | None = None
     resume_available: bool = False
     dwell_cancelled: bool = False
+    dwell_ownership_invalidated: bool = False
     setpoint_source: str = "rpp"
     hold_active: bool = False
     hold_north_m: float | None = None
@@ -193,6 +234,18 @@ class PointMissionStatus:
             "settle_met": self.settle_met,
             "mark_enabled": self.mark_enabled,
             "active_dwell_command_id": self.active_dwell_command_id,
+            "parent_mission_id": self.parent_mission_id,
+            "point_mission_generation": self.point_mission_generation,
+            "active_dwell_command_revision": self.active_dwell_command_revision,
+            "active_dwell_configuration_revision": (
+                self.active_dwell_configuration_revision
+            ),
+            "active_dwell_point_index": self.active_dwell_point_index,
+            "active_dwell_source_index": self.active_dwell_source_index,
+            "recovery_required": self.recovery_required,
+            "terminal_failure_reason": self.terminal_failure_reason,
+            "dwell_cancel_result": self.dwell_cancel_result,
+            "spray_off_result": self.spray_off_result,
             "last_failure_reason": self.last_failure_reason,
             "run_active": self.run_active,
             "obstacle_clear": self.obstacle_clear,
@@ -206,6 +259,7 @@ class PointMissionStatus:
             "paused_point_index": self.paused_point_index,
             "resume_available": self.resume_available,
             "dwell_cancelled": self.dwell_cancelled,
+            "dwell_ownership_invalidated": self.dwell_ownership_invalidated,
             "setpoint_source": self.setpoint_source,
             "hold_active": self.hold_active,
             "hold_north_m": self.hold_north_m,
@@ -235,15 +289,47 @@ class PointMissionStatus:
             "point_leg_length_m": self.point_leg_length_m,
         }
 
+    def as_spray_status_dict(self) -> dict[str, Any]:
+        """Point status view for /api/spray/status without spray-runtime collisions."""
+        payload = self.as_dict()
+        payload.update(
+            {
+                "point_ready": self.ready,
+                "point_active_dwell": self.active_dwell,
+                "point_dwell_remaining_s": self.dwell_remaining_s,
+                "point_last_transition": self.last_transition,
+                "point_last_error": self.last_error,
+                "point_hold_active": self.hold_active,
+            }
+        )
+        for key in (
+            "ready",
+            "active_dwell",
+            "dwell_remaining_s",
+            "last_transition",
+            "last_error",
+            "hold_active",
+        ):
+            payload.pop(key, None)
+        return payload
+
 
 @dataclass
 class PointMissionRun:
     generation: int
     mission_id: str
     cancel_event: asyncio.Event
+    parent_mission_id: str = ""
     continue_gate: asyncio.Future | None = None
     resume_gate: asyncio.Future | None = None
     pause_requested: bool = False
+    active_dwell_command_id: int | None = None
+    active_dwell_command_revision: int | None = None
+    active_dwell_configuration_revision: int | None = None
+    active_dwell_point_index: int | None = None
+    active_dwell_source_index: int | None = None
+    dwell_revision_invalid: bool = False
+    spray_runtime_fingerprint: tuple[int, int, float] | None = None
 
 
 class PointMissionOrchestrator:
@@ -293,11 +379,14 @@ class PointMissionOrchestrator:
         return self._status.state in PAUSED_STATES
 
     def _mark_offboard_terminal(self, offboard_ctrl, state: MissionState) -> None:
+        """Legacy state-only writes — COMPLETED is forbidden; use parent terminal APIs."""
         if offboard_ctrl is None:
             return
-        if state == MissionState.COMPLETED and hasattr(offboard_ctrl, "mark_completed"):
-            offboard_ctrl.mark_completed()
-            return
+        if state == MissionState.COMPLETED:
+            raise RuntimeError(
+                "point mission must not mark parent COMPLETED directly; "
+                "use complete_async()"
+            )
         offboard_ctrl.state = state
         if hasattr(offboard_ctrl, "_running_mission_id"):
             offboard_ctrl._running_mission_id = None
@@ -307,6 +396,253 @@ class PointMissionOrchestrator:
             get_control_arbiter().mark_idle_if_not_joystick()
         except Exception:
             log.exception("point mission terminal arbiter cleanup failed")
+
+    def _spray_runtime_fingerprint(self, status: dict[str, Any]) -> tuple[int, int, float]:
+        return (
+            int(status.get("configuration_revision", -1)),
+            int(status.get("model_revision", -1)),
+            float(status.get("timestamp_monotonic_s", 0.0)),
+        )
+
+    def _validate_dwell_poll_status(self, status: dict[str, Any]) -> None:
+        for field in _DWELL_POLL_REQUIRED_FIELDS:
+            if field not in status:
+                raise SprayRuntimeSchemaError(
+                    f"spray runtime status missing required field {field!r}"
+                )
+        for field in (
+            "commanded_on",
+            "confirmed_off",
+            "off_acknowledged",
+            "active_dwell",
+            "status_stale",
+        ):
+            if not isinstance(status[field], bool):
+                raise SprayRuntimeSchemaError(
+                    f"spray runtime status field {field!r} must be bool"
+                )
+        for field in ("dwell_command_id", "dwell_point_index"):
+            if status[field] is not None and not isinstance(status[field], int):
+                raise SprayRuntimeSchemaError(
+                    f"spray runtime status field {field!r} must be int or null"
+                )
+        mission_id = status.get("dwell_mission_id")
+        if mission_id is not None and not isinstance(mission_id, str):
+            raise SprayRuntimeSchemaError(
+                "spray runtime status field dwell_mission_id must be str or null"
+            )
+        if status.get("active_dwell") and (
+            not isinstance(mission_id, str) or not mission_id
+        ):
+            raise SprayRuntimeSchemaError(
+                "active dwell requires non-empty dwell_mission_id"
+            )
+
+    def _bind_dwell_identity(
+        self,
+        run: PointMissionRun,
+        *,
+        command_id: int,
+        command_revision: int,
+        point_index: int,
+        source_index: int,
+    ) -> None:
+        parent_id = run.parent_mission_id or run.mission_id
+        config_revision = self._config.revision if self._config is not None else 0
+        run.active_dwell_command_id = command_id
+        run.active_dwell_command_revision = command_revision
+        run.active_dwell_configuration_revision = config_revision
+        run.active_dwell_point_index = point_index
+        run.active_dwell_source_index = source_index
+        run.dwell_revision_invalid = False
+        self._write(
+            run,
+            parent_mission_id=parent_id,
+            point_mission_generation=run.generation,
+            active_dwell_command_id=command_id,
+            active_dwell_command_revision=command_revision,
+            active_dwell_configuration_revision=config_revision,
+            active_dwell_point_index=point_index,
+            active_dwell_source_index=source_index,
+        )
+
+    def _invalidate_dwell_identity(self, run: PointMissionRun | None) -> None:
+        if run is None:
+            return
+        run.dwell_revision_invalid = True
+        run.active_dwell_command_id = None
+        run.active_dwell_command_revision = None
+        run.active_dwell_configuration_revision = None
+        run.active_dwell_point_index = None
+        run.active_dwell_source_index = None
+        self._write(
+            run,
+            dwell_ownership_invalidated=True,
+            active_dwell_command_id=None,
+            active_dwell_command_revision=None,
+            active_dwell_configuration_revision=None,
+            active_dwell_point_index=None,
+            active_dwell_source_index=None,
+        )
+
+    def _dwell_identity_matches(
+        self,
+        run: PointMissionRun,
+        status: dict[str, Any],
+        offboard_ctrl,
+    ) -> bool:
+        if run.dwell_revision_invalid:
+            return False
+        if not self._is_current(run):
+            return False
+        if run.generation != self._generation:
+            return False
+        if offboard_ctrl is not None and getattr(
+            offboard_ctrl, "running_mission_id", None
+        ) not in {None, run.parent_mission_id, run.mission_id}:
+            return False
+        expected_id = run.active_dwell_command_id
+        if expected_id is None:
+            return False
+        seen_id = status.get("dwell_command_id")
+        if seen_id is None or int(seen_id) != expected_id:
+            return False
+        mission_id = status.get("dwell_mission_id")
+        if not isinstance(mission_id, str) or not mission_id:
+            return False
+        if mission_id not in {run.mission_id, run.parent_mission_id}:
+            return False
+        if int(status.get("dwell_point_index", -1)) != int(
+            run.active_dwell_point_index if run.active_dwell_point_index is not None else -1
+        ):
+            return False
+        config_revision = run.active_dwell_configuration_revision
+        if config_revision is not None and int(
+            status.get("configuration_revision", -1)
+        ) != config_revision:
+            return False
+        return True
+
+    async def _cancel_dwell_service(self, ros_node) -> dict[str, Any]:
+        if ros_node is None or not hasattr(ros_node, "cancel_spray_dwell_async"):
+            return {"success": False, "message": "dwell cancel unavailable"}
+        try:
+            ok, message = await asyncio.wait_for(
+                ros_node.cancel_spray_dwell_async(),
+                timeout=self._DRAIN_TIMEOUT_S,
+            )
+            return {"success": bool(ok), "message": message or ""}
+        except asyncio.TimeoutError:
+            return {"success": False, "message": "dwell cancel timed out", "timeout": True}
+        except Exception as exc:
+            return {"success": False, "message": str(exc)}
+
+    async def _force_spray_off_with_result(
+        self,
+        ros_node,
+        *,
+        check_cancel=None,
+        require_confirm: bool = True,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]:
+        result = await force_spray_off_confirmed(
+            ros_node,
+            timeout_s=self._DRAIN_TIMEOUT_S if timeout_s is None else timeout_s,
+            check_cancel=check_cancel,
+        )
+        payload = result.as_dict()
+        if require_confirm and not result.success:
+            payload["recovery_required"] = bool(
+                result.recovery_required or (result.attempted and result.live)
+            )
+        return payload
+
+    async def _parent_abort_terminal(
+        self,
+        offboard_ctrl,
+        run: PointMissionRun | None,
+        *,
+        reason: str,
+    ) -> dict[str, Any] | None:
+        if offboard_ctrl is None or not hasattr(offboard_ctrl, "abort_async"):
+            return None
+        if reason not in _PARENT_ABORT_REASONS:
+            return None
+        try:
+            result = await offboard_ctrl.abort_async()
+            if run is not None and self._is_current(run):
+                recovery = not bool(result.get("success", False))
+                spray_off = result.get("spray_off_result") or {}
+                if spray_off.get("recovery_required"):
+                    recovery = True
+                self._write(
+                    run,
+                    recovery_required=recovery,
+                    terminal_safety_ok=not recovery,
+                    terminal_failure_reason=(
+                        "; ".join(result.get("errors") or [])
+                        or result.get("message", "")
+                    ),
+                    spray_off_result=spray_off or None,
+                )
+            return result
+        except Exception as exc:
+            self._record("error", f"parent abort terminal failed: {exc}")
+            if run is not None and self._is_current(run):
+                self._write(
+                    run,
+                    recovery_required=True,
+                    terminal_safety_ok=False,
+                    terminal_failure_reason=str(exc),
+                )
+            return {"success": False, "message": str(exc)}
+
+    async def _fail_point_with_cleanup(
+        self,
+        run: PointMissionRun,
+        ros_node,
+        offboard_ctrl,
+        *,
+        reason: str,
+        terminal_reason: str,
+        state: PointMissionState = PointMissionState.FAILED,
+    ) -> None:
+        self._invalidate_dwell_identity(run)
+        dwell_cancel = await self._cancel_dwell_service(ros_node)
+        spray_off = await self._force_spray_off_with_result(
+            ros_node,
+            check_cancel=lambda: self._check_cancel(run),
+            require_confirm=True,
+            timeout_s=1.0,
+        )
+        recovery = bool(
+            spray_off.get("recovery_required")
+            or not spray_off.get("success", False)
+        )
+        if not dwell_cancel.get("success", False):
+            recovery = True
+        parent = await self._parent_abort_terminal(
+            offboard_ctrl, run, reason=terminal_reason
+        )
+        if parent is not None and not parent.get("success", False):
+            recovery = True
+        self._write(
+            run,
+            state=state,
+            last_error=reason,
+            last_failure_reason=reason,
+            last_transition=terminal_reason,
+            ready=False,
+            run_active=False,
+            waiting_for_continue=False,
+            active_dwell=False,
+            dwell_remaining_s=0.0,
+            dwell_cancel_result=dwell_cancel,
+            spray_off_result=spray_off,
+            recovery_required=recovery,
+            terminal_safety_ok=not recovery,
+            terminal_failure_reason=reason if recovery else "",
+        )
 
     def set_obstacle_clear(self, clear: bool) -> None:
         self._obstacle_clear = bool(clear)
@@ -465,8 +801,6 @@ class PointMissionOrchestrator:
         was_spraying = (
             phase == PointMissionState.DWELLING.value or bool(self._status.active_dwell)
         )
-        await ros_node.cancel_spray_dwell_async()
-        ros_node.publish_spray_manual(False)
         await self._confirm_spray_off(run, ros_node, require_confirm=was_spraying)
         if params.hold_drift_policy == "pause":
             await self._pause_cycle(
@@ -581,9 +915,15 @@ class PointMissionOrchestrator:
         self._install(mission_id, points, config, LOCAL_NED, None, mode)
 
     async def replace_from_staged(
-        self, staged: dict[str, Any], config: SprayConfiguration, ros_node
+        self,
+        staged: dict[str, Any],
+        config: SprayConfiguration,
+        ros_node,
+        offboard_ctrl=None,
     ) -> None:
-        await self.cancel_and_drain(ros_node, reason="reload")
+        await self.cancel_and_drain(
+            ros_node, reason="reload", offboard_ctrl=offboard_ctrl
+        )
         rows = staged.get("point_mission_points") or []
         points = points_from_staged_dict(
             rows,
@@ -639,9 +979,13 @@ class PointMissionOrchestrator:
             ready=ready,
         )
 
-    async def clear_mission(self, ros_node, *, reason: str = "cleared") -> None:
+    async def clear_mission(
+        self, ros_node, *, reason: str = "cleared", offboard_ctrl=None
+    ) -> None:
         """Cancel any active run, force spray OFF, and reset to unloaded IDLE."""
-        await self.cancel_and_drain(ros_node, reason=reason)
+        await self.cancel_and_drain(
+            ros_node, reason=reason, offboard_ctrl=offboard_ctrl
+        )
         self._points = []
         self._resolved_points = []
         self._config = None
@@ -652,96 +996,163 @@ class PointMissionOrchestrator:
         self._task = None
         self._status = self._empty_status(last_transition=reason)
 
-    async def cancel_and_drain(self, ros_node, *, reason: str = "cancelled") -> None:
+    async def cancel_and_drain(
+        self,
+        ros_node,
+        *,
+        reason: str = "cancelled",
+        offboard_ctrl=None,
+    ) -> None:
         """Cancel the active run and guarantee cleanup.
 
-        Cleanup (gate cancellation, task/run-token reset, dwell cancel, forced
-        spray OFF, hold cleanup) is unconditional: a slow/hung task unwind that
-        exceeds the drain budget logs a warning and proceeds with cleanup. This
-        method never raises on drain timeout, so stop/abort/clear/start-replace
-        cannot wedge or surface a 500 solely because the task took >1 s to drain.
+        Nested try/finally ensures task-drain timeout, ``CancelledError``, and
+        intermediate cleanup exceptions cannot skip dwell cancel or forced OFF.
         """
         run, task = self._run_token, self._task
-        # 1) Gate cancellation — always, even before we touch the task.
-        if run is not None:
-            run.cancel_event.set()
-            run.pause_requested = False
-            if run.continue_gate is not None and not run.continue_gate.done():
-                run.continue_gate.cancel()
-            if run.resume_gate is not None and not run.resume_gate.done():
-                run.resume_gate.cancel()
-            self._write(
-                run,
-                state=PointMissionState.ABORTING,
-                last_transition=reason,
-                ready=False,
-                waiting_for_continue=False,
-                run_active=False,
-            )
-        # 2) Best-effort drain. A timeout here must NOT skip the cleanup below;
-        #    the task is shielded and finishes its own spray-off in background.
-        if task is not None and not task.done():
-            task.cancel()
+        dwell_cancel_result: dict[str, Any] | None = None
+        spray_off_result: dict[str, Any] | None = None
+        recovery_required = False
+        terminal_failure_reason = ""
+        terminal_safety_ok = True
+        try:
+            if run is not None:
+                run.cancel_event.set()
+                run.pause_requested = False
+                if run.continue_gate is not None and not run.continue_gate.done():
+                    run.continue_gate.cancel()
+                if run.resume_gate is not None and not run.resume_gate.done():
+                    run.resume_gate.cancel()
+                self._write(
+                    run,
+                    state=PointMissionState.ABORTING,
+                    last_transition=reason,
+                    ready=False,
+                    waiting_for_continue=False,
+                    run_active=False,
+                )
+            self._invalidate_dwell_identity(run)
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(task), timeout=self._DRAIN_TIMEOUT_S
+                    )
+                except asyncio.CancelledError:
+                    pass
+                except asyncio.TimeoutError:
+                    self._record(
+                        "error",
+                        f"point mission cancellation did not drain within "
+                        f"{self._DRAIN_TIMEOUT_S}s ({reason}); forcing cleanup",
+                    )
+                except Exception:
+                    pass
+        finally:
             try:
-                await asyncio.wait_for(
-                    asyncio.shield(task), timeout=self._DRAIN_TIMEOUT_S
-                )
-            except asyncio.CancelledError:
-                pass
-            except asyncio.TimeoutError:
-                self._record(
-                    "error",
-                    f"point mission cancellation did not drain within "
-                    f"{self._DRAIN_TIMEOUT_S}s ({reason}); forcing cleanup",
-                )
-            except Exception:
-                # The run owns failure reporting; replacement only guarantees drain.
-                pass
-        # 3) Forced spray OFF — mandatory confirm for stop/abort/clear/replace.
-        #    Bounded so a hung spray service cannot wedge the stop; the OFF
-        #    command itself is published synchronously inside (before any
-        #    awaited service), so OFF intent is guaranteed even on timeout.
-        #    Failure to confirm is recorded, never raised (no 500/wedge).
-        if ros_node is not None:
-            try:
-                await asyncio.wait_for(
-                    self._force_spray_off_confirmed(ros_node, require_confirm=True),
-                    timeout=self._DRAIN_TIMEOUT_S,
-                )
-            except asyncio.CancelledError:
-                raise
-            except asyncio.TimeoutError:
-                self._record(
-                    "error",
-                    f"forced spray-off during {reason} exceeded "
-                    f"{self._DRAIN_TIMEOUT_S}s; OFF commanded, confirmation skipped",
-                )
-            except Exception as exc:
-                self._record(
-                    "error",
-                    f"forced spray-off during {reason} not confirmed: {exc}",
-                )
-        # 4) Task/run-token + status cleanup — always runs.
-        if self._run_token is run:
-            self._task = None
-            self._run_token = None
-            self._write(
-                run,
-                active_dwell=False,
-                dwell_remaining_s=0.0,
-                active_dwell_command_id=None,
-                run_active=False,
-                waiting_for_continue=False,
-            )
+                if ros_node is not None:
+                    try:
+                        dwell_cancel_result = await self._cancel_dwell_service(ros_node)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        dwell_cancel_result = {
+                            "success": False,
+                            "message": str(exc),
+                        }
+            finally:
+                try:
+                    if ros_node is not None:
+                        try:
+                            spray_off_result = await self._force_spray_off_with_result(
+                                ros_node, require_confirm=True
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            spray_off_result = {
+                                "success": False,
+                                "message": str(exc),
+                                "recovery_required": True,
+                            }
+                finally:
+                    if dwell_cancel_result is not None and not dwell_cancel_result.get(
+                        "success", False
+                    ):
+                        recovery_required = True
+                        terminal_safety_ok = False
+                        terminal_failure_reason = (
+                            dwell_cancel_result.get("message")
+                            or "dwell cancel failed during cancellation"
+                        )
+                    if spray_off_result is not None and (
+                        spray_off_result.get("recovery_required")
+                        or not spray_off_result.get("success", False)
+                    ):
+                        recovery_required = True
+                        terminal_safety_ok = False
+                        terminal_failure_reason = (
+                            spray_off_result.get("failure_reason")
+                            or spray_off_result.get("message")
+                            or terminal_failure_reason
+                            or "spray OFF not confirmed during cancellation"
+                        )
+                        self._record(
+                            "error",
+                            f"forced spray-off during {reason} not confirmed: "
+                            f"{terminal_failure_reason}",
+                        )
+                    if reason in _PARENT_ABORT_REASONS:
+                        parent = await self._parent_abort_terminal(
+                            offboard_ctrl, run, reason=reason
+                        )
+                        if parent is not None and not parent.get("success", False):
+                            recovery_required = True
+                            terminal_safety_ok = False
+                            terminal_failure_reason = (
+                                terminal_failure_reason
+                                or parent.get("message", "")
+                            )
+                    if self._run_token is run:
+                        self._write(
+                            run,
+                            active_dwell=False,
+                            dwell_remaining_s=0.0,
+                            active_dwell_command_id=None,
+                            active_dwell_command_revision=None,
+                            active_dwell_configuration_revision=None,
+                            active_dwell_point_index=None,
+                            active_dwell_source_index=None,
+                            run_active=False,
+                            waiting_for_continue=False,
+                            dwell_cancel_result=dwell_cancel_result,
+                            spray_off_result=spray_off_result,
+                            recovery_required=recovery_required,
+                            terminal_safety_ok=terminal_safety_ok,
+                            terminal_failure_reason=terminal_failure_reason,
+                            terminal_safety_reason=terminal_failure_reason,
+                        )
+                        self._task = None
+                        self._run_token = None
 
-    async def abort(self, ros_node) -> None:
-        await self.cancel_and_drain(ros_node, reason="abort")
+    async def abort(self, ros_node, offboard_ctrl=None) -> None:
+        await self.cancel_and_drain(
+            ros_node, reason="abort", offboard_ctrl=offboard_ctrl
+        )
 
-    async def stop_mission(self, ros_node, hold_owner, *, reason: str = "stopped") -> None:
+    async def stop_mission(
+        self,
+        ros_node,
+        hold_owner,
+        *,
+        reason: str = "stopped",
+        offboard_ctrl=None,
+    ) -> None:
         """Non-resumable stop — drain task and release hold."""
         if hold_owner is not None:
             hold_owner.deactivate(ros_node)
-        await self.cancel_and_drain(ros_node, reason=reason)
+        await self.cancel_and_drain(
+            ros_node, reason=reason, offboard_ctrl=offboard_ctrl
+        )
 
     async def pause_mission(self, ros_node, hold_owner) -> tuple[bool, str, int]:
         if self._config is None or not self._points:
@@ -858,7 +1269,9 @@ class PointMissionOrchestrator:
     async def start(self, ros_node, offboard_ctrl, hold_owner=None) -> tuple[bool, str]:
         if self._config is None or not self._points:
             return False, "point mission not loaded"
-        await self.cancel_and_drain(ros_node, reason="start_replace")
+        await self.cancel_and_drain(
+            ros_node, reason="start_replace", offboard_ctrl=offboard_ctrl
+        )
         if not self._resolved_points:
             try:
                 self.prepare(ros_node.get_state())
@@ -868,7 +1281,17 @@ class PointMissionOrchestrator:
                 self._status.last_failure_reason = str(exc)
                 self._status.ready = False
                 return False, str(exc)
-        run = PointMissionRun(self._generation, self._status.mission_id, asyncio.Event())
+        parent_id = (
+            getattr(offboard_ctrl, "running_mission_id", None)
+            or getattr(offboard_ctrl, "loaded_mission_id", None)
+            or self._status.mission_id
+        )
+        run = PointMissionRun(
+            self._generation,
+            self._status.mission_id,
+            asyncio.Event(),
+            parent_mission_id=str(parent_id or ""),
+        )
         self._run_token = run
         self._spray_ever_on = False
         self._write(
@@ -888,6 +1311,12 @@ class PointMissionOrchestrator:
             active_dwell_command_id=None,
             terminal_safety_ok=True,
             terminal_safety_reason="",
+            parent_mission_id=run.parent_mission_id,
+            point_mission_generation=run.generation,
+            recovery_required=False,
+            terminal_failure_reason="",
+            dwell_cancel_result=None,
+            spray_off_result=None,
         )
         self._task = asyncio.create_task(
             self._run(run, ros_node, offboard_ctrl, hold_owner),
@@ -960,8 +1389,6 @@ class PointMissionOrchestrator:
             f"point mission GPS-safety FAIL during {phase} at point "
             f"{self._status.current_point_index}: {verdict.reason}",
         )
-        await ros_node.cancel_spray_dwell_async()
-        ros_node.publish_spray_manual(False)
         await self._confirm_spray_off(run, ros_node, require_confirm=dwell_cancelled)
         state = ros_node.get_state()
         north = float(state.get("pos_n", 0.0))
@@ -1014,8 +1441,6 @@ class PointMissionOrchestrator:
             f"point mission pausing ({pause_reason}) during {phase} at point "
             f"{self._status.current_point_index}",
         )
-        await ros_node.cancel_spray_dwell_async()
-        ros_node.publish_spray_manual(False)
         await self._confirm_spray_off(run, ros_node, require_confirm=dwell_cancelled)
         state = ros_node.get_state()
         north = float(state.get("pos_n", 0.0))
@@ -1155,7 +1580,14 @@ class PointMissionOrchestrator:
                 self._update_live_diagnostics(run, ros_node, point, params)
                 is_last = index >= total - 1
                 await self._execute_point(
-                    run, ros_node, hold_owner, point, params, index, is_last=is_last
+                    run,
+                    ros_node,
+                    hold_owner,
+                    offboard_ctrl,
+                    point,
+                    params,
+                    index,
+                    is_last=is_last,
                 )
                 # Pure mark=false legs never engage spray, so a stale spray node
                 # must not fail navigation. Marked legs require confirmed OFF.
@@ -1182,16 +1614,34 @@ class PointMissionOrchestrator:
                         state=PointMissionState.ADVANCING,
                         last_transition=f"advanced:{index}",
                     )
-            # Mandatory terminal spray-off when spray was ever engaged this run;
-            # raises (→ FAILED) only if a sprayed mission cannot confirm OFF.
             await self._confirm_spray_off(
                 run, ros_node, require_confirm=self._spray_ever_on
             )
-            # Mission-work is complete here. Terminal HOLD/spray-recheck failures
-            # are degraded *terminal safety*, not failed mission work: report
-            # COMPLETED but flag terminal_safety_ok=False truthfully.
+            if self._status.active_dwell:
+                raise RuntimeError("point completion blocked: dwell still active")
+            completion = None
+            if self._is_current(run) and offboard_ctrl is not None:
+                completion = await offboard_ctrl.complete_async()
+            elif offboard_ctrl is None:
+                raise RuntimeError("parent controller unavailable for completion")
+            if completion is None or not completion.get("success", False):
+                reason = (
+                    (completion or {}).get("message", "")
+                    or "parent completion terminalization failed"
+                )
+                warnings = "; ".join((completion or {}).get("warnings") or [])
+                if warnings:
+                    reason = f"{reason}: {warnings}"
+                await self._fail_point_with_cleanup(
+                    run,
+                    ros_node,
+                    offboard_ctrl,
+                    reason=reason,
+                    terminal_reason="completion_degraded",
+                )
+                return
             terminal_safety_ok = True
-            terminal_safety_reason = ""
+            terminal_failure_reason = ""
             if self._resolved_points and hold_owner is not None:
                 last = self._resolved_points[-1]
                 hold_owner.activate(
@@ -1203,15 +1653,13 @@ class PointMissionOrchestrator:
                 self._merge_hold_status(run, hold_owner, ros_node)
                 if not hold_owner.active:
                     terminal_safety_ok = False
-                    terminal_safety_reason = "terminal hold failed to activate"
-                    self._record("error", f"terminal safety degraded: {terminal_safety_reason}")
+                    terminal_failure_reason = "terminal hold failed to activate"
+                    self._record(
+                        "error",
+                        f"terminal safety degraded: {terminal_failure_reason}",
+                    )
                 else:
                     hold_owner.refresh(ros_node)
-                # Spray already confirmed OFF above; this re-check is best-effort.
-                try:
-                    await self._confirm_spray_off(run, ros_node, require_confirm=False)
-                except Exception as exc:  # pragma: no cover - best effort
-                    self._record("warning", f"post-hold spray re-confirm: {exc}")
             self._write(
                 run,
                 state=PointMissionState.COMPLETED,
@@ -1226,48 +1674,56 @@ class PointMissionOrchestrator:
                 mark_enabled=False,
                 resume_available=False,
                 terminal_safety_ok=terminal_safety_ok,
-                terminal_safety_reason=terminal_safety_reason,
+                terminal_safety_reason=terminal_failure_reason,
+                terminal_failure_reason=terminal_failure_reason,
+                recovery_required=not terminal_safety_ok,
+                spray_off_result=(completion or {}).get("spray_off_result"),
             )
-            if self._is_current(run) and offboard_ctrl is not None:
-                self._mark_offboard_terminal(offboard_ctrl, MissionState.COMPLETED)
         except asyncio.CancelledError:
-            self._write(
-                run,
-                state=PointMissionState.FAILED,
-                last_error="cancelled",
-                last_failure_reason="cancelled",
-                last_transition="cancelled",
-                ready=False,
-                run_active=False,
-                waiting_for_continue=False,
-            )
-            if self._is_current(run) and offboard_ctrl is not None:
-                self._mark_offboard_terminal(offboard_ctrl, MissionState.ABORTED)
+            if self._is_current(run):
+                self._write(
+                    run,
+                    state=PointMissionState.FAILED,
+                    last_error="cancelled",
+                    last_failure_reason="cancelled",
+                    last_transition="operator_abort",
+                    ready=False,
+                    run_active=False,
+                    waiting_for_continue=False,
+                )
             raise
+        except SprayRuntimeSchemaError as exc:
+            await self._fail_point_with_cleanup(
+                run,
+                ros_node,
+                offboard_ctrl,
+                reason=str(exc),
+                terminal_reason="schema_fault",
+            )
+            self._record("error", f"point mission spray schema fault: {exc}")
         except Exception as exc:
             terminal = (
                 PointMissionState.FAILED_GPS_SAFETY
                 if self._status.state == PointMissionState.FAILED_GPS_SAFETY
                 else PointMissionState.FAILED
             )
-            self._write(
+            await self._fail_point_with_cleanup(
                 run,
+                ros_node,
+                offboard_ctrl,
+                reason=str(exc),
+                terminal_reason="failed",
                 state=terminal,
-                last_error=str(exc),
-                last_failure_reason=str(exc),
-                last_transition="failed",
-                ready=False,
-                run_active=False,
-                waiting_for_continue=False,
             )
-            if self._is_current(run) and offboard_ctrl is not None:
-                self._mark_offboard_terminal(offboard_ctrl, MissionState.ERROR)
             self._record("error", f"point mission failed: {exc}")
         finally:
-            # Terminal safety net. Must NOT escape as an unretrieved task
-            # exception (success path is not awaited). Always command OFF;
-            # record honest degraded diagnostics if a sprayed run can't confirm.
-            if ros_node is not None:
+            cancelled = run.cancel_event.is_set()
+            if cancelled:
+                self._write(run, run_active=False, waiting_for_continue=False)
+            elif ros_node is not None:
+                # Terminal safety net. Must NOT escape as an unretrieved task
+                # exception (success path is not awaited). Always command OFF;
+                # record honest degraded diagnostics if a sprayed run can't confirm.
                 try:
                     confirmed = await self._force_spray_off_confirmed(
                         ros_node, require_confirm=False
@@ -1374,7 +1830,16 @@ class PointMissionOrchestrator:
         )
 
     async def _execute_point(
-        self, run, ros_node, hold_owner, point, params, index, *, is_last: bool = False
+        self,
+        run,
+        ros_node,
+        hold_owner,
+        offboard_ctrl,
+        point,
+        params,
+        index,
+        *,
+        is_last: bool = False,
     ) -> None:
         phase = "navigating"
         started = time.monotonic()
@@ -1416,7 +1881,15 @@ class PointMissionOrchestrator:
                 self._write(run, state=PointMissionState.DWELLING, last_transition=f"dwelling:{index}")
                 self._command_seq += 1
                 command_id = self._command_seq
-                self._write(run, active_dwell_command_id=command_id, dwell_cancelled=False)
+                command_revision = time.monotonic_ns()
+                self._bind_dwell_identity(
+                    run,
+                    command_id=command_id,
+                    command_revision=command_revision,
+                    point_index=index,
+                    source_index=point.source_index,
+                )
+                self._write(run, dwell_cancelled=False)
                 dwell_s = float(point.dwell_s or params.default_dwell_s)
                 ok, why = await ros_node.start_spray_dwell_async(
                     mission_id=run.mission_id,
@@ -1426,12 +1899,27 @@ class PointMissionOrchestrator:
                     configuration_revision=self._config.revision,
                 )
                 if not ok:
+                    await self._handle_dwell_start_failure(
+                        run,
+                        ros_node,
+                        offboard_ctrl,
+                        command_id=command_id,
+                        point_index=index,
+                        service_error=why or "dwell rejected",
+                    )
                     raise RuntimeError(why or "dwell rejected")
                 # Spray has now been engaged this run → terminal/cancel cleanup
                 # must require confirmed OFF.
                 self._spray_ever_on = True
                 next_phase = await self._wait_dwell_complete(
-                    run, ros_node, hold_owner, point, dwell_s, command_id, params
+                    run,
+                    ros_node,
+                    hold_owner,
+                    offboard_ctrl,
+                    point,
+                    dwell_s,
+                    command_id,
+                    params,
                 )
                 self._write(run, active_dwell_command_id=None)
                 if hold_owner is not None and not is_last:
@@ -1516,8 +2004,80 @@ class PointMissionOrchestrator:
                 )
             await asyncio.sleep(0.05)
 
+    async def _handle_dwell_start_failure(
+        self,
+        run: PointMissionRun,
+        ros_node,
+        offboard_ctrl,
+        *,
+        command_id: int,
+        point_index: int,
+        service_error: str,
+    ) -> None:
+        status = ros_node.get_spray_runtime_status()
+        if self._dwell_identity_matches(run, status, offboard_ctrl) and bool(
+            status.get("active_dwell", False)
+        ):
+            self._record(
+                "warning",
+                f"dwell start reported failure ({service_error}) but runtime shows active; "
+                "cancelling",
+            )
+            self._invalidate_dwell_identity(run)
+            dwell_cancel = await self._cancel_dwell_service(ros_node)
+            spray_off = await self._force_spray_off_with_result(
+                ros_node, require_confirm=True
+            )
+            recovery = bool(
+                spray_off.get("recovery_required")
+                or not spray_off.get("success", False)
+            )
+            self._write(
+                run,
+                dwell_cancel_result=dwell_cancel,
+                spray_off_result=spray_off,
+                recovery_required=recovery,
+                terminal_safety_ok=not recovery,
+                terminal_failure_reason=service_error if recovery else "",
+            )
+
+    async def _handle_dwell_identity_fault(
+        self,
+        run: PointMissionRun,
+        ros_node,
+        offboard_ctrl,
+        *,
+        reason: str,
+    ) -> None:
+        self._invalidate_dwell_identity(run)
+        dwell_cancel = await self._cancel_dwell_service(ros_node)
+        spray_off = await self._force_spray_off_with_result(
+            ros_node, check_cancel=lambda: self._check_cancel(run), require_confirm=True
+        )
+        recovery = bool(
+            spray_off.get("recovery_required") or not spray_off.get("success", False)
+        )
+        await self._parent_abort_terminal(offboard_ctrl, run, reason="dwell_fault")
+        self._write(
+            run,
+            dwell_cancel_result=dwell_cancel,
+            spray_off_result=spray_off,
+            recovery_required=recovery,
+            terminal_safety_ok=not recovery,
+            terminal_failure_reason=reason,
+        )
+        raise RuntimeError(reason)
+
     async def _wait_dwell_complete(
-        self, run, ros_node, hold_owner, point, dwell_s, command_id, params
+        self,
+        run,
+        ros_node,
+        hold_owner,
+        offboard_ctrl,
+        point,
+        dwell_s,
+        command_id,
+        params,
     ) -> str:
         deadline = time.monotonic() + dwell_s + 1.0
         observed_active = False
@@ -1539,14 +2099,36 @@ class PointMissionOrchestrator:
             if drift is not None:
                 return drift
             status = ros_node.get_spray_runtime_status()
-            if status.get("status_stale", True):
+            self._validate_dwell_poll_status(status)
+            if status["status_stale"]:
                 raise RuntimeError("spray runtime status is stale")
+            fingerprint = self._spray_runtime_fingerprint(status)
+            if run.spray_runtime_fingerprint is None:
+                run.spray_runtime_fingerprint = fingerprint
+            elif fingerprint[:2] != run.spray_runtime_fingerprint[:2]:
+                await self._handle_dwell_identity_fault(
+                    run,
+                    ros_node,
+                    offboard_ctrl,
+                    reason="spray runtime restarted during dwell",
+                )
+            elif fingerprint[2] + 1e-3 < run.spray_runtime_fingerprint[2]:
+                await self._handle_dwell_identity_fault(
+                    run,
+                    ros_node,
+                    offboard_ctrl,
+                    reason="spray runtime timestamp regressed during dwell",
+                )
+            if not self._dwell_identity_matches(run, status, offboard_ctrl):
+                await self._handle_dwell_identity_fault(
+                    run,
+                    ros_node,
+                    offboard_ctrl,
+                    reason="dwell identity mismatch",
+                )
             if status.get("last_error") or not status.get("ready", False):
                 raise RuntimeError(status.get("last_error") or "spray node is not ready")
-            seen_id = status.get("dwell_command_id")
-            if seen_id is not None and int(seen_id) != command_id:
-                raise RuntimeError("spray dwell command mismatch")
-            active = bool(status.get("active_dwell", False))
+            active = status["active_dwell"]
             self._write(
                 run,
                 active_dwell=active,
@@ -1556,23 +2138,35 @@ class PointMissionOrchestrator:
             if active:
                 observed_active = True
             elif observed_active:
-                if not status.get("commanded_on", False) and status.get("confirmed_off", False):
-                    self._write(
-                        run,
-                        active_dwell=False,
-                        dwell_remaining_s=0.0,
-                        active_dwell_command_id=None,
-                    )
+                if (
+                    not status["commanded_on"]
+                    and status["confirmed_off"]
+                    and status["off_acknowledged"]
+                ):
+                    self._invalidate_dwell_identity(run)
                     return "done"
             await asyncio.sleep(0.05)
-        raise TimeoutError("dwell never became active" if not observed_active else "dwell completion timeout")
+        raise TimeoutError(
+            "dwell never became active" if not observed_active else "dwell completion timeout"
+        )
 
     async def _confirm_spray_off(self, run, ros_node, *, require_confirm: bool = True) -> bool:
-        return await self._force_spray_off_confirmed(
+        result = await self._force_spray_off_with_result(
             ros_node,
             check_cancel=lambda: self._check_cancel(run),
             require_confirm=require_confirm,
+            timeout_s=1.0,
         )
+        if result.get("success"):
+            return True
+        if require_confirm:
+            raise TimeoutError(result.get("message") or "spray OFF not confirmed")
+        self._record(
+            "warning",
+            "spray OFF commanded but not confirmed (spray status stale/unavailable); "
+            "proceeding for non-spraying leg",
+        )
+        return False
 
     async def _force_spray_off_confirmed(
         self, ros_node, *, check_cancel=None, require_confirm: bool = True
@@ -1587,25 +2181,15 @@ class PointMissionOrchestrator:
         spray node as a logged warning and returns ``False`` rather than
         failing the mission. Returns whether confirmation was observed.
         """
-        # Publish the manual-OFF command FIRST: it is synchronous and immediate,
-        # so the OFF intent is guaranteed even if the (slower, network) dwell
-        # cancel service stalls. Then issue the authoritative dwell cancel.
-        ros_node.publish_spray_manual(False)
-        await ros_node.cancel_spray_dwell_async()
-        deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline:
-            if check_cancel is not None:
-                check_cancel()
-            status = ros_node.get_spray_runtime_status()
-            if (
-                not status.get("status_stale", True)
-                and status.get("confirmed_off", False)
-                and not status.get("commanded_on", True)
-            ):
-                return True
-            await asyncio.sleep(0.05)
+        result = await force_spray_off_confirmed(
+            ros_node,
+            timeout_s=1.0,
+            check_cancel=check_cancel,
+        )
+        if result.success:
+            return True
         if require_confirm:
-            raise TimeoutError("spray OFF was not confirmed")
+            raise TimeoutError(result.message)
         self._record(
             "warning",
             "spray OFF commanded but not confirmed (spray status stale/unavailable); "

@@ -89,7 +89,9 @@ async def clear_mission():
     if hold_owner is not None:
         hold_owner.deactivate(ros_node)
     if point_mission is not None:
-        await point_mission.clear_mission(ros_node, reason="cleared")
+        await point_mission.clear_mission(
+            ros_node, reason="cleared", offboard_ctrl=offboard_ctrl
+        )
     try:
         status = await offboard_ctrl.clear_mission_async()
     except MissionClearConflict as exc:
@@ -192,7 +194,7 @@ async def abort_mission():
     if hold_owner is not None:
         hold_owner.deactivate(ros_node)
     if point_mission is not None:
-        await point_mission.abort(ros_node)
+        await point_mission.abort(ros_node, offboard_ctrl=offboard_ctrl)
     result = await offboard_ctrl.abort_async()
     if mission_capture is not None:
         mission_capture.record_terminal(

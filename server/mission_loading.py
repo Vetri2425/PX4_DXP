@@ -6,7 +6,22 @@ import asyncio
 from typing import Optional
 
 from config import POSE_STALE_MS, SPRAY_DEFAULT_ON
+from logging_setup import get_logger
 from models import MissionState
+from spray_safety import cleanup_mission_start_failure
+
+log = get_logger("server.mission_loading")
+
+
+def _spray_startup_block_reason() -> str | None:
+    try:
+        from main import spray_startup_reconciliation
+    except Exception:
+        return None
+    if spray_startup_reconciliation is None:
+        return None
+    return spray_startup_reconciliation.block_reason()
+
 
 MIN_MISSION_POINTS = 2
 LOAD_ALLOWED_STATES = {
@@ -76,6 +91,9 @@ async def load_path_for_controller(
 ) -> list[tuple[float, float]]:
     """Load and validate a path without blocking the FastAPI event loop."""
     async with _load_lock:
+        startup_block = _spray_startup_block_reason()
+        if startup_block:
+            raise MissionLoadConflict(startup_block)
         if offboard_ctrl.has_protected_mission:
             raise MissionLoadConflict(
                 f"Loaded mission {offboard_ctrl.loaded_mission_id!r} is staged/surveyed; "
@@ -119,6 +137,9 @@ async def start_mission_for_controller(
     start_request: dict | None = None,
 ) -> tuple[bool, str]:
     """Start the resident mission, preserving legacy load-and-start for local paths."""
+    startup_block = _spray_startup_block_reason()
+    if startup_block:
+        raise MissionLoadConflict(startup_block)
     if offboard_ctrl.has_protected_mission and name:
         raise MissionLoadConflict(
             f"Loaded mission {offboard_ctrl.loaded_mission_id!r} is staged/surveyed; "
@@ -169,6 +190,7 @@ async def start_mission_for_controller(
         if capture_coordinator is not None:
             capture_coordinator.record_placement(capture_id, payload)
 
+    needs_point_cleanup = False
     try:
         if offboard_ctrl.spray_mode == "point":
             from main import point_mission
@@ -186,11 +208,15 @@ async def start_mission_for_controller(
         if ok and offboard_ctrl.spray_mode == "point":
             from main import hold_owner
 
-            started, why = await point_mission.start(
-                ros_node, offboard_ctrl, hold_owner
-            )
+            try:
+                started, why = await point_mission.start(
+                    ros_node, offboard_ctrl, hold_owner
+                )
+            except Exception:
+                needs_point_cleanup = True
+                raise
             if not started:
-                await offboard_ctrl.stop_async()
+                needs_point_cleanup = True
                 ok, message = False, why
     except Exception as exc:
         if capture_coordinator is not None:
@@ -201,6 +227,23 @@ async def start_mission_for_controller(
                 message=str(exc),
             )
         raise
+    finally:
+        if needs_point_cleanup and ros_node is not None:
+            try:
+                spray_off_result = await cleanup_mission_start_failure(
+                    ros_node, offboard_ctrl
+                )
+                if (
+                    spray_off_result.get("attempted")
+                    and spray_off_result.get("live")
+                    and not spray_off_result.get("success")
+                ):
+                    log.warning(
+                        "point mission start cleanup: spray OFF not confirmed: %s",
+                        spray_off_result,
+                    )
+            except Exception:
+                log.exception("point mission start cleanup failed")
     if capture_coordinator is not None:
         capture_coordinator.record_start_result(
             capture_id,

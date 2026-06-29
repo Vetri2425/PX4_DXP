@@ -1,4 +1,10 @@
-"""Atomic spray mission configuration plumbing for the FastAPI server."""
+"""Atomic spray mission configuration plumbing for the FastAPI server.
+
+Ownership: ``server/spray_mission_config.py`` is the sole production module for
+mission-bound spray configuration apply/validate on the companion server.
+There is intentionally no ``src/spray_mission_config.py`` duplicate; ROS-side
+configuration is owned by ``src/spray_config.py`` plus ``spray_controller_node``.
+"""
 
 from __future__ import annotations
 

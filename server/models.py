@@ -93,6 +93,8 @@ class SprayTestRequest(BaseModel):
     # Clamped to MAX_SPRAY_TEST_DURATION_S; the node's
     # manual_override_timeout_s is the hard backstop.
     duration_s: Optional[float] = None
+    # Bench-test ON requires explicit operator diagnostic authorization.
+    diagnostic_authorized: bool = False
 
 
 class SprayModeConfig(BaseModel):
@@ -128,6 +130,21 @@ class SprayModeConfig(BaseModel):
     obstacle_signal_max_age_s: float = 2.0
     max_spray_speed_mps: float = 1.0
     unsafe_speed_behavior: Literal["BLOCK_SPRAY", "CLAMP_PWM"] = "BLOCK_SPRAY"
+    max_along_track_heading_error_deg: float = 30.0
+    max_cross_track_speed_mps: float = 0.10
+    max_reverse_speed_tolerance_mps: float = 0.03
+    max_projection_jump_m: float = 0.50
+    max_backward_projection_jump_m: float = 0.10
+    projection_ambiguity_distance_m: float = 0.03
+    max_lead_distance_m: float = 0.50
+    min_on_distance_m: float = 0.05
+    min_off_distance_m: float = 0.05
+    flow_mode: Literal["fixed", "mapped", "disabled"] = "mapped"
+    min_target_flow: float = 0.0
+    max_target_flow: float = 1.0
+    max_pwm_change_per_s: float = 500.0
+    low_speed_anti_puddle_behavior: Literal["block"] = "block"
+    high_speed_underflow_behavior: Literal["block", "clamp"] = "block"
     calibration_profile_id: str = "factory_default"
     calibration_profile_version: int = 1
     target_paint_density: float = 1.0
@@ -159,6 +176,21 @@ class ContinuousModeRequest(BaseModel):
     max_xtrack_error_m: float = Field(0.10, gt=0.0)
     nozzle_forward_offset_m: float = 0.0
     nozzle_lateral_offset_m: float = 0.0
+    max_along_track_heading_error_deg: float = Field(30.0, gt=0.0, le=180.0)
+    max_cross_track_speed_mps: float = Field(0.10, ge=0.0)
+    max_reverse_speed_tolerance_mps: float = Field(0.03, ge=0.0)
+    max_projection_jump_m: float = Field(0.50, ge=0.0)
+    max_backward_projection_jump_m: float = Field(0.10, ge=0.0)
+    projection_ambiguity_distance_m: float = Field(0.03, ge=0.0)
+    max_lead_distance_m: float = Field(0.50, ge=0.0)
+    min_on_distance_m: float = Field(0.05, ge=0.0)
+    min_off_distance_m: float = Field(0.05, ge=0.0)
+    flow_mode: Literal["fixed", "mapped", "disabled"] = "mapped"
+    min_target_flow: float = Field(0.0, ge=0.0)
+    max_target_flow: float = Field(1.0, gt=0.0)
+    max_pwm_change_per_s: float = Field(500.0, ge=0.0)
+    low_speed_anti_puddle_behavior: Literal["block"] = "block"
+    high_speed_underflow_behavior: Literal["block", "clamp"] = "block"
     calibration_profile_id: str = "factory_default"
     calibration_profile_version: int = Field(1, ge=1)
     target_paint_density: float = Field(1.0, gt=0.0)
@@ -244,13 +276,74 @@ class TelemetryData(BaseModel):
     measured_speed_m_s: Optional[float] = None
     spraying: Optional[bool] = None
     marking_state: Optional[Literal["marking", "transit", "off"]] = None
-    # Spray actuator truth (F-05): `spraying` is the commanded belief only —
-    # these report what the spray node actually confirmed and why it is gated.
+    # Spray actuator truth (Task_17): `spraying` is MAVROS-command-accepted ON
+    # only — not confirmed physical paint flow. Stale runtime status suppresses
+    # both `spraying` and `marking_state="marking"`.
     commanded_on: Optional[bool] = None
     confirmed_off: Optional[bool] = None
+    spray_state: Optional[str] = None
+    desired_on: Optional[bool] = None
+    pending_command: Optional[bool] = None
+    accepted_command_on: Optional[bool] = None
+    accepted_command_off: Optional[bool] = None
+    off_acknowledged: Optional[bool] = None
+    physical_feedback_supported: Optional[bool] = None
+    physical_actuator_state: Optional[str] = None
+    spray_runtime_status_age_s: Optional[float] = None
+    spray_faulted: Optional[bool] = None
+    spray_recovery_required: Optional[bool] = None
+    last_spray_command_result: Optional[str] = None
+    last_spray_command_reason: Optional[str] = None
     spray_safety_reason: Optional[str] = None
+    along_track_speed_mps: Optional[float] = None
+    projection_ambiguous: Optional[bool] = None
+    flow_under_capacity: Optional[bool] = None
+    geometry_hash: Optional[str] = None
+    runtime_spray_geometry_hash: Optional[str] = None
     gps_safety_ok: Optional[bool] = None
     manual_resume_required: Optional[bool] = None
+    pending_value: Optional[float] = None
+    physical_confirmation_available: Optional[bool] = None
+    physical_feedback_stale: Optional[bool] = None
+    physical_feedback_age_s: Optional[float] = None
+    physical_off_confirmed: Optional[bool] = None
+    last_command_error: Optional[str] = None
+    projection_s: Optional[float] = None
+    projection_segment_index: Optional[int] = None
+    projection_xtrack_error_m: Optional[float] = None
+    projection_jump_m: Optional[float] = None
+    ambiguity_clearance_confidence: Optional[float] = None
+    cross_track_speed_mps: Optional[float] = None
+    velocity_heading_error_deg: Optional[float] = None
+    current_run_length_m: Optional[float] = None
+    next_run_length_m: Optional[float] = None
+    next_boundary_kind: Optional[str] = None
+    distance_to_boundary_m: Optional[float] = None
+    raw_on_lead_m: Optional[float] = None
+    bounded_on_lead_m: Optional[float] = None
+    raw_off_lead_m: Optional[float] = None
+    bounded_off_lead_m: Optional[float] = None
+    lead_clamped: Optional[bool] = None
+    lead_block_reason: Optional[str] = None
+    flow_mode: Optional[str] = None
+    target_flow: Optional[float] = None
+    target_pwm: Optional[float] = None
+    command_pwm: Optional[float] = None
+    pwm_ramp_limited: Optional[bool] = None
+    flow_capacity_limited: Optional[bool] = None
+    flow_clamp_reason: Optional[str] = None
+    dash_feasible: Optional[bool] = None
+    dash_feasibility_reason: Optional[str] = None
+    shortest_dash_on_run_m: Optional[float] = None
+    shortest_dash_off_gap_m: Optional[float] = None
+    dash_phase_reset: Optional[str] = None
+    dash_expected_speed_mps: Optional[float] = None
+    dash_feasibility_speed_source: Optional[str] = None
+    vehicle_state_age_s: Optional[float] = None
+    vehicle_state_stale: Optional[bool] = None
+    vehicle_state_block_reason: Optional[str] = None
+    geometry_spray_request: Optional[bool] = None
+    dry_run_active: Optional[bool] = None
     # FCU
     armed: Optional[bool] = None
     mode: Optional[str] = None
@@ -317,6 +410,16 @@ class PointMissionStatusResponse(BaseModel):
     mark_enabled: bool = True
     active_dwell: bool = False
     active_dwell_command_id: Optional[int] = None
+    parent_mission_id: str = ""
+    point_mission_generation: int = 0
+    active_dwell_command_revision: Optional[int] = None
+    active_dwell_configuration_revision: Optional[int] = None
+    active_dwell_point_index: Optional[int] = None
+    active_dwell_source_index: Optional[int] = None
+    recovery_required: bool = False
+    terminal_failure_reason: str = ""
+    dwell_cancel_result: Optional[dict] = None
+    spray_off_result: Optional[dict] = None
     dwell_remaining_s: float = 0.0
     last_failure_reason: str = ""
     last_transition: str = ""
@@ -335,6 +438,7 @@ class PointMissionStatusResponse(BaseModel):
     paused_point_index: Optional[int] = None
     resume_available: bool = False
     dwell_cancelled: bool = False
+    dwell_ownership_invalidated: bool = False
     setpoint_source: str = "rpp"
     hold_active: bool = False
     hold_north_m: Optional[float] = None
@@ -486,11 +590,16 @@ class PingResponse(BaseModel):
 class ArmResponse(BaseModel):
     success: bool
     message: str
+    spray_off_confirmed: Optional[bool] = None
+    spray_off_result: Optional[dict] = None
+    disarmed: Optional[bool] = None
 
 
 class ModeResponse(BaseModel):
     success: bool
     message: str
+    spray_off_confirmed: Optional[bool] = None
+    spray_off_result: Optional[dict] = None
 
 
 # ── Path planning request / response models ────────────────────────────────────

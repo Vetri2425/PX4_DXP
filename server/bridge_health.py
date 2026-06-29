@@ -36,6 +36,7 @@ from config import (
 )
 from logging_setup import get_logger
 from models import MissionState
+from spray_safety import force_spray_off_confirmed, spray_off_blocks_success
 
 log = get_logger("server.bridge")
 
@@ -70,6 +71,8 @@ class BridgeHealthManager:
         self._last_recovery_reason: Optional[str] = None
         self._observe_alerted = False  # one-shot "would-recover" alert in 3A
         self._last_snapshot: dict[str, Any] = {}
+        self._spray_recovery_required = False
+        self._spray_recovery_reason: Optional[str] = None
 
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
@@ -107,6 +110,8 @@ class BridgeHealthManager:
             "recovery_count": self._recovery_count,
             "last_recovery_ts": self._last_recovery_ts,
             "last_recovery_reason": self._last_recovery_reason,
+            "spray_recovery_required": self._spray_recovery_required,
+            "spray_recovery_reason": self._spray_recovery_reason,
             **self._last_snapshot,
         }
 
@@ -225,13 +230,31 @@ class BridgeHealthManager:
         self._last_recovery_reason = reason
         await self._transition(RECOVERING, f"restarting px4-dxp ({reason})")
 
-        # Mid-mission: best-effort graceful stop (don't block; bridge may be
-        # frozen so this can fail — PX4 OFFBOARD failsafe is the real net).
-        try:
-            if self._ctrl is not None and self._ctrl.state == MissionState.RUNNING:
+        # Mid-mission: confirm spray OFF, then best-effort soft stop. Bridge may
+        # be frozen so either step can fail — PX4 OFFBOARD failsafe is the net.
+        self._spray_recovery_required = False
+        self._spray_recovery_reason = None
+        if self._ctrl is not None and self._ctrl.state == MissionState.RUNNING:
+            if self._ros is not None:
+                try:
+                    spray_off = await force_spray_off_confirmed(
+                        self._ros, timeout_s=2.0
+                    )
+                    if spray_off_blocks_success(spray_off):
+                        self._spray_recovery_required = True
+                        self._spray_recovery_reason = spray_off.message
+                        self._record(
+                            "warning",
+                            f"bridge recovery: {spray_off.message}",
+                        )
+                except Exception:
+                    self._spray_recovery_required = True
+                    self._spray_recovery_reason = "spray OFF confirmation failed"
+                    log.exception("bridge recovery: force spray OFF failed")
+            try:
                 await asyncio.wait_for(self._ctrl.stop_async(), timeout=3.0)
-        except Exception:
-            log.warning("bridge recovery: best-effort stop_async failed/timed out")
+            except Exception:
+                log.warning("bridge recovery: best-effort stop_async failed/timed out")
 
         rc = await self._restart_px4dxp()
         await self._safe_emit(

@@ -65,23 +65,40 @@ def register_handlers(sio) -> None:
     @sio.on("arm")
     async def on_arm(sid, data):
         from main import ros_node, activity_log
+        from spray_safety import disarm_with_spray_safety
         if not _auth_ok(data):
             return await _emit_unauth(sio, sid)
         if ros_node is None:
             return
         arm_val = data.get("arm", True) if isinstance(data, dict) else bool(data)
-        ok, why = await ros_node.arm_async(arm_val)
-        verb = "Armed" if arm_val else "Disarmed"
-        activity_log.append({"timestamp": _now(),
-                              "level": "info" if ok else "error",
-                              "message": f"{verb} via socket: "
-                                         f"{'OK' if ok else f'FAILED ({why})'}"})
-        await sio.emit("arm_result",
-                       {"success": ok, "arm": arm_val, "message": why}, to=sid)
+        if arm_val:
+            ok, why = await ros_node.arm_async(True)
+            activity_log.append({"timestamp": _now(),
+                                  "level": "info" if ok else "error",
+                                  "message": f"Armed via socket: "
+                                             f"{'OK' if ok else f'FAILED ({why})'}"})
+            await sio.emit(
+                "arm_result",
+                {"success": ok, "arm": True, "message": why},
+                to=sid,
+            )
+            return
+        result = await disarm_with_spray_safety(ros_node)
+        activity_log.append(
+            {
+                "timestamp": _now(),
+                "level": "info" if result.success else "warning",
+                "message": f"Disarmed via socket: {result.message}",
+            }
+        )
+        payload = result.as_socket_payload(transition_key="arm", transition_value=False)
+        payload["arm"] = False
+        await sio.emit("arm_result", payload, to=sid)
 
     @sio.on("set_mode")
     async def on_set_mode(sid, data):
         from main import ros_node, activity_log
+        from spray_safety import set_mode_with_spray_safety
         if not _auth_ok(data):
             return await _emit_unauth(sio, sid)
         if ros_node is None:
@@ -98,13 +115,23 @@ def register_handlers(sio) -> None:
                 to=sid,
             )
             return
-        ok, why = await ros_node.set_mode_async(mode)
-        activity_log.append({"timestamp": _now(),
-                              "level": "info" if ok else "error",
-                              "message": f"set_mode {mode}: "
-                                         f"{'OK' if ok else f'FAILED ({why})'}"})
-        await sio.emit("mode_result",
-                       {"success": ok, "mode": mode, "message": why}, to=sid)
+        state = ros_node.get_state()
+        current_mode = str(state.get("mode", "UNKNOWN"))
+        result = await set_mode_with_spray_safety(
+            ros_node,
+            target_mode=str(mode),
+            current_mode=current_mode,
+        )
+        activity_log.append(
+            {
+                "timestamp": _now(),
+                "level": "info" if result.success else "warning",
+                "message": f"set_mode {mode}: {result.message}",
+            }
+        )
+        payload = result.as_socket_payload(transition_key="mode", transition_value=mode)
+        payload["mode"] = mode
+        await sio.emit("mode_result", payload, to=sid)
 
     @sio.on("emergency_stop")
     async def on_estop(sid, data=None):
@@ -261,7 +288,7 @@ def register_handlers(sio) -> None:
         if hold_owner is not None:
             hold_owner.deactivate(ros_node)
         if point_mission is not None:
-            await point_mission.abort(ros_node)
+            await point_mission.abort(ros_node, offboard_ctrl=offboard_ctrl)
         result = await offboard_ctrl.abort_async()
         if mission_capture is not None:
             mission_capture.record_terminal(

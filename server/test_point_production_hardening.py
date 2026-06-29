@@ -65,8 +65,14 @@ class StaleSprayRos(FakeRos):
             "dwell_remaining_s": 0.0,
             "commanded_on": False,
             "confirmed_off": False,
+            "off_acknowledged": False,
             "last_error": "",
             "dwell_command_id": None,
+            "dwell_mission_id": "",
+            "dwell_point_index": None,
+            "configuration_revision": 0,
+            "model_revision": 0,
+            "timestamp_monotonic_s": 0.0,
         }
 
 
@@ -183,7 +189,7 @@ async def test_hung_spray_service_stop_does_not_wedge():
     t0 = time.monotonic()
     await orch.stop_mission(ros, hold, reason="operator_stop")  # must not raise
     elapsed = time.monotonic() - t0
-    assert elapsed < 1.5, f"stop wedged for {elapsed:.2f}s"
+    assert elapsed < 2.5, f"stop wedged for {elapsed:.2f}s"
     # Cleanup ran regardless of the hung service.
     assert orch._task is None
     assert orch._run_token is None
@@ -212,7 +218,7 @@ async def test_hung_spray_service_abort_clear_do_not_wedge(op):
         await orch.abort(ros)
     else:
         await orch.clear_mission(ros, reason="cleared")
-    assert time.monotonic() - t0 < 1.5
+    assert time.monotonic() - t0 < 2.5
     assert orch._task is None
     assert orch._run_token is None
     assert not orch.is_active()

@@ -14,6 +14,7 @@ from collections import deque
 
 from logging_setup import get_logger
 from models import MissionState
+from spray_safety import force_spray_off_confirmed
 
 log = get_logger("server.emergency")
 
@@ -59,7 +60,16 @@ class EmergencyHandler:
             errors.append(f"publish_stop_path: {exc}")
             log.exception("publish_stop_path failed")
 
-        # 2. Switch to MANUAL
+        # 2. Force spray OFF before changing mode/disarming.
+        try:
+            spray_off = await force_spray_off_confirmed(self._node, timeout_s=2.0)
+            if not spray_off.success and spray_off.live:
+                errors.append(f"spray OFF: {spray_off.message}")
+        except Exception as exc:
+            errors.append(f"spray OFF raised: {exc}")
+            log.exception("spray OFF during estop raised")
+
+        # 3. Switch to MANUAL
         try:
             ok, why = await self._node.set_mode_async("MANUAL")
             if not ok:
@@ -68,7 +78,7 @@ class EmergencyHandler:
             errors.append(f"set_mode raised: {exc}")
             log.exception("set_mode(MANUAL) raised")
 
-        # 3. Disarm
+        # 4. Disarm
         try:
             ok, why = await self._node.arm_async(False)
             if not ok:
@@ -86,7 +96,7 @@ class EmergencyHandler:
             errors.append(f"joystick release: {exc}")
             log.exception("joystick release during estop failed")
 
-        # 4. Update mission state (hold lock only for the write, not around awaits)
+        # 5. Update mission state (hold lock only for the write, not around awaits)
         if self._controller is not None:
             async with self._controller._lifecycle_lock():
                 self._controller.state = MissionState.ABORTED

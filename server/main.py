@@ -78,6 +78,7 @@ point_mission: Optional["object"] = None
 hold_owner: Optional["object"] = None
 manual_gateway: Optional["object"] = None
 joystick_ctrl: Optional["object"] = None
+spray_startup_reconciliation: Optional["object"] = None
 
 # Bounded, thread-safe ring buffer (deque maxlen). All log appends are atomic
 # under the GIL; bounded eviction is built in. Replaces the racy list+trim.
@@ -104,6 +105,7 @@ async def lifespan(app: FastAPI):
     global ros_node, offboard_ctrl, path_mgr, emergency_handler
     global _executor, _beacon, _listener, _telemetry_task, bridge_health, rtk_manager
     global mission_capture, point_mission, hold_owner, manual_gateway, joystick_ctrl
+    global spray_startup_reconciliation
 
     configure_logging()
     init_auth()
@@ -160,6 +162,14 @@ async def lifespan(app: FastAPI):
     point_mission.set_logger(_record)
     if ros_node is not None:
         ros_node.set_obstacle_callback(point_mission.set_obstacle_clear)
+
+    from spray_startup_reconciliation import SprayStartupReconciliation
+
+    spray_startup_reconciliation = SprayStartupReconciliation()
+    if ros_node is not None:
+        await spray_startup_reconciliation.start(ros_node, record=_record)
+    else:
+        spray_startup_reconciliation.mark_bridge_unavailable()
     mission_capture = MissionDebugCoordinator()
     emergency_handler = EmergencyHandler(
         ros_node, offboard_ctrl, activity_log, mission_capture
@@ -352,19 +362,45 @@ async def _telemetry_loop() -> None:
                 s = ros_node.get_state()
                 code = s.get("rpp_state", 0)
                 now = time.time()
-                spraying = bool(s.get("spraying", False))
+                legacy_spraying = bool(s.get("spraying", False))
                 spray_rt = ros_node.get_spray_runtime_status()
                 mission_running = (
                     offboard_ctrl is not None
                     and offboard_ctrl.state == MissionState.RUNNING
                     and bool(s.get("armed", False))
                 )
-                if not mission_running:
-                    marking_state = "off"
-                elif spraying:
-                    marking_state = "marking"
-                else:
-                    marking_state = "transit"
+                from spray_safety import build_spray_telemetry_fields
+
+                mission_dash = None
+                if offboard_ctrl is not None and hasattr(
+                    offboard_ctrl, "loaded_path_summary"
+                ):
+                    summary = offboard_ctrl.loaded_path_summary()
+                    mission_dash = {
+                        "dash_feasible": summary.get("dash_feasible"),
+                        "dash_feasibility_reason": summary.get(
+                            "dash_feasibility_reason"
+                        ),
+                        "shortest_dash_on_run_m": summary.get(
+                            "shortest_dash_on_run_m"
+                        ),
+                        "shortest_dash_off_gap_m": summary.get(
+                            "shortest_dash_off_gap_m"
+                        ),
+                        "dash_phase_reset": summary.get("dash_phase_reset"),
+                        "dash_expected_speed_mps": summary.get(
+                            "dash_expected_speed_mps"
+                        ),
+                        "dash_feasibility_speed_source": summary.get(
+                            "dash_feasibility_speed_source"
+                        ),
+                    }
+                spray_fields = build_spray_telemetry_fields(
+                    legacy_spraying=legacy_spraying,
+                    spray_rt=spray_rt,
+                    mission_running=mission_running,
+                    mission_dash=mission_dash,
+                )
 
                 # ── 1. Push telemetry ──────────────────────────────────────────
                 telem = {
@@ -381,16 +417,7 @@ async def _telemetry_loop() -> None:
                     "pose_age_ms": s.get("pose_age_ms"),
                     "rpp_state": code,
                     "rpp_state_name": RPP_STATE_NAMES.get(code, "UNKNOWN"),
-                    "spraying": spraying,
-                    "marking_state": marking_state,
-                    "commanded_on": spray_rt.get("commanded_on"),
-                    "confirmed_off": spray_rt.get("confirmed_off"),
-                    "spray_safety_reason": (
-                        spray_rt.get("gps_safety_reason")
-                        or spray_rt.get("safety_reason")
-                    ),
-                    "gps_safety_ok": spray_rt.get("gps_safety_ok"),
-                    "manual_resume_required": spray_rt.get("manual_resume_required"),
+                    **spray_fields,
                     "armed": s.get("armed"),
                     "mode": s.get("mode"),
                     "connected": s.get("connected"),
@@ -540,8 +567,16 @@ async def _telemetry_loop() -> None:
                             gctx["spray_mode"], verdict.reason,
                         )
                         try:
-                            ros_node.publish_spray_manual(False)
-                            await ros_node.cancel_spray_dwell_async()
+                            from spray_safety import force_spray_off_confirmed
+
+                            spray_off = await force_spray_off_confirmed(
+                                ros_node, timeout_s=2.0
+                            )
+                            if not spray_off.success and spray_off.live:
+                                log.warning(
+                                    "GPS fault spray OFF not confirmed: %s",
+                                    spray_off.as_dict(),
+                                )
                         except Exception:
                             log.exception("force spray OFF during GPS fault failed")
                         if emergency_handler is not None:

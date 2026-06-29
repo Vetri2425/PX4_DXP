@@ -38,11 +38,13 @@ def _mark_only_path():
 
 
 def _decision(**kwargs):
+    speed = kwargs.pop("speed_mps", 1.0)
     defaults = {
         "model": _straight_mark_path(),
         "nozzle_n": 1.5,
         "nozzle_e": 0.0,
-        "speed_mps": 1.0,
+        "vel_n": speed,
+        "vel_e": 0.0,
         "safety_ok": True,
         "safety_reason": "",
         "solenoid_open_delay_s": 0.10,
@@ -55,7 +57,7 @@ def _decision(**kwargs):
     return _make_spray_decision(**defaults)
 
 
-def _make_distance_node(path_model=None, pose_n=1.0, pose_e=0.0, speed=1.0):
+def _make_distance_node(path_model=None, pose_n=1.0, pose_e=0.0, speed=0.35):
     node = make_node()
     node._params["use_distance_aware_spray"] = _Param(True)
     node._path_model = path_model if path_model is not None else _straight_mark_path()
@@ -99,7 +101,7 @@ def test_projection_onto_straight_path():
 
 def test_transit_to_mark_anticipatory_on():
     decision = _decision(
-        nozzle_n=0.91,
+        nozzle_n=0.88,
         nozzle_e=0.0,
     )
     assert decision.event == "ON_EARLY"
@@ -126,9 +128,9 @@ def test_off_margin_does_not_cut_mark_tail_short():
 
 
 def test_on_overspray_margin_extends_mark_start():
-    with_margin = _decision(nozzle_n=0.89, nozzle_e=0.0)
+    with_margin = _decision(nozzle_n=0.88, nozzle_e=0.0)
     without_margin = _decision(
-        nozzle_n=0.89,
+        nozzle_n=0.88,
         nozzle_e=0.0,
         on_overspray_margin_m=0.0,
     )
@@ -140,7 +142,7 @@ def test_on_overspray_margin_extends_mark_start():
 def test_safety_off_when_disarmed():
     node = make_node(armed=False)
     node._path_model = _straight_mark_path()
-    ok, reason = node._auto_safety_status(pose_fresh=True, speed=1.0)
+    ok, reason = node._auto_safety_status(pose_fresh=True, along_track_speed=1.0)
     assert ok is False
     assert reason == "disarmed"
 
@@ -148,7 +150,7 @@ def test_safety_off_when_disarmed():
 def test_safety_off_when_not_offboard():
     node = make_node(mode="MANUAL", require_offboard=True)
     node._path_model = _straight_mark_path()
-    ok, reason = node._auto_safety_status(pose_fresh=True, speed=1.0)
+    ok, reason = node._auto_safety_status(pose_fresh=True, along_track_speed=1.0)
     assert ok is False
     assert reason == "not OFFBOARD"
 
@@ -202,6 +204,8 @@ def test_fallback_to_spray_active_when_distance_aware_disabled():
     node = make_node()
     node._params["use_distance_aware_spray"] = _Param(False)
     node._params["allow_legacy_spray_active_fallback"] = _Param(True)
+    node._params["diagnostic_profile"] = _Param(True)
+    node._params["diagnostic_lease_active"] = _Param(True)
 
     node._active_cb(_bool_msg(True))
 
@@ -247,7 +251,7 @@ def test_cross_track_gate_forces_off_on_mark_geometry():
 
 
 def test_velocity_stale_forces_off():
-    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=1.0)
+    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=0.35)
     node._clock.ns += 600_000_000
     node._pose_recv_time = node.get_clock().now()
 
@@ -283,7 +287,10 @@ def test_clamp_pwm_policy_allows_speed_outside_window():
     node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=1.2)
     node._params["max_spray_speed_mps"] = _Param(0.5)
     node._params["unsafe_speed_behavior"] = _Param(UnsafeSpeedBehavior.CLAMP_PWM.value)
+    node._params["high_speed_underflow_behavior"] = _Param("clamp")
+    node._params["max_pwm_change_per_s"] = _Param(5000.0)
     node._active_config = node._configuration_from_node_parameters()
+    node._continuous_runtime.previous_pwm = 1800.0
 
     node._distance_aware_tick()
 
@@ -296,7 +303,9 @@ def test_dynamic_pwm_interpolation_reaches_actuator_request():
     node._params["speed_pwm_table"] = _Param(
         '[{"speed_mps":0.1,"pwm":1200.0},{"speed_mps":0.3,"pwm":2000.0}]'
     )
+    node._params["max_pwm_change_per_s"] = _Param(5000.0)
     node._active_config = node._configuration_from_node_parameters()
+    node._continuous_runtime.previous_pwm = 1600.0
 
     node._distance_aware_tick()
 
@@ -393,7 +402,7 @@ def test_conditioned_path_configuration_revision_mismatch_fails_closed():
 
 
 def test_conditioned_path_clear_identity_clears_model_and_forces_off():
-    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=1.0)
+    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=0.35)
     msg = types.SimpleNamespace(
         data='{"configuration_revision":0,"mission_id":"","path_fingerprint":"","source":"clear"}'
     )
@@ -437,7 +446,7 @@ def test_on_command_failure_fails_closed_and_retries_off():
 
 def test_anticipation_lead_scales_with_fresh_speed():
     slow = _decision(nozzle_n=0.93, speed_mps=0.2)
-    fast = _decision(nozzle_n=0.93, speed_mps=1.0)
+    fast = _decision(nozzle_n=0.88, speed_mps=1.0)
     assert slow.desired is False
     assert fast.event == "ON_EARLY"
     assert fast.desired is True
@@ -448,7 +457,7 @@ def test_disarm_retains_path_across_sustained_disarm():
     by the armed/OFFBOARD safety gate, so retaining the path is harmless, and
     discarding it broke the normal mission flow (path is published once,
     sometimes before arm — clearing it left no model for the armed drive)."""
-    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=1.0)
+    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=0.35)
     node._distance_aware_tick()
     assert node._commanded is True
 
@@ -464,7 +473,7 @@ def test_disarm_retains_path_across_sustained_disarm():
 
 
 def test_brief_disarm_flap_keeps_path_and_resumes_spray():
-    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=1.0)
+    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=0.35)
     node._distance_aware_tick()
     assert node._commanded is True
 
@@ -484,7 +493,7 @@ def test_path_published_before_arm_survives_to_drive():
     """Regression for auto-spray never firing: the mission /path is published
     once (sometimes while still disarmed), then the rover arms and drives.
     The model must persist so spray engages on the armed drive — no republish."""
-    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=1.0)
+    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=0.35)
 
     # Path already loaded while disarmed; a long pre-arm dwell elapses.
     node._state_cb(types.SimpleNamespace(armed=False, mode="OFFBOARD"))
@@ -501,7 +510,7 @@ def test_path_published_before_arm_survives_to_drive():
 
 
 def test_xtrack_gate_forces_off_through_tick():
-    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=1.0)
+    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=0.35)
     node._pose_ned = (1.0, 0.25, 0.0)  # 0.25m off the e=0 line > 0.10 gate
     node._pose_recv_time = node.get_clock().now()
     node._distance_aware_tick()
@@ -567,18 +576,20 @@ def test_runtime_entry_stays_off_until_original_mark_start():
 
     assert entry.geometry_desired is False
     assert entry.desired is False
-    assert boundary.geometry_desired is True
+    # Progress-aware projection keeps TRANSIT at the shared vertex until
+    # forward progress enters the MARK segment.
+    assert boundary.geometry_desired is False
 
 
 def test_full_distance_aware_tick_anticipatory_on_and_off():
-    node = _make_distance_node(path_model=_straight_mark_path(), pose_n=0.91, speed=1.0)
+    node = _make_distance_node(path_model=_straight_mark_path(), pose_n=0.945, speed=0.35)
     node._distance_aware_tick()
 
     assert node._desired_pub.msgs[-1] is True
     assert node._commanded_pub.msgs[-1] is True
     assert node._commanded is True
 
-    node._pose_ned = (2.96, 0.0, 0.0)
+    node._pose_ned = (2.985, 0.0, 0.0)
     node._pose_recv_time = node.get_clock().now()
     node._distance_aware_tick()
 
@@ -593,9 +604,11 @@ def test_late_on_success_does_not_resurrect_commanded_on():
     node = make_node()
     node._command_cli = _Cli(deferred=True)
 
-    node._send_command(True, reason="edge")    # seq=1, commanded optimistic ON
+    node._send_command(True, reason="edge")    # seq=1, pending ON
     on_future = node._command_cli.futures[-1]
-    assert node._commanded is True
+    assert node._commanded is False
+    assert node._actuator_state.pending is True
+    assert node._actuator_state.pending_on is True
 
     node._send_command(False, reason="edge")   # seq=2 supersedes
     off_future = node._command_cli.futures[-1]
@@ -617,10 +630,15 @@ def test_late_off_success_does_not_clear_newer_on():
     node._send_command(False, reason="edge")   # seq=1
     off_future = node._command_cli.futures[-1]
 
-    node._send_command(True, reason="edge")    # seq=2, commanded ON
-    assert node._commanded is True
+    node._send_command(True, reason="edge")    # seq=2, pending ON
+    assert node._commanded is False
+    assert node._actuator_state.pending_on is True
 
     off_future.fire(success=True)              # stale OFF success — ignored
+    assert node._commanded is False
+    assert node._off_confirmed is False
+
+    node._command_cli.futures[-1].fire(success=True)
     assert node._commanded is True
     assert node._off_confirmed is False
 
@@ -651,12 +669,182 @@ def test_stale_failed_result_ignored_does_not_corrupt_state():
 
     node._send_command(False, reason="edge")   # seq=1
     off_future = node._command_cli.futures[-1]
-    node._send_command(True, reason="edge")    # seq=2, commanded ON
-    assert node._commanded is True
+    node._send_command(True, reason="edge")    # seq=2, pending ON
+    assert node._commanded is False
+    assert node._actuator_state.pending_on is True
 
     off_future.fire(exc=RuntimeError("late failure"))  # stale failed OFF — ignored
-    assert node._commanded is True
+    assert node._commanded is False
     assert node._off_confirmed is False
+
+
+def test_on_command_does_not_publish_state_until_accepted():
+    node = make_node()
+    node._command_cli = _Cli(deferred=True)
+
+    node._send_command(True, reason="edge")
+
+    assert node._commanded is False
+    assert node._actuator_state.pending is True
+    assert node._actuator_state.pending_on is True
+    assert node._state_pub.msgs == []
+    assert node.get_runtime_status()["spray_state"] == "PENDING_ON"
+
+    node._command_cli.futures[-1].fire(success=True)
+
+    assert node._commanded is True
+    assert node._state_pub.msgs[-1] is True
+    assert node.get_runtime_status()["spray_state"] == "ACCEPTED_ON"
+
+
+def test_on_rejection_never_reports_spray_on():
+    node = make_node()
+    node._command_cli = _Cli(responses=[(False, 99), True])
+
+    node._send_command(True, reason="edge")
+
+    assert node._commanded is False
+    assert node._actuator_state.current_on is False
+    assert node._actuator_state.pending is False
+    assert node._state_pub.msgs[-1] is False
+    assert len(node._command_cli.requests) == 2
+
+
+def _runtime_ack(node):
+    return node.get_runtime_status()
+
+
+def test_successful_off_sets_off_acknowledged_and_confirmed_off():
+    node = make_node()
+    node._command_cli = _Cli(deferred=True)
+    node._send_command(False, reason="edge")
+    node._command_cli.futures[-1].fire(success=True)
+    status = _runtime_ack(node)
+    assert status["off_acknowledged"] is True
+    assert status["confirmed_off"] is True
+
+
+def test_on_after_off_clears_acknowledgement_flags():
+    node = make_node()
+    node._command_cli = _Cli(deferred=True)
+    node._send_command(False, reason="edge")
+    node._command_cli.futures[-1].fire(success=True)
+    node._send_command(True, reason="edge")
+    node._command_cli.futures[-1].fire(success=True)
+    status = _runtime_ack(node)
+    assert status["off_acknowledged"] is False
+    assert status["confirmed_off"] is False
+
+
+def test_off_pending_leaves_acknowledgement_flags_false():
+    node = make_node()
+    node._command_cli = _Cli(deferred=True)
+    node._send_command(False, reason="edge")
+    status = _runtime_ack(node)
+    assert status["off_acknowledged"] is False
+    assert status["confirmed_off"] is False
+
+
+def test_rejected_off_leaves_acknowledgement_flags_false():
+    node = make_node()
+    node._command_cli = _Cli(deferred=True)
+    node._send_command(False, reason="edge")
+    node._command_cli.futures[-1].fire(success=False, result=4)
+    status = _runtime_ack(node)
+    assert status["off_acknowledged"] is False
+    assert status["confirmed_off"] is False
+
+
+def test_confirmed_off_false_when_commanded_on():
+    node = make_node()
+    node._actuator_state.off_confirmed = True
+    node._commanded = True
+    status = _runtime_ack(node)
+    assert status["off_acknowledged"] is True
+    assert status["confirmed_off"] is False
+
+
+def test_runtime_status_physical_feedback_unavailable_contract():
+    node = make_node()
+    status = _runtime_ack(node)
+    assert status["physical_confirmation_available"] is False
+    assert status["physical_feedback_timestamp_monotonic_s"] is None
+    assert status["physical_feedback_age_s"] is None
+    assert status["physical_feedback_stale"] is True
+
+
+def test_safety_loss_edge_forces_off_once():
+    node = make_node(armed=True, mode="OFFBOARD")
+    node._commanded = True
+    node._off_confirmed = False
+    node._last_safety_allows_on = True
+    node._armed = False
+    node._watchdog_tick()
+    assert node._desired_pub.msgs[-1] is False
+    assert node._last_safety_allows_on is False
+
+
+def test_sustained_safety_loss_does_not_spam_desired_off():
+    node = make_node(armed=False)
+    node._last_safety_allows_on = False
+    node._commanded = False
+    node._off_confirmed = True
+    for _ in range(20):
+        node._watchdog_tick()
+    assert len(node._desired_pub.msgs) == 0
+
+
+def test_safety_loss_retries_failed_off_without_spamming_desired():
+    node = make_node(armed=True, mode="OFFBOARD")
+    node._commanded = True
+    node._off_confirmed = False
+    node._last_safety_allows_on = True
+    node._command_cli = _Cli(deferred=True)
+    node._armed = False
+    node._watchdog_tick()
+    assert node._desired_pub.msgs[-1] is False
+    node._command_cli.futures[-1].fire(success=False, result=4)
+    desired_count = len(node._desired_pub.msgs)
+    request_count = len(node._command_cli.requests)
+    node._clock.ns += 600_000_000
+    for _ in range(5):
+        node._watchdog_tick()
+    assert len(node._desired_pub.msgs) == desired_count
+    assert len(node._command_cli.requests) > request_count
+
+
+def test_safety_recovery_does_not_auto_command_on():
+    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=0.35)
+    node._distance_aware_tick()
+    assert node._commanded is True
+    node._armed = False
+    node._last_safety_allows_on = True
+    node._watchdog_tick()
+    assert node._commanded is False
+    node._armed = True
+    node._mode = "OFFBOARD"
+    node._last_safety_allows_on = False
+    node._watchdog_tick()
+    assert node._commanded is False
+
+
+def test_reassert_on_rejection_keeps_prior_accepted_on_until_off_ack():
+    node = make_node()
+    node._send_command(True, reason="edge")
+    assert node._commanded is True
+    node._command_cli = _Cli(deferred=True)
+
+    node._send_command(True, reason="reassert")
+    reassert_future = node._command_cli.futures[-1]
+    reassert_future.fire(success=False, result=99)
+
+    assert node._commanded is True
+    assert node._actuator_state.current_on is True
+    assert node._actuator_state.pending_on is False
+
+    node._command_cli.futures[-1].fire(success=True)
+    assert node._commanded is False
+    assert node._off_confirmed is True
 
 
 def main():

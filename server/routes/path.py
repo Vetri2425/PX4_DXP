@@ -1094,6 +1094,7 @@ def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
         "anchor": anchor,
         "mission_id": mission_id,
         "created_at": time.time(),
+        "marking_speed_mps": float(req.marking_speed),
         "waypoints": result.get("merged_waypoints", []),
         "spray_flags": result.get("spray_flags", []),
         "path_fingerprint": path_fingerprint,
@@ -1195,11 +1196,16 @@ async def load_mission_to_controller(req: LoadMissionRequest):
     the controller — no re-planning, no re-alignment — so the loaded mission is
     byte-for-byte what the operator confirmed in the preview.
     """
-    from main import offboard_ctrl
+    from main import offboard_ctrl, spray_startup_reconciliation
     from models import MissionState
 
     if offboard_ctrl is None:
         raise HTTPException(503, "Controller not ready")
+
+    if spray_startup_reconciliation is not None:
+        block = spray_startup_reconciliation.block_reason()
+        if block:
+            raise HTTPException(503, block)
 
     # Field-safety: refuse to swap the loaded path while a mission is active or
     # mid-lifecycle. Loading is only meaningful from a settled state; the operator
@@ -1281,6 +1287,24 @@ async def load_mission_to_controller(req: LoadMissionRequest):
         spray_flags = [bool(f) for f in staged.get("spray_flags", [])]
         if spray_config_degraded:
             spray_flags = [False] * len(waypoints)
+        dash_feasibility_payload = None
+        if spray_mode == "dash" and not point_mode:
+            from spray_dash import validate_dash_feasibility
+            from spray_path_model import build_path_model
+
+            dash_model = build_path_model(waypoints, spray_flags)
+            marking_speed_mps = float(staged.get("marking_speed_mps", 0.35))
+            dash_result = validate_dash_feasibility(
+                dash_model,
+                validated_spray_config,
+                expected_speed_mps=marking_speed_mps,
+            )
+            dash_feasibility_payload = dash_result.as_dict()
+            dash_feasibility_payload["dash_phase_reset"] = (
+                validated_spray_config.dash.phase_reset.value
+            )
+            if not dash_result.dash_feasible:
+                raise HTTPException(422, dash_result.dash_feasibility_reason)
         # The staged fingerprint binds the staged geometry+flags. It is only valid
         # to enforce when what we actually load is unchanged from staging. The
         # degraded fallback zeroes spray_flags (and point-mode below synthesizes a
@@ -1298,7 +1322,9 @@ async def load_mission_to_controller(req: LoadMissionRequest):
         if point_mode:
             if point_mission is None:
                 raise HTTPException(503, "Point mission orchestrator unavailable")
-            await point_mission.replace_from_staged(staged, spray_config, ros_node)
+            await point_mission.replace_from_staged(
+                staged, spray_config, ros_node, offboard_ctrl=offboard_ctrl
+            )
             first = staged["point_mission_points"][0]
             load_points = [
                 (float(first["north_m"]), float(first["east_m"])),
@@ -1310,7 +1336,9 @@ async def load_mission_to_controller(req: LoadMissionRequest):
             load_fingerprint = ""
         else:
             if point_mission is not None:
-                await point_mission.cancel_and_drain(ros_node, reason="non_point_load")
+                await point_mission.cancel_and_drain(
+                    ros_node, reason="non_point_load", offboard_ctrl=offboard_ctrl
+                )
             load_points = waypoints
 
         offboard_ctrl.load_path(
@@ -1326,6 +1354,7 @@ async def load_mission_to_controller(req: LoadMissionRequest):
             spray_mode=staged.get("spray_mode", "continuous"),
             path_fingerprint=load_fingerprint,
             configuration_revision=int(staged.get("configuration_revision", 0)),
+            dash_feasibility=dash_feasibility_payload,
         )
     except HTTPException:
         raise

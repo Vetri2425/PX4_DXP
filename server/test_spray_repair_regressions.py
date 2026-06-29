@@ -113,10 +113,14 @@ async def test_point_mode_load_succeeds_when_dependencies_ready(monkeypatch, tmp
     class PointOrch:
         loaded = None
 
-        async def replace_from_staged(self, staged_payload, spray_config, ros_node):
+        async def replace_from_staged(
+            self, staged_payload, spray_config, ros_node, offboard_ctrl=None
+        ):
             self.loaded = staged_payload["mission_id"]
 
-        async def cancel_and_drain(self, ros_node, reason="cancelled"):
+        async def cancel_and_drain(
+            self, ros_node, reason="cancelled", offboard_ctrl=None
+        ):
             return None
 
     ctrl = _Controller()

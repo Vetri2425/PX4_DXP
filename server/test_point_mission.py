@@ -23,8 +23,17 @@ from point_mission import PointExecutionMode, PointMissionOrchestrator, PointMis
 from spray_config import PointSprayParams, SprayConfiguration, SprayMode
 
 
+class FakeRppMonitor:
+    def reset(self):
+        pass
+
+    def is_done(self):
+        return True
+
+
 class FakeRos:
     def __init__(self):
+        self.rpp_monitor = FakeRppMonitor()
         self.state = {
             "pose_received": True,
             "pos_n": 0.0,
@@ -37,6 +46,9 @@ class FakeRos:
             "spraying": False,
             "connected": True,
             "heading_ned_rad": 0.0,
+            "measured_speed_m_s": 0.0,
+            "armed": True,
+            "mode": "OFFBOARD",
         }
         self.paths = []
         self.dwells = []
@@ -47,6 +59,23 @@ class FakeRos:
 
     def get_state(self):
         return dict(self.state)
+
+    def get_rpp_monitor(self):
+        return self.rpp_monitor
+
+    def publish_stop_path(self):
+        return (float(self.state["pos_n"]), float(self.state["pos_e"]))
+
+    async def arm_async(self, arm):
+        self.state["armed"] = bool(arm)
+        return True, ""
+
+    async def set_mode_async(self, mode):
+        self.state["mode"] = mode
+        return True, ""
+
+    async def set_spray_param_async(self, name, value):
+        return True, ""
 
     def publish_path(self, points, spray_flags=None, runtime_entry=False):
         self.paths.append((list(points), spray_flags, runtime_entry))
@@ -67,32 +96,55 @@ class FakeRos:
         return True, "ok"
 
     def get_spray_runtime_status(self):
+        base = {
+            "configuration_revision": 1,
+            "model_revision": 0,
+            "timestamp_monotonic_s": time.monotonic(),
+            "dwell_mission_id": "",
+            "dwell_point_index": None,
+            "off_acknowledged": True,
+            "commanded_on": False,
+            "confirmed_off": True,
+            "pending_command": False,
+            "accepted_command_on": False,
+        }
         if self.live_dwell is not None:
             remaining = self.live_dwell["deadline"] - time.monotonic()
             active = remaining > 0.0
             return {
+                **base,
+                "configuration_revision": int(
+                    self.live_dwell.get("configuration_revision", base["configuration_revision"])
+                ),
                 "status_stale": False,
                 "ready": True,
                 "active_dwell": active,
                 "dwell_remaining_s": max(0.0, remaining),
                 "commanded_on": active,
                 "confirmed_off": not active,
+                "off_acknowledged": not active,
                 "dwell_command_id": self.live_dwell["command_id"],
+                "dwell_mission_id": self.live_dwell.get("mission_id", ""),
+                "dwell_point_index": self.live_dwell.get("point_index"),
                 "last_error": "",
             }
         if self.runtime_statuses:
             self.last_runtime_status = self.runtime_statuses.pop(0)
-            return self.last_runtime_status
+            return {**base, **self.last_runtime_status}
         if self.last_runtime_status is not None:
-            return self.last_runtime_status
+            return {**base, **self.last_runtime_status}
         return {
+            **base,
             "status_stale": False,
             "ready": True,
             "active_dwell": False,
             "dwell_remaining_s": 0.0,
             "commanded_on": False,
             "confirmed_off": True,
+            "off_acknowledged": True,
             "dwell_command_id": self.dwells[-1]["command_id"] if self.dwells else None,
+            "dwell_mission_id": self.dwells[-1]["mission_id"] if self.dwells else "",
+            "dwell_point_index": self.dwells[-1]["point_index"] if self.dwells else None,
             "last_error": "",
         }
 
@@ -101,8 +153,33 @@ class FakeRos:
 
 
 class FakeOffboard:
-    state = "running"
+    state = MissionState.RUNNING
     _running_mission_id = "m1"
+    loaded_mission_id = "m1"
+
+    async def complete_async(self):
+        self.state = MissionState.COMPLETED
+        self._running_mission_id = None
+        return {
+            "success": True,
+            "message": "mission completed",
+            "warnings": [],
+            "spray_off_confirmed": True,
+        }
+
+    async def abort_async(self):
+        self.state = MissionState.ABORTED
+        self._running_mission_id = None
+        return {
+            "success": True,
+            "message": "mission ABORTED",
+            "errors": [],
+            "spray_off_result": {"success": True, "recovery_required": False},
+        }
+
+    @property
+    def running_mission_id(self):
+        return self._running_mission_id
 
 
 class FakeTransport:
@@ -173,14 +250,30 @@ def test_dwell_must_become_active_before_completion():
     async def run():
         ros = FakeRos()
         orch = PointMissionOrchestrator()
-        orch.load(mission_id="m1", points=[SprayPoint(0, 0, 0.01, 0)], config=SprayConfiguration(mode=SprayMode.POINT))
-        token = PointMissionRun(orch.status.generation, "m1", asyncio.Event())
+        orch.load(
+            mission_id="m1",
+            points=[SprayPoint(0, 0, 0.01, 0)],
+            config=SprayConfiguration(mode=SprayMode.POINT, revision=1),
+        )
+        token = PointMissionRun(
+            orch.status.generation, "m1", asyncio.Event(), parent_mission_id="m1"
+        )
         orch._run_token = token
-        ros.dwells.append({"command_id": 5})
+        orch._bind_dwell_identity(
+            token, command_id=5, command_revision=1, point_index=0, source_index=0
+        )
+        ros.dwells.append({"command_id": 5, "mission_id": "m1", "point_index": 0})
         try:
             point = SprayPoint(0, 0, 0.01, 0)
             await orch._wait_dwell_complete(
-                token, ros, None, point, 0.01, 5, SprayConfiguration(mode=SprayMode.POINT).point
+                token,
+                ros,
+                None,
+                FakeOffboard(),
+                point,
+                0.01,
+                5,
+                SprayConfiguration(mode=SprayMode.POINT).point,
             )
             assert False, "inactive default status passed as completion"
         except TimeoutError as exc:
@@ -192,29 +285,70 @@ def test_dwell_identity_and_final_off_required():
     async def run():
         ros = FakeRos()
         orch = PointMissionOrchestrator()
-        orch.load(mission_id="m1", points=[SprayPoint(0, 0, 0.1, 0)], config=SprayConfiguration(mode=SprayMode.POINT))
-        token = PointMissionRun(orch.status.generation, "m1", asyncio.Event())
+        orch.load(
+            mission_id="m1",
+            points=[SprayPoint(0, 0, 0.1, 0)],
+            config=SprayConfiguration(mode=SprayMode.POINT, revision=1),
+        )
+        token = PointMissionRun(
+            orch.status.generation, "m1", asyncio.Event(), parent_mission_id="m1"
+        )
         orch._run_token = token
-        base = {"status_stale": False, "ready": True, "last_error": "", "dwell_remaining_s": 0.05}
+        orch._bind_dwell_identity(
+            token, command_id=7, command_revision=1, point_index=0, source_index=0
+        )
+        base = {
+            "status_stale": False,
+            "ready": True,
+            "last_error": "",
+            "dwell_remaining_s": 0.05,
+            "dwell_mission_id": "m1",
+            "dwell_point_index": 0,
+            "off_acknowledged": False,
+            "configuration_revision": 1,
+            "model_revision": 0,
+            "timestamp_monotonic_s": time.monotonic(),
+        }
         ros.runtime_statuses = [
             {**base, "dwell_command_id": 8, "active_dwell": True, "commanded_on": True, "confirmed_off": False},
         ]
         try:
             point = SprayPoint(0, 0, 0.1, 0)
             await orch._wait_dwell_complete(
-                token, ros, None, point, 0.1, 7, SprayConfiguration(mode=SprayMode.POINT).point
+                token,
+                ros,
+                None,
+                FakeOffboard(),
+                point,
+                0.1,
+                7,
+                SprayConfiguration(mode=SprayMode.POINT).point,
             )
             assert False, "wrong command ID accepted"
         except RuntimeError as exc:
             assert "mismatch" in str(exc)
 
+        token = PointMissionRun(
+            orch.status.generation, "m1", asyncio.Event(), parent_mission_id="m1"
+        )
+        orch._run_token = token
+        orch._bind_dwell_identity(
+            token, command_id=7, command_revision=2, point_index=0, source_index=0
+        )
         ros.runtime_statuses = [
-            {**base, "dwell_command_id": 7, "active_dwell": True, "commanded_on": True, "confirmed_off": False},
-            {**base, "dwell_command_id": 7, "active_dwell": False, "commanded_on": True, "confirmed_off": False},
+            {**base, "dwell_command_id": 7, "active_dwell": True, "commanded_on": True, "confirmed_off": False, "off_acknowledged": False},
+            {**base, "dwell_command_id": 7, "active_dwell": False, "commanded_on": True, "confirmed_off": False, "off_acknowledged": False},
         ]
         try:
             await orch._wait_dwell_complete(
-                token, ros, None, point, 0.1, 7, SprayConfiguration(mode=SprayMode.POINT).point
+                token,
+                ros,
+                None,
+                FakeOffboard(),
+                point,
+                0.1,
+                7,
+                SprayConfiguration(mode=SprayMode.POINT).point,
             )
             assert False, "unconfirmed OFF accepted"
         except TimeoutError as exc:
@@ -338,6 +472,7 @@ def test_point_completion_clears_mission_owner_and_allows_joystick_acquire():
         orch = PointMissionOrchestrator()
         cfg = SprayConfiguration(
             mode=SprayMode.POINT,
+            revision=1,
             point=PointSprayParams(
                 default_dwell_s=0.01,
                 arrival_tolerance_m=0.05,
@@ -356,7 +491,9 @@ def test_point_completion_clears_mission_owner_and_allows_joystick_acquire():
         assert started, message
         await asyncio.wait_for(orch._task, timeout=2.0)
 
-        assert orch.status.state == PointMissionState.COMPLETED
+        assert orch.status.state == PointMissionState.COMPLETED, (
+            orch.status.last_failure_reason
+        )
         assert offboard.state == MissionState.COMPLETED
         assert arbiter.owner == ControlOwner.IDLE
 
@@ -408,7 +545,7 @@ def test_point_abort_failure_and_cancellation_clear_mission_owner():
         offboard.state = MissionState.RUNNING
         arbiter = await seed_owner(offboard)
         orch = await start_long_point(ros, offboard)
-        await orch.abort(ros)
+        await orch.abort(ros, offboard_ctrl=offboard)
         assert offboard.state == MissionState.ABORTED
         assert arbiter.owner == ControlOwner.IDLE
 
@@ -418,7 +555,7 @@ def test_point_abort_failure_and_cancellation_clear_mission_owner():
         offboard.state = MissionState.RUNNING
         arbiter = await seed_owner(offboard)
         orch = await start_long_point(ros, offboard)
-        await orch.cancel_and_drain(ros, reason="cancelled")
+        await orch.cancel_and_drain(ros, reason="cancelled", offboard_ctrl=offboard)
         assert offboard.state == MissionState.ABORTED
         assert arbiter.owner == ControlOwner.IDLE
 
@@ -437,7 +574,7 @@ def test_point_abort_failure_and_cancellation_clear_mission_owner():
         started, message = await orch.start(ros, offboard)
         assert started, message
         await asyncio.wait_for(orch._task, timeout=1.0)
-        assert offboard.state == MissionState.ERROR
+        assert offboard.state == MissionState.ABORTED
         assert arbiter.owner == ControlOwner.IDLE
 
     asyncio.run(run_abort())

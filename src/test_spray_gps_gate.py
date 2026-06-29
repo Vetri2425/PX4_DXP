@@ -85,14 +85,14 @@ def test_auto_safety_status_ands_in_gate(monkeypatch):
     node = make_node()
     monkeypatch.setattr(scn, "auto_safety_status", lambda **kw: (True, ""))
     # Gate inactive → base result passes through
-    ok, _ = node._auto_safety_status(pose_fresh=True, speed=0.2)
+    ok, _ = node._auto_safety_status(pose_fresh=True, along_track_speed=0.2)
     assert ok is True
     # Gate active + fault → blocked despite base OK
     node._gps_gate_active = True
     node._gps_gate_ok = False
     node._gps_gate_reason = "rtk lost"
     node._gps_gate_recv_time = time.monotonic()
-    ok, reason = node._auto_safety_status(pose_fresh=True, speed=0.2)
+    ok, reason = node._auto_safety_status(pose_fresh=True, along_track_speed=0.2)
     assert ok is False
     assert reason == "rtk lost"
 

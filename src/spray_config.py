@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
@@ -63,6 +64,58 @@ class UnsafeSpeedBehavior(str, Enum):
             ) from exc
 
 
+class FlowMode(str, Enum):
+    FIXED = "fixed"
+    MAPPED = "mapped"
+    DISABLED = "disabled"
+
+    @classmethod
+    def parse(cls, value: Any) -> FlowMode:
+        if isinstance(value, cls):
+            return value
+        text = str(value).strip().lower()
+        try:
+            return cls(text)
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid flow_mode {value!r}; expected "
+                f"{cls.FIXED.value}, {cls.MAPPED.value}, or {cls.DISABLED.value}"
+            ) from exc
+
+
+class LowSpeedAntiPuddleBehavior(str, Enum):
+    BLOCK = "block"
+
+    @classmethod
+    def parse(cls, value: Any) -> LowSpeedAntiPuddleBehavior:
+        if isinstance(value, cls):
+            return value
+        text = str(value).strip().lower()
+        try:
+            return cls(text)
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid low_speed_anti_puddle_behavior {value!r}; expected block"
+            ) from exc
+
+
+class HighSpeedUnderflowBehavior(str, Enum):
+    BLOCK = "block"
+    CLAMP = "clamp"
+
+    @classmethod
+    def parse(cls, value: Any) -> HighSpeedUnderflowBehavior:
+        if isinstance(value, cls):
+            return value
+        text = str(value).strip().lower()
+        try:
+            return cls(text)
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid high_speed_underflow_behavior {value!r}; expected block or clamp"
+            ) from exc
+
+
 @dataclass(frozen=True)
 class SpeedPwmPoint:
     speed_mps: float
@@ -113,6 +166,21 @@ class ContinuousSprayParams:
     max_xtrack_error_m: float = 0.10
     nozzle_forward_offset_m: float = 0.0
     nozzle_lateral_offset_m: float = 0.0
+    max_along_track_heading_error_deg: float = 30.0
+    max_cross_track_speed_mps: float = 0.10
+    max_reverse_speed_tolerance_mps: float = 0.03
+    max_projection_jump_m: float = 0.50
+    max_backward_projection_jump_m: float = 0.10
+    projection_ambiguity_distance_m: float = 0.03
+    max_lead_distance_m: float = 0.50
+    min_on_distance_m: float = 0.05
+    min_off_distance_m: float = 0.05
+    flow_mode: str = "mapped"
+    min_target_flow: float = 0.0
+    max_target_flow: float = 1.0
+    max_pwm_change_per_s: float = 500.0
+    low_speed_anti_puddle_behavior: str = "block"
+    high_speed_underflow_behavior: str = "block"
 
 
 @dataclass(frozen=True)
@@ -199,13 +267,18 @@ class SprayConfiguration:
         )
 
 
-def _finite_positive(name: str, value: Any, *, allow_zero: bool = False) -> float:
+def _finite_float(name: str, value: Any) -> float:
     try:
         num = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be a number") from exc
-    if not (num == num):  # NaN
+    if not math.isfinite(num):
         raise ValueError(f"{name} must be finite")
+    return num
+
+
+def _finite_positive(name: str, value: Any, *, allow_zero: bool = False) -> float:
+    num = _finite_float(name, value)
     if allow_zero:
         if num < 0.0:
             raise ValueError(f"{name} must be >= 0")
@@ -265,11 +338,11 @@ def interpolate_speed_pwm(
     speed = float(speed_mps)
     if not table:
         raise ValueError("speed_pwm_table is empty")
-    if speed <= table[0].speed_mps:
+    if speed < table[0].speed_mps:
         if not clamp:
             raise ValueError("speed below calibration table")
         return table[0].pwm
-    if speed >= table[-1].speed_mps:
+    if speed > table[-1].speed_mps:
         if not clamp:
             raise ValueError("speed above calibration table")
         return table[-1].pwm
@@ -288,9 +361,12 @@ def _parse_calibration_profile(raw: dict[str, Any]) -> CalibrationProfile:
         min_pwm=_finite_non_negative("actuator_min_pwm", raw.get("actuator_min_pwm", 0.0)),
         max_pwm=_finite_positive("actuator_max_pwm", raw.get("actuator_max_pwm", 2200.0)),
         off_pwm=_finite_non_negative("actuator_off_pwm", raw.get("actuator_off_pwm", raw.get("off_pwm_us", 0.0))),
-        min_value=float(raw.get("actuator_min_value", -1.0)),
-        max_value=float(raw.get("actuator_max_value", 1.0)),
-        off_value=float(raw.get("actuator_off_value", raw.get("off_value", -1.0))),
+        min_value=_finite_float("actuator_min_value", raw.get("actuator_min_value", -1.0)),
+        max_value=_finite_float("actuator_max_value", raw.get("actuator_max_value", 1.0)),
+        off_value=_finite_float(
+            "actuator_off_value",
+            raw.get("actuator_off_value", raw.get("off_value", -1.0)),
+        ),
     )
     if limits.max_pwm <= limits.min_pwm:
         raise ValueError("actuator_max_pwm must be greater than actuator_min_pwm")
@@ -376,11 +452,85 @@ def validate_spray_configuration(
         max_xtrack_error_m=_finite_positive(
             "max_xtrack_error_m", raw.get("max_xtrack_error_m", 0.10)
         ),
-        nozzle_forward_offset_m=float(raw.get("nozzle_forward_offset_m", 0.0)),
-        nozzle_lateral_offset_m=float(raw.get("nozzle_lateral_offset_m", 0.0)),
+        nozzle_forward_offset_m=_finite_float(
+            "nozzle_forward_offset_m", raw.get("nozzle_forward_offset_m", 0.0)
+        ),
+        nozzle_lateral_offset_m=_finite_float(
+            "nozzle_lateral_offset_m", raw.get("nozzle_lateral_offset_m", 0.0)
+        ),
+        max_along_track_heading_error_deg=_finite_positive(
+            "max_along_track_heading_error_deg",
+            raw.get("max_along_track_heading_error_deg", 30.0),
+        ),
+        max_cross_track_speed_mps=_finite_non_negative(
+            "max_cross_track_speed_mps",
+            raw.get("max_cross_track_speed_mps", 0.10),
+        ),
+        max_reverse_speed_tolerance_mps=_finite_non_negative(
+            "max_reverse_speed_tolerance_mps",
+            raw.get("max_reverse_speed_tolerance_mps", 0.03),
+        ),
+        max_projection_jump_m=_finite_non_negative(
+            "max_projection_jump_m",
+            raw.get("max_projection_jump_m", 0.50),
+        ),
+        max_backward_projection_jump_m=_finite_non_negative(
+            "max_backward_projection_jump_m",
+            raw.get("max_backward_projection_jump_m", 0.10),
+        ),
+        projection_ambiguity_distance_m=_finite_non_negative(
+            "projection_ambiguity_distance_m",
+            raw.get("projection_ambiguity_distance_m", 0.03),
+        ),
+        max_lead_distance_m=_finite_non_negative(
+            "max_lead_distance_m",
+            raw.get("max_lead_distance_m", 0.50),
+        ),
+        min_on_distance_m=_finite_non_negative(
+            "min_on_distance_m",
+            raw.get("min_on_distance_m", 0.05),
+        ),
+        min_off_distance_m=_finite_non_negative(
+            "min_off_distance_m",
+            raw.get("min_off_distance_m", 0.05),
+        ),
+        flow_mode=FlowMode.parse(raw.get("flow_mode", FlowMode.MAPPED.value)).value,
+        min_target_flow=_finite_non_negative(
+            "min_target_flow",
+            raw.get("min_target_flow", 0.0),
+        ),
+        max_target_flow=_finite_positive(
+            "max_target_flow",
+            raw.get("max_target_flow", 1.0),
+        ),
+        max_pwm_change_per_s=_finite_non_negative(
+            "max_pwm_change_per_s",
+            raw.get("max_pwm_change_per_s", 500.0),
+        ),
+        low_speed_anti_puddle_behavior=LowSpeedAntiPuddleBehavior.parse(
+            raw.get("low_speed_anti_puddle_behavior", "block")
+        ).value,
+        high_speed_underflow_behavior=HighSpeedUnderflowBehavior.parse(
+            raw.get("high_speed_underflow_behavior", "block")
+        ).value,
     )
     if continuous.max_spray_speed_mps <= continuous.min_spray_speed_mps:
         raise ValueError("max_spray_speed_mps must be greater than min_spray_speed_mps")
+    if continuous.max_along_track_heading_error_deg > 180.0:
+        raise ValueError("max_along_track_heading_error_deg must be <= 180")
+    if continuous.max_target_flow <= continuous.min_target_flow:
+        raise ValueError("max_target_flow must be greater than min_target_flow")
+    if continuous.max_projection_jump_m < continuous.max_backward_projection_jump_m:
+        raise ValueError(
+            "max_projection_jump_m must be >= max_backward_projection_jump_m"
+        )
+    if _bool_value(raw.get("allow_legacy_spray_active_fallback", False)):
+        if mission_id := str(raw.get("mission_id", "") or ""):
+            if not _bool_value(raw.get("timing_only_compatibility", False)):
+                raise ValueError(
+                    "allow_legacy_spray_active_fallback is rejected for production "
+                    "mission-bound spray configuration"
+                )
 
     dash = DashSprayParams(
         on_distance_m=_finite_non_negative(
@@ -553,6 +703,33 @@ def configuration_to_param_dict(config: SprayConfiguration) -> dict[str, Any]:
         "max_xtrack_error_m": config.continuous.max_xtrack_error_m,
         "nozzle_forward_offset_m": config.continuous.nozzle_forward_offset_m,
         "nozzle_lateral_offset_m": config.continuous.nozzle_lateral_offset_m,
+        "max_along_track_heading_error_deg": (
+            config.continuous.max_along_track_heading_error_deg
+        ),
+        "max_cross_track_speed_mps": config.continuous.max_cross_track_speed_mps,
+        "max_reverse_speed_tolerance_mps": (
+            config.continuous.max_reverse_speed_tolerance_mps
+        ),
+        "max_projection_jump_m": config.continuous.max_projection_jump_m,
+        "max_backward_projection_jump_m": (
+            config.continuous.max_backward_projection_jump_m
+        ),
+        "projection_ambiguity_distance_m": (
+            config.continuous.projection_ambiguity_distance_m
+        ),
+        "max_lead_distance_m": config.continuous.max_lead_distance_m,
+        "min_on_distance_m": config.continuous.min_on_distance_m,
+        "min_off_distance_m": config.continuous.min_off_distance_m,
+        "flow_mode": config.continuous.flow_mode,
+        "min_target_flow": config.continuous.min_target_flow,
+        "max_target_flow": config.continuous.max_target_flow,
+        "max_pwm_change_per_s": config.continuous.max_pwm_change_per_s,
+        "low_speed_anti_puddle_behavior": (
+            config.continuous.low_speed_anti_puddle_behavior
+        ),
+        "high_speed_underflow_behavior": (
+            config.continuous.high_speed_underflow_behavior
+        ),
         "dash_on_distance_m": config.dash.on_distance_m,
         "dash_off_distance_m": config.dash.off_distance_m,
         "dash_phase_reset": config.dash.phase_reset.value,
@@ -622,6 +799,33 @@ def staged_spray_defaults() -> dict[str, Any]:
         "max_xtrack_error_m": cfg.continuous.max_xtrack_error_m,
         "nozzle_forward_offset_m": cfg.continuous.nozzle_forward_offset_m,
         "nozzle_lateral_offset_m": cfg.continuous.nozzle_lateral_offset_m,
+        "max_along_track_heading_error_deg": (
+            cfg.continuous.max_along_track_heading_error_deg
+        ),
+        "max_cross_track_speed_mps": cfg.continuous.max_cross_track_speed_mps,
+        "max_reverse_speed_tolerance_mps": (
+            cfg.continuous.max_reverse_speed_tolerance_mps
+        ),
+        "max_projection_jump_m": cfg.continuous.max_projection_jump_m,
+        "max_backward_projection_jump_m": (
+            cfg.continuous.max_backward_projection_jump_m
+        ),
+        "projection_ambiguity_distance_m": (
+            cfg.continuous.projection_ambiguity_distance_m
+        ),
+        "max_lead_distance_m": cfg.continuous.max_lead_distance_m,
+        "min_on_distance_m": cfg.continuous.min_on_distance_m,
+        "min_off_distance_m": cfg.continuous.min_off_distance_m,
+        "flow_mode": cfg.continuous.flow_mode,
+        "min_target_flow": cfg.continuous.min_target_flow,
+        "max_target_flow": cfg.continuous.max_target_flow,
+        "max_pwm_change_per_s": cfg.continuous.max_pwm_change_per_s,
+        "low_speed_anti_puddle_behavior": (
+            cfg.continuous.low_speed_anti_puddle_behavior
+        ),
+        "high_speed_underflow_behavior": (
+            cfg.continuous.high_speed_underflow_behavior
+        ),
         "dash_on_distance_m": cfg.dash.on_distance_m,
         "dash_off_distance_m": cfg.dash.off_distance_m,
         "dash_phase_reset": cfg.dash.phase_reset.value,
