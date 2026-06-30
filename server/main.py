@@ -30,6 +30,7 @@ from typing import Optional
 import socketio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 from starlette.middleware.gzip import GZipMiddleware
 
 from auth import authenticated_sids, init_auth
@@ -287,6 +288,27 @@ def create_app() -> FastAPI:
         version="1.0.0",
         lifespan=lifespan,
     )
+
+    def custom_openapi():
+        if app.openapi_schema:
+            return app.openapi_schema
+        schema = get_openapi(
+            title=app.title,
+            version=app.version,
+            routes=app.routes,
+        )
+        schema.setdefault("components", {}).setdefault("securitySchemes", {})[
+            "RoverToken"
+        ] = {
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-Rover-Token",
+        }
+        schema["security"] = [{"RoverToken": []}]
+        app.openapi_schema = schema
+        return schema
+
+    app.openapi = custom_openapi
     app.add_middleware(GZipMiddleware, minimum_size=1024)
     app.add_middleware(
         CORSMiddleware,
