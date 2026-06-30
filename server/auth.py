@@ -22,6 +22,7 @@ from typing import Literal
 from fastapi import Header, HTTPException, status
 
 from config import (
+    AUTH_DISABLED,
     AUTH_MACHINE_TOKENS_FILE,
     AUTH_PASSWORD_FILE,
     AUTH_PBKDF2_ITERATIONS,
@@ -278,9 +279,14 @@ def _validate_machine_token(token: str | None, scope: MachineScope) -> AuthConte
     return AuthContext(kind="machine", token_id=tid, name=record.get("name"))
 
 
+_BYPASS_CONTEXT = AuthContext(kind="operator", token_id="dev-bypass", session_id="dev")
+
+
 def require_operator_token(
     x_rover_token: str | None = Header(default=None, alias=TOKEN_HEADER_NAME),
 ) -> AuthContext:
+    if AUTH_DISABLED:
+        return _BYPASS_CONTEXT
     context = validate_operator_token(x_rover_token)
     if context is None:
         raise HTTPException(
@@ -301,6 +307,8 @@ def require_operator_or_machine(scope: MachineScope):
     def dependency(
         x_rover_token: str | None = Header(default=None, alias=TOKEN_HEADER_NAME),
     ) -> AuthContext:
+        if AUTH_DISABLED:
+            return _BYPASS_CONTEXT
         operator = validate_operator_token(x_rover_token)
         if operator is not None:
             return operator

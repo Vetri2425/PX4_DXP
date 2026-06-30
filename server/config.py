@@ -304,6 +304,7 @@ AUTH_MACHINE_TOKENS_FILE = os.environ.get(
 )
 AUTH_SESSION_TTL_S = float(os.environ.get("ROVER_SESSION_TTL_S", str(12 * 3600)))
 AUTH_PBKDF2_ITERATIONS = int(os.environ.get("ROVER_AUTH_PBKDF2_ITERATIONS", "260000"))
+AUTH_DISABLED = os.environ.get("ROVER_AUTH_DISABLED", "").lower() in {"1", "true", "yes"}
 # Backward-compatible name for older local tooling; not used for operator auth.
 TOKEN_FILE_DEFAULT = os.environ.get("ROVER_TOKEN_FILE", AUTH_MACHINE_TOKENS_FILE)
 
