@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+from zoneinfo import ZoneInfo
 import json
 import os
 import re
@@ -94,9 +95,52 @@ _SECRET_PATTERNS = (
     re.compile(r"(?i)(basic|bearer)\s+[A-Za-z0-9+/=_\-.]+"),
 )
 
+# Chennai and all of India use Asia/Kolkata (IST, UTC+05:30).
+CAPTURE_TZ_NAME = os.environ.get("BAG_CAPTURE_TZ", "Asia/Kolkata")
+CAPTURE_TZ = ZoneInfo(CAPTURE_TZ_NAME)
+
 
 def utc_now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def readable_capture_stamp(when: datetime.datetime) -> str:
+    """Filesystem-safe readable stamp in the capture timezone (default IST)."""
+    local = when.astimezone(CAPTURE_TZ)
+    return (
+        local.strftime("%Y-%m-%d_%H-%M-%S")
+        + f".{local.microsecond // 1000:03d}_IST"
+    )
+
+
+def readable_log_stamp() -> str:
+    local = datetime.datetime.now(CAPTURE_TZ)
+    return (
+        local.strftime("%Y-%m-%d %H:%M:%S")
+        + f".{local.microsecond // 1000:03d} IST"
+    )
+
+
+def utc_to_readable_ist(iso_utc: Any) -> str | None:
+    parsed = parse_utc(iso_utc)
+    if parsed is None:
+        return None
+    return readable_capture_stamp(parsed)
+
+
+def enrich_manifest_timestamps(manifest: dict[str, Any]) -> None:
+    timestamps = manifest.get("timestamps")
+    if not isinstance(timestamps, dict):
+        return
+    for key, value in list(timestamps.items()):
+        if not key.endswith("_utc"):
+            continue
+        ist_key = f"{key[:-4]}_ist"
+        if isinstance(value, str):
+            timestamps[ist_key] = utc_to_readable_ist(value)
+        else:
+            timestamps[ist_key] = None
+    manifest["capture_timezone"] = CAPTURE_TZ_NAME
 
 
 def parse_utc(value: Any) -> datetime.datetime | None:
@@ -121,7 +165,7 @@ def request_age_s(request: dict[str, Any]) -> float | None:
 
 
 def log(message: str) -> None:
-    print(f"[bag_autorecord] {utc_now()} {message}", flush=True)
+    print(f"[bag_autorecord] {readable_log_stamp()} {message}", flush=True)
 
 
 def safe_component(value: Any, fallback: str = "mission", limit: int = 80) -> str:
@@ -132,7 +176,9 @@ def safe_component(value: Any, fallback: str = "mission", limit: int = 80) -> st
 
 def bundle_name(source: Any, mission_id: Any, when: datetime.datetime | None = None) -> str:
     now = when or datetime.datetime.now(datetime.timezone.utc)
-    stamp = now.astimezone(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S.%f")[:19] + "Z"
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=datetime.timezone.utc)
+    stamp = readable_capture_stamp(now)
     return f"{stamp}_{safe_component(source)}_{safe_component(mission_id, 'unknown')}"
 
 
@@ -273,6 +319,7 @@ def reconcile_incomplete_bundles() -> int:
                 "capture was active when the recorder process restarted"
             )
             manifest.setdefault("timestamps", {})["recorder_end_utc"] = utc_now()
+            enrich_manifest_timestamps(manifest)
             atomic_json(manifest_path, manifest)
             (manifest_path.parent / "INCOMPLETE").write_text(
                 "incomplete\n", encoding="ascii"
@@ -330,6 +377,7 @@ class CaptureSession:
 
     def _write_manifest(self) -> None:
         assert self.bundle is not None
+        enrich_manifest_timestamps(self.manifest)
         serialized = json.dumps(self.manifest, indent=2, sort_keys=True)
         if serialized == self._manifest_written:
             return

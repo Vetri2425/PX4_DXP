@@ -92,12 +92,28 @@ def _configure_recorder(monkeypatch, tmp_path):
     return repo, staging, bundles
 
 
-def test_bundle_naming_is_utc_source_and_mission():
+def test_bundle_naming_is_ist_source_and_mission():
     when = datetime.datetime(2026, 6, 19, 12, 34, 56, 789000,
                              tzinfo=datetime.timezone.utc)
     assert recorder.bundle_name("../Field Name.dxf", "stg:abc", when) == (
-        "20260619T123456.789Z_Field_Name.dxf_stg_abc"
+        "2026-06-19_18-04-56.789_IST_Field_Name.dxf_stg_abc"
     )
+
+
+def test_manifest_timestamps_gain_ist_readable_fields():
+    manifest = {
+        "timestamps": {
+            "requested_utc": "2026-07-02T11:30:28.340Z",
+            "recorder_start_utc": "2026-07-02T11:30:28.419Z",
+            "terminal_utc": None,
+            "recorder_end_utc": None,
+        },
+    }
+    recorder.enrich_manifest_timestamps(manifest)
+    assert manifest["capture_timezone"] == "Asia/Kolkata"
+    assert manifest["timestamps"]["requested_ist"] == "2026-07-02_17-00-28.340_IST"
+    assert manifest["timestamps"]["recorder_start_ist"] == "2026-07-02_17-00-28.419_IST"
+    assert manifest["timestamps"]["terminal_ist"] is None
 
 
 def test_staged_json_is_copied_byte_for_byte(monkeypatch, tmp_path):
