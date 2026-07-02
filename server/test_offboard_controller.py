@@ -1,4 +1,5 @@
 import asyncio
+import math
 import os
 import sys
 from collections import deque
@@ -303,15 +304,28 @@ def test_surveyed_start_preserves_spray_flags_and_does_not_accumulate_translatio
         flags = [False, True, True]
         load_surveyed(ctrl, spray_flags=flags)
 
-        ok, _ = run(ctrl.start_async(expected_mission_id="stg_field"))
+        evidence = []
+        ok, _ = run(ctrl.start_async(
+            expected_mission_id="stg_field", pre_publish_hook=evidence.append
+        ))
         assert ok is True
         first_publish = node.calls[0]
+        k = evidence[0]["entry_leg_point_count"]
         assert first_publish[0] == "publish_path"
         assert first_publish[1][0] == pytest.approx((state["pos_n"], state["pos_e"]))
-        assert first_publish[1][1] == pytest.approx((5.192, -0.910), abs=0.02)
-        assert first_publish[1][2] == pytest.approx(first_publish[1][1])
-        assert first_publish[2] == [False, False, *flags]
+        # entry leg ends on wp0, immediately duplicated as the mission's first point
+        assert first_publish[1][k - 1] == pytest.approx((5.192, -0.910), abs=0.02)
+        assert first_publish[1][k] == pytest.approx(first_publish[1][k - 1])
+        assert first_publish[2] == [False] * k + flags
         assert first_publish[3] is True
+        # entry acquisition leg densified at <=5 cm
+        entry_leg = first_publish[1][:k]
+        gaps = [
+            math.hypot(entry_leg[i + 1][0] - entry_leg[i][0],
+                       entry_leg[i + 1][1] - entry_leg[i][1])
+            for i in range(len(entry_leg) - 1)
+        ]
+        assert not gaps or max(gaps) <= 0.05 + 1e-6
 
         ctrl.state = MissionState.IDLE
         node.calls.clear()
@@ -338,25 +352,34 @@ def test_surveyed_mark_first_adds_off_duplicate_boundary_and_preserves_source():
         assert run(ctrl.start_async(pre_publish_hook=evidence.append))[0] is True
 
         published = node.calls[0]
-        resolved_first = published[1][1]
+        k = evidence[0]["entry_leg_point_count"]
+        resolved_first = evidence[0]["resolved_first_waypoint_ned"]
         offset_n = resolved_first[0] - source_before[0][0]
         offset_e = resolved_first[1] - source_before[0][1]
         expected_mission = [
             (point[0] + offset_n, point[1] + offset_e) for point in source_before
         ]
         assert published[1][0] == pytest.approx((state["pos_n"], state["pos_e"]))
-        assert published[1][2] == pytest.approx(resolved_first)
-        assert published[1][2:] == pytest.approx(expected_mission)
-        assert published[2] == [False, False, *flags]
+        # entry-run end (wp0) at index k-1, duplicated as the mission's first point at k
+        assert published[1][k - 1] == pytest.approx(resolved_first)
+        assert published[1][k:] == pytest.approx(expected_mission)
+        assert published[2] == [False] * k + flags
         assert published[3] is True
         assert ctrl.loaded_path_summary()["sample_coords"] == source_before
-        assert evidence[0]["resolved_first_waypoint_ned"] == pytest.approx(resolved_first)
         assert evidence[0]["published_first_waypoint_ned"] == pytest.approx(
             (state["pos_n"], state["pos_e"])
         )
         assert evidence[0]["entry_transit_added"] is True
         assert evidence[0]["source_point_count"] == len(source_before)
-        assert evidence[0]["published_point_count"] == len(source_before) + 2
+        assert evidence[0]["published_point_count"] == len(source_before) + k
+        # entry acquisition leg densified at <=5 cm
+        entry_leg = published[1][:k]
+        gaps = [
+            math.hypot(entry_leg[i + 1][0] - entry_leg[i][0],
+                       entry_leg[i + 1][1] - entry_leg[i][1])
+            for i in range(len(entry_leg) - 1)
+        ]
+        assert not gaps or max(gaps) <= 0.05 + 1e-6
     finally:
         offboard_module.SETPOINT_STREAM_GRACE_S = old_grace
 

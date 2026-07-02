@@ -60,6 +60,32 @@ ABORT_NOOP_STATES = {
 }
 STOP_SETTLE_S = 0.1
 ENTRY_COINCIDENT_TOLERANCE_M = 1e-6
+# Entry acquisition leg waypoint spacing (m). Matches the path engine's MARK
+# densification so the runtime-added rover->wp0 leg is not a single coarse
+# segment. Without intermediate points the leg length is below RPP's min
+# lookahead, so the lookahead resolves past wp0 onto the first mission side and
+# the rover cuts the wp0 corner instead of arriving on it.
+ENTRY_DENSIFY_SPACING_M = 0.05
+
+
+def _densify_leg(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    spacing: float = ENTRY_DENSIFY_SPACING_M,
+) -> list[tuple[float, float]]:
+    """Straight leg start->end (both inclusive) with no interval > ``spacing``.
+
+    The final point is the exact ``end`` tuple's coordinates so it coincides with
+    the mission's first waypoint (the entry-run boundary duplicate). A leg shorter
+    than one spacing step stays a clean 2-point segment.
+    """
+    dn = end[0] - start[0]
+    de = end[1] - start[1]
+    length = math.hypot(dn, de)
+    n = max(1, math.ceil(length / spacing))
+    pts = [(start[0] + dn * i / n, start[1] + de * i / n) for i in range(n)]
+    pts.append((end[0], end[1]))
+    return pts
 CLEAR_ALLOWED_STATES = {
     MissionState.IDLE,
     MissionState.COMPLETED,
@@ -94,13 +120,19 @@ def _build_runtime_entry_path(
     if not evidence["entry_transit_added"]:
         return list(points), list(spray_flags) if spray_flags is not None else None, evidence
 
+    # Densify the acquisition leg at MARK spacing so RPP tracks it to wp0
+    # precisely (~1-2 cm) instead of aiming past the short leg. entry_leg ends on
+    # original_first, which the following *points also starts with — that duplicate
+    # marks the end of the runtime-only entry run. For MARK-first it is also the
+    # zero-distance OFF->ON boundary; PRE-first stays OFF->OFF.
+    entry_leg = _densify_leg(rover_ned, original_first)
+    evidence["entry_leg_point_count"] = len(entry_leg)
+    entry_off = [False] * len(entry_leg)
     if spray_flags is None:
-        return [rover_ned, original_first, *points], None, evidence
-    # The duplicate marks the end of the runtime-only entry run. For MARK-first
-    # it is also the zero-distance OFF->ON boundary; PRE-first stays OFF->OFF.
+        return [*entry_leg, *points], None, evidence
     return (
-        [rover_ned, original_first, *points],
-        [False, False, *spray_flags],
+        [*entry_leg, *points],
+        [*entry_off, *spray_flags],
         evidence,
     )
 
