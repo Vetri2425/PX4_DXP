@@ -726,11 +726,14 @@ class RPPControllerNode(Node):
 
         stamp = msg.header.stamp
         runs: list[dict] = []
-        for run_pts, run_flags in raw_runs:
+        entry_run_present = entry_run is not None
+        for raw_run_idx, (run_pts, run_flags) in enumerate(raw_runs):
+            is_runtime_entry_run = entry_run_present and raw_run_idx == 0
             point_leg_densified = (
                 runtime_entry_marked
                 and len(run_pts) >= 3
                 and is_collinear_straight_leg(run_pts)
+                and (is_runtime_entry_run or not any(run_flags))
             )
             if point_leg_densified:
                 # Point-mode straight leg: smooth resample only — intermediates
@@ -767,6 +770,7 @@ class RPPControllerNode(Node):
                 "length": self._pts_length(c_pts),
                 "cum_s": self._pts_cumulative_lengths(c_pts),
                 "closed": self._is_closed_run(c_pts),
+                "runtime_entry": is_runtime_entry_run,
             })
 
         # Drop degenerate slivers (e.g. the ~3 cm reversed stub that spray
@@ -1424,7 +1428,7 @@ class RPPControllerNode(Node):
             h1 = math.atan2(n1.y - n0.y, n1.x - n0.x)
             threshold = math.radians(float(self.get_parameter("segment_corner_threshold_deg").value))
             turn = abs(self._heading_delta(h0, h1))
-            if turn >= threshold:
+            if turn >= threshold or self._runtime_entry_to_mark_boundary(prev_run, run):
                 self._run_align_pending = True
                 self._run_align_turn_rad = turn   # angle-aware pivot budget
         self._reset_corner_pivot_state()
@@ -1490,7 +1494,20 @@ class RPPControllerNode(Node):
         h1 = math.atan2(b1.y - b0.y, b1.x - b0.x)
         return abs(self._angle_wrap(h1 - h0))
 
+    @staticmethod
+    def _runtime_entry_to_mark_boundary(
+        prev_run: dict | None, next_run: dict | None
+    ) -> bool:
+        if not prev_run or not next_run:
+            return False
+        return bool(prev_run.get("runtime_entry") and any(next_run.get("flags", [])))
+
     def _next_run_requires_alignment(self) -> bool:
+        if self._run_idx + 1 < len(self._runs) and self._runtime_entry_to_mark_boundary(
+            self._runs[self._run_idx],
+            self._runs[self._run_idx + 1],
+        ):
+            return True
         threshold = math.radians(
             float(self.get_parameter("segment_corner_threshold_deg").value)
         )
