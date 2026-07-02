@@ -252,7 +252,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "segment_corner_threshold_deg": {
         "type": "float",
-        "default": 45.0,
+        "default": 25.0,
         "group": "Tracking Profile",
         "description": "Auto-profile threshold: heading changes at or above this angle select segment mode",
         "min": 1.0,
@@ -276,7 +276,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "segment_corner_acceptance_radius": {
         "type": "float",
-        "default": 0.05,
+        "default": 0.02,
         "group": "Tracking Profile",
         "description": "Distance from a segment end where corner alignment begins (m)",
         "min": 0.005,

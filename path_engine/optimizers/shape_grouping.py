@@ -34,6 +34,15 @@ from ..core import (
     SegmentType,
 )
 
+# Point-coincidence epsilon (metres) for collapsing the duplicated junction
+# vertex when two chained segments are concatenated. This MUST stay far below
+# the densification spacing: the chaining/join tolerance (~5 cm) decides whether
+# two *segments* connect, but reusing it to de-duplicate *points* would strip
+# every legitimately densified point that sits one spacing-step (5 cm) from its
+# neighbour, doubling the effective gap to 10 cm. Only truly coincident vertices
+# are removed here.
+_JUNCTION_COINCIDENT_EPS_M = 1e-4
+
 # Shared taxonomy (core.py) — a curve is never absorbed into a line chain.
 _CURVED_GEOMETRY = CURVED_GEOMETRY_TYPES
 _CURVED_PREFIXES = ("ARC_", "CIRCLE_", "ELLIPSE_", "SPLINE_")
@@ -181,7 +190,11 @@ def _merge_chain(chain: list[PathSegment], tol: float) -> PathSegment:
         if seg.source_entity:
             sources.append(seg.source_entity)
         for pt in seg.points:
-            if pts and math.hypot(pt[0] - pts[-1][0], pt[1] - pts[-1][1]) <= tol:
+            # Only drop the duplicated junction vertex (coincident endpoints of
+            # adjacent chained segments). Using the segment-join `tol` here would
+            # decimate the densified run to double spacing — see
+            # _JUNCTION_COINCIDENT_EPS_M.
+            if pts and math.hypot(pt[0] - pts[-1][0], pt[1] - pts[-1][1]) <= _JUNCTION_COINCIDENT_EPS_M:
                 continue
             pts.append(pt)
     head = chain[0]

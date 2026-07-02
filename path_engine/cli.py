@@ -152,7 +152,7 @@ def main():
     plan_parser.add_argument("--output", "-o", help="Write waypoints to CSV file")
     plan_parser.add_argument("--json", action="store_true", help="Print JSON summary")
     plan_parser.add_argument("--mark-spacing", type=float, default=0.05, help="MARK waypoint spacing (m)")
-    plan_parser.add_argument("--transit-spacing", type=float, default=0.15, help="TRANSIT waypoint spacing (m)")
+    plan_parser.add_argument("--transit-spacing", type=float, default=0.05, help="TRANSIT waypoint spacing (m)")
     plan_parser.add_argument("--mark-speed", type=float, default=0.35, help="MARK speed (m/s)")
     plan_parser.add_argument("--transit-speed", type=float, default=0.50, help="TRANSIT speed (m/s)")
     plan_parser.set_defaults(func=cmd_plan)

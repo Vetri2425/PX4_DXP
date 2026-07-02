@@ -338,7 +338,7 @@ class RPPControllerNode(Node):
         #   smooth  — existing RPP with optional corner smoothing
         # `sharp` is accepted as a runtime alias for `segment`.
         self.declare_parameter("tracking_profile",                    "auto")
-        self.declare_parameter("segment_corner_threshold_deg",         45.0)
+        self.declare_parameter("segment_corner_threshold_deg",         25.0)
         self.declare_parameter("segment_slowdown_dist",               0.50)
         self.declare_parameter("segment_min_corner_speed",             0.08)
         # Final-segment (run-endpoint) goal-approach floor. A per-line PRE/AFT
@@ -352,7 +352,7 @@ class RPPControllerNode(Node):
         # ~0.05 m/s (floor + overshoot) so drift is <1 cm, without touching the
         # non-extension square's within-run corners or arc approaches.
         self.declare_parameter("segment_endpoint_approach_speed",      0.03)   # m/s
-        self.declare_parameter("segment_corner_acceptance_radius",     0.05)
+        self.declare_parameter("segment_corner_acceptance_radius",     0.02)
         # Pivot exit tolerance. 2.0° gives the "spin in place, exit facing the
         # next point" behaviour; pair with FCU param RD_TRANS_TRN_DRV lowered
         # to the same angle (set via QGC) or the firmware starts driving

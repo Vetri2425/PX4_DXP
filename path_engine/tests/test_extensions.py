@@ -23,7 +23,30 @@ from path_engine.planners.extensions import (
     split_mark_segment_with_extensions,
 )
 from path_engine.optimizers.shape_grouping import group_connected_segments
-from path_engine.engine import PathEngine
+from path_engine.engine import PathEngine, MAX_DENSIFY_SPACING_M
+
+
+def _assert_closed_square_topology(wps):
+    """The 2x2 closed square, densified at <=5 cm: corners preserved in order,
+    closed loop, and no interval exceeds the densification ceiling.
+
+    Replaces the old corner-only exact-list assertion, which relied on a coarse
+    mark_spacing that is now clamped to MAX_DENSIFY_SPACING_M.
+    """
+    corners = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0)]
+    assert wps[0] == (0.0, 0.0) and wps[-1] == (0.0, 0.0), "run must be a closed loop"
+    # Each corner appears, and their first occurrences are strictly in order.
+    last_idx = -1
+    for c in corners[:-1]:
+        idxs = [i for i, w in enumerate(wps) if math.hypot(w[0] - c[0], w[1] - c[1]) < 1e-6]
+        assert idxs, f"corner {c} missing from densified run"
+        assert idxs[0] > last_idx, f"corner {c} out of order"
+        last_idx = idxs[0]
+    ivs = [
+        math.hypot(wps[i + 1][0] - wps[i][0], wps[i + 1][1] - wps[i][1])
+        for i in range(len(wps) - 1)
+    ]
+    assert max(ivs) <= MAX_DENSIFY_SPACING_M + 1e-6, f"gap >5 cm: {max(ivs):.3f} m"
 
 
 # ---------------------------------------------------------------------------
@@ -638,13 +661,9 @@ class TestExtensionStitchingThroughEngine:
         plan = engine.plan_segments(self._square_edges())
 
         assert [s.segment_type for s in plan.segments] == [SegmentType.MARK]
-        assert plan.merged_waypoints == [
-            (0.0, 0.0),
-            (2.0, 0.0),
-            (2.0, 2.0),
-            (0.0, 2.0),
-            (0.0, 0.0),
-        ]
+        # mark_spacing=2.0 is clamped to the 5 cm ceiling, so the CAD corners are
+        # preserved in order but the run is densified at <=5 cm (no 10 cm gaps).
+        _assert_closed_square_topology(plan.merged_waypoints)
 
     def test_square_extensions_vertex_anchored_no_corner_spurs(self):
         """Vertex-anchored policy: a CLOSED square has no free end, so enabling
@@ -670,15 +689,9 @@ class TestExtensionStitchingThroughEngine:
         assert connectors == []
 
         # The closed square collapses to a single clean MARK chain — identical
-        # topology to enable_path_extensions=False.
+        # topology to enable_path_extensions=False (densified at <=5 cm).
         assert [s.segment_type for s in plan.segments] == [SegmentType.MARK]
-        assert plan.merged_waypoints == [
-            (0.0, 0.0),
-            (2.0, 0.0),
-            (2.0, 2.0),
-            (0.0, 2.0),
-            (0.0, 0.0),
-        ]
+        _assert_closed_square_topology(plan.merged_waypoints)
 
         # No >100° heading reversal anywhere (the spur signature was 135°).
         wps = plan.merged_waypoints

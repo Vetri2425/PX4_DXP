@@ -38,6 +38,13 @@ from .ned import latlon_to_ned, dxf_to_ned_affine, apply_affine_transform
 
 log = logging.getLogger(__name__)
 
+# Hard cap on waypoint densification spacing (metres). Every densified interval
+# — MARK, TRANSIT, and discretized curves (arc/circle) — must be <= 5 cm for
+# drawing accuracy. Callers (and API clients) may request a finer spacing, but a
+# coarser request is clamped down to this ceiling so no mission ever ships with
+# >5 cm gaps regardless of what the GCS sends.
+MAX_DENSIFY_SPACING_M = 0.05
+
 # Curved geometry is already smoothly discretised by the parser — re-running the
 # corner rounder on it would distort the curve. Sourced from the shared taxonomy
 # so "what counts as a curve" stays defined in exactly one place (core.py).
@@ -147,7 +154,7 @@ class PathEngine:
     def __init__(
         self,
         mark_spacing: float = 0.05,
-        transit_spacing: float = 0.15,
+        transit_spacing: float = 0.05,
         marking_speed: float = 0.35,
         transit_speed: float = 0.50,
         spray_on_latency: float = 0.10,
@@ -185,6 +192,15 @@ class PathEngine:
             raise ValueError(f"corner_smooth_arc_pts must be >= 2, got {corner_smooth_arc_pts}")
         if max_two_opt_segments < 0:
             raise ValueError(f"max_two_opt_segments must be >= 0, got {max_two_opt_segments}")
+        # Enforce the <=5 cm densification ceiling on both MARK and TRANSIT. A
+        # client may request finer (e.g. 3 cm); a coarser request (e.g. the GCS
+        # sending 10 cm line_spacing) is clamped down so no leg ships >5 cm.
+        if mark_spacing > MAX_DENSIFY_SPACING_M:
+            log.info("mark_spacing %.3f m clamped to %.3f m", mark_spacing, MAX_DENSIFY_SPACING_M)
+            mark_spacing = MAX_DENSIFY_SPACING_M
+        if transit_spacing > MAX_DENSIFY_SPACING_M:
+            log.info("transit_spacing %.3f m clamped to %.3f m", transit_spacing, MAX_DENSIFY_SPACING_M)
+            transit_spacing = MAX_DENSIFY_SPACING_M
         self.mark_spacing = mark_spacing
         self.transit_spacing = transit_spacing
         self.marking_speed = marking_speed

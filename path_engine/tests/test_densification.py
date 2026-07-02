@@ -192,9 +192,9 @@ def test_generic_transit_unaffected():
     ])
     transit = [s for s in plan.segments if s.segment_type == SegmentType.TRANSIT][0]
     ivs = _nz(transit.points)
-    # spaced at transit_spacing (0.15), NOT mark_spacing (0.05)
-    assert max(ivs) > 0.05 + 1e-3
-    assert max(ivs) <= 0.15 + 1e-6
+    # A requested transit_spacing of 0.15 is clamped to the 5 cm densification
+    # ceiling (MAX_DENSIFY_SPACING_M): every interval must be <= 5 cm.
+    assert max(ivs) <= 0.05 + 1e-6
 
 
 # ── Test 8 — float-guard subdivision behaviour ───────────────────────────────

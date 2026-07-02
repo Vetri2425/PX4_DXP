@@ -495,7 +495,7 @@ def entities_to_segments(
     transit_speed: float = 0.50,
     chord_error: float = 0.005,
     min_spacing: float = 0.02,
-    max_spacing: float = 0.10,
+    max_spacing: float = 0.05,
 ) -> list[PathSegment]:
     """Convert DXFEntity list to PathSegment list.
 

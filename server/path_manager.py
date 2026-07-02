@@ -23,7 +23,7 @@ log = get_logger("server.path")
 
 # ── Hardcoded path generators (mirror path_publisher_node.py) ─────────────────
 
-def gen_straight_5m(spacing: float = 0.1) -> list[tuple[float, float]]:
+def gen_straight_5m(spacing: float = 0.05) -> list[tuple[float, float]]:
     return [(i * spacing, 0.0) for i in range(int(5.0 / spacing) + 1)]
 
 
@@ -83,19 +83,19 @@ def _polyline(
     return pts
 
 
-def gen_lshape_2x2(spacing: float = 0.15) -> list[tuple[float, float]]:
+def gen_lshape_2x2(spacing: float = 0.05) -> list[tuple[float, float]]:
     # Open L: north 2 m then east 2 m. Corners land exactly at (2,0) and (2,2).
     return _polyline([(0.0, 0.0), (2.0, 0.0), (2.0, 2.0)], spacing)
 
 
-def gen_square_2x2(spacing: float = 0.15) -> list[tuple[float, float]]:
+def gen_square_2x2(spacing: float = 0.05) -> list[tuple[float, float]]:
     # Closed 2x2 square — exact corners, returns to (0,0).
     return _polyline(
         [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0)], spacing
     )
 
 
-def gen_rectangle_3x2(spacing: float = 0.15) -> list[tuple[float, float]]:
+def gen_rectangle_3x2(spacing: float = 0.05) -> list[tuple[float, float]]:
     # Closed 3 m (north) x 2 m (east) rectangle — exact corners, returns to (0,0).
     return _polyline(
         [(0.0, 0.0), (3.0, 0.0), (3.0, 2.0), (0.0, 2.0), (0.0, 0.0)], spacing
@@ -116,12 +116,12 @@ def gen_circle_1m5(
 
 
 BUILTIN_PATHS: dict[str, dict] = {
-    "straight_5m":     {"gen": gen_straight_5m,      "desc": "5 m straight north, 10 cm spacing"},
+    "straight_5m":     {"gen": gen_straight_5m,      "desc": "5 m straight north, 5 cm spacing"},
     "arc_quarter_1m5": {"gen": gen_arc_quarter_1m5,  "desc": "Quarter circle, R=1.5 m, 5 cm arc spacing, north then east"},
     "arc_half_1m5":    {"gen": gen_arc_half_1m5,     "desc": "Half circle, R=1.5 m, 5 cm arc spacing, north then east"},
-    "lshape_2x2":      {"gen": gen_lshape_2x2,       "desc": "2 m north then 2 m east, 15 cm spacing"},
-    "square_2x2":      {"gen": gen_square_2x2,       "desc": "2 m × 2 m closed square, 15 cm spacing"},
-    "rectangle_3x2":   {"gen": gen_rectangle_3x2,    "desc": "3 m north × 2 m east rectangle, 15 cm spacing"},
+    "lshape_2x2":      {"gen": gen_lshape_2x2,       "desc": "2 m north then 2 m east, 5 cm spacing"},
+    "square_2x2":      {"gen": gen_square_2x2,       "desc": "2 m × 2 m closed square, 5 cm spacing"},
+    "rectangle_3x2":   {"gen": gen_rectangle_3x2,    "desc": "3 m north × 2 m east rectangle, 5 cm spacing"},
     "circle_1m5":      {"gen": gen_circle_1m5,       "desc": "Full circle, R=1.5 m, 5 cm arc spacing, closed loop"},
 }
 
@@ -877,7 +877,9 @@ class PathManager:
         corner_smooth_arc_pts = kwargs.pop("corner_smooth_arc_pts", 6)
         use_two_opt = kwargs.pop("use_two_opt", True)
         max_two_opt_segments = kwargs.pop("max_two_opt_segments", 80)
-        max_waypoints = kwargs.pop("max_waypoints", 10000)
+        # 40k accommodates the mandated 5 cm densification on large fields
+        # (5 cm × 40k = 2 km of marking path) without tripping the safety cap.
+        max_waypoints = kwargs.pop("max_waypoints", 40000)
         max_segments = kwargs.pop("max_segments", 2000)
         line_spacing = kwargs.pop("line_spacing", 0.05)
         transit_spacing = kwargs.pop("transit_spacing", 0.15)

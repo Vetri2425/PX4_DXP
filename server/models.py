@@ -914,8 +914,8 @@ class PathPlanRequest(BaseModel):
     origin_gps: Optional[list[float]] = None  # [latitude, longitude] WGS84 reference
     rotation_deg: float = 0.0  # DXF rotation relative to true north
     close_loop: bool = False  # True to close open loop paths
-    line_spacing: float = 0.05  # MARK waypoint spacing (m)
-    transit_spacing: float = 0.15  # TRANSIT waypoint spacing (m)
+    line_spacing: float = 0.05  # MARK waypoint spacing (m); capped at 5 cm in PathEngine
+    transit_spacing: float = 0.05  # TRANSIT waypoint spacing (m); capped at 5 cm in PathEngine
     marking_speed: float = 0.35  # MARK speed (m/s)
     transit_speed: float = 0.50  # TRANSIT speed (m/s)
     optimize: bool = True  # Reorder segments for minimal dead-heading
@@ -933,7 +933,7 @@ class PathPlanRequest(BaseModel):
     corner_smooth_arc_pts: int = Field(6, ge=2)  # Points per smoothed corner arc
     use_two_opt: bool = True  # Improve greedy segment order with 2-opt
     max_two_opt_segments: int = Field(80, ge=0, le=1000)  # Skip 2-opt above this MARK count
-    max_waypoints: int = Field(10000, ge=100, le=500000)  # Hard publication guard
+    max_waypoints: int = Field(40000, ge=100, le=500000)  # Hard publication guard (5 cm on large fields)
     max_segments: int = Field(2000, ge=1, le=100000)  # Hard segment-count guard
     include_waypoints: bool = True  # If False, return summary only (no waypoint arrays)
     spray_mode: Optional[Literal["continuous", "dash", "point"]] = None

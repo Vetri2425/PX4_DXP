@@ -342,7 +342,7 @@ def _entity_preview_tuples(ent, max_points: int = 200) -> list[tuple[float, floa
                 closed,
                 chord_error=0.05,
                 min_spacing=0.05,
-                max_spacing=0.50,
+                max_spacing=0.05,
             )
         else:
             pts = vertices

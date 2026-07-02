@@ -22,7 +22,7 @@ class PathValidator:
         min_turn_radius_m: float = 0.3,
         max_gap_m: float = 0.5,
         max_bbox_size_m: float = 1000.0,
-        max_waypoints: int = 10000,
+        max_waypoints: int = 40000,
         max_segments: int = 2000,
     ):
         self.min_turn_radius_m = min_turn_radius_m
