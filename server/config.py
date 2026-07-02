@@ -124,6 +124,12 @@ GPS_FIX_STALE_MS = float(os.environ.get("ROVER_GPS_FIX_STALE_MS", "500"))
 POSE_GLOBAL_MAX_SKEW_MS = float(os.environ.get("ROVER_POSE_GPS_MAX_SKEW_MS", "100"))
 RPP_DEBUG_STALE_MS = float(os.environ.get("ROVER_RPP_DEBUG_STALE_MS", "500"))
 SAFETY_STALE_GRACE_S = 1.0  # auto-abort after this long in STALE
+# GPS_SURVEYED runtime gate: a single marginal staleness sample (e.g. 534ms >
+# 500ms) must not auto-e-stop. Mirror SAFETY_STALE_GRACE_S — require the fault
+# to persist this long before driving the spray-OFF + e-stop. The spray gate is
+# still published not-ok immediately (spray stops fast); only the drive e-stop
+# is debounced. At 0.35 m/s a 0.5s grace tolerates ~18cm of travel.
+GPS_RUNTIME_FAULT_GRACE_S = float(os.environ.get("ROVER_GPS_RUNTIME_FAULT_GRACE_S", "0.5"))
 DONE_SETTLE_S = 1.0  # require this much DONE before auto-completing
 SETPOINT_STREAM_GRACE_S = 0.5  # path/setpoint settle time before OFFBOARD request
 

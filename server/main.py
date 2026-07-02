@@ -41,6 +41,7 @@ from config import (
     CORS_ALLOW_ORIGINS,
     DEFAULT_PORT,
     GPS_FIX_NAMES,
+    GPS_RUNTIME_FAULT_GRACE_S,
     MAX_ACTIVITY_LOG,
     MISSION_DIR,
     POSE_STALE_MS,
@@ -395,6 +396,7 @@ async def _telemetry_loop() -> None:
     gps_gate_seq = 0
     gps_gate_fault_count = 0
     gps_gate_last_fault_time: Optional[float] = None
+    gps_gate_fault_since: Optional[float] = None
     _WATCHDOG_EVERY_N = TELEMETRY_HZ * 3  # ping systemd every ~3s
 
     log.info("telemetry loop started @ %d Hz", TELEMETRY_HZ)
@@ -619,54 +621,75 @@ async def _telemetry_loop() -> None:
                     if not verdict.ok:
                         gps_gate_fault_count += 1
                         gps_gate_last_fault_time = now
+                        # Publish the spray gate not-ok immediately so the spray
+                        # node stops fast, but debounce the drive e-stop: a
+                        # single marginal staleness sample (e.g. 534ms > 500ms)
+                        # must not auto-e-stop. Only trip once the fault has
+                        # persisted past the grace window, mirroring the pose
+                        # watchdog's SAFETY_STALE_GRACE_S.
                         ros_node.publish_gps_gate(
                             active=True, ok=False,
                             reason=verdict.reason, seq=gps_gate_seq,
                         )
-                        log.warning(
-                            "GPS_SURVEYED runtime fault (%s mission): %s",
-                            gctx["spray_mode"], verdict.reason,
-                        )
-                        try:
-                            from spray_safety import force_spray_off_confirmed
-
-                            spray_off = await force_spray_off_confirmed(
-                                ros_node, timeout_s=2.0
+                        if gps_gate_fault_since is None:
+                            gps_gate_fault_since = now
+                        if now - gps_gate_fault_since <= GPS_RUNTIME_FAULT_GRACE_S:
+                            # Hold e-stop until the grace elapses; re-evaluate
+                            # next tick (spray gate already published not-ok).
+                            log.warning(
+                                "GPS_SURVEYED runtime fault (%s mission), within "
+                                "grace %.2fs: %s",
+                                gctx["spray_mode"],
+                                now - gps_gate_fault_since,
+                                verdict.reason,
                             )
-                            if not spray_off.success and spray_off.live:
-                                log.warning(
-                                    "GPS fault spray OFF not confirmed: %s",
-                                    spray_off.as_dict(),
+                        else:
+                            log.warning(
+                                "GPS_SURVEYED runtime fault (%s mission): %s",
+                                gctx["spray_mode"], verdict.reason,
+                            )
+                            try:
+                                from spray_safety import force_spray_off_confirmed
+
+                                spray_off = await force_spray_off_confirmed(
+                                    ros_node, timeout_s=2.0
                                 )
-                        except Exception:
-                            log.exception("force spray OFF during GPS fault failed")
-                        if emergency_handler is not None:
-                            await emergency_handler.estop_async()
-                        if mission_capture is not None:
-                            mission_capture.record_terminal(
-                                None, "gps_safety_abort",
-                                state=offboard_ctrl.state.value,
-                                details={
+                                if not spray_off.success and spray_off.live:
+                                    log.warning(
+                                        "GPS fault spray OFF not confirmed: %s",
+                                        spray_off.as_dict(),
+                                    )
+                            except Exception:
+                                log.exception("force spray OFF during GPS fault failed")
+                            if emergency_handler is not None:
+                                await emergency_handler.estop_async()
+                            if mission_capture is not None:
+                                mission_capture.record_terminal(
+                                    None, "gps_safety_abort",
+                                    state=offboard_ctrl.state.value,
+                                    details={
+                                        "reason": verdict.reason,
+                                        "spray_mode": gctx["spray_mode"],
+                                    },
+                                )
+                            await _emit_authenticated(
+                                "gps_safety_abort",
+                                {
                                     "reason": verdict.reason,
                                     "spray_mode": gctx["spray_mode"],
+                                    "gps_fix": verdict.current_fix_type,
+                                    "manual_resume_required": True,
                                 },
                             )
-                        await _emit_authenticated(
-                            "gps_safety_abort",
-                            {
-                                "reason": verdict.reason,
-                                "spray_mode": gctx["spray_mode"],
-                                "gps_fix": verdict.current_fix_type,
-                                "manual_resume_required": True,
-                            },
-                        )
                     else:
                         gps_gate_fault_count = 0
+                        gps_gate_fault_since = None
                         ros_node.publish_gps_gate(
                             active=True, ok=True, reason="", seq=gps_gate_seq,
                         )
                 else:
                     gps_gate_fault_count = 0
+                    gps_gate_fault_since = None
                     ros_node.publish_gps_gate(
                         active=False, ok=True, reason="", seq=gps_gate_seq,
                     )

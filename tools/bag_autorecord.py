@@ -315,6 +315,12 @@ class CaptureSession:
         self.api_fail_since: float | None = None
         self.mission_became_active = False
         self.manifest: dict[str, Any] = {}
+        # Last-written manifest serialization. update_from_control() runs every
+        # POLL_S (0.1s) for the whole recording; re-fsyncing an unchanged
+        # manifest each tick is sustained disk I/O that contends with the
+        # rosbag's own sqlite WAL writes and can stall finalization. Skip the
+        # write when nothing changed.
+        self._manifest_written: str | None = None
         # Throttled cache for the expensive total-bundle-size guard.
         self._dirsize_checked_at: float | None = None
         self._dirsize_cached: int = 0
@@ -324,7 +330,11 @@ class CaptureSession:
 
     def _write_manifest(self) -> None:
         assert self.bundle is not None
+        serialized = json.dumps(self.manifest, indent=2, sort_keys=True)
+        if serialized == self._manifest_written:
+            return
         atomic_json(self.bundle / "manifest.json", self.manifest)
+        self._manifest_written = serialized
 
     def _cleanup_control_files(self) -> None:
         # Remove the request first so deleting its acknowledgement cannot make it
@@ -887,12 +897,37 @@ class RecorderDaemon:
             except OSError as exc:
                 log(f"control purge failed for {group}/{capture_id}: {exc}")
 
+    def _reject_as_busy(self, capture_id: str) -> None:
+        """Immediately NACK a capture request that arrived while recording.
+
+        The recorder handles one capture at a time. Without this, a request that
+        shows up while a bag is open (recording or finalizing) is never polled
+        until the session ends, so the server's begin_capture() hangs the full
+        ack timeout (~3s) and surfaces a 503 — and after an e-stop the operator's
+        immediate retries pile up as phantom requests. Writing a prompt busy NACK
+        turns that into an instant, truthful "recorder busy" error the operator
+        can retry once the current capture finalizes.
+        """
+        active = self.session.capture_id if self.session is not None else "unknown"
+        atomic_json(CONTROL_DIR / "acks" / f"{capture_id}.json", {
+            "capture_id": capture_id,
+            "ready": False,
+            "error": f"recorder busy: capture {active} still in progress",
+            "acknowledged_at_utc": utc_now(),
+        })
+        log(f"rejected concurrent capture request {capture_id} (busy with {active})")
+
     def _next_request(self) -> dict[str, Any] | None:
         request_dir = CONTROL_DIR / "requests"
         request_dir.mkdir(parents=True, exist_ok=True)
         for path in sorted(request_dir.glob("*.json"), key=lambda item: item.stat().st_mtime):
             capture_id = path.stem
             if (CONTROL_DIR / "acks" / f"{capture_id}.json").exists():
+                if (CONTROL_DIR / "cancelled" / f"{capture_id}.json").exists():
+                    # Handshake fully resolved: we acked (e.g. a busy NACK) and
+                    # the server then cancelled. Purge so rejected concurrent
+                    # captures do not accumulate under the control directory.
+                    self._purge_control(capture_id)
                 continue
             if (CONTROL_DIR / "cancelled" / f"{capture_id}.json").exists():
                 # Server gave up before readiness (e.g. ack timeout) and is no
@@ -955,6 +990,14 @@ class RecorderDaemon:
                         session.reject(exc)
                 time.sleep(POLL_S)
                 continue
+
+            # A session is active. Keep serving the handshake so a concurrent
+            # start attempt (e.g. an operator retrying right after an e-stop,
+            # while this capture is still finalizing) gets an immediate busy
+            # NACK instead of hanging until the server's ack timeout.
+            pending = self._next_request()
+            if pending is not None:
+                self._reject_as_busy(str(pending["capture_id"]))
 
             self.session.update_from_control()
             self.session.poll_mission()
