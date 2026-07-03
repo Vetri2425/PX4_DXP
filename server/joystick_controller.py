@@ -104,6 +104,7 @@ class JoystickController:
         self._last_deadman = False
         self._last_throttle = 0.0
         self._last_steering = 0.0
+        self._coalesced_command_count = 0
         self._stop_reason: str | None = None
         self._watchdog_task: asyncio.Task | None = None
 
@@ -138,6 +139,7 @@ class JoystickController:
             self._last_deadman = False
             self._last_throttle = 0.0
             self._last_steering = 0.0
+            self._coalesced_command_count = 0
             self._stop_reason = None
 
             try:
@@ -196,8 +198,8 @@ class JoystickController:
         self._check_transport_healthy()
         self._check_manual_mode()
         self._validate_sequence(cmd)
-        self._validate_rate(now)
         self._validate_values(cmd)
+        coalesced = self._is_over_command_rate(now)
 
         throttle = _clamp(cmd.throttle, -self._max_abs_throttle, self._max_abs_throttle)
         steering = _clamp(cmd.steering, -self._max_abs_steering, self._max_abs_steering)
@@ -214,7 +216,10 @@ class JoystickController:
         self._last_seq = cmd.sequence
         self._last_client_mono_ms = cmd.client_monotonic_ms
         self._last_valid_cmd_mono = now
-        self._last_rate_mono = now
+        if coalesced:
+            self._coalesced_command_count += 1
+        else:
+            self._last_rate_mono = now
         self._last_deadman = bool(cmd.deadman)
         self._last_throttle = throttle
         self._last_steering = steering
@@ -224,6 +229,7 @@ class JoystickController:
             "state": self._state.value,
             "throttle": throttle,
             "steering": steering,
+            "coalesced": coalesced,
         }
 
     async def release(
@@ -268,6 +274,7 @@ class JoystickController:
         self._last_deadman = False
         self._last_throttle = 0.0
         self._last_steering = 0.0
+        self._coalesced_command_count = 0
         self._stop_reason = reason
 
     async def shutdown(self) -> None:
@@ -293,6 +300,7 @@ class JoystickController:
             "joystick_deadman": self._last_deadman,
             "joystick_commanded_throttle": self._last_throttle,
             "joystick_commanded_steering": self._last_steering,
+            "joystick_coalesced_command_count": self._coalesced_command_count,
             "joystick_stop_reason": self._stop_reason,
         }
 
@@ -343,12 +351,11 @@ class JoystickController:
         ):
             raise JoystickError("replay", "client monotonic timestamp moved backward")
 
-    def _validate_rate(self, now: float) -> None:
-        if (
+    def _is_over_command_rate(self, now: float) -> bool:
+        return (
             self._last_rate_mono is not None
             and now - self._last_rate_mono < self._min_command_interval_s
-        ):
-            raise JoystickError("rate_exceeded", "joystick command rate exceeded")
+        )
 
     def _validate_values(self, cmd: JoystickCommand) -> None:
         if not math.isfinite(cmd.throttle) or not math.isfinite(cmd.steering):
@@ -406,6 +413,7 @@ class JoystickController:
         self._last_deadman = False
         self._last_throttle = 0.0
         self._last_steering = 0.0
+        self._coalesced_command_count = 0
         self._stop_reason = reason
         self._arbiter.clear_joystick(reason=reason)
 

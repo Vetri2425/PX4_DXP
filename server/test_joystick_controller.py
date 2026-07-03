@@ -146,6 +146,30 @@ def test_valid_command_clamps_to_configured_manual_limits():
     assert gateway.snapshot()["gateway_last_frame"]["y"] == -200
 
 
+def test_fast_commands_are_coalesced_not_rejected_or_dropped():
+    ctrl, gateway, _, _, _ = make_controller(command_rate_hz=20.0)
+    lease = run(acquire(ctrl))["lease_id"]
+    first = ctrl.handle_command("sid", command(lease, sequence=1, client_monotonic_ms=10))
+    second = ctrl.handle_command(
+        "sid",
+        command(
+            lease,
+            sequence=2,
+            client_monotonic_ms=11,
+            throttle=-0.4,
+            steering=0.1,
+        ),
+    )
+
+    assert first["coalesced"] is False
+    assert second["coalesced"] is True
+    assert second["throttle"] == -0.35
+    assert second["steering"] == 0.1
+    assert gateway.snapshot()["gateway_last_frame"]["z"] == 325
+    assert gateway.snapshot()["gateway_last_frame"]["y"] == 100
+    assert ctrl.snapshot()["joystick_coalesced_command_count"] == 1
+
+
 def test_rejected_command_does_not_refresh_watchdogs_or_last_command():
     ctrl, gateway, _, _, _ = make_controller()
     lease = run(acquire(ctrl))["lease_id"]

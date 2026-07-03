@@ -339,18 +339,18 @@ class RPPControllerNode(Node):
         # `sharp` is accepted as a runtime alias for `segment`.
         self.declare_parameter("tracking_profile",                    "auto")
         self.declare_parameter("segment_corner_threshold_deg",         45.0)
-        self.declare_parameter("segment_slowdown_dist",               0.50)
+        self.declare_parameter("segment_slowdown_dist",               1.00)
         self.declare_parameter("segment_min_corner_speed",             0.08)
         # Final-segment (run-endpoint) goal-approach floor. A per-line PRE/AFT
         # run ends AT a corner, so the rover must arrive slow enough for active
         # braking to stop it within the corner point. The old endpoint floor was
         # min_approach_linear_velocity (0.10 m/s); the speed loop overshot to
         # ~0.13 and braking (0.08 cap) coasted 3-4.6 cm past the corner, smearing
-        # MARK entry to ~4.8 cm. A dedicated, lower floor here — separate from the
-        # WITHIN-run corner floor (segment_min_corner_speed) and the smooth/arc
-        # floor (min_approach_linear_velocity) — drops run-endpoint arrival to
-        # ~0.05 m/s (floor + overshoot) so drift is <1 cm, without touching the
-        # non-extension square's within-run corners or arc approaches.
+        # MARK entry to ~4.8 cm. A dedicated, lower floor here — separate from
+        # pivot rollout (segment_min_corner_speed) and the smooth/arc floor
+        # (min_approach_linear_velocity) — drops hard-corner arrival to
+        # ~0.05 m/s (floor + overshoot) so drift is <1 cm, without slowing
+        # smooth arcs/circles/splines that should keep rolling.
         self.declare_parameter("segment_endpoint_approach_speed",      0.03)   # m/s
         self.declare_parameter("segment_corner_acceptance_radius",     0.05)
         # Pivot exit tolerance. 2.0° gives the "spin in place, exit facing the
@@ -369,11 +369,12 @@ class RPPControllerNode(Node):
         self.declare_parameter("segment_stop_dwell_s",                 0.30)   # s
         # Active braking at a corner stop. PX4 velocity-OFFBOARD does not brake
         # on a zero setpoint — it coasts — so a rover that reaches the corner
-        # still at ~0.1-0.16 m/s drifts 2-3 cm before the dwell confirms, and
-        # then pivots from the wrong point. When velocity data is fresh and the
-        # rover is still above the stop threshold, command a small velocity
-        # opposing its motion (capped here) to actively decelerate. 0 disables.
-        self.declare_parameter("segment_brake_velocity_cap_m_s",       0.08)   # m/s
+        # still at ~0.1-0.2 m/s can drift far past the point. When velocity data
+        # is fresh and the rover is still above the stop threshold, command a
+        # velocity opposing its motion (capped here) to actively decelerate.
+        # 0 disables. Field bag 2026-07-03_12-59 showed 0.08 m/s was too weak:
+        # actual speed stayed near 0.19 m/s for ~3 s, overshooting ~0.9 m.
+        self.declare_parameter("segment_brake_velocity_cap_m_s",       0.18)   # m/s
         # CORNER_ALIGN exit: heading error AND yaw-rate (AND, when fresh, linear
         # speed) must be within tolerance for segment_align_settle_s before the
         # state machine advances. Prevents premature exit while the rover is
@@ -2693,6 +2694,7 @@ class RPPControllerNode(Node):
         speed = max_v
         slowdown = float(self.get_parameter("segment_slowdown_dist").value)
         min_corner_speed = float(self.get_parameter("segment_min_corner_speed").value)
+        stop_corner_speed = float(self.get_parameter("segment_endpoint_approach_speed").value)
         self._segment_state = SegmentStateCode.TRACK_SEGMENT
         corner_threshold_deg = float(
             self.get_parameter("segment_corner_threshold_deg").value
@@ -2705,7 +2707,10 @@ class RPPControllerNode(Node):
             and abs(corner_angle) >= corner_threshold_deg
         ):
             scale = self._clamp(dist_to_corner / slowdown, 0.0, 1.0)
-            speed = max(min_corner_speed, max_v * scale)
+            # Hard corners are stop-and-pivot transitions, not rolling turns.
+            # Use the low endpoint approach floor so the rover arrives at the
+            # corner slow enough for CORNER_STOP braking to hold the point.
+            speed = max(stop_corner_speed, max_v * scale)
             self._segment_state = SegmentStateCode.PRE_CORNER_SLOWDOWN
 
         # Final-segment goal-approach deceleration.

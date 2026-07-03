@@ -38,16 +38,16 @@ def main():
         assert node.get_parameter("segment_pivot_release_max_deg").value == 3.0, "hard release ceiling 3°"
         assert node.get_parameter("segment_timeout_heading_tolerance_deg").value == 2.0, "precision timeout must stay 2°"
         assert node.get_parameter("segment_align_settle_s").value == 0.20
-        assert node.get_parameter("segment_brake_velocity_cap_m_s").value == 0.08
+        assert node.get_parameter("segment_brake_velocity_cap_m_s").value == 0.18
         assert node.get_parameter("segment_align_speed_threshold").value == 0.02
-        print("PASS params: aim=2° release_max=3° timeout_tol=2° settle=0.20 brake_cap=0.08")
+        print("PASS params: aim=2° release_max=3° timeout_tol=2° settle=0.20 brake_cap=0.18")
 
         # ---- TEST 4: braking command opposes motion, capped ----------------
-        P(segment_brake_velocity_cap_m_s=0.08, segment_stop_speed_threshold=0.02)
+        P(segment_brake_velocity_cap_m_s=0.18, segment_stop_speed_threshold=0.02)
         node._latest_vel_time = now(); node._latest_vel_ned = (0.20, 0.0)
         bn, be = node._corner_brake_velocity(0.0)
         assert bn < 0 and abs(be) < 1e-9, f"brake must oppose +N motion, got {(bn,be)}"
-        assert math.hypot(bn, be) <= 0.08 + 1e-9, "brake must be capped"
+        assert math.hypot(bn, be) <= 0.18 + 1e-9, "brake must be capped"
         node._latest_vel_ned = (0.0, 0.20)                # lateral-only motion
         assert node._corner_brake_velocity(0.0) == (0.0, 0.0), "lateral motion must not create reverse-flip command"
         node._latest_vel_ned = (0.0, 0.20)                # forward when yaw is East
@@ -62,7 +62,7 @@ def main():
         assert node._corner_brake_velocity(0.0) == (0.0, 0.0), "no brake on stale velocity"
         node._latest_vel_time = now(); P(segment_brake_velocity_cap_m_s=0.0)
         assert node._corner_brake_velocity(0.0) == (0.0, 0.0), "cap=0 disables braking"
-        P(segment_brake_velocity_cap_m_s=0.08)
+        P(segment_brake_velocity_cap_m_s=0.18)
         print("PASS braking safe-zeros: below-threshold / stale / disabled → (0,0)")
 
         # ---- TEST 2: fresh + still moving → does NOT timeout-pivot ----------

@@ -135,6 +135,7 @@ start_bag() {
         /mavros/gpsstatus/gps1/raw \
         /mavros/setpoint_raw/local \
         /rpp/debug \
+        /rpp/setpoint_bridge_debug \
         /rpp/velocity_ned \
         /rpp/yaw_rate_body \
         -o "$BAG_DIR" >>"$LOG" 2>&1 &

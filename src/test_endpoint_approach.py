@@ -4,9 +4,9 @@
 A per-line PRE/AFT run ends AT a corner (final_segment=True). The endpoint
 approach floor must be the dedicated segment_endpoint_approach_speed (low, so the
 rover arrives slow enough for active braking to stop on the corner), NOT the
-smooth/arc min_approach_linear_velocity and NOT the within-run corner floor
-segment_min_corner_speed — so the non-extension square's corners and arc
-approaches are unaffected.
+smooth/arc min_approach_linear_velocity and NOT the pivot rollout speed
+segment_min_corner_speed. The same low floor also applies to hard within-run
+corners because those are stop-and-pivot transitions too.
 
 Run on a ROS2-sourced host (needs rclpy):
     python3 -X utf8 src/test_endpoint_approach.py
@@ -38,8 +38,8 @@ def main():
         # ---- decoupling: the three approach floors are distinct params -------
         assert node.get_parameter("segment_endpoint_approach_speed").value == 0.03, "endpoint floor default 0.03"
         assert node.get_parameter("min_approach_linear_velocity").value == 0.1, "smooth/arc floor unchanged (0.10)"
-        assert node.get_parameter("segment_min_corner_speed").value == 0.08, "within-run corner floor unchanged (0.08)"
-        print("PASS decoupling: endpoint=0.03, smooth/arc=0.10, within-run-corner=0.08 are separate")
+        assert node.get_parameter("segment_min_corner_speed").value == 0.08, "pivot rollout speed unchanged (0.08)"
+        print("PASS decoupling: endpoint/hard-corner=0.03, smooth/arc=0.10, pivot rollout=0.08 are separate")
 
         # ---- functional: the endpoint floor controls final-segment speed -----
         captured = {}
@@ -76,6 +76,27 @@ def main():
         sp_high = converged_endpoint_speed()
         assert sp_high > sp_low + 0.05, f"endpoint speed must track the param ({sp_low:.3f} vs {sp_high:.3f})"
         print(f"PASS endpoint floor controls final-segment approach: 0.03→{sp_low:.3f} m/s, 0.20→{sp_high:.3f} m/s")
+
+        # Hard within-run corners use the same stop approach floor, not the
+        # pivot rollout speed. This prevents arriving at CORNER_STOP still too
+        # fast to hold the point.
+        node._path = [_pose(0.0, 0.0), _pose(2.0, 0.0), _pose(2.0, 2.0)]
+        node._path_s = [0.0, 2.0, 4.0]
+        node._spray_flags = [True, True, True]
+        node._segment_idx = 0
+        node._path_travel_m = 1.9
+        node._latest_yaw_rate_ned = 0.0
+        node._last_speed_cmd = 0.35
+        P(segment_endpoint_approach_speed=0.03, segment_min_corner_speed=0.20)
+        for _ in range(120):
+            captured.clear()
+            node._control_segment_profile(1.9, 0.0, 0.0, 0.0, 0.10)
+        sp_corner = captured.get("sp", float("nan"))
+        assert 0.0 < sp_corner < 0.10, (
+            "hard-corner approach must use endpoint floor, not pivot rollout "
+            f"speed; got {sp_corner:.3f}"
+        )
+        print(f"PASS hard-corner approach uses stop floor: {sp_corner:.3f} m/s")
 
         node.destroy_node()
         print("\n=== ALL ENDPOINT-APPROACH TESTS PASSED ===")

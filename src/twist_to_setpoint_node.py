@@ -44,7 +44,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 
 from geometry_msgs.msg import Vector3Stamped
 from mavros_msgs.msg import PositionTarget
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Float32MultiArray, MultiArrayDimension
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +98,13 @@ class TwistToSetpointNode(Node):
     """Bridges /rpp/velocity_ned to /mavros/setpoint_raw/local at 50 Hz."""
 
     STREAM_HZ = 50
+    SEGMENT_STATE_CORNER_STOP = 5
+    HEADING_MODE_FROM_VELOCITY = 0.0
+    HEADING_MODE_HOLD_LAST = 1.0
+    HEADING_MODE_ZERO_HOLD = 2.0
+    SOURCE_ZERO = 0.0
+    SOURCE_RPP = 1.0
+    SOURCE_STALE = 2.0
 
     def __init__(self):
         super().__init__("twist_to_setpoint")
@@ -114,6 +121,14 @@ class TwistToSetpointNode(Node):
         # is fresh, a yaw_rate up to ~1.5× older is still the matching sample.
         self.declare_parameter("yaw_rate_max_age_s", 0.3)
         self.declare_parameter("expected_input_frame", "local_ned")
+        # Universal braking guard: when RPP commands a reverse longitudinal
+        # vector, keep heading continuous instead of turning that vector into
+        # a 180-degree explicit yaw request. The segment state catches normal
+        # CORNER_STOP; the angle fallback catches endpoint/run settle braking
+        # or future profiles that reuse the same reverse-brake primitive.
+        self.declare_parameter("hold_yaw_in_corner_stop", True)
+        self.declare_parameter("reverse_brake_yaw_hold_enabled", True)
+        self.declare_parameter("reverse_brake_yaw_hold_angle_deg", 100.0)
         # Explicit yaw computed from velocity direction (always on since 2026-05-23).
         # PX4 leaves trajectory_setpoint.yaw=NaN without explicit yaw, causing
         # yaw tracking lag on turns.
@@ -126,6 +141,9 @@ class TwistToSetpointNode(Node):
         self._latest_yaw_rate_body: float = 0.0   # NED CW+ rad/s from RPP
         self._yaw_rate_recv_time = None
         self._last_yaw_cmd: float = 0.0  # Track last yaw for zero-speed hold
+        self._last_motion_yaw_valid: bool = False
+        self._latest_segment_state: int | None = None
+        self._segment_state_recv_time = None
         self._published_count = 0
         self._stale_warn_count = 0
 
@@ -151,6 +169,12 @@ class TwistToSetpointNode(Node):
         self.create_subscription(
             Float32, "/rpp/yaw_rate_body", self._yaw_rate_cb, be_qos
         )
+        self.create_subscription(
+            Float32MultiArray, "/rpp/segment_debug", self._segment_debug_cb, be_qos
+        )
+        self._bridge_dbg_pub = self.create_publisher(
+            Float32MultiArray, "/rpp/setpoint_bridge_debug", be_qos
+        )
 
         # ------------------------------------------------------------------
         # 50 Hz stream timer
@@ -160,7 +184,7 @@ class TwistToSetpointNode(Node):
         self.get_logger().info(
             f"twist_to_setpoint started — streaming /mavros/setpoint_raw/local "
             f"at {self.STREAM_HZ} Hz (frame=LOCAL_NED). Sources: /rpp/velocity_ned + "
-            f"/rpp/yaw_rate_body. Yaw+yaw_rate feedforward active "
+            f"/rpp/yaw_rate_body + /rpp/segment_debug. Yaw+yaw_rate feedforward active "
             f"(type_mask={TYPE_MASK_VEL_YAW_YAWRATE})."
         )
 
@@ -194,6 +218,18 @@ class TwistToSetpointNode(Node):
             self._latest_yaw_rate_body = msg.data
             self._yaw_rate_recv_time = self.get_clock().now()
 
+    def _segment_debug_cb(self, msg: Float32MultiArray):
+        # /rpp/segment_debug[1] is SegmentStateCode. Keep this optional: smooth
+        # or future profiles may not publish it, so the geometry fallback below
+        # still protects reverse-brake commands.
+        if len(msg.data) > 1 and math.isfinite(msg.data[1]):
+            self._latest_segment_state = int(round(float(msg.data[1])))
+            self._segment_state_recv_time = self.get_clock().now()
+
+    @staticmethod
+    def _angle_wrap(angle: float) -> float:
+        return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
     # ------------------------------------------------------------------
     # 50 Hz stream
     # ------------------------------------------------------------------
@@ -211,21 +247,25 @@ class TwistToSetpointNode(Node):
         v_e = 0.0
         v_d = 0.0
         source = "zero"
+        source_code = self.SOURCE_ZERO
+        input_age_s = float("inf")
 
         if self._latest_vel is not None and self._latest_recv_time is not None:
-            age_s = (self.get_clock().now() - self._latest_recv_time).nanoseconds * 1e-9
-            if age_s <= max_age:
+            input_age_s = (self.get_clock().now() - self._latest_recv_time).nanoseconds * 1e-9
+            if input_age_s <= max_age:
                 v_n = float(self._latest_vel.vector.x)
                 v_e = float(self._latest_vel.vector.y)
                 v_d = float(self._latest_vel.vector.z)
                 source = "rpp"
+                source_code = self.SOURCE_RPP
             else:
                 source = "stale"
+                source_code = self.SOURCE_STALE
                 self._stale_warn_count += 1
                 # Warn at most once per second
                 if self._stale_warn_count % self.STREAM_HZ == 0:
                     self.get_logger().warn(
-                        f"Input stale ({age_s * 1000:.0f} ms > "
+                        f"Input stale ({input_age_s * 1000:.0f} ms > "
                         f"{max_age * 1000:.0f} ms) — streaming zero velocity"
                     )
 
@@ -248,13 +288,48 @@ class TwistToSetpointNode(Node):
         # For a velocity vector: yaw_NED = atan2(v_e, v_n),
         # so yaw_ENU = π/2 - atan2(v_e, v_n) = atan2(v_n, v_e).
         speed = math.hypot(v_n, v_e)
+        heading_mode = self.HEADING_MODE_ZERO_HOLD
+        segment_state = self._latest_segment_state
+        segment_state_age_s = float("inf")
+        if self._segment_state_recv_time is not None:
+            segment_state_age_s = (
+                self.get_clock().now() - self._segment_state_recv_time
+            ).nanoseconds * 1e-9
+        segment_state_fresh = segment_state_age_s <= max_age
+        in_corner_stop = (
+            bool(self.get_parameter("hold_yaw_in_corner_stop").value)
+            and segment_state_fresh
+            and segment_state == self.SEGMENT_STATE_CORNER_STOP
+        )
+
         if speed > 0.01:
-            yaw_enu = math.atan2(v_n, v_e)  # ENU: 0=East, CCW+
+            velocity_yaw_enu = math.atan2(v_n, v_e)  # ENU: 0=East, CCW+
+            reverse_hold = False
+            if bool(self.get_parameter("reverse_brake_yaw_hold_enabled").value):
+                hold_angle = math.radians(
+                    float(self.get_parameter("reverse_brake_yaw_hold_angle_deg").value)
+                )
+                reverse_hold = (
+                    source == "rpp"
+                    and self._last_motion_yaw_valid
+                    and abs(self._angle_wrap(velocity_yaw_enu - self._last_yaw_cmd)) >= hold_angle
+                )
+
+            if in_corner_stop or reverse_hold:
+                # The nonzero vector is a braking actuator request, not a new
+                # travel-bearing contract. Keep the last commanded heading so
+                # reverse braking does not become "face backward".
+                yaw_enu = self._last_yaw_cmd
+                heading_mode = self.HEADING_MODE_HOLD_LAST
+            else:
+                yaw_enu = velocity_yaw_enu
+                heading_mode = self.HEADING_MODE_FROM_VELOCITY
         else:
             # Below 1 cm/s — hold last known heading to avoid atan2(0,0) noise.
             # P4 zero-vel freeze prevents actual motion, so this is just for
             # the yaw setpoint continuity.
             yaw_enu = self._last_yaw_cmd
+            heading_mode = self.HEADING_MODE_ZERO_HOLD
         msg.yaw = yaw_enu
 
         # Position and acceleration: ignored by mask, set to safe values.
@@ -287,7 +362,23 @@ class TwistToSetpointNode(Node):
             msg.type_mask = TYPE_MASK_VELOCITY_AND_YAW  # 2503: vel + yaw, ignore yaw_rate
 
         self._sp_pub.publish(msg)
+        self._publish_bridge_debug(
+            source_code=source_code,
+            input_age_s=input_age_s,
+            segment_state=float(segment_state) if segment_state is not None else float("nan"),
+            segment_state_age_s=segment_state_age_s,
+            heading_mode=heading_mode,
+            v_n=v_n,
+            v_e=v_e,
+            v_d=v_d,
+            yaw_enu=yaw_enu,
+            yaw_rate=msg.yaw_rate,
+            type_mask=float(msg.type_mask),
+            speed=speed,
+        )
         self._last_yaw_cmd = yaw_enu  # Track for next cycle's zero-speed hold
+        if heading_mode == self.HEADING_MODE_FROM_VELOCITY:
+            self._last_motion_yaw_valid = True
         self._published_count += 1
 
         # Heartbeat log every 5 seconds
@@ -297,6 +388,45 @@ class TwistToSetpointNode(Node):
                 f"yaw_enu={yaw_enu:.3f}rad yaw_rate={msg.yaw_rate:+.3f}rad/s "
                 f"published={self._published_count}"
             )
+
+    def _publish_bridge_debug(
+        self,
+        *,
+        source_code: float,
+        input_age_s: float,
+        segment_state: float,
+        segment_state_age_s: float,
+        heading_mode: float,
+        v_n: float,
+        v_e: float,
+        v_d: float,
+        yaw_enu: float,
+        yaw_rate: float,
+        type_mask: float,
+        speed: float,
+    ) -> None:
+        msg = Float32MultiArray()
+        msg.layout.dim.append(
+            MultiArrayDimension(label="rpp_setpoint_bridge_debug", size=13, stride=13)
+        )
+        msg.data = [
+            float(self._published_count),              # [0] bridge publish sequence
+            float(source_code),                        # [1] 0 zero, 1 rpp, 2 stale
+            float(input_age_s * 1000.0) if math.isfinite(input_age_s) else -1.0,
+                                                        # [2] /rpp/velocity_ned age ms
+            float(segment_state),                      # [3] latest SegmentStateCode
+            float(segment_state_age_s * 1000.0) if math.isfinite(segment_state_age_s) else -1.0,
+                                                        # [4] /rpp/segment_debug age ms
+            float(heading_mode),                       # [5] 0 vector, 1 hold, 2 zero-hold
+            float(v_n),                                # [6] input velocity north m/s
+            float(v_e),                                # [7] input velocity east m/s
+            float(v_d),                                # [8] input velocity down m/s
+            float(yaw_enu),                            # [9] published ENU yaw rad
+            float(yaw_rate),                           # [10] published yaw_rate rad/s
+            float(type_mask),                          # [11] PositionTarget type_mask
+            float(speed),                              # [12] horizontal speed m/s
+        ]
+        self._bridge_dbg_pub.publish(msg)
 
 def main():
     rclpy.init()

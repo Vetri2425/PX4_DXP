@@ -433,7 +433,7 @@ def test_smoke():
         node.set_parameters([Parameter("tracking_profile", value="segment")])
         node._path_cb(ext_msg)
         assert len(node._path) >= 4, "Segment simplify should keep spray boundary vertices"
-        # Rover 0.05 m before the PRE→MARK vertex, inside segment_slowdown_dist (0.5 m).
+        # Rover 0.05 m before the PRE→MARK vertex, inside segment_slowdown_dist.
         node._segment_idx = 0
         node._last_speed_cmd = 0.35
         cap_dbg.messages.clear()
