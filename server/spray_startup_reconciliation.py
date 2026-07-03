@@ -101,6 +101,7 @@ class SprayStartupReconciliationState:
     dwell_cancel_result: dict[str, Any] | None = None
     spray_off_result: dict[str, Any] | None = None
     residual_detected: bool = False
+    attempts: int = 0
     started_at_monotonic_s: float = 0.0
     finished_at_monotonic_s: float = 0.0
 
@@ -113,6 +114,7 @@ class SprayStartupReconciliationState:
             "dwell_cancel_result": self.dwell_cancel_result,
             "spray_off_result": self.spray_off_result,
             "residual_detected": self.residual_detected,
+            "attempts": self.attempts,
             "started_at_monotonic_s": self.started_at_monotonic_s,
             "finished_at_monotonic_s": self.finished_at_monotonic_s,
         }
@@ -122,6 +124,8 @@ class SprayStartupReconciliation:
     _BRIDGE_WAIT_S = 5.0
     _BRIDGE_POLL_S = 0.1
     _OFF_TIMEOUT_S = 5.0
+    _MAX_OFF_ATTEMPTS = 3
+    _RETRY_BACKOFF_S = 1.0
 
     def __init__(self) -> None:
         self._state = SprayStartupReconciliationState()
@@ -263,26 +267,37 @@ class SprayStartupReconciliation:
                 f"spray startup reconciliation: residual activity detected ({residual_reason})",
             )
 
-            dwell_cancel = await self._cancel_dwell(ros_node)
-            self._state.dwell_cancel_result = dwell_cancel
-            if hasattr(ros_node, "publish_spray_manual"):
-                try:
-                    ros_node.publish_spray_manual(False)
-                except Exception as exc:
-                    _log("warning", f"startup reconciliation manual OFF publish failed: {exc}")
+            off_confirmed = False
+            still_residual = True
+            for attempt in range(1, self._MAX_OFF_ATTEMPTS + 1):
+                self._state.attempts = attempt
 
-            spray_off = await force_spray_off_confirmed(
-                ros_node,
-                timeout_s=self._OFF_TIMEOUT_S,
-            )
-            self._state.spray_off_result = spray_off.as_dict()
+                dwell_cancel = await self._cancel_dwell(ros_node)
+                self._state.dwell_cancel_result = dwell_cancel
+                if hasattr(ros_node, "publish_spray_manual"):
+                    try:
+                        ros_node.publish_spray_manual(False)
+                    except Exception as exc:
+                        _log(
+                            "warning",
+                            f"startup reconciliation manual OFF publish failed: {exc}",
+                        )
 
-            verify_status, verify_error = _read_runtime_status(ros_node)
-            still_residual, still_reason = indicates_residual_spray_activity(verify_status)
-            off_confirmed = bool(spray_off.success)
+                spray_off = await force_spray_off_confirmed(
+                    ros_node,
+                    timeout_s=self._OFF_TIMEOUT_S,
+                )
+                self._state.spray_off_result = spray_off.as_dict()
 
-            if not off_confirmed or still_residual:
-                self._state.recovery_required = True
+                verify_status, verify_error = _read_runtime_status(ros_node)
+                still_residual, still_reason = indicates_residual_spray_activity(
+                    verify_status
+                )
+                off_confirmed = bool(spray_off.success)
+
+                if off_confirmed and not still_residual:
+                    break
+
                 parts = []
                 if not off_confirmed:
                     parts.append(spray_off.failure_reason or spray_off.message)
@@ -290,14 +305,31 @@ class SprayStartupReconciliation:
                     parts.append(
                         verify_error or still_reason or "residual spray activity persists"
                     )
-                self._state.reason = "; ".join(p for p in parts if p)
+                attempt_reason = "; ".join(p for p in parts if p)
+
+                if attempt < self._MAX_OFF_ATTEMPTS:
+                    _log(
+                        "warning",
+                        f"spray startup reconciliation attempt {attempt}/"
+                        f"{self._MAX_OFF_ATTEMPTS} failed ({attempt_reason}) — retrying",
+                    )
+                    await asyncio.sleep(self._RETRY_BACKOFF_S)
+                else:
+                    self._state.reason = attempt_reason
+
+            if off_confirmed and not still_residual:
                 _log(
-                    "error",
-                    "spray startup reconciliation failed: "
-                    f"{self._state.reason}",
+                    "info",
+                    "spray startup reconciliation: residual dwell cancelled and OFF "
+                    f"confirmed (attempt {self._state.attempts}/{self._MAX_OFF_ATTEMPTS})",
                 )
             else:
-                _log("info", "spray startup reconciliation: residual dwell cancelled and OFF confirmed")
+                self._state.recovery_required = True
+                _log(
+                    "error",
+                    f"spray startup reconciliation failed after {self._state.attempts}/"
+                    f"{self._MAX_OFF_ATTEMPTS} attempts: {self._state.reason}",
+                )
         finally:
             self._state.in_progress = False
             self._state.finished_at_monotonic_s = time.monotonic()

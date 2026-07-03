@@ -124,13 +124,65 @@ async def test_startup_reconcile_commanded_on_without_active_dwell():
 
 
 @pytest.mark.asyncio
-async def test_startup_reconcile_failure_sets_recovery_required():
+async def test_startup_reconcile_failure_sets_recovery_required(monkeypatch):
+    monkeypatch.setattr(SprayStartupReconciliation, "_RETRY_BACKOFF_S", 0.0)
     ros = ResidualSprayRos(off_confirms=False)
     reconciler = SprayStartupReconciliation()
     await reconciler.start(ros)
     assert reconciler.is_ready() is False
     assert reconciler.state.recovery_required is True
     assert reconciler.state.reason
+    assert reconciler.state.attempts == SprayStartupReconciliation._MAX_OFF_ATTEMPTS
+
+
+def _fake_off_result(*, success: bool, reason: str):
+    from spray_safety import SprayOffResult
+
+    return SprayOffResult(
+        success=success,
+        attempted=True,
+        timeout=False,
+        fault=not success,
+        live=True,
+        message=reason,
+        failure_reason="" if success else reason,
+    )
+
+
+@pytest.mark.asyncio
+async def test_startup_reconcile_retries_transient_failure_then_succeeds(monkeypatch):
+    """Mimics a freshly-restarted spray_controller caught mid-command on the
+    first attempt (real-world race behind the 2026-07-03 mission-load block),
+    which then settles and confirms OFF on retry."""
+    import spray_startup_reconciliation as mod
+
+    monkeypatch.setattr(SprayStartupReconciliation, "_RETRY_BACKOFF_S", 0.0)
+    calls = {"n": 0}
+
+    async def fake_force_off(ros_node, *, timeout_s):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _fake_off_result(success=False, reason="spray command pending (False)")
+        ros.runtime.update(
+            {
+                "active_dwell": False,
+                "commanded_on": False,
+                "confirmed_off": True,
+                "off_acknowledged": True,
+                "accepted_command_on": False,
+                "pending_command": False,
+            }
+        )
+        return _fake_off_result(success=True, reason="spray OFF confirmed")
+
+    monkeypatch.setattr(mod, "force_spray_off_confirmed", fake_force_off)
+
+    ros = ResidualSprayRos(off_confirms=False)
+    reconciler = SprayStartupReconciliation()
+    await reconciler.start(ros)
+    assert reconciler.is_ready() is True
+    assert reconciler.state.recovery_required is False
+    assert reconciler.state.attempts == 2
 
 
 @pytest.mark.asyncio
