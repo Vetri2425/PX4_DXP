@@ -171,6 +171,31 @@ def test_valid_rtcm_age_uses_handshake_before_first_frame():
     assert age == pytest.approx(30.0)
 
 
+def test_valid_rtcm_age_resets_grace_period_on_reconnect_after_stale_data():
+    """2026-07-03 bug: the parser persists across reconnects, so a
+    last_valid_frame_monotonic from a long-dead prior connection must not
+    make a *fresh* reconnect appear instantly >= no_rtcm_reconnect_s. The
+    watchdog needs a full grace period from the new handshake, not from
+    whenever data last flowed on a socket that no longer exists."""
+    import dataclasses
+
+    node = _make_node()
+    stats = node._parser.snapshot_stats()
+    # A valid frame was parsed 200s ago, on a connection that has since died.
+    stats = dataclasses.replace(stats, last_valid_frame_monotonic=100.0)
+    # This connection's handshake just completed 5s ago.
+    node._handshake_complete_monotonic = 295.0
+    now = 300.0
+
+    age = node._valid_rtcm_age_s(now, stats)
+
+    # Age must be measured from the fresh handshake (5s), not the stale
+    # last-valid timestamp (200s) — otherwise the 45s reconnect watchdog
+    # trips before the new socket ever gets a chance to receive data.
+    assert age == pytest.approx(5.0)
+    assert age < node._no_rtcm_reconnect_s
+
+
 def _prepare_node_for_destroy(node, status_path):
     """Wire up the minimal attributes destroy_node() touches."""
     node._rate_tracker = TransportRateTracker()

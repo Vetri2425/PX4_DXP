@@ -251,11 +251,22 @@ class NtripNode(Node):
             return False
 
     def _valid_rtcm_age_s(self, now: float, stats) -> float | None:
-        if stats.last_valid_frame_monotonic is not None:
-            return max(0.0, now - stats.last_valid_frame_monotonic)
-        if self._handshake_complete_monotonic is not None:
-            return max(0.0, now - self._handshake_complete_monotonic)
-        return None
+        # Age since the more recent of: the last valid RTCM frame ever parsed,
+        # or this connection's handshake. The parser persists across
+        # reconnects, so without the handshake anchor a stale
+        # last_valid_frame_monotonic from a prior (long-dead) connection would
+        # make every fresh reconnect appear instantly >= no_rtcm_reconnect_s —
+        # tripping the watchdog before the new socket ever gets a chance to
+        # receive data (observed 2026-07-03: connect/reconnect looping every
+        # ~2s with no error logged in between).
+        anchors = [
+            t
+            for t in (stats.last_valid_frame_monotonic, self._handshake_complete_monotonic)
+            if t is not None
+        ]
+        if not anchors:
+            return None
+        return max(0.0, now - max(anchors))
 
     def _build_status_payload(self, state: str) -> dict:
         with self._stats_lock:
