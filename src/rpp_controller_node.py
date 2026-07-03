@@ -474,6 +474,11 @@ class RPPControllerNode(Node):
         self._runs: list[dict] = []
         self._run_idx: int = 0
         self._run_align_pending: bool = False
+        # Set when run 0 is applied (mission start / new path load); there's
+        # no prev_run to diff heading against at that point, and self._pose
+        # may not have arrived yet. Consumed once on the first control-loop
+        # tick with a fresh pose, where pos/yaw are already guaranteed valid.
+        self._run0_align_decision_pending: bool = False
         # Latched while a completed run is physically stopping before the
         # controller is allowed to switch to the next, differently-headed run.
         self._run_boundary_stop_pending: bool = False
@@ -1431,6 +1436,14 @@ class RPPControllerNode(Node):
             if turn >= threshold or self._runtime_entry_to_mark_boundary(prev_run, run):
                 self._run_align_pending = True
                 self._run_align_turn_rad = turn   # angle-aware pivot budget
+        elif idx == 0:
+            # Mission start: no prev_run to diff heading against, and
+            # self._pose may still be None here (path conditioning can run
+            # before the first pose callback). Defer the actual heading
+            # comparison to the control loop's first tick for this run,
+            # where a fresh pose is guaranteed (see _run0_align_decision_pending
+            # consumption below run-readiness checks).
+            self._run0_align_decision_pending = True
         self._reset_corner_pivot_state()
         # A hard run boundary is stopped before _advance_run(). Carry that
         # confirmation into the new run so _run_alignment_hold pivots directly
@@ -2964,6 +2977,25 @@ class RPPControllerNode(Node):
                 self._publish_zero(StateCode.JUMP_SKIP, pose_age_ms=pose_age_s * 1000)
                 return
         self._last_pos = (pos_n, pos_e)
+
+        # ---- Mission-start alignment decision (one-shot) ----
+        # _apply_run(0) couldn't compare heading against the first segment's
+        # bearing (no prev_run, pose maybe not yet received). pos_n/pos_e/
+        # yaw_ned above are already guaranteed fresh at this point, so decide
+        # here instead, exactly once, before the run-transition pivot check.
+        if self._run0_align_decision_pending:
+            self._run0_align_decision_pending = False
+            if self._run_idx == 0 and len(self._path) > 1:
+                n0 = self._path[0].pose.position
+                n1 = self._path[1].pose.position
+                h1 = math.atan2(n1.y - n0.y, n1.x - n0.x)
+                threshold = math.radians(
+                    float(self.get_parameter("segment_corner_threshold_deg").value)
+                )
+                turn = abs(self._heading_delta(yaw_ned, h1))
+                if turn >= threshold:
+                    self._run_align_pending = True
+                    self._run_align_turn_rad = turn
 
         # ---- Run-transition alignment (per-entity profile switching) ----
         # After advancing to a new run, pivot toward its initial heading
