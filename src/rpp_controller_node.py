@@ -284,8 +284,19 @@ class RPPControllerNode(Node):
         self.declare_parameter("close_loop_threshold_m",              0.15)   # endpoint gap → "closed"
         self.declare_parameter("close_loop_min_len_m",                1.0)    # only guard runs longer than this
         self.declare_parameter("closed_loop_min_travel_frac",         0.9)    # fraction of circumference required
-        self.declare_parameter("approach_velocity_scaling_dist",      0.6)    # m
-        self.declare_parameter("min_approach_linear_velocity",        0.1)
+        # Fix C (2026-07-05, corner-overshoot fix — see docs/stg_circle_cause.md).
+        # The rover's actual speed lags the command ~2× on deceleration, so a
+        # 0.6 m ramp arrived at ~0.35 m/s (commanded 0.10) and coasted ~0.3 m
+        # PAST the corner — the CORNER_STOP brake (0.18 m/s cap) could not hold
+        # it, the stop-dwell never completed, and the pivot never fired
+        # (bag stg_267134e9: overshoot up to 2.37 m). Start decelerating far
+        # earlier and to a lower arrival floor so the lagging drivetrain is
+        # genuinely near-zero when it reaches the point — governs BOTH the
+        # smooth entry-transit (GPS_SURVEYED lead-in) and, via the shared
+        # scaling distance, segment-profile corners. This only affects the last
+        # ~1.5 m before a run endpoint/corner; mid-segment tracking is unchanged.
+        self.declare_parameter("approach_velocity_scaling_dist",      1.5)    # m (was 0.6)
+        self.declare_parameter("min_approach_linear_velocity",        0.05)   # m/s (was 0.10); stays > p4_zero_vel_threshold so no freeze
         self.declare_parameter("p4_zero_vel_threshold",               0.02)   # m/s; floor speed below this to exactly 0 to trigger PX4 P4
 
         # Safety
