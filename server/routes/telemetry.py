@@ -7,7 +7,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 
 from auth import require_token
-from config import GPS_FIX_NAMES, RPP_STATE_NAMES
+from config import GPS_FIX_NAMES, RPP_STATE_NAMES, format_gps_coord
 from models import MissionState, TelemetryData
 from spray_safety import build_spray_telemetry_fields
 
@@ -74,8 +74,8 @@ async def telemetry_latest():
         gps_sat         = s.get("gps_sat"),
         hrms            = s.get("hrms"),
         vrms            = s.get("vrms"),
-        lat             = s.get("lat"),
-        lon             = s.get("lon"),
+        lat             = format_gps_coord(s.get("lat")),
+        lon             = format_gps_coord(s.get("lon")),
         alt             = s.get("alt"),
         **spray_fields,
     )

@@ -71,6 +71,20 @@ GPS_FIX_NAMES = {
 # so server/main.py and server/offboard_controller.py stay in sync.
 RPP_UNHEALTHY_CODES = {RPP_STALE, RPP_RTK_WAIT, RPP_JUMP_SKIP}
 
+# Decimal places for lat/lon in outbound telemetry (WS + REST) only. 8 decimal
+# degrees is sub-millimeter resolution — far finer than RTK's actual ~1-2 cm
+# accuracy — so no precision is lost versus the raw float; this just gives the
+# client a consistent digit count instead of the variable 6-17 digits that
+# fall out of Python's shortest-round-trip float repr. Does NOT touch
+# ros_node.py's internal state or mission placement (resolve_surveyed_points),
+# which keep full float64 precision for anchor/EKF math.
+GPS_TELEMETRY_DECIMALS = 8
+
+
+def format_gps_coord(value: float | None) -> float | None:
+    """Round a lat/lon value to GPS_TELEMETRY_DECIMALS for client emit."""
+    return None if value is None else round(value, GPS_TELEMETRY_DECIMALS)
+
 # ── Server Defaults ───────────────────────────────────────────────────────────
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = int(os.environ.get("FASTAPI_PORT", "5001"))
