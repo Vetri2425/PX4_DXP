@@ -377,7 +377,46 @@ def rotate_session_token(old_token_id: str) -> dict:
     }
 
 
+_BYPASS_SESSION_TOKEN_ID = "dev-bypass"
+_BYPASS_SESSION_LIFETIME_S = 365 * 86400  # AUTH_DISABLED is already an explicit
+# insecure bench-mode choice (env var), so a long-lived session is consistent
+# with intent, not an added risk. Refreshed on every bind so it effectively
+# never expires while AUTH_DISABLED stays set.
+
+
+def _ensure_bypass_session() -> OperatorSession:
+    now = time.time()
+    session = _sessions.get(_BYPASS_SESSION_TOKEN_ID)
+    if session is None:
+        session = OperatorSession(
+            token_id=_BYPASS_SESSION_TOKEN_ID,
+            session_id="dev-bypass",
+            created_at=now,
+            expires_at=now + _BYPASS_SESSION_LIFETIME_S,
+            last_seen=now,
+        )
+        _sessions[_BYPASS_SESSION_TOKEN_ID] = session
+    else:
+        session.expires_at = now + _BYPASS_SESSION_LIFETIME_S
+        session.last_seen = now
+        session.revoked = False
+    return session
+
+
 def bind_socket_sid(sid: str, token: str | None) -> AuthContext | None:
+    # AUTH_DISABLED already bypasses REST auth (require_operator_token /
+    # _BYPASS_CONTEXT). Socket.IO's connect handler had no equivalent bypass,
+    # so on an AUTH_DISABLED deployment every socket was refused at connect
+    # (ConnectionRefusedError("unauthorised")) and never appeared in
+    # authenticated_sids() -- meaning it received ZERO telemetry pushes,
+    # forever, with no error visible past the initial connect attempt. Mirror
+    # the REST bypass here so a disabled-auth deployment behaves consistently
+    # on both transports.
+    if AUTH_DISABLED:
+        session = _ensure_bypass_session()
+        session.socket_sids.add(sid)
+        _sid_to_token_id[sid] = session.token_id
+        return _BYPASS_CONTEXT
     context = validate_operator_token(token)
     if context is None:
         return None
