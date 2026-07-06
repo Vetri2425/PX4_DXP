@@ -42,6 +42,7 @@ from config import (
     DEFAULT_PORT,
     GPS_FIX_NAMES,
     GPS_RUNTIME_FAULT_GRACE_S,
+    format_gps_coord,
     MAX_ACTIVITY_LOG,
     MISSION_DIR,
     POSE_STALE_MS,
@@ -476,8 +477,8 @@ async def _telemetry_loop() -> None:
                     "gps_sat": s.get("gps_sat"),
                     "hrms": s.get("hrms"),
                     "vrms": s.get("vrms"),
-                    "lat": s.get("lat"),
-                    "lon": s.get("lon"),
+                    "lat": format_gps_coord(s.get("lat")),
+                    "lon": format_gps_coord(s.get("lon")),
                     "alt": s.get("alt"),
                 }
                 if joystick_ctrl is not None:
