@@ -98,7 +98,6 @@ class TwistToSetpointNode(Node):
     """Bridges /rpp/velocity_ned to /mavros/setpoint_raw/local at 50 Hz."""
 
     STREAM_HZ = 50
-    SEGMENT_STATE_TRACK = 1
     SEGMENT_STATE_CORNER_STOP = 5
     HEADING_MODE_FROM_VELOCITY = 0.0
     HEADING_MODE_HOLD_LAST = 1.0
@@ -302,18 +301,6 @@ class TwistToSetpointNode(Node):
             and segment_state_fresh
             and segment_state == self.SEGMENT_STATE_CORNER_STOP
         )
-        # Forward tracking (RPP SegmentStateCode.TRACK_SEGMENT) always commands a
-        # forward-cone velocity — never a reverse brake — so the velocity bearing
-        # IS the intended travel heading. This gate is essential after a
-        # RUNTIME_ENTRY→MARK (or any run-boundary) pivot: on release the new MARK
-        # heading can be ~180° from the previous entry-leg heading held in
-        # _last_yaw_cmd, which would otherwise latch reverse_hold forever
-        # (2026-07-07 14:26 bag: rover drove ~0.6 m backward on MARK with spray
-        # ON because the bridge kept HOLD_LAST yaw at the stale entry heading).
-        forward_tracking = (
-            segment_state_fresh
-            and segment_state == self.SEGMENT_STATE_TRACK
-        )
 
         if speed > 0.01:
             velocity_yaw_enu = math.atan2(v_n, v_e)  # ENU: 0=East, CCW+
@@ -325,7 +312,6 @@ class TwistToSetpointNode(Node):
                 reverse_hold = (
                     source == "rpp"
                     and self._last_motion_yaw_valid
-                    and not forward_tracking
                     and abs(self._angle_wrap(velocity_yaw_enu - self._last_yaw_cmd)) >= hold_angle
                 )
 
