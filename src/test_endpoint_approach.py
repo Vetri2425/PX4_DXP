@@ -27,6 +27,43 @@ def _pose(n, e):
     return ps
 
 
+def _mavros_pose(n, e, yaw_ned=0.0):
+    """MAVROS ENU pose: x=East, y=North; yaw_enu = pi/2 - yaw_ned."""
+    from geometry_msgs.msg import PoseStamped
+    ps = PoseStamped()
+    ps.pose.position.x = float(e)
+    ps.pose.position.y = float(n)
+    yaw_enu = math.pi / 2.0 - yaw_ned
+    ps.pose.orientation.z = math.sin(yaw_enu / 2.0)
+    ps.pose.orientation.w = math.cos(yaw_enu / 2.0)
+    return ps
+
+
+def _runtime_entry_two_run_path(entry_len, mark_len):
+    """Collinear runtime-entry(OFF) → MARK(ON) path, both north (NED)."""
+    from geometry_msgs.msg import PoseStamped
+    from nav_msgs.msg import Path
+    p = Path()
+    p.header.frame_id = "local_ned"
+
+    def wp(n, e, z):
+        ps = PoseStamped()
+        ps.pose.position.x = float(n)
+        ps.pose.position.y = float(e)
+        ps.pose.position.z = float(z)
+        ps.pose.orientation.w = 1.0
+        return ps
+
+    a = wp(0.0, 0.0, 0.0)
+    a.pose.orientation.x = 1.0  # runtime-entry marker
+    a.pose.orientation.w = 0.0
+    b = wp(entry_len, 0.0, 0.0)               # entry end == boundary
+    c = wp(entry_len, 0.0, 1.0)               # MARK start (duplicate vertex)
+    d = wp(entry_len + mark_len, 0.0, 1.0)    # MARK end
+    p.poses = [a, b, c, d]
+    return p
+
+
 def main():
     rclpy.init(args=["--ros-args", "-p", "require_rtk_fix:=false"])
     ok = True
@@ -97,6 +134,65 @@ def main():
             f"speed; got {sp_corner:.3f}"
         )
         print(f"PASS hard-corner approach uses stop floor: {sp_corner:.3f} m/s")
+
+        node.destroy_node()
+
+        # ---- smooth runtime-entry leg decelerates before the run boundary ----
+        # 2026-07-07 14:26 bag: a 1.4 m runtime-entry (smooth) leg reached the
+        # entry→MARK boundary at full mission speed (0.37 m/s), overshot ~26 cm,
+        # and oscillated ~11 s. approach_velocity_scaling_dist=1.5 m gates the
+        # final-goal approach behind path_travel_m >= 1.5 m, which a sub-1.5 m
+        # entry leg can never satisfy. The run-boundary approach branch must
+        # decelerate on remaining distance regardless of that gate.
+        node = RPPControllerNode()
+        node.set_parameters([
+            Parameter("require_rtk_fix", value=False),
+            Parameter("tracking_profile", value="smooth"),
+            Parameter("mission_speed", value=0.35),
+        ])
+        node._gps_fix_type = 6
+        cap = {}
+        node._publish_velocity = lambda vn, ve: cap.update(sp=math.hypot(vn, ve))
+
+        entry_len, mark_len = 1.4, 2.0
+        node._pose_cb(_mavros_pose(0.0, 0.0, 0.0))
+        node._path_cb(_runtime_entry_two_run_path(entry_len, mark_len))
+        assert len(node._runs) == 2, f"expected entry+MARK runs, got {len(node._runs)}"
+        assert node._runs[0].get("runtime_entry") is True
+        assert node._runs[0]["profile"] != "segment", "entry leg must be smooth"
+
+        def converged_speed_at(dist_before_boundary):
+            # Rover on the entry leg, aligned north, `dist_before_boundary`
+            # metres short of the boundary. Loop so the accel/decel speed loop
+            # converges to the steady commanded speed at that point.
+            n = entry_len - dist_before_boundary
+            node._run_idx = 0
+            node._last_speed_cmd = 0.35
+            node._path_travel_m = max(0.0, n)
+            sp = float("nan")
+            for _ in range(150):
+                cap.clear()
+                node._pose_cb(_mavros_pose(n, 0.0, 0.0))
+                node._control_loop()
+                sp = cap.get("sp", sp)
+            return sp
+
+        # Far from boundary (well outside the boundary approach window): full speed.
+        sp_far = converged_speed_at(1.2)
+        # Near boundary (inside the 0.5*run_len window): decelerated.
+        sp_near = converged_speed_at(0.15)
+        assert sp_far == sp_far and sp_near == sp_near, "captured speeds must be finite"
+        assert sp_near < sp_far, (
+            f"entry leg must slow approaching the boundary "
+            f"(far={sp_far:.3f} near={sp_near:.3f})"
+        )
+        assert sp_near < 0.20, (
+            f"near-boundary entry speed must be well below mission speed, got {sp_near:.3f}"
+        )
+        print(
+            f"PASS runtime-entry leg decelerates into boundary: "
+            f"far={sp_far:.3f} m/s → near={sp_near:.3f} m/s"
+        )
 
         node.destroy_node()
         print("\n=== ALL ENDPOINT-APPROACH TESTS PASSED ===")

@@ -3880,11 +3880,28 @@ class RPPControllerNode(Node):
         # only in the final approach_d metres back to the seam.
         state_code = StateCode.TRACKING
         run_closed = bool(self._runs and self._runs[self._run_idx].get("closed"))
+        has_next_run = self._run_idx + 1 < len(self._runs)
         if run_closed:
             run_len = float(self._runs[self._run_idx]["length"])
             remaining = max(0.0, run_len - self._path_travel_m)
             if remaining < approach_d:
                 scale = self._clamp(remaining / approach_d, 0.0, 1.0)
+                speed = min(speed, max(approach_v, speed * scale))
+                state_code = StateCode.APPROACH
+        elif has_next_run:
+            # Run boundary ahead (e.g. runtime-entry → MARK): the rover must
+            # arrive slow so the boundary stop certifies in one shot instead of
+            # overshooting and oscillating back. The final-goal approach below
+            # is gated on path_travel_m >= approach_d, which a short entry leg
+            # (< approach_d, e.g. 1.4 m < 1.5 m) can never satisfy — so it would
+            # otherwise reach the boundary at full mission speed (2026-07-07
+            # 14:26 bag: arrived 0.37 m/s, overshot ~26 cm, took ~11 s to
+            # settle). Decelerate on remaining distance to the boundary using a
+            # window capped to half the run length so short runs still brake.
+            run_len = float(self._runs[self._run_idx].get("length", 0.0))
+            boundary_approach_d = min(approach_d, 0.5 * run_len) if run_len > 0.0 else approach_d
+            if boundary_approach_d > 1e-6 and dist_to_goal < boundary_approach_d:
+                scale = self._clamp(dist_to_goal / boundary_approach_d, 0.0, 1.0)
                 speed = min(speed, max(approach_v, speed * scale))
                 state_code = StateCode.APPROACH
         elif dist_to_goal < approach_d and self._path_travel_m >= approach_d:
