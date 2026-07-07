@@ -149,7 +149,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "approach_velocity_scaling_dist": {
         "type": "float",
-        "default": 0.6,
+        "default": 0.3,
         "group": "Goal Handling",
         "description": "Distance from goal where approach speed scaling begins (m)",
         "min": 0.0,
@@ -316,7 +316,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "segment_stop_speed_threshold": {
         "type": "float",
-        "default": 0.02,
+        "default": 0.08,
         "group": "Tracking Profile",
         "description": "Actual horizontal speed required for confirmed corner stop (m/s)",
         "min": 0.001,
@@ -356,7 +356,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "segment_align_speed_threshold": {
         "type": "float",
-        "default": 0.02,
+        "default": 0.08,
         "group": "Tracking Profile",
         "description": "Maximum fresh horizontal speed allowed at pivot release (m/s)",
         "min": 0.001,

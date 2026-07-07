@@ -370,8 +370,8 @@ class RPPControllerNode(Node):
         # genuinely near-zero when it reaches the point — governs BOTH the
         # smooth entry-transit (GPS_SURVEYED lead-in) and, via the shared
         # scaling distance, segment-profile corners. This only affects the last
-        # ~1.5 m before a run endpoint/corner; mid-segment tracking is unchanged.
-        self.declare_parameter("approach_velocity_scaling_dist",      1.5)    # m (was 0.6)
+        # ~0.3 m before a run endpoint/corner; mid-segment tracking is unchanged.
+        self.declare_parameter("approach_velocity_scaling_dist",      0.3)    # m (was 1.5)
         self.declare_parameter("min_approach_linear_velocity",        0.05)   # m/s (was 0.10); stays > p4_zero_vel_threshold so no freeze
         self.declare_parameter("p4_zero_vel_threshold",               0.02)   # m/s; floor speed below this to exactly 0 to trigger PX4 P4
 
@@ -451,7 +451,7 @@ class RPPControllerNode(Node):
         # must be below their thresholds for segment_stop_dwell_s. The 2 s
         # stale-data cap prevents a deadlock if the velocity topic goes quiet;
         # it never overrides fresh evidence that the rover is still moving.
-        self.declare_parameter("segment_stop_speed_threshold",         0.02)   # m/s
+        self.declare_parameter("segment_stop_speed_threshold",         0.08)   # m/s (8 cm/s)
         self.declare_parameter("segment_stop_yaw_rate_threshold",      0.05)   # rad/s (~2.9 deg/s)
         self.declare_parameter("segment_stop_dwell_s",                 0.30)   # s
         # Stop certification must prove both "not moving" and "at the point".
@@ -475,7 +475,7 @@ class RPPControllerNode(Node):
         # state machine advances. Prevents premature exit while the rover is
         # still spinning or drifting.
         self.declare_parameter("segment_align_settle_s",               0.20)   # s
-        self.declare_parameter("segment_align_speed_threshold",        0.02)   # m/s (release gate)
+        self.declare_parameter("segment_align_speed_threshold",        0.08)   # m/s (8 cm/s release gate)
         # Pivot watchdog: after this long, relax the heading tolerance but
         # still require yaw-rate settling. Never launch onto the next line
         # merely because the timer expired while the rover is still turning.

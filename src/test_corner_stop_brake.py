@@ -43,13 +43,13 @@ def main():
         assert node.get_parameter("segment_timeout_heading_tolerance_deg").value == 2.0, "precision timeout must stay 2°"
         assert node.get_parameter("segment_align_settle_s").value == 0.20
         assert node.get_parameter("segment_brake_velocity_cap_m_s").value == 0.18
-        assert node.get_parameter("segment_align_speed_threshold").value == 0.02
+        assert node.get_parameter("segment_align_speed_threshold").value == 0.08
         assert node.get_parameter("corner_position_tolerance_m").value == 0.02
         assert node.get_parameter("require_stop_certificates").value is True
         print("PASS params: aim=2° release_max=3° timeout_tol=2° settle=0.20 brake_cap=0.18 pos_tol=0.02")
 
         # ---- TEST 4: braking command opposes motion, capped ----------------
-        P(segment_brake_velocity_cap_m_s=0.18, segment_stop_speed_threshold=0.02)
+        P(segment_brake_velocity_cap_m_s=0.18, segment_stop_speed_threshold=0.08)
         node._latest_vel_time = now(); node._latest_vel_ned = (0.20, 0.0)
         bn, be = node._corner_brake_velocity(0.0)
         assert bn < 0 and abs(be) < 1e-9, f"brake must oppose +N motion, got {(bn,be)}"
@@ -160,7 +160,7 @@ def main():
         print("PASS stop confirm: fresh velocity below threshold → confirmed by dwell")
 
         # ---- speed gate for release ---------------------------------------
-        P(segment_align_speed_threshold=0.02)
+        P(segment_align_speed_threshold=0.08)
         node._latest_vel_time = now(); node._latest_vel_ned = (0.019, 0.0)
         assert node._align_speed_ok() is True, "below align speed → ok"
         node._latest_vel_ned = (0.10, 0.0)

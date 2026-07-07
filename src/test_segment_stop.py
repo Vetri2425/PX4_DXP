@@ -81,7 +81,7 @@ class TestSegmentStop(unittest.TestCase):
 class CornerStopDwell:
     """Mirror of rpp_controller_node._corner_stop_satisfied (time injected)."""
 
-    THRESH = 0.02   # segment_stop_speed_threshold
+    THRESH = 0.08   # segment_stop_speed_threshold
     DWELL = 0.30    # segment_stop_dwell_s
     MAX_HOLD = 2.0  # _CORNER_STOP_MAX_HOLD_S
 
@@ -111,7 +111,7 @@ class CornerStopDwell:
 class CompletionSettleDwell:
     """Mirror of rpp_controller_node._completion_settle_satisfied."""
 
-    THRESH = 0.02   # segment_stop_speed_threshold
+    THRESH = 0.08   # segment_stop_speed_threshold
     DWELL = 0.30    # segment_stop_dwell_s
     STALE_CAP = 2.0 # _CORNER_STOP_MAX_HOLD_S
 
