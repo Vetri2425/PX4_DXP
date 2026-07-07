@@ -91,11 +91,16 @@ def _runtime_entry_path(n_entry, e_entry, n_mark, e_mark, n1, e1):
     b = PoseStamped()
     b.pose.position.x = n_mark
     b.pose.position.y = e_mark
+    b.pose.position.z = 0.0
+    b_on = PoseStamped()
+    b_on.pose.position.x = n_mark
+    b_on.pose.position.y = e_mark
+    b_on.pose.position.z = 1.0
     c = PoseStamped()
     c.pose.position.x = n1
     c.pose.position.y = e1
     c.pose.position.z = 1.0
-    p.poses = [a, b, c]
+    p.poses = [a, b, b_on, c]
     return p
 
 
