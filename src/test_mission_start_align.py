@@ -22,6 +22,36 @@ import rclpy
 from rclpy.parameter import Parameter
 
 
+class _CapturePub:
+    def __init__(self):
+        self.messages = []
+
+    def publish(self, msg):
+        self.messages.append(msg)
+
+    @property
+    def last(self):
+        return self.messages[-1] if self.messages else None
+
+
+def _wire_captures(node):
+    caps = {
+        "vel": _CapturePub(),
+        "yaw": _CapturePub(),
+        "debug": _CapturePub(),
+        "segment": _CapturePub(),
+        "stop": _CapturePub(),
+        "spray": _CapturePub(),
+    }
+    node._vel_pub = caps["vel"]
+    node._yaw_rate_pub = caps["yaw"]
+    node._dbg_pub = caps["debug"]
+    node._segment_dbg_pub = caps["segment"]
+    node._stop_dbg_pub = caps["stop"]
+    node._spray_active_pub = caps["spray"]
+    return caps
+
+
 def _pose(n, e, yaw_ned=0.0):
     from geometry_msgs.msg import PoseStamped
     ps = PoseStamped()
@@ -164,6 +194,64 @@ def main():
         assert yr_ok is False, "still turning: yaw-rate gate must stay strict"
         assert sp_ok is True
         print("PASS: align release bypasses yaw-rate when heading already OK")
+
+        node.destroy_node()
+
+        # ---- runtime-entry MARK pivot must not creep down the MARK line ----
+        from rpp_controller_node import StopReason
+
+        node = RPPControllerNode()
+        node.set_parameters([
+            Parameter("require_rtk_fix", value=False),
+            Parameter("segment_align_settle_s", value=0.0),
+        ])
+        node._gps_fix_type = 6
+        caps = _wire_captures(node)
+        node._path_cb(_runtime_entry_path(-2.0, -4.0, 0.0, 0.0, 2.0, 0.0))
+        assert len(node._runs) == 2
+        boundary = node._runs[0]["poses"][-1].pose.position
+        boundary_seg_idx = max(0, len(node._runs[0]["poses"]) - 2)
+        node._make_stop_certificate(
+            StopReason.RUNTIME_ENTRY_TO_MARK,
+            boundary.x,
+            boundary.y,
+            0.0,
+            0.0,
+            segment_idx=boundary_seg_idx,
+        )
+        assert node._advance_run(pre_stopped=True)
+        assert node._run_idx == 1
+        assert node._run_align_pending is True
+        assert node._corner_stop_complete is True
+        node._latest_vel_time = node.get_clock().now()
+        node._latest_vel_ned = (0.0, 0.0)
+        node._latest_yaw_rate_ned = 0.0
+
+        yaw_ned = math.radians(-84.0)
+        caps["vel"].messages.clear()
+        held = node._run_alignment_hold(0.0, 0.0, yaw_ned, 0.0)
+        assert held is True
+        v = caps["vel"].last.vector
+        speed = math.hypot(v.x, v.y)
+        bearing = math.atan2(v.y, v.x)
+        offset = abs(node._angle_wrap(bearing - yaw_ned))
+        assert speed <= 0.051, f"runtime-entry pivot speed must stay small, got {speed:.3f}"
+        assert offset <= math.radians(20.0) + 1e-6, (
+            f"runtime-entry pivot must use tight forward cone, got {math.degrees(offset):.1f}°"
+        )
+        assert v.x < 0.04, (
+            f"runtime-entry pivot must not command a large MARK-forward component, got {v.x:.3f}"
+        )
+
+        caps["vel"].messages.clear()
+        held = node._run_alignment_hold(0.015, 0.0, yaw_ned, 0.0)
+        assert held is True
+        v = caps["vel"].last.vector
+        assert v.x < 0.0, (
+            "inside the normal 2 cm stop gate but outside the stricter "
+            "runtime-entry pivot-start gate, command recovery back to MARK start"
+        )
+        print("PASS: runtime-entry MARK pivot uses anti-creep limits and strict start recovery")
 
         node.destroy_node()
         print("\n=== ALL MISSION-START ALIGN TESTS PASSED ===")
