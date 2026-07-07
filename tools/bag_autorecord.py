@@ -62,6 +62,7 @@ TOPICS = [
     "/mavros/gpsstatus/gps1/raw",
     "/rpp/debug",
     "/rpp/segment_debug",
+    "/rpp/stop_debug",
     "/rpp/setpoint_bridge_debug",
     "/rpp/velocity_ned",
     "/rpp/yaw_rate_body",
