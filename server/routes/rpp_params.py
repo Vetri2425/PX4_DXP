@@ -149,7 +149,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "approach_velocity_scaling_dist": {
         "type": "float",
-        "default": 0.3,
+        "default": 1.5,
         "group": "Goal Handling",
         "description": "Distance from goal where approach speed scaling begins (m)",
         "min": 0.0,

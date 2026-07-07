@@ -369,9 +369,16 @@ class RPPControllerNode(Node):
         # earlier and to a lower arrival floor so the lagging drivetrain is
         # genuinely near-zero when it reaches the point — governs BOTH the
         # smooth entry-transit (GPS_SURVEYED lead-in) and, via the shared
-        # scaling distance, segment-profile corners. This only affects the last
-        # ~0.3 m before a run endpoint/corner; mid-segment tracking is unchanged.
-        self.declare_parameter("approach_velocity_scaling_dist",      0.3)    # m (was 1.5)
+        # scaling distance, segment-profile corners. This affects the last
+        # ~1.5 m before a run endpoint/corner; mid-segment tracking is unchanged.
+        # 2026-07-07 (0ee4c35) shrank this to 0.3 m to fix short GPS_SURVEYED
+        # entry legs hitting the boundary at full speed — but that problem has
+        # its own scoped fix (boundary_approach_d = min(approach_d, 0.5*run_len)
+        # below), so shrinking this global value only reintroduced the Fix C
+        # overshoot on every normal-length stop (5-27 cm, 2026-07-07 new_01
+        # bags). Restored to the validated 1.5 m; short legs stay protected by
+        # boundary_approach_d regardless of this value.
+        self.declare_parameter("approach_velocity_scaling_dist",      1.5)    # m (was 0.3, restored 2026-07-08)
         self.declare_parameter("min_approach_linear_velocity",        0.05)   # m/s (was 0.10); stays > p4_zero_vel_threshold so no freeze
         self.declare_parameter("p4_zero_vel_threshold",               0.02)   # m/s; floor speed below this to exactly 0 to trigger PX4 P4
 
@@ -1933,22 +1940,24 @@ class RPPControllerNode(Node):
         )
         # Run-boundary pivot (RUNTIME_ENTRY_TO_MARK / RUN_BOUNDARY): PX4's
         # velocity-vector pivot inherently translates the rover by ~corner_speed
-        # over the pivot duration.  For intra-run corners that translation is
-        # small (short turn, same speed).  For a large run-boundary turn (e.g.
-        # 91.56° entry-to-MARK), the creep accumulates to several cm and knocks
-        # position_ok out of spec every cycle, preventing the settle clock from
-        # ever reaching align_settle_s.  The RPP lookahead corrects any residual
-        # position offset as soon as normal tracking resumes, so strict
-        # position accuracy at the run-boundary waypoint is not required for
-        # safe release.  Omit position_ok from the settle gate here; it is
-        # retained in _control_segment_profile for intra-run corners where the
-        # corner point must be hit precisely.
+        # over the pivot duration, so position_ok is expected to read false
+        # while heading is still converging — that's fine, position isn't
+        # checked until heading_ok is already true and pivoting has stopped
+        # (see the heading_ok recenter branch below, which is the only thing
+        # allowed to drive position_ok back to true). Once heading_ok is true,
+        # require position_ok too so release waits for that recenter to
+        # actually land, instead of certifying a run-boundary point that's
+        # still 5-24cm off. Bounded by the same angle-aware pivot watchdog
+        # used for heading (timed_out) so a recenter that can't fully converge
+        # (gain/EKF noise floor) doesn't deadlock the mission in the field.
+        position_release_ok = position_ok or timed_out
         if (
             self._corner_stop_complete
             and stop_cert_ok
             and heading_ok
             and yaw_rate_ok
             and speed_ok
+            and position_release_ok
         ):
             if self._align_settle_since is None:
                 self._align_settle_since = now_align
