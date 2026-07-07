@@ -32,7 +32,12 @@ class EmergencyHandler:
         self._log        = activity_log
         self._mission_capture = mission_capture
 
-    async def estop_async(self) -> dict:
+    async def estop_async(
+        self,
+        *,
+        terminal_reason: str = "emergency_stop",
+        terminal_details: dict | None = None,
+    ) -> dict:
         """Execute emergency stop. Returns {success, message}."""
         from mission_ops import MissionOperationCoordinator
 
@@ -47,11 +52,21 @@ class EmergencyHandler:
         estop_token = coordinator.begin_estop_nowait()
 
         try:
-            return await self._estop_async_with_token(estop_token)
+            return await self._estop_async_with_token(
+                estop_token,
+                terminal_reason=terminal_reason,
+                terminal_details=terminal_details,
+            )
         finally:
             await coordinator.finish(estop_token)
 
-    async def _estop_async_with_token(self, estop_token) -> dict:
+    async def _estop_async_with_token(
+        self,
+        estop_token,
+        *,
+        terminal_reason: str = "emergency_stop",
+        terminal_details: dict | None = None,
+    ) -> dict:
         # Guard: if ROS node is unavailable, short-circuit cleanly
         if self._node is None:
             msg = "ROS node not available — e-stop cannot reach FCU"
@@ -139,7 +154,7 @@ class EmergencyHandler:
                         point_mission.terminal_cleanup(
                             self._node,
                             hold_owner,
-                            reason="emergency_stop",
+                            reason=terminal_reason,
                             terminal_state=PointMissionState.ABORTING,
                             operation_token=estop_token,
                             require_spray_confirm=False,
@@ -164,11 +179,14 @@ class EmergencyHandler:
         getattr(log, level)(msg)
 
         if self._mission_capture is not None:
+            details = {"success": not errors, "errors": errors}
+            if terminal_details:
+                details.update(terminal_details)
             self._mission_capture.record_terminal(
                 None,
-                "emergency_stop",
+                terminal_reason,
                 state=MissionState.ABORTED.value,
-                details={"success": not errors, "errors": errors},
+                details=details,
             )
 
         return {"success": not errors, "message": msg}

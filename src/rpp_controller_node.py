@@ -173,6 +173,7 @@ Frame conventions
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from enum import IntEnum
 
 import rclpy
@@ -226,6 +227,81 @@ class SegmentStateCode(IntEnum):
     # does CORNER_ALIGN pivot toward the next heading. Prevents approach
     # momentum from carrying the rover past the corner during the pivot.
     CORNER_STOP = 5
+
+
+class StopReason(IntEnum):
+    INTRA_RUN_CORNER = 1
+    RUN_BOUNDARY = 2
+    RUNTIME_ENTRY_TO_MARK = 3
+    FINAL_ENDPOINT = 4
+
+
+class CertificateSource(IntEnum):
+    FRESH_TELEMETRY = 1
+    STALE_FALLBACK = 2
+
+
+class StopDebugPhase(IntEnum):
+    INACTIVE = 0
+    HOLDING = 1
+    STOP_CERTIFIED = 2
+    ALIGNING = 3
+    ALIGN_CERTIFIED = 4
+    FINAL_CERTIFIED = 5
+    RELEASED = 6
+    BLOCKED = 7
+
+
+@dataclass
+class StopCertificate:
+    reason: StopReason
+    source: CertificateSource
+    run_idx: int
+    segment_idx: int
+    target_n: float
+    target_e: float
+    position_error_m: float
+    measured_speed_m_s: float
+    yaw_rate_rad_s: float
+    heading_error_rad: float
+    dwell_s: float
+    created_sec: float
+    valid: bool = True
+    degraded: bool = False
+
+
+@dataclass
+class AlignmentCertificate:
+    reason: StopReason
+    source: CertificateSource
+    run_idx: int
+    segment_idx: int
+    target_n: float
+    target_e: float
+    target_heading_rad: float
+    heading_error_rad: float
+    measured_speed_m_s: float
+    yaw_rate_rad_s: float
+    dwell_s: float
+    created_sec: float
+    valid: bool = True
+    degraded: bool = False
+
+
+@dataclass
+class FinalStopCertificate:
+    reason: StopReason
+    source: CertificateSource
+    run_idx: int
+    segment_idx: int
+    target_n: float
+    target_e: float
+    position_error_m: float
+    measured_speed_m_s: float
+    dwell_s: float
+    created_sec: float
+    valid: bool = True
+    degraded: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +454,14 @@ class RPPControllerNode(Node):
         self.declare_parameter("segment_stop_speed_threshold",         0.02)   # m/s
         self.declare_parameter("segment_stop_yaw_rate_threshold",      0.05)   # rad/s (~2.9 deg/s)
         self.declare_parameter("segment_stop_dwell_s",                 0.30)   # s
+        # Stop certification must prove both "not moving" and "at the point".
+        # CORNER_STOP still arms at segment_corner_acceptance_radius (default
+        # 5 cm) so braking can start early, but release requires this tighter
+        # position gate around the actual vertex/run boundary.
+        self.declare_parameter("corner_position_tolerance_m",          0.02)   # m
+        self.declare_parameter("corner_hold_along_gain",               1.5)    # 1/s
+        self.declare_parameter("corner_hold_cross_gain",               0.8)    # 1/s
+        self.declare_parameter("corner_hold_damping_gain",             0.5)    # dimensionless
         # Active braking at a corner stop. PX4 velocity-OFFBOARD does not brake
         # on a zero setpoint — it coasts — so a rover that reaches the corner
         # still at ~0.1-0.2 m/s can drift far past the point. When velocity data
@@ -414,6 +498,11 @@ class RPPControllerNode(Node):
         # residual error into forward TRACK acceleration. Tightened to 3° for
         # precision (per-line extension) missions where MARK entry must be <2 cm.
         self.declare_parameter("segment_pivot_release_max_deg",        3.0)    # deg
+        # Phase 1 production FSM migration: require explicit stop/alignment/
+        # final certificates before pivot, next-leg tracking, or DONE. The
+        # certificates wrap the existing physical gates; debug publishing stays
+        # active even if this is disabled for first bench rollout.
+        self.declare_parameter("require_stop_certificates",            True)
         # Connector absorption (Part A): adjacent apex waypoints can leave a
         # sub-threshold "connector" segment (e.g. 8 cm) between two real legs.
         # If it survives into run-splitting it becomes its own pivot target and
@@ -505,6 +594,9 @@ class RPPControllerNode(Node):
         self._pivot_turn_angle_rad: float = 0.0                # corner magnitude this pivot must cover
         self._align_settle_since: RclTime | None = None        # heading+yaw-rate both OK since
         self._run_align_turn_rad: float = 0.0                  # run-transition corner magnitude (for budget)
+        self._stop_certificate: StopCertificate | None = None
+        self._alignment_certificate: AlignmentCertificate | None = None
+        self._final_stop_certificate: FinalStopCertificate | None = None
         self._last_segment_debug: tuple[float, ...] = (
             0.0, 0.0, 0.0, float("nan"), float("nan"),
             float("nan"), float("nan"), float("nan"), 0.0, 0.0,
@@ -587,6 +679,9 @@ class RPPControllerNode(Node):
         )
         self._segment_dbg_pub = self.create_publisher(
             Float32MultiArray, "/rpp/segment_debug", be_qos
+        )
+        self._stop_dbg_pub = self.create_publisher(
+            Float32MultiArray, "/rpp/stop_debug", be_qos
         )
         self._conditioned_path_pub = self.create_publisher(
             Path, "/rpp/conditioned_path", path_qos
@@ -794,7 +889,10 @@ class RPPControllerNode(Node):
         # pointless stop + double 180° pivot. The next run starts within
         # goal tolerance of the dropped geometry, so nothing is lost.
         if len(runs) > 1:
-            kept = [r for r in runs if r["length"] >= 0.05]
+            kept = [
+                r for r in runs
+                if r["length"] >= 0.05 or r.get("runtime_entry")
+            ]
             if kept and len(kept) < len(runs):
                 self.get_logger().info(
                     f"Dropped {len(runs) - len(kept)} sliver run(s) < 5 cm"
@@ -1455,12 +1553,14 @@ class RPPControllerNode(Node):
             # where a fresh pose is guaranteed (see _run0_align_decision_pending
             # consumption below run-readiness checks).
             self._run0_align_decision_pending = True
+        carried_stop_certificate = self._stop_certificate if pre_stopped else None
         self._reset_corner_pivot_state()
         # A hard run boundary is stopped before _advance_run(). Carry that
         # confirmation into the new run so _run_alignment_hold pivots directly
         # instead of running a duplicate CORNER_STOP after the switch.
         if pre_stopped and self._run_align_pending:
             self._corner_stop_complete = True
+            self._stop_certificate = carried_stop_certificate
         self._run_boundary_stop_pending = False
         self._run_idx = idx
         self._path = run["poses"]
@@ -1565,15 +1665,63 @@ class RPPControllerNode(Node):
         n0, n1 = next_poses[0].pose.position, next_poses[1].pose.position
         target_heading = math.atan2(n1.y - n0.y, n1.x - n0.x)
         heading_err = self._angle_wrap(target_heading - yaw_ned)
+        current_poses = self._runs[self._run_idx]["poses"]
+        stop_pt = current_poses[-1].pose.position
+        prev_pt = current_poses[-2].pose.position if len(current_poses) >= 2 else stop_pt
+        stop_reason = (
+            StopReason.RUNTIME_ENTRY_TO_MARK
+            if self._runtime_entry_to_mark_boundary(
+                self._runs[self._run_idx], self._runs[self._run_idx + 1]
+            )
+            else StopReason.RUN_BOUNDARY
+        )
+        pos_error, _, _ = self._corner_position_errors(
+            pos_n, pos_e, stop_pt.x, stop_pt.y,
+            stop_pt.x - prev_pt.x, stop_pt.y - prev_pt.y,
+        )
+        position_ok = self._corner_position_ok(
+            pos_n, pos_e, stop_pt.x, stop_pt.y,
+            stop_pt.x - prev_pt.x, stop_pt.y - prev_pt.y,
+        )
 
-        if self._corner_stop_satisfied():
+        if self._corner_stop_satisfied(position_ok=position_ok):
+            boundary_seg_idx = max(0, len(self._path) - 2)
+            self._make_stop_certificate(
+                stop_reason, stop_pt.x, stop_pt.y, pos_error, heading_err,
+                segment_idx=boundary_seg_idx,
+            )
+            if not self._stop_certificate_valid_for(
+                stop_reason, stop_pt.x, stop_pt.y,
+                run_idx=self._run_idx, segment_idx=boundary_seg_idx,
+            ):
+                self._publish_stop_debug(
+                    StopDebugPhase.BLOCKED, stop_reason, stop_pt.x, stop_pt.y,
+                    pos_error, heading_err,
+                    self._certificate_dwell_s(
+                        self._corner_stop_settle_since, self._corner_stop_entered
+                    ),
+                    transition_code=9.0,
+                )
+                return True
+            self._publish_stop_debug(
+                StopDebugPhase.STOP_CERTIFIED, stop_reason, stop_pt.x, stop_pt.y,
+                pos_error, heading_err,
+                self._certificate_dwell_s(
+                    self._corner_stop_settle_since, self._corner_stop_entered
+                ),
+                transition_code=2.0,
+            )
             self._run_boundary_stop_pending = False
             self._advance_run(pre_stopped=True)
             return True
 
         self._segment_state = SegmentStateCode.CORNER_STOP
         self._last_speed_cmd = 0.0
-        brake_n, brake_e = self._corner_brake_velocity(yaw_ned)
+        brake_n, brake_e = self._corner_hold_velocity(
+            pos_n, pos_e, stop_pt.x, stop_pt.y,
+            stop_pt.x - prev_pt.x, stop_pt.y - prev_pt.y,
+            yaw_ned,
+        )
         brake_speed = math.hypot(brake_n, brake_e)
         self._publish_velocity(brake_n, brake_e)
         self._publish_yaw_rate(0.0)
@@ -1600,6 +1748,14 @@ class RPPControllerNode(Node):
             target_heading,
             heading_err,
             0.0,
+        )
+        self._publish_stop_debug(
+            StopDebugPhase.HOLDING, stop_reason, stop_pt.x, stop_pt.y,
+            pos_error, heading_err,
+            self._certificate_dwell_s(
+                self._corner_stop_settle_since, self._corner_stop_entered
+            ),
+            transition_code=1.0,
         )
         return True
 
@@ -1685,6 +1841,19 @@ class RPPControllerNode(Node):
 
         target_heading = math.atan2(b.y - a.y, b.x - a.x)
         heading_err = self._angle_wrap(target_heading - yaw_ned)
+        stop_reason = (
+            StopReason.RUNTIME_ENTRY_TO_MARK
+            if self._run_idx > 0 and self._runtime_entry_to_mark_boundary(
+                self._runs[self._run_idx - 1], self._runs[self._run_idx]
+            )
+            else StopReason.RUN_BOUNDARY
+        )
+        pos_error, _, _ = self._corner_position_errors(
+            pos_n, pos_e, a.x, a.y, b.x - a.x, b.y - a.y
+        )
+        position_ok = self._corner_position_ok(
+            pos_n, pos_e, a.x, a.y, b.x - a.x, b.y - a.y
+        )
         heading_tol = math.radians(
             float(self.get_parameter("segment_heading_tolerance_deg").value)
         )
@@ -1711,6 +1880,37 @@ class RPPControllerNode(Node):
         )
         heading_ok = abs(heading_err) <= release_heading_tol
         vel_fresh = self._vel_is_fresh()
+        expected_stop_run_idx = self._run_idx
+        expected_stop_seg_idx = 0
+        if (
+            self._stop_certificate is not None
+            and self._run_idx > 0
+            and self._stop_certificate.run_idx == self._run_idx - 1
+        ):
+            prev_run = self._runs[self._run_idx - 1]
+            expected_stop_run_idx = self._run_idx - 1
+            expected_stop_seg_idx = max(0, len(prev_run["poses"]) - 2)
+        stop_cert_ok = self._stop_certificate_valid_for(
+            (StopReason.RUN_BOUNDARY, StopReason.RUNTIME_ENTRY_TO_MARK), a.x, a.y,
+            run_idx=expected_stop_run_idx, segment_idx=expected_stop_seg_idx,
+        )
+        if self._corner_stop_complete and not stop_cert_ok:
+            self._segment_state = SegmentStateCode.CORNER_STOP
+            self._last_speed_cmd = 0.0
+            hold_n, hold_e = self._corner_hold_velocity(
+                pos_n, pos_e, a.x, a.y, b.x - a.x, b.y - a.y, yaw_ned
+            )
+            self._publish_velocity(hold_n, hold_e)
+            self._publish_yaw_rate(0.0)
+            self._publish_stop_debug(
+                StopDebugPhase.BLOCKED, stop_reason, a.x, a.y,
+                pos_error, heading_err,
+                self._certificate_dwell_s(
+                    self._corner_stop_settle_since, self._corner_stop_entered
+                ),
+                transition_code=9.0,
+            )
+            return True
         # Fresh telemetry is mandatory during normal alignment. If the
         # velocity topic disappears, the angle-aware pivot watchdog is the
         # bounded fallback: pose heading is still fresh (enforced by the outer
@@ -1721,7 +1921,14 @@ class RPPControllerNode(Node):
             if vel_fresh else timed_out
         )
         speed_ok = self._align_speed_ok() if vel_fresh else timed_out
-        if self._corner_stop_complete and heading_ok and yaw_rate_ok and speed_ok:
+        if (
+            self._corner_stop_complete
+            and stop_cert_ok
+            and position_ok
+            and heading_ok
+            and yaw_rate_ok
+            and speed_ok
+        ):
             if self._align_settle_since is None:
                 self._align_settle_since = now_align
             settled = (now_align - self._align_settle_since).nanoseconds * 1e-9 >= align_settle_s
@@ -1729,6 +1936,27 @@ class RPPControllerNode(Node):
             self._align_settle_since = None
             settled = False
         if settled:
+            self._make_alignment_certificate(
+                stop_reason, a.x, a.y, target_heading, heading_err,
+                segment_idx=0, degraded=not vel_fresh,
+            )
+            if not self._alignment_certificate_valid_for(
+                stop_reason, a.x, a.y, target_heading,
+                run_idx=self._run_idx, segment_idx=0,
+            ):
+                self._publish_stop_debug(
+                    StopDebugPhase.BLOCKED, stop_reason, a.x, a.y,
+                    pos_error, heading_err,
+                    self._certificate_dwell_s(self._align_settle_since, None),
+                    transition_code=9.0,
+                )
+                return True
+            self._publish_stop_debug(
+                StopDebugPhase.ALIGN_CERTIFIED, stop_reason, a.x, a.y,
+                pos_error, heading_err,
+                self._certificate_dwell_s(self._align_settle_since, None),
+                transition_code=3.0,
+            )
             self._run_align_pending = False
             self._last_speed_cmd = 0.0
             self._reset_corner_pivot_state()
@@ -1742,7 +1970,9 @@ class RPPControllerNode(Node):
         # keep linear speed above the release threshold until the watchdog.
         if self._corner_stop_complete and heading_ok:
             self._last_speed_cmd = 0.0
-            brake_n, brake_e = self._corner_brake_velocity(yaw_ned)
+            brake_n, brake_e = self._corner_hold_velocity(
+                pos_n, pos_e, a.x, a.y, b.x - a.x, b.y - a.y, yaw_ned
+            )
             self._publish_velocity(brake_n, brake_e)
             self._publish_yaw_rate(0.0)
             self._publish_debug(
@@ -1763,6 +1993,45 @@ class RPPControllerNode(Node):
                 SegmentStateCode.CORNER_ALIGN, 0, float("nan"), float("nan"),
                 float("nan"), target_heading, heading_err, 0.0,
             )
+            self._publish_stop_debug(
+                StopDebugPhase.ALIGNING, stop_reason, a.x, a.y,
+                pos_error, heading_err,
+                self._certificate_dwell_s(self._align_settle_since, None),
+                transition_code=1.0,
+            )
+            return True
+
+        if self._corner_stop_complete and not position_ok:
+            self._last_speed_cmd = 0.0
+            hold_n, hold_e = self._corner_hold_velocity(
+                pos_n, pos_e, a.x, a.y, b.x - a.x, b.y - a.y, yaw_ned
+            )
+            self._publish_velocity(hold_n, hold_e)
+            self._publish_yaw_rate(0.0)
+            self._publish_debug(
+                cross_track=0.0,
+                heading_err=heading_err,
+                lookahead=float("nan"),
+                speed=math.hypot(hold_n, hold_e),
+                kappa=0.0,
+                dist_goal=dist_to_goal,
+                pose_age_ms=pose_age_s * 1000.0,
+                state=StateCode.TRACKING,
+                l_d_raw=float("nan"),
+                kappa_speed=0.0,
+                yaw_rate=0.0,
+                spray_active=False,
+            )
+            self._publish_segment_debug(
+                SegmentStateCode.CORNER_ALIGN, 0, float("nan"), float("nan"),
+                float("nan"), target_heading, heading_err, 0.0,
+            )
+            self._publish_stop_debug(
+                StopDebugPhase.ALIGNING, stop_reason, a.x, a.y,
+                pos_error, heading_err,
+                self._certificate_dwell_s(self._align_settle_since, None),
+                transition_code=1.0,
+            )
             return True
 
         # Stop-and-spin: hold zero velocity at the corner until the rover is
@@ -1770,13 +2039,15 @@ class RPPControllerNode(Node):
         # this the residual ~0.09 m/s arrival speed carries the rover past
         # the corner point during the first part of the turn.
         if not self._corner_stop_complete:
-            if not self._corner_stop_satisfied():
+            if not self._corner_stop_satisfied(position_ok=position_ok):
                 # Active braking: PX4 coasts on a zero setpoint, so command a
                 # small velocity opposing the rover's motion to truly stop it at
                 # the corner point before pivoting. (0,0) when already stopped or
                 # velocity is stale.
                 self._last_speed_cmd = 0.0
-                brake_n, brake_e = self._corner_brake_velocity(yaw_ned)
+                brake_n, brake_e = self._corner_hold_velocity(
+                    pos_n, pos_e, a.x, a.y, b.x - a.x, b.y - a.y, yaw_ned
+                )
                 self._publish_velocity(brake_n, brake_e)
                 self._publish_yaw_rate(0.0)
                 self._publish_debug(
@@ -1797,7 +2068,38 @@ class RPPControllerNode(Node):
                     SegmentStateCode.CORNER_STOP, 0, float("nan"), float("nan"),
                     float("nan"), target_heading, heading_err, 0.0,
                 )
+                self._publish_stop_debug(
+                    StopDebugPhase.HOLDING, stop_reason, a.x, a.y,
+                    pos_error, heading_err,
+                    self._certificate_dwell_s(
+                        self._corner_stop_settle_since, self._corner_stop_entered
+                    ),
+                    transition_code=1.0,
+                )
                 return True
+            self._make_stop_certificate(
+                stop_reason, a.x, a.y, pos_error, heading_err, segment_idx=0
+            )
+            if not self._stop_certificate_valid_for(
+                stop_reason, a.x, a.y, run_idx=self._run_idx, segment_idx=0
+            ):
+                self._publish_stop_debug(
+                    StopDebugPhase.BLOCKED, stop_reason, a.x, a.y,
+                    pos_error, heading_err,
+                    self._certificate_dwell_s(
+                        self._corner_stop_settle_since, self._corner_stop_entered
+                    ),
+                    transition_code=9.0,
+                )
+                return True
+            self._publish_stop_debug(
+                StopDebugPhase.STOP_CERTIFIED, stop_reason, a.x, a.y,
+                pos_error, heading_err,
+                self._certificate_dwell_s(
+                    self._corner_stop_settle_since, self._corner_stop_entered
+                ),
+                transition_code=2.0,
+            )
             self._corner_stop_complete = True
 
         # Firmware-aware pivot (see segment CORNER_ALIGN for the full
@@ -1831,6 +2133,12 @@ class RPPControllerNode(Node):
         self._publish_segment_debug(
             SegmentStateCode.CORNER_ALIGN, 0, float("nan"), float("nan"),
             float("nan"), target_heading, heading_err, 0.0,
+        )
+        self._publish_stop_debug(
+            StopDebugPhase.ALIGNING, stop_reason, a.x, a.y,
+            pos_error, heading_err,
+            self._certificate_dwell_s(self._align_settle_since, None),
+            transition_code=1.0,
         )
         return True
 
@@ -2429,16 +2737,73 @@ class RPPControllerNode(Node):
             # the next control cycle tracks the new run.
             if self._advance_run():
                 return
+            target = self._path[0].pose.position if self._path else None
+            target_n = target.x if target is not None else pos_n
+            target_e = target.y if target is not None else pos_e
+            point_error = self._dist(pos_n, pos_e, target_n, target_e)
+            if not self._completion_settle_satisfied():
+                self._segment_state = SegmentStateCode.PRE_CORNER_SLOWDOWN
+                self._publish_zero(
+                    StateCode.APPROACH,
+                    pose_age_ms=pose_age_s * 1000.0,
+                    dist_to_goal=point_error,
+                )
+                self._publish_stop_debug(
+                    StopDebugPhase.HOLDING, StopReason.FINAL_ENDPOINT,
+                    target_n, target_e, point_error, float("nan"),
+                    self._certificate_dwell_s(
+                        self._completion_settle_since,
+                        self._completion_settle_entered,
+                    ),
+                    transition_code=1.0,
+                )
+                return
+            if not self._final_position_ok(point_error):
+                self._segment_state = SegmentStateCode.PRE_CORNER_SLOWDOWN
+                self._publish_zero(
+                    StateCode.APPROACH,
+                    pose_age_ms=pose_age_s * 1000.0,
+                    dist_to_goal=point_error,
+                )
+                self._publish_stop_debug(
+                    StopDebugPhase.BLOCKED, StopReason.FINAL_ENDPOINT,
+                    target_n, target_e, point_error, float("nan"),
+                    self._certificate_dwell_s(
+                        self._completion_settle_since,
+                        self._completion_settle_entered,
+                    ),
+                    transition_code=9.0,
+                )
+                return
+            self._make_final_stop_certificate(target_n, target_e, point_error, segment_idx=0)
+            if not self._final_stop_certificate_valid_for(
+                target_n, target_e, run_idx=self._run_idx, segment_idx=0
+            ):
+                self._publish_stop_debug(
+                    StopDebugPhase.BLOCKED, StopReason.FINAL_ENDPOINT,
+                    target_n, target_e, point_error, float("nan"),
+                    self._certificate_dwell_s(
+                        self._completion_settle_since,
+                        self._completion_settle_entered,
+                    ),
+                    transition_code=9.0,
+                )
+                return
+            self._publish_stop_debug(
+                StopDebugPhase.FINAL_CERTIFIED, StopReason.FINAL_ENDPOINT,
+                target_n, target_e, point_error, float("nan"),
+                self._certificate_dwell_s(
+                    self._completion_settle_since,
+                    self._completion_settle_entered,
+                ),
+                transition_code=5.0,
+            )
             self._segment_state = SegmentStateCode.DONE
             self._path_done = True
             self._publish_zero(
                 StateCode.DONE,
                 pose_age_ms=pose_age_s * 1000.0,
-                dist_to_goal=dist_to_goal,
-            )
-            self._publish_segment_debug(
-                self._segment_state, 0, float("nan"), dist_to_goal,
-                float("nan"), float("nan"), float("nan"), 0.0,
+                dist_to_goal=point_error,
             )
             return
 
@@ -2488,7 +2853,58 @@ class RPPControllerNode(Node):
                     pose_age_ms=pose_age_s * 1000.0,
                     dist_to_goal=dist_to_corner,
                 )
+                self._publish_stop_debug(
+                    StopDebugPhase.HOLDING, StopReason.FINAL_ENDPOINT,
+                    b.x, b.y, dist_to_corner, float("nan"),
+                    self._certificate_dwell_s(
+                        self._completion_settle_since,
+                        self._completion_settle_entered,
+                    ),
+                    transition_code=1.0,
+                )
                 return
+            if not self._final_position_ok(dist_to_corner):
+                self._segment_state = SegmentStateCode.PRE_CORNER_SLOWDOWN
+                self._publish_zero(
+                    StateCode.APPROACH,
+                    pose_age_ms=pose_age_s * 1000.0,
+                    dist_to_goal=dist_to_corner,
+                )
+                self._publish_stop_debug(
+                    StopDebugPhase.BLOCKED, StopReason.FINAL_ENDPOINT,
+                    b.x, b.y, dist_to_corner, float("nan"),
+                    self._certificate_dwell_s(
+                        self._completion_settle_since,
+                        self._completion_settle_entered,
+                    ),
+                    transition_code=9.0,
+                )
+                return
+            self._make_final_stop_certificate(
+                b.x, b.y, dist_to_corner, segment_idx=seg_idx
+            )
+            if not self._final_stop_certificate_valid_for(
+                b.x, b.y, run_idx=self._run_idx, segment_idx=seg_idx
+            ):
+                self._publish_stop_debug(
+                    StopDebugPhase.BLOCKED, StopReason.FINAL_ENDPOINT,
+                    b.x, b.y, dist_to_corner, float("nan"),
+                    self._certificate_dwell_s(
+                        self._completion_settle_since,
+                        self._completion_settle_entered,
+                    ),
+                    transition_code=9.0,
+                )
+                return
+            self._publish_stop_debug(
+                StopDebugPhase.FINAL_CERTIFIED, StopReason.FINAL_ENDPOINT,
+                b.x, b.y, dist_to_corner, float("nan"),
+                self._certificate_dwell_s(
+                    self._completion_settle_since,
+                    self._completion_settle_entered,
+                ),
+                transition_code=5.0,
+            )
             self.get_logger().info(
                 f"Segment path complete — within {dist_to_corner * 100:.1f} cm "
                 f"of final point (tol={goal_tol * 100:.1f} cm)"
@@ -2521,6 +2937,12 @@ class RPPControllerNode(Node):
             c = self._path[seg_idx + 2].pose.position
             target_heading = math.atan2(c.y - b.y, c.x - b.x)
             heading_err = self._angle_wrap(target_heading - yaw_ned)
+            pos_error, _, _ = self._corner_position_errors(
+                pos_n, pos_e, b.x, b.y, b.x - a.x, b.y - a.y
+            )
+            position_ok = self._corner_position_ok(
+                pos_n, pos_e, b.x, b.y, b.x - a.x, b.y - a.y
+            )
             timed_out = self._corner_stop_complete and self._pivot_timed_out(
                 math.radians(path_corner_deg)
             )
@@ -2541,12 +2963,44 @@ class RPPControllerNode(Node):
             )
             heading_ok = abs(heading_err) <= release_heading_tol
             vel_fresh = self._vel_is_fresh()
+            stop_cert_ok = self._stop_certificate_valid_for(
+                StopReason.INTRA_RUN_CORNER, b.x, b.y,
+                run_idx=self._run_idx, segment_idx=seg_idx,
+            )
+            if (
+                path_corner_deg >= threshold_deg
+                and self._corner_stop_complete
+                and not stop_cert_ok
+            ):
+                self._segment_state = SegmentStateCode.CORNER_STOP
+                self._last_speed_cmd = 0.0
+                hold_n, hold_e = self._corner_hold_velocity(
+                    pos_n, pos_e, b.x, b.y, b.x - a.x, b.y - a.y, yaw_ned
+                )
+                self._publish_velocity(hold_n, hold_e)
+                self._publish_yaw_rate(0.0)
+                self._publish_stop_debug(
+                    StopDebugPhase.BLOCKED, StopReason.INTRA_RUN_CORNER,
+                    b.x, b.y, pos_error, heading_err,
+                    self._certificate_dwell_s(
+                        self._corner_stop_settle_since, self._corner_stop_entered
+                    ),
+                    transition_code=9.0,
+                )
+                return
             yaw_rate_ok = (
                 abs(self._latest_yaw_rate_ned) < yaw_rate_tol
                 if vel_fresh else timed_out
             )
             speed_ok = self._align_speed_ok() if vel_fresh else timed_out
-            if self._corner_stop_complete and heading_ok and yaw_rate_ok and speed_ok:
+            if (
+                self._corner_stop_complete
+                and stop_cert_ok
+                and position_ok
+                and heading_ok
+                and yaw_rate_ok
+                and speed_ok
+            ):
                 if self._align_settle_since is None:
                     self._align_settle_since = now_align
                 settled = (now_align - self._align_settle_since).nanoseconds * 1e-9 >= align_settle_s
@@ -2556,6 +3010,28 @@ class RPPControllerNode(Node):
             # Advance immediately for geometrically tangent junctions; otherwise
             # require the corner-stop settle/timeout gate for hard corners.
             if path_corner_deg < threshold_deg or settled:
+                if path_corner_deg >= threshold_deg:
+                    self._make_alignment_certificate(
+                        StopReason.INTRA_RUN_CORNER, b.x, b.y, target_heading,
+                        heading_err, segment_idx=seg_idx, degraded=not vel_fresh,
+                    )
+                    if not self._alignment_certificate_valid_for(
+                        StopReason.INTRA_RUN_CORNER, b.x, b.y, target_heading,
+                        run_idx=self._run_idx, segment_idx=seg_idx,
+                    ):
+                        self._publish_stop_debug(
+                            StopDebugPhase.BLOCKED, StopReason.INTRA_RUN_CORNER,
+                            b.x, b.y, pos_error, heading_err,
+                            self._certificate_dwell_s(self._align_settle_since, None),
+                            transition_code=9.0,
+                        )
+                        return
+                    self._publish_stop_debug(
+                        StopDebugPhase.ALIGN_CERTIFIED, StopReason.INTRA_RUN_CORNER,
+                        b.x, b.y, pos_error, heading_err,
+                        self._certificate_dwell_s(self._align_settle_since, None),
+                        transition_code=3.0,
+                    )
                 self._segment_idx += 1
                 self._segment_state = SegmentStateCode.TRACK_SEGMENT
                 # Collinear (sub-threshold) junctions keep momentum so the rover
@@ -2565,11 +3041,18 @@ class RPPControllerNode(Node):
                 # stop/align settle gate) zeroes speed for the pivot.
                 if path_corner_deg >= threshold_deg:
                     self._last_speed_cmd = 0.0
-                self._reset_corner_pivot_state()
                 self._publish_segment_debug(
                     self._segment_state, self._segment_idx, float("nan"),
                     dist_to_corner, corner_angle, target_heading, heading_err, 0.0,
                 )
+                if path_corner_deg >= threshold_deg:
+                    self._publish_stop_debug(
+                        StopDebugPhase.RELEASED, StopReason.INTRA_RUN_CORNER,
+                        b.x, b.y, pos_error, heading_err,
+                        self._certificate_dwell_s(self._align_settle_since, None),
+                        transition_code=4.0,
+                    )
+                self._reset_corner_pivot_state()
                 self._control_segment_profile(
                     pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
                 )
@@ -2580,7 +3063,9 @@ class RPPControllerNode(Node):
             # corner-speed command itself prevents the speed gate from passing.
             if self._corner_stop_complete and heading_ok:
                 self._last_speed_cmd = 0.0
-                brake_n, brake_e = self._corner_brake_velocity(yaw_ned)
+                brake_n, brake_e = self._corner_hold_velocity(
+                    pos_n, pos_e, b.x, b.y, b.x - a.x, b.y - a.y, yaw_ned
+                )
                 self._publish_velocity(brake_n, brake_e)
                 self._publish_yaw_rate(0.0)
                 self._publish_debug(
@@ -2602,18 +3087,60 @@ class RPPControllerNode(Node):
                     dist_to_end_along, dist_to_corner, corner_angle,
                     target_heading, heading_err, 0.0,
                 )
+                self._publish_stop_debug(
+                    StopDebugPhase.ALIGNING, StopReason.INTRA_RUN_CORNER,
+                    b.x, b.y, pos_error, heading_err,
+                    self._certificate_dwell_s(self._align_settle_since, None),
+                    transition_code=1.0,
+                )
+                return
+
+            if self._corner_stop_complete and not position_ok:
+                self._last_speed_cmd = 0.0
+                hold_n, hold_e = self._corner_hold_velocity(
+                    pos_n, pos_e, b.x, b.y, b.x - a.x, b.y - a.y, yaw_ned
+                )
+                self._publish_velocity(hold_n, hold_e)
+                self._publish_yaw_rate(0.0)
+                self._publish_debug(
+                    cross_track=signed_xtrack,
+                    heading_err=heading_err,
+                    lookahead=dist_to_corner,
+                    speed=math.hypot(hold_n, hold_e),
+                    kappa=0.0,
+                    dist_goal=dist_to_goal,
+                    pose_age_ms=pose_age_s * 1000.0,
+                    state=StateCode.TRACKING,
+                    l_d_raw=float("nan"),
+                    kappa_speed=0.0,
+                    yaw_rate=0.0,
+                    spray_active=spray_active,
+                )
+                self._publish_segment_debug(
+                    SegmentStateCode.CORNER_ALIGN, seg_idx,
+                    dist_to_end_along, dist_to_corner, corner_angle,
+                    target_heading, heading_err, 0.0,
+                )
+                self._publish_stop_debug(
+                    StopDebugPhase.ALIGNING, StopReason.INTRA_RUN_CORNER,
+                    b.x, b.y, pos_error, heading_err,
+                    self._certificate_dwell_s(self._align_settle_since, None),
+                    transition_code=1.0,
+                )
                 return
 
             # Stop-and-spin: confirm the rover is physically stopped at the
             # corner before pivoting (see _run_alignment_hold for the twin).
             if not self._corner_stop_complete:
-                if not self._corner_stop_satisfied():
+                if not self._corner_stop_satisfied(position_ok=position_ok):
                     self._segment_state = SegmentStateCode.CORNER_STOP
                     # Active braking (see _run_alignment_hold twin): drive a
                     # small velocity opposing the rover's motion so it physically
                     # stops at the corner instead of coasting past it.
                     self._last_speed_cmd = 0.0
-                    brake_n, brake_e = self._corner_brake_velocity(yaw_ned)
+                    brake_n, brake_e = self._corner_hold_velocity(
+                        pos_n, pos_e, b.x, b.y, b.x - a.x, b.y - a.y, yaw_ned
+                    )
                     self._publish_velocity(brake_n, brake_e)
                     self._publish_yaw_rate(0.0)
                     self._publish_debug(
@@ -2635,7 +3162,40 @@ class RPPControllerNode(Node):
                         dist_to_corner, corner_angle, target_heading,
                         heading_err, 0.0,
                     )
+                    self._publish_stop_debug(
+                        StopDebugPhase.HOLDING, StopReason.INTRA_RUN_CORNER,
+                        b.x, b.y, pos_error, heading_err,
+                        self._certificate_dwell_s(
+                            self._corner_stop_settle_since, self._corner_stop_entered
+                        ),
+                        transition_code=1.0,
+                    )
                     return
+                self._make_stop_certificate(
+                    StopReason.INTRA_RUN_CORNER, b.x, b.y, pos_error,
+                    heading_err, segment_idx=seg_idx,
+                )
+                if not self._stop_certificate_valid_for(
+                    StopReason.INTRA_RUN_CORNER, b.x, b.y,
+                    run_idx=self._run_idx, segment_idx=seg_idx,
+                ):
+                    self._publish_stop_debug(
+                        StopDebugPhase.BLOCKED, StopReason.INTRA_RUN_CORNER,
+                        b.x, b.y, pos_error, heading_err,
+                        self._certificate_dwell_s(
+                            self._corner_stop_settle_since, self._corner_stop_entered
+                        ),
+                        transition_code=9.0,
+                    )
+                    return
+                self._publish_stop_debug(
+                    StopDebugPhase.STOP_CERTIFIED, StopReason.INTRA_RUN_CORNER,
+                    b.x, b.y, pos_error, heading_err,
+                    self._certificate_dwell_s(
+                        self._corner_stop_settle_since, self._corner_stop_entered
+                    ),
+                    transition_code=2.0,
+                )
                 self._corner_stop_complete = True
 
             self._segment_state = SegmentStateCode.CORNER_ALIGN
@@ -2685,6 +3245,12 @@ class RPPControllerNode(Node):
             self._publish_segment_debug(
                 self._segment_state, seg_idx, dist_to_end_along, dist_to_corner,
                 corner_angle, target_heading, heading_err, 0.0,
+            )
+            self._publish_stop_debug(
+                StopDebugPhase.ALIGNING, StopReason.INTRA_RUN_CORNER,
+                b.x, b.y, pos_error, heading_err,
+                self._certificate_dwell_s(self._align_settle_since, None),
+                transition_code=1.0,
             )
             return
 
@@ -3048,7 +3614,58 @@ class RPPControllerNode(Node):
                     pose_age_ms=pose_age_s * 1000.0,
                     dist_to_goal=dist_to_goal,
                 )
+                self._publish_stop_debug(
+                    StopDebugPhase.HOLDING, StopReason.FINAL_ENDPOINT,
+                    final.x, final.y, dist_to_goal, float("nan"),
+                    self._certificate_dwell_s(
+                        self._completion_settle_since,
+                        self._completion_settle_entered,
+                    ),
+                    transition_code=1.0,
+                )
                 return
+            if not self._final_position_ok(dist_to_goal):
+                self._publish_zero(
+                    StateCode.APPROACH,
+                    pose_age_ms=pose_age_s * 1000.0,
+                    dist_to_goal=dist_to_goal,
+                )
+                self._publish_stop_debug(
+                    StopDebugPhase.BLOCKED, StopReason.FINAL_ENDPOINT,
+                    final.x, final.y, dist_to_goal, float("nan"),
+                    self._certificate_dwell_s(
+                        self._completion_settle_since,
+                        self._completion_settle_entered,
+                    ),
+                    transition_code=9.0,
+                )
+                return
+            self._make_final_stop_certificate(
+                final.x, final.y, dist_to_goal, segment_idx=max(0, len(self._path) - 2)
+            )
+            final_seg_idx = max(0, len(self._path) - 2)
+            if not self._final_stop_certificate_valid_for(
+                final.x, final.y, run_idx=self._run_idx, segment_idx=final_seg_idx
+            ):
+                self._publish_stop_debug(
+                    StopDebugPhase.BLOCKED, StopReason.FINAL_ENDPOINT,
+                    final.x, final.y, dist_to_goal, float("nan"),
+                    self._certificate_dwell_s(
+                        self._completion_settle_since,
+                        self._completion_settle_entered,
+                    ),
+                    transition_code=9.0,
+                )
+                return
+            self._publish_stop_debug(
+                StopDebugPhase.FINAL_CERTIFIED, StopReason.FINAL_ENDPOINT,
+                final.x, final.y, dist_to_goal, float("nan"),
+                self._certificate_dwell_s(
+                    self._completion_settle_since,
+                    self._completion_settle_entered,
+                ),
+                transition_code=5.0,
+            )
             self.get_logger().info(
                 f"Path complete — within {dist_to_goal * 100:.1f} cm of goal "
                 f"(tol={goal_tol * 100:.1f} cm)"
@@ -3498,6 +4115,100 @@ class RPPControllerNode(Node):
         sign = -1.0 if v_forward > 0.0 else 1.0
         return (sign * mag * fwd_n, sign * mag * fwd_e)
 
+    def _corner_position_errors(
+        self,
+        pos_n: float,
+        pos_e: float,
+        stop_n: float,
+        stop_e: float,
+        tangent_n: float,
+        tangent_e: float,
+    ) -> tuple[float, float, float]:
+        """Return (distance, along_error, cross_error) to a corner stop point."""
+        err_n = pos_n - stop_n
+        err_e = pos_e - stop_e
+        dist = math.hypot(err_n, err_e)
+        t_mag = math.hypot(tangent_n, tangent_e)
+        if t_mag <= 1e-9:
+            return dist, dist, 0.0
+        t_n, t_e = tangent_n / t_mag, tangent_e / t_mag
+        # Left/right sign is only diagnostic/control decomposition. The
+        # Euclidean distance remains the certification gate.
+        n_n, n_e = -t_e, t_n
+        along = err_n * t_n + err_e * t_e
+        cross = err_n * n_n + err_e * n_e
+        return dist, along, cross
+
+    def _corner_position_ok(
+        self,
+        pos_n: float,
+        pos_e: float,
+        stop_n: float,
+        stop_e: float,
+        tangent_n: float,
+        tangent_e: float,
+    ) -> bool:
+        dist, _, _ = self._corner_position_errors(
+            pos_n, pos_e, stop_n, stop_e, tangent_n, tangent_e
+        )
+        return dist <= float(self.get_parameter("corner_position_tolerance_m").value)
+
+    def _corner_hold_velocity(
+        self,
+        pos_n: float,
+        pos_e: float,
+        stop_n: float,
+        stop_e: float,
+        tangent_n: float,
+        tangent_e: float,
+        yaw_ned: float,
+    ) -> tuple[float, float]:
+        """Bounded velocity command that holds/recovers the exact stop point.
+
+        When the rover is already inside the position tolerance, fall back to
+        the body-axis brake so residual measured speed is bled off without
+        inventing a new travel bearing. Outside tolerance, servo toward the
+        vertex in the segment frame and damp with EKF velocity when fresh.
+        """
+        cap = float(self.get_parameter("segment_brake_velocity_cap_m_s").value)
+        if cap <= 0.0:
+            return (0.0, 0.0)
+
+        dist, along, cross = self._corner_position_errors(
+            pos_n, pos_e, stop_n, stop_e, tangent_n, tangent_e
+        )
+        if dist <= float(self.get_parameter("corner_position_tolerance_m").value):
+            return self._corner_brake_velocity(yaw_ned)
+
+        t_mag = math.hypot(tangent_n, tangent_e)
+        if t_mag <= 1e-9:
+            dir_n = (stop_n - pos_n) / dist if dist > 1e-9 else 0.0
+            dir_e = (stop_e - pos_e) / dist if dist > 1e-9 else 0.0
+            v_n = cap * dir_n
+            v_e = cap * dir_e
+        else:
+            t_n, t_e = tangent_n / t_mag, tangent_e / t_mag
+            n_n, n_e = -t_e, t_n
+            along_gain = float(self.get_parameter("corner_hold_along_gain").value)
+            cross_gain = float(self.get_parameter("corner_hold_cross_gain").value)
+            v_n = -along_gain * along * t_n - cross_gain * cross * n_n
+            v_e = -along_gain * along * t_e - cross_gain * cross * n_e
+
+        if self._vel_is_fresh():
+            damp = float(self.get_parameter("corner_hold_damping_gain").value)
+            vel_n, vel_e = self._latest_vel_ned
+            v_n -= damp * vel_n
+            v_e -= damp * vel_e
+
+        speed = math.hypot(v_n, v_e)
+        if speed <= 1e-9:
+            return self._corner_brake_velocity(yaw_ned)
+        if speed > cap:
+            scale = cap / speed
+            v_n *= scale
+            v_e *= scale
+        return (v_n, v_e)
+
     def _align_speed_ok(self) -> bool:
         """Require fresh velocity and low linear speed for alignment release."""
         if not self._vel_is_fresh():
@@ -3507,6 +4218,246 @@ class RPPControllerNode(Node):
             self.get_parameter("segment_align_speed_threshold").value
         )
 
+    def _certificate_enforced(self) -> bool:
+        return bool(self.get_parameter("require_stop_certificates").value)
+
+    def _final_stop_position_tolerance(self) -> float:
+        """Strict endpoint certificate tolerance.
+
+        The controller may enter final settle at xy_goal_tolerance, but the
+        terminal certificate uses the tighter of goal and corner-stop tolerance
+        so precision line endpoints are proven as tightly as corner stops.
+        """
+        goal_tol = float(self.get_parameter("xy_goal_tolerance").value)
+        stop_tol = float(self.get_parameter("corner_position_tolerance_m").value)
+        return min(goal_tol, stop_tol)
+
+    def _final_position_ok(self, position_error_m: float) -> bool:
+        return float(position_error_m) <= self._final_stop_position_tolerance()
+
+    def _measured_speed(self) -> float:
+        v_n, v_e = self._latest_vel_ned
+        return math.hypot(v_n, v_e)
+
+    def _certificate_dwell_s(self, since: RclTime | None, entered: RclTime | None) -> float:
+        now = self.get_clock().now()
+        ref = since if since is not None else entered
+        if ref is None:
+            return 0.0
+        return max(0.0, (now - ref).nanoseconds * 1e-9)
+
+    def _cert_source(self) -> CertificateSource:
+        return (
+            CertificateSource.FRESH_TELEMETRY
+            if self._vel_is_fresh() else CertificateSource.STALE_FALLBACK
+        )
+
+    def _make_stop_certificate(
+        self,
+        reason: StopReason,
+        target_n: float,
+        target_e: float,
+        pos_error_m: float,
+        heading_error_rad: float = float("nan"),
+        segment_idx: int | None = None,
+    ) -> StopCertificate:
+        source = self._cert_source()
+        cert = StopCertificate(
+            reason=reason,
+            source=source,
+            run_idx=int(self._run_idx),
+            segment_idx=int(self._segment_idx if segment_idx is None else segment_idx),
+            target_n=float(target_n),
+            target_e=float(target_e),
+            position_error_m=float(pos_error_m),
+            measured_speed_m_s=float(self._measured_speed()),
+            yaw_rate_rad_s=float(self._latest_yaw_rate_ned),
+            heading_error_rad=float(heading_error_rad),
+            dwell_s=self._certificate_dwell_s(
+                self._corner_stop_settle_since, self._corner_stop_entered
+            ),
+            created_sec=self.get_clock().now().nanoseconds * 1e-9,
+            valid=True,
+            degraded=(source == CertificateSource.STALE_FALLBACK),
+        )
+        self._stop_certificate = cert
+        return cert
+
+    def _stop_certificate_valid_for(
+        self,
+        reason: StopReason | tuple[StopReason, ...],
+        target_n: float,
+        target_e: float,
+        run_idx: int | None = None,
+        segment_idx: int | None = None,
+    ) -> bool:
+        if not self._certificate_enforced():
+            return True
+        cert = self._stop_certificate
+        if cert is None or not cert.valid:
+            return False
+        reasons = reason if isinstance(reason, tuple) else (reason,)
+        if cert.reason not in reasons:
+            return False
+        if run_idx is not None and cert.run_idx != int(run_idx):
+            return False
+        if segment_idx is not None and cert.segment_idx != int(segment_idx):
+            return False
+        return self._dist(cert.target_n, cert.target_e, target_n, target_e) <= 0.01
+
+    def _make_alignment_certificate(
+        self,
+        reason: StopReason,
+        target_n: float,
+        target_e: float,
+        target_heading_rad: float,
+        heading_error_rad: float,
+        segment_idx: int | None = None,
+        degraded: bool = False,
+    ) -> AlignmentCertificate:
+        source = self._cert_source()
+        cert = AlignmentCertificate(
+            reason=reason,
+            source=source,
+            run_idx=int(self._run_idx),
+            segment_idx=int(self._segment_idx if segment_idx is None else segment_idx),
+            target_n=float(target_n),
+            target_e=float(target_e),
+            target_heading_rad=float(target_heading_rad),
+            heading_error_rad=float(heading_error_rad),
+            measured_speed_m_s=float(self._measured_speed()),
+            yaw_rate_rad_s=float(self._latest_yaw_rate_ned),
+            dwell_s=self._certificate_dwell_s(self._align_settle_since, None),
+            created_sec=self.get_clock().now().nanoseconds * 1e-9,
+            valid=True,
+            degraded=degraded or source == CertificateSource.STALE_FALLBACK,
+        )
+        self._alignment_certificate = cert
+        return cert
+
+    def _alignment_certificate_valid_for(
+        self,
+        reason: StopReason,
+        target_n: float,
+        target_e: float,
+        target_heading_rad: float,
+        run_idx: int | None = None,
+        segment_idx: int | None = None,
+    ) -> bool:
+        if not self._certificate_enforced():
+            return True
+        cert = self._alignment_certificate
+        if cert is None or not cert.valid or cert.reason != reason:
+            return False
+        if run_idx is not None and cert.run_idx != int(run_idx):
+            return False
+        if segment_idx is not None and cert.segment_idx != int(segment_idx):
+            return False
+        if self._dist(cert.target_n, cert.target_e, target_n, target_e) > 0.01:
+            return False
+        return abs(self._angle_wrap(cert.target_heading_rad - target_heading_rad)) <= math.radians(0.5)
+
+    def _make_final_stop_certificate(
+        self,
+        target_n: float,
+        target_e: float,
+        pos_error_m: float,
+        segment_idx: int | None = None,
+    ) -> FinalStopCertificate:
+        source = self._cert_source()
+        cert = FinalStopCertificate(
+            reason=StopReason.FINAL_ENDPOINT,
+            source=source,
+            run_idx=int(self._run_idx),
+            segment_idx=int(self._segment_idx if segment_idx is None else segment_idx),
+            target_n=float(target_n),
+            target_e=float(target_e),
+            position_error_m=float(pos_error_m),
+            measured_speed_m_s=float(self._measured_speed()),
+            dwell_s=self._certificate_dwell_s(
+                self._completion_settle_since, self._completion_settle_entered
+            ),
+            created_sec=self.get_clock().now().nanoseconds * 1e-9,
+            valid=self._final_position_ok(pos_error_m),
+            degraded=(source == CertificateSource.STALE_FALLBACK),
+        )
+        self._final_stop_certificate = cert
+        return cert
+
+    def _final_stop_certificate_valid_for(
+        self,
+        target_n: float,
+        target_e: float,
+        run_idx: int | None = None,
+        segment_idx: int | None = None,
+    ) -> bool:
+        if not self._certificate_enforced():
+            return True
+        cert = self._final_stop_certificate
+        if cert is None or not cert.valid:
+            return False
+        if run_idx is not None and cert.run_idx != int(run_idx):
+            return False
+        if segment_idx is not None and cert.segment_idx != int(segment_idx):
+            return False
+        if not self._final_position_ok(cert.position_error_m):
+            return False
+        return self._dist(cert.target_n, cert.target_e, target_n, target_e) <= 0.01
+
+    def _publish_stop_debug(
+        self,
+        phase: StopDebugPhase,
+        reason: StopReason,
+        target_n: float = float("nan"),
+        target_e: float = float("nan"),
+        position_error_m: float = float("nan"),
+        heading_error_rad: float = float("nan"),
+        dwell_s: float = float("nan"),
+        transition_code: float = 0.0,
+    ) -> None:
+        stop_valid = 1.0 if self._stop_certificate and self._stop_certificate.valid else 0.0
+        align_valid = (
+            1.0 if self._alignment_certificate and self._alignment_certificate.valid else 0.0
+        )
+        final_valid = (
+            1.0 if self._final_stop_certificate and self._final_stop_certificate.valid else 0.0
+        )
+        source = self._cert_source()
+        degraded = 0.0
+        for cert in (
+            self._stop_certificate, self._alignment_certificate, self._final_stop_certificate
+        ):
+            if cert is not None and getattr(cert, "degraded", False):
+                degraded = 1.0
+                break
+        msg = Float32MultiArray()
+        msg.layout.dim.append(
+            MultiArrayDimension(label="rpp_stop_debug", size=20, stride=20)
+        )
+        msg.data = [
+            float(phase.value),                      # [0] phase
+            float(reason.value),                     # [1] stop reason
+            float(self._run_idx),                    # [2] run index
+            float(self._segment_idx),                # [3] segment index
+            float(target_n),                         # [4] target N
+            float(target_e),                         # [5] target E
+            float(position_error_m),                 # [6] position error
+            float(self._measured_speed()),           # [7] measured speed
+            float(self._latest_yaw_rate_ned),        # [8] measured yaw rate
+            float(heading_error_rad),                # [9] heading error
+            float(dwell_s),                          # [10] dwell/hold time
+            1.0 if self._vel_is_fresh() else 0.0,    # [11] velocity fresh
+            float(source.value),                     # [12] certificate source
+            stop_valid,                              # [13] stop certificate valid
+            align_valid,                             # [14] alignment certificate valid
+            final_valid,                             # [15] final certificate valid
+            degraded,                                # [16] degraded stale fallback seen
+            1.0 if self._certificate_enforced() else 0.0,  # [17] enforcement
+            float(transition_code),                  # [18] transition/release code
+            float(self._segment_state.value),        # [19] segment state
+        ]
+        self._stop_dbg_pub.publish(msg)
+
     def _reset_corner_pivot_state(self):
         self._corner_stop_entered = None
         self._corner_stop_settle_since = None
@@ -3515,10 +4466,13 @@ class RPPControllerNode(Node):
         self._pivot_timeout_warned = False
         self._pivot_turn_angle_rad = 0.0
         self._align_settle_since = None
+        self._stop_certificate = None
+        self._alignment_certificate = None
 
     def _reset_completion_settle_state(self):
         self._completion_settle_entered = None
         self._completion_settle_since = None
+        self._final_stop_certificate = None
 
     def _completion_settle_satisfied(self) -> bool:
         """True once final mission completion is physically settled.
@@ -3562,11 +4516,12 @@ class RPPControllerNode(Node):
 
         return False
 
-    def _corner_stop_satisfied(self) -> bool:
+    def _corner_stop_satisfied(self, *, position_ok: bool = True) -> bool:
         """True once the rover is confirmed physically stopped at the corner.
 
-        Confirmation = actual ground speed AND yaw-rate (both from velocity_local)
-        below their thresholds continuously for segment_stop_dwell_s.
+        Confirmation = position inside the stop tolerance AND actual ground
+        speed AND yaw-rate (both from velocity_local) below their thresholds
+        continuously for segment_stop_dwell_s.
 
         Timeout policy (per-line extension fix): the rover is actively braked
         toward zero by the caller, so a FRESH velocity that is still above the
@@ -3584,6 +4539,10 @@ class RPPControllerNode(Node):
         speed_thresh = float(self.get_parameter("segment_stop_speed_threshold").value)
         yaw_rate_thresh = float(self.get_parameter("segment_stop_yaw_rate_threshold").value)
         dwell = float(self.get_parameter("segment_stop_dwell_s").value)
+
+        if not position_ok:
+            self._corner_stop_settle_since = None
+            return False
 
         fresh = self._vel_is_fresh()
         held = (now - self._corner_stop_entered).nanoseconds * 1e-9

@@ -349,6 +349,53 @@ def test_estop_releases_operation_token_after_physical_actions(monkeypatch):
     run(scenario())
 
 
+def test_estop_terminal_reason_can_distinguish_safety_abort(monkeypatch):
+    import main
+
+    class FakeOffboard:
+        state = MissionState.RUNNING
+
+        def __init__(self):
+            self._lock = None
+
+        def _lifecycle_lock(self):
+            if self._lock is None:
+                self._lock = asyncio.Lock()
+            return self._lock
+
+    class FakeRos:
+        def publish_stop_path(self):
+            return (0.0, 0.0)
+
+        async def set_mode_async(self, mode):
+            return True, ""
+
+        async def arm_async(self, arm):
+            return True, ""
+
+    class FakeCapture:
+        def __init__(self):
+            self.terminal = None
+
+        def record_terminal(self, capture_id, reason, *, state, details):
+            self.terminal = (capture_id, reason, state, details)
+
+    async def scenario():
+        monkeypatch.setattr(main, "point_mission", None, raising=False)
+        monkeypatch.setattr(main, "hold_owner", None, raising=False)
+        capture = FakeCapture()
+        handler = EmergencyHandler(FakeRos(), FakeOffboard(), deque(), capture)
+        result = await handler.estop_async(
+            terminal_reason="safety_abort",
+            terminal_details={"rpp_state": -1},
+        )
+        assert result["success"] is True
+        assert capture.terminal[1] == "safety_abort"
+        assert capture.terminal[3]["rpp_state"] == -1
+
+    run(scenario())
+
+
 def test_acquire_rejects_if_interrupted_before_lease():
     ctrl, gateway, transport, _, _ = make_controller(ros=FakeRos(mode="POSCTL"))
 

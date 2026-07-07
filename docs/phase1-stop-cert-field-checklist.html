@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Phase 1 Stop Certificate — Field Checklist</title>
+  <style>
+    @page { size: A4 portrait; margin: 10mm; }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Helvetica Neue", Arial, sans-serif;
+      font-size: 8.5pt;
+      line-height: 1.25;
+      color: #111;
+      max-width: 190mm;
+      margin: 0 auto;
+      padding: 8mm;
+    }
+    h1 { font-size: 13pt; margin: 0 0 2pt; }
+    .sub { font-size: 8pt; color: #333; margin-bottom: 6pt; }
+    h2 { font-size: 9pt; margin: 5pt 0 2pt; border-bottom: 0.5pt solid #000; }
+    table { width: 100%; border-collapse: collapse; margin: 2pt 0 4pt; }
+    th, td { border: 0.4pt solid #666; padding: 2pt 3pt; vertical-align: top; }
+    th { background: #eee; font-size: 7.5pt; text-align: left; }
+    .chk { width: 14pt; text-align: center; }
+    .cols2 { display: grid; grid-template-columns: 1fr 1fr; gap: 6pt; }
+    .cols3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 5pt; }
+    code, .mono { font-family: "SF Mono", Consolas, monospace; font-size: 7.5pt; }
+    .fail { color: #900; font-weight: bold; }
+    .pass { color: #060; font-weight: bold; }
+    .box { border: 0.5pt solid #000; padding: 4pt; margin-top: 3pt; }
+    .tiny { font-size: 7pt; }
+    ul { margin: 2pt 0; padding-left: 12pt; }
+    li { margin: 1pt 0; }
+    @media print {
+      body { padding: 0; }
+      h2 { break-after: avoid; }
+      table { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+
+<h1>Phase 1 Stop Certificate — Field Checklist (A4)</h1>
+<p class="sub">
+  <strong>Scope:</strong> RPP stop/align/final certificate gating (Phase 1 + 1.1) on Jetson <code>flash@192.168.1.102</code>.
+  <strong>Profile:</strong> segment / stop-pivot @ 0.35 m/s. <strong>Not production-grade until this sheet is signed off with bags.</strong>
+  Date: __________ &nbsp; Operator: __________ &nbsp; Commit: __________
+</p>
+
+<h2>1 — Pre-flight (before missions)</h2>
+<div class="cols3">
+  <table>
+    <tr><th class="chk">✓</th><th>Jetson services</th></tr>
+    <tr><td class="chk">☐</td><td><code>px4-dxp</code>, <code>rpp-pipeline</code>, <code>rover-server</code> active</td></tr>
+    <tr><td class="chk">☐</td><td><code>curl localhost:5001/api/ping</code> → OK</td></tr>
+    <tr><td class="chk">☐</td><td>RTK FIXED; NTRIP flowing</td></tr>
+    <tr><td class="chk">☐</td><td>OFFBOARD arms; setpoints ≥ 2 Hz</td></tr>
+  </table>
+  <table>
+    <tr><th class="chk">✓</th><th>Unit tests (Jetson)</th></tr>
+    <tr><td class="chk">☐</td><td><code>python3 -X utf8 src/test_corner_stop_brake.py</code></td></tr>
+    <tr><td class="chk">☐</td><td><code>python3 -X utf8 src/test_smoke_rpp_controller.py</code></td></tr>
+    <tr><td class="chk">☐</td><td>After code deploy: <code>sudo systemctl restart rpp-pipeline</code></td></tr>
+    <tr><td class="chk">☐</td><td><code>require_stop_certificates=true</code> (default)</td></tr>
+  </table>
+  <table>
+    <tr><th class="chk">✓</th><th>Key params (confirm)</th></tr>
+    <tr><td class="chk">☐</td><td><code>corner_position_tolerance_m=0.02</code></td></tr>
+    <tr><td class="chk">☐</td><td><code>segment_stop_speed_threshold=0.02</code></td></tr>
+    <tr><td class="chk">☐</td><td><code>segment_stop_dwell_s=0.30</code></td></tr>
+    <tr><td class="chk">☐</td><td><code>segment_brake_velocity_cap_m_s=0.18</code></td></tr>
+  </table>
+</div>
+
+<h2>2 — Mission matrix (run all three; auto-bag each)</h2>
+<table>
+  <tr>
+    <th class="chk">✓</th><th>Mission</th><th>Purpose</th><th>Bag name</th><th>Result</th>
+  </tr>
+  <tr><td class="chk">☐</td><td><strong>Square 2×2 m</strong> (segment)</td><td>Hard corners: stop → pivot → align → advance</td><td>________________</td><td>☐ PASS ☐ FAIL</td></tr>
+  <tr><td class="chk">☐</td><td><strong>Line + runtime entry</strong></td><td><code>RUNTIME_ENTRY_TO_MARK</code> boundary cert</td><td>________________</td><td>☐ PASS ☐ FAIL</td></tr>
+  <tr><td class="chk">☐</td><td><strong>PRE→MARK→AFT line</strong></td><td>Collinear roll-through (no false stop)</td><td>________________</td><td>☐ PASS ☐ FAIL</td></tr>
+</table>
+<p class="tiny"><strong>Record bag:</strong>
+<code>ros2 bag record /mavros/local_position/pose /mavros/local_position/velocity_local /rpp/velocity_ned /rpp/debug /rpp/segment_debug /rpp/stop_debug /mavros/state -o ~/bags/phase1_$(date +%Y%m%d_%H%M%S)</code>
+</p>
+
+<h2>3 — Per hard corner &amp; mission end (bag pass criteria)</h2>
+<div class="cols2">
+  <table>
+    <tr><th class="chk">✓</th><th>Hard corner (each vertex)</th><th>Limit</th></tr>
+    <tr><td class="chk">☐</td><td><code>stop_debug[6]</code> position error at STOP cert</td><td>≤ 2 cm</td></tr>
+    <tr><td class="chk">☐</td><td><code>stop_debug[7]</code> speed at STOP cert</td><td>&lt; 0.02 m/s</td></tr>
+    <tr><td class="chk">☐</td><td><code>stop_debug[13]=1</code> before pivot (phase 2→3)</td><td>required</td></tr>
+    <tr><td class="chk">☐</td><td><code>stop_debug[14]=1</code> before segment advance</td><td>hard corner only</td></tr>
+    <tr><td class="chk">☐</td><td><code>stop_debug[2],[3]</code> match boundary run/seg</td><td>identity</td></tr>
+    <tr><td class="chk">☐</td><td><code>stop_debug[18]≠9</code> sustained &gt;1 s</td><td>no deadlock</td></tr>
+    <tr><td class="chk">☐</td><td>Corner dist does <strong>not</strong> climb (runaway drift)</td><td>≤ 5 cm max</td></tr>
+    <tr><td class="chk">☐</td><td>Hold velocity bounded (not full mission speed)</td><td>≤ 0.18 m/s</td></tr>
+    <tr><td class="chk">☐</td><td>If <code>[11]=0</code> (stale vel): <code>[16]=1</code> degraded</td><td>flag, not precision</td></tr>
+  </table>
+  <table>
+    <tr><th class="chk">✓</th><th>Mission end (DONE)</th><th>Limit</th></tr>
+    <tr><td class="chk">☐</td><td><code>stop_debug[0]=5</code> FINAL_CERTIFIED before DONE</td><td>required</td></tr>
+    <tr><td class="chk">☐</td><td><code>stop_debug[15]=1</code> final cert valid</td><td>required</td></tr>
+    <tr><td class="chk">☐</td><td><code>stop_debug[6]</code> at DONE</td><td>≤ 2 cm (min goal &amp; corner tol)</td></tr>
+    <tr><td class="chk">☐</td><td><code>stop_debug[7]</code> at DONE</td><td>&lt; 0.02 m/s</td></tr>
+    <tr><td class="chk">☐</td><td><code>rpp/debug</code> state → DONE after cert</td><td>order correct</td></tr>
+    <tr><td class="chk">☐</td><td>No <code>emergency_stop</code> / safety_abort</td><td>required</td></tr>
+    <tr><td class="chk">☐</td><td>Collinear spray boundary: no PRE_CORNER_SLOWDOWN</td><td>full speed</td></tr>
+    <tr><td class="chk">☐</td><td>Cross-track RMS (square straights)</td><td>≤ 2 cm target</td></tr>
+    <tr><td class="chk">☐</td><td>Pivot: single-direction, ≤1 reversal &gt;0.1 rad/s</td><td>no oscillation</td></tr>
+  </table>
+</div>
+
+<h2>4 — <code>/rpp/stop_debug</code> quick decode</h2>
+<table class="tiny">
+  <tr>
+    <td><strong>[0] phase:</strong> 1=HOLD 2=STOP_CERT 3=ALIGN_CERT 4=RELEASED 5=FINAL_CERT 9=BLOCKED</td>
+    <td><strong>[1] reason:</strong> 1=RUN_BOUNDARY 2=INTRA_CORNER 3=RUNTIME_ENTRY 4=FINAL</td>
+  </tr>
+  <tr>
+    <td><strong>[2][3]</strong> run_idx, segment_idx &nbsp; <strong>[4][5]</strong> target N/E &nbsp; <strong>[6]</strong> pos err m</td>
+    <td><strong>[11]</strong> vel fresh &nbsp; <strong>[16]</strong> degraded &nbsp; <strong>[17]</strong> enforcement &nbsp; <strong>[18]</strong> transition code</td>
+  </tr>
+</table>
+
+<h2>5 — Phase 1 sign-off &amp; next phase</h2>
+<div class="box cols2">
+  <div>
+    <strong>Phase 1 PASS requires ALL:</strong>
+    <ul>
+      <li>Both unit tests PASS on Jetson</li>
+      <li>All 3 missions PASS with bags archived</li>
+      <li>Every hard corner meets §3 table</li>
+      <li>DONE only with final cert + ≤2 cm endpoint</li>
+      <li>No corner runaway drift (&gt;5 cm past vertex)</li>
+    </ul>
+    <p>
+      <strong>Overall:</strong> ☐ <span class="pass">PASS</span> &nbsp; ☐ <span class="fail">FAIL</span> &nbsp;
+      Signed: __________
+    </p>
+    <p class="tiny fail">Auto-FAIL: sustained transition_code=9; dist climbs at corner; DONE with [6]&gt;2 cm; emergency_stop during corner hold.</p>
+  </div>
+  <div>
+    <strong>After Phase 1 PASS → Phase 2 (stop hardening):</strong>
+    <ul>
+      <li><strong>Layer A:</strong> kinematic √(2·a·d) approach decel (replace linear ramp)</li>
+      <li><strong>Layer B:</strong> validate position-hold velocity under hot arrival</li>
+      <li><strong>Layer C:</strong> bounded <code>corner_fault</code> / CONTROL_FAULT FSM (no 10 s STALE e-stop)</li>
+      <li>Enforce or reject <code>degraded</code> stale certs on precision paths</li>
+      <li>Bag replay tool for <code>/rpp/stop_debug</code> transition timeline</li>
+    </ul>
+    <strong>Then → Phase 3 (full pipeline):</strong>
+    <ul>
+      <li>Path engine + CRS geodesic import (DXF → mission)</li>
+      <li>Spray flag conditioning end-to-end on field geometry</li>
+      <li>CAD/DXF → path → mission → drive → spray hardware validation</li>
+    </ul>
+    <p class="tiny"><strong>Do not reopen</strong> arc PID / smooth-profile tuning unless regression appears. Production tracking stays <strong>segment / stop-pivot</strong>.</p>
+  </div>
+</div>
+
+<p class="tiny" style="margin-top:4pt;text-align:center;">
+  PX4_DXP · docs/phase1-stop-cert-field-checklist.html · Print: Cmd/Ctrl+P → A4 portrait, margins minimum
+</p>
+
+</body>
+</html>

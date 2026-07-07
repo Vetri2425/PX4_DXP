@@ -569,18 +569,22 @@ async def _telemetry_loop() -> None:
                                 rpp_name,
                                 s.get("connected"),
                             )
-                            await emergency_handler.estop_async()
+                            safety_details = {
+                                "reason": "pose stale or FCU disconnected",
+                                "pose_age_ms": pose_age,
+                                "rpp_state": code,
+                                "rpp_state_name": RPP_STATE_NAMES.get(
+                                    code, "UNKNOWN"
+                                ),
+                                "connected": s.get("connected"),
+                            }
+                            await emergency_handler.estop_async(
+                                terminal_reason="safety_abort",
+                                terminal_details=safety_details,
+                            )
                             await _emit_authenticated(
                                 "safety_abort",
-                                {
-                                    "reason": "pose stale or FCU disconnected",
-                                    "pose_age_ms": pose_age,
-                                    "rpp_state": code,
-                                    "rpp_state_name": RPP_STATE_NAMES.get(
-                                        code, "UNKNOWN"
-                                    ),
-                                    "connected": s.get("connected"),
-                                },
+                                safety_details,
                             )
                         stale_since = None
                 else:
@@ -596,7 +600,12 @@ async def _telemetry_loop() -> None:
                 ):
                     await joystick_ctrl.force_release(reason="fcu_disconnected")
                     if emergency_handler is not None:
-                        await emergency_handler.estop_async()
+                        await emergency_handler.estop_async(
+                            terminal_reason="safety_abort",
+                            terminal_details={
+                                "reason": "FCU disconnected during joystick control"
+                            },
+                        )
 
                 # ── 3b. GPS_SURVEYED continuous/dash runtime gate (F-01/F-02) ──
                 # Point missions self-gate in the orchestrator; LOCAL_NED is
@@ -662,16 +671,14 @@ async def _telemetry_loop() -> None:
                                     )
                             except Exception:
                                 log.exception("force spray OFF during GPS fault failed")
+                            gps_details = {
+                                "reason": verdict.reason,
+                                "spray_mode": gctx["spray_mode"],
+                            }
                             if emergency_handler is not None:
-                                await emergency_handler.estop_async()
-                            if mission_capture is not None:
-                                mission_capture.record_terminal(
-                                    None, "gps_safety_abort",
-                                    state=offboard_ctrl.state.value,
-                                    details={
-                                        "reason": verdict.reason,
-                                        "spray_mode": gctx["spray_mode"],
-                                    },
+                                await emergency_handler.estop_async(
+                                    terminal_reason="gps_safety_abort",
+                                    terminal_details=gps_details,
                                 )
                             await _emit_authenticated(
                                 "gps_safety_abort",

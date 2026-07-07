@@ -74,7 +74,7 @@ def test_smoke():
     rclpy.init(args=["--ros-args", "-p", "require_rtk_fix:=false"])
 
     try:
-        from rpp_controller_node import RPPControllerNode
+        from rpp_controller_node import RPPControllerNode, StopReason
         from path_publisher_node import (
             gen_arc_quarter_1m5,
             gen_circle_1m5,
@@ -93,12 +93,14 @@ def test_smoke():
         cap_yaw = _CapturePub()
         cap_dbg = _CapturePub()
         cap_segment_dbg = _CapturePub()
+        cap_stop_dbg = _CapturePub()
         cap_conditioned = _CapturePub()
         cap_spray = _CapturePub()
         node._vel_pub = cap_vel
         node._yaw_rate_pub = cap_yaw
         node._dbg_pub = cap_dbg
         node._segment_dbg_pub = cap_segment_dbg
+        node._stop_dbg_pub = cap_stop_dbg
         node._conditioned_path_pub = cap_conditioned
         node._spray_active_pub = cap_spray
 
@@ -221,11 +223,32 @@ def test_smoke():
         cap_yaw.messages.clear()
         node._control_segment_profile(corner.x, corner.y, 0.0, 0.02, 2.0)
         assert cap_vel.last is not None and cap_yaw.last is not None
-        assert abs(cap_vel.last.vector.x) < 1e-9 and abs(cap_vel.last.vector.y) < 1e-9, (
-            "CORNER_STOP must hold zero velocity until the stop is confirmed"
+        stop_speed = math.hypot(cap_vel.last.vector.x, cap_vel.last.vector.y)
+        brake_cap = float(node.get_parameter("segment_brake_velocity_cap_m_s").value)
+        assert stop_speed <= brake_cap + 1e-9, (
+            f"CORNER_STOP must be bounded by brake cap, got {stop_speed:.3f} m/s"
         )
+        assert stop_speed < 1e-6, "Inside tolerance and stopped should command near-zero hold"
         assert abs(cap_yaw.last.data) < 1e-9, "yaw_rate is firmware-inert — always zero"
-        print("PASS: segment corner stop holds zero velocity (yaw-rate inert)")
+        print("PASS: segment corner stop is bounded and near-zero inside tolerance")
+
+        # Outside the strict certification gate, CORNER_STOP may command a
+        # bounded recovery velocity toward the point. That is valid; the smoke
+        # contract is "controlled hold", not exact zero.
+        node._segment_idx = 0
+        node._last_speed_cmd = 0.2
+        node._reset_corner_pivot_state()
+        cap_vel.messages.clear()
+        cap_yaw.messages.clear()
+        node._control_segment_profile(corner.x, corner.y + 0.03, 0.0, 0.02, 2.0)
+        assert cap_vel.last is not None and cap_yaw.last is not None
+        hold_speed = math.hypot(cap_vel.last.vector.x, cap_vel.last.vector.y)
+        assert 0.0 <= hold_speed <= brake_cap + 1e-9, (
+            f"Outside-tolerance CORNER_STOP must be bounded, got {hold_speed:.3f} m/s"
+        )
+        assert hold_speed < 0.35, "CORNER_STOP must not command mission/full tracking speed"
+        assert abs(cap_yaw.last.data) < 1e-9, "yaw_rate is firmware-inert — always zero"
+        print("PASS: segment corner stop allows bounded recovery outside tolerance")
 
         # Phase 2 — CORNER_ALIGN: force stop-confirmed, expect a nonzero
         # forward-cone velocity vector toward the exit heading, yaw-rate zero.
@@ -233,6 +256,9 @@ def test_smoke():
         node._last_speed_cmd = 0.0
         node._reset_corner_pivot_state()
         node._corner_stop_complete = True
+        node._make_stop_certificate(
+            StopReason.INTRA_RUN_CORNER, corner.x, corner.y, 0.0, 0.0, segment_idx=0
+        )
         cap_vel.messages.clear()
         cap_yaw.messages.clear()
         node._control_segment_profile(corner.x, corner.y, 0.0, 0.02, 2.0)
@@ -258,6 +284,9 @@ def test_smoke():
         node._last_speed_cmd = 0.0
         node._reset_corner_pivot_state()
         node._corner_stop_complete = True
+        node._make_stop_certificate(
+            StopReason.INTRA_RUN_CORNER, corner.x, corner.y, 0.0, 0.0, segment_idx=0
+        )
         cap_vel.messages.clear()
         cap_yaw.messages.clear()
         node._control_segment_profile(corner.x, corner.y, 0.0, 0.02, 2.0)
@@ -383,8 +412,10 @@ def test_smoke():
         cap_yaw.messages.clear()
         held = node._run_alignment_hold(1.0, 0.0, 0.0, 0.02)
         assert held, "Hold must engage while misaligned"
-        assert abs(cap_vel.last.vector.x) < 1e-9 and abs(cap_vel.last.vector.y) < 1e-9, (
-            "CORNER_STOP must hold zero velocity until the stop is confirmed"
+        stop_speed = math.hypot(cap_vel.last.vector.x, cap_vel.last.vector.y)
+        brake_cap = float(node.get_parameter("segment_brake_velocity_cap_m_s").value)
+        assert stop_speed <= brake_cap + 1e-9, (
+            f"Run-boundary CORNER_STOP must be bounded, got {stop_speed:.3f} m/s"
         )
         assert abs(cap_yaw.last.data) < 1e-9, "yaw_rate is firmware-inert — always zero"
 
@@ -392,6 +423,9 @@ def test_smoke():
         # forward-cone velocity vector toward east (+E, forward N), yaw zero.
         node._reset_corner_pivot_state()
         node._corner_stop_complete = True
+        node._make_stop_certificate(
+            StopReason.RUN_BOUNDARY, 1.0, 0.0, 0.0, 0.0, segment_idx=0
+        )
         cap_vel.messages.clear()
         cap_yaw.messages.clear()
         held = node._run_alignment_hold(1.0, 0.0, 0.0, 0.02)
@@ -477,6 +511,29 @@ def test_smoke():
         assert (entry_end.x, entry_end.y) == (0.0, 0.0)
         assert (mark_start.x, mark_start.y) == (0.0, 0.0)
         print("PASS: forced smooth preserves separate OFF entry and original MARK start")
+
+        # Hot-start/tiny-entry regression: a runtime entry leg shorter than the
+        # generic 5 cm sliver threshold must still survive, otherwise W1 can be
+        # handed off without an explicit entry->mark stop/align.
+        tiny_entry_msg = Path()
+        tiny_entry_msg.header.frame_id = "local_ned"
+        tiny_entry_msg.header.stamp = node.get_clock().now().to_msg()
+        tiny_entry_msg.poses = [
+            _make_path_pose(-0.03, 0.0, mark=False),
+            _make_path_pose(0.0, 0.0, mark=False),
+            _make_path_pose(0.0, 0.0, mark=True),
+            _make_path_pose(1.0, 0.0, mark=True),
+        ]
+        tiny_entry_msg.poses[0].pose.orientation.x = 1.0
+        tiny_entry_msg.poses[0].pose.orientation.w = 0.0
+        node.set_parameters([Parameter("tracking_profile", value="auto")])
+        node._path_cb(tiny_entry_msg)
+        assert len(node._runs) == 2, "Tiny runtime entry must not be dropped as a sliver"
+        assert node._runs[0]["runtime_entry"] is True
+        assert node._runs[0]["length"] < 0.05
+        assert not any(node._runs[0]["flags"])
+        assert all(node._runs[1]["flags"])
+        print("PASS: tiny runtime entry is preserved for W1 settle")
 
         # Real 90° in-run corner must still slow before the turn.
         node.set_parameters([Parameter("tracking_profile", value="segment")])

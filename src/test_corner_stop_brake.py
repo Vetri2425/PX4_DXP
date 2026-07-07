@@ -28,7 +28,11 @@ def main():
     rclpy.init(args=["--ros-args", "-p", "require_rtk_fix:=false"])
     ok = True
     try:
-        from rpp_controller_node import RPPControllerNode
+        from rpp_controller_node import (
+            CertificateSource,
+            RPPControllerNode,
+            StopReason,
+        )
         node = RPPControllerNode()
         P = lambda **kw: node.set_parameters([Parameter(k, value=v) for k, v in kw.items()])
         now = lambda: node.get_clock().now()
@@ -40,7 +44,9 @@ def main():
         assert node.get_parameter("segment_align_settle_s").value == 0.20
         assert node.get_parameter("segment_brake_velocity_cap_m_s").value == 0.18
         assert node.get_parameter("segment_align_speed_threshold").value == 0.02
-        print("PASS params: aim=2° release_max=3° timeout_tol=2° settle=0.20 brake_cap=0.18")
+        assert node.get_parameter("corner_position_tolerance_m").value == 0.02
+        assert node.get_parameter("require_stop_certificates").value is True
+        print("PASS params: aim=2° release_max=3° timeout_tol=2° settle=0.20 brake_cap=0.18 pos_tol=0.02")
 
         # ---- TEST 4: braking command opposes motion, capped ----------------
         P(segment_brake_velocity_cap_m_s=0.18, segment_stop_speed_threshold=0.02)
@@ -65,11 +71,28 @@ def main():
         P(segment_brake_velocity_cap_m_s=0.18)
         print("PASS braking safe-zeros: below-threshold / stale / disabled → (0,0)")
 
+        # Position hold must recover sideways/along-track error instead of
+        # relying only on body-longitudinal braking.
+        P(segment_brake_velocity_cap_m_s=0.18)
+        node._latest_vel_time = now(); node._latest_vel_ned = (0.0, 0.0)
+        hn, he = node._corner_hold_velocity(
+            1.00, 0.05, 1.00, 0.00, 1.0, 0.0, 0.0
+        )
+        assert he < 0.0, f"hold must correct lateral +E error toward stop point, got {(hn, he)}"
+        assert math.hypot(hn, he) <= 0.18 + 1e-9, "hold command must be capped"
+        assert node._corner_position_ok(1.0, 0.015, 1.0, 0.0, 1.0, 0.0)
+        assert not node._corner_position_ok(1.0, 0.030, 1.0, 0.0, 1.0, 0.0)
+        print("PASS position hold: corrects off-point error and gates at 2cm")
+
         # ---- TEST 2: fresh + still moving → does NOT timeout-pivot ----------
         node._reset_corner_pivot_state()
         node._latest_vel_time = now(); node._latest_vel_ned = (0.14, 0.0); node._latest_yaw_rate_ned = 0.0
         node._corner_stop_entered = now() - Duration(seconds=3.0)   # past the 2s cap
         assert node._corner_stop_satisfied() is False, "fresh+moving must not pivot past the 2s cap"
+        node._latest_vel_ned = (0.0, 0.0)
+        P(segment_stop_dwell_s=0.0)
+        assert node._corner_stop_satisfied(position_ok=False) is False, "position gate must block stopped-but-off-point release"
+        P(segment_stop_dwell_s=0.30)
         print("PASS test 2: fresh velocity still moving → no timeout-pivot at 2s cap")
 
         # ---- TEST 1: real run boundary does not advance while moving --------
@@ -101,6 +124,9 @@ def main():
         assert node._run_idx == 1, "confirmed stop must advance exactly once"
         assert node._run_align_pending is True
         assert node._corner_stop_complete is True, "pre-stop must carry into pivot without duplicate stop"
+        assert node._stop_certificate is not None, "run boundary must carry a stop certificate"
+        assert node._stop_certificate.reason == StopReason.RUN_BOUNDARY
+        assert node._stop_certificate.source == CertificateSource.FRESH_TELEMETRY
         P(segment_stop_dwell_s=0.30)
         print("PASS test 1: run boundary stops before advance and carries stop confirmation")
 
@@ -118,6 +144,11 @@ def main():
         assert node._corner_stop_satisfied() is False, "stale velocity must not pass via the 0.3s dwell"
         node._corner_stop_entered = now() - Duration(seconds=3.0)
         assert node._corner_stop_satisfied() is True, "stale velocity must use the 2s cap"
+        cert = node._make_stop_certificate(
+            StopReason.INTRA_RUN_CORNER, 0.0, 0.0, 0.0, 0.0, segment_idx=0
+        )
+        assert cert.source == CertificateSource.STALE_FALLBACK
+        assert cert.degraded is True
         print("PASS test 3: stale velocity → 2s timeout fallback fires")
 
         # fresh + truly stopped → confirms via dwell
@@ -150,6 +181,9 @@ def main():
             node._latest_yaw_rate_ned = 0.0
             node._align_settle_since = None
             P(segment_align_settle_s=0.0, segment_heading_tolerance_deg=2.0)
+            node._make_stop_certificate(
+                StopReason.RUN_BOUNDARY, 0.0, 0.0, 0.0, 0.0, segment_idx=0
+            )
 
         # TEST 5: 4° heading error, strict 2° → must NOT release (still holding)
         setup_pivot()
@@ -161,6 +195,7 @@ def main():
         setup_pivot()
         held = node._run_alignment_hold(0.0, 0.0, math.radians(-1.0), 0.0)
         assert held is False, "1° <= 2° with settled yaw + speed → must release"
+        assert node._alignment_certificate is None, "alignment cert is cleared after release"
         print("PASS test 6: release succeeds at <=2° with settled yaw-rate and speed")
 
         # release blocked while still drifting even at 1°
@@ -180,6 +215,38 @@ def main():
         held = node._run_alignment_hold(0.0, 0.0, math.radians(-1.0), 0.0)
         assert held is False, "stale velocity after timeout must use bounded heading fallback"
         print("PASS stale alignment: held before watchdog, bounded release after timeout")
+
+        # Enforcement: pivot must not proceed if a caller tries to bypass the
+        # stop certificate by setting only the legacy boolean.
+        node._reset_corner_pivot_state()
+        node._path = [_pose(0.0, 0.0), _pose(1.0, 0.0)]
+        node._run_align_pending = True
+        node._corner_stop_complete = True
+        node._latest_vel_time = now(); node._latest_vel_ned = (0.0, 0.0)
+        node._latest_yaw_rate_ned = 0.0
+        held = node._run_alignment_hold(0.0, 0.0, math.radians(-20.0), 0.0)
+        assert held is True
+        assert node._stop_certificate is None, "missing stop certificate must stay missing"
+        print("PASS certificate gate: no run-alignment pivot without StopCertificate")
+
+        # Certificate identity: same coordinate is not enough. Run/segment
+        # identity must match the boundary being authorized.
+        node._run_idx = 2
+        node._segment_idx = 1
+        node._latest_vel_time = now(); node._latest_vel_ned = (0.0, 0.0)
+        node._make_stop_certificate(
+            StopReason.INTRA_RUN_CORNER, 5.0, 5.0, 0.0, 0.0, segment_idx=1
+        )
+        assert node._stop_certificate_valid_for(
+            StopReason.INTRA_RUN_CORNER, 5.0, 5.0, run_idx=2, segment_idx=1
+        )
+        assert not node._stop_certificate_valid_for(
+            StopReason.INTRA_RUN_CORNER, 5.0, 5.0, run_idx=3, segment_idx=1
+        )
+        assert not node._stop_certificate_valid_for(
+            StopReason.INTRA_RUN_CORNER, 5.0, 5.0, run_idx=2, segment_idx=2
+        )
+        print("PASS certificate identity: stop cert cannot authorize another run/segment")
 
         # A normal, non-extension square remains one segment run. Even if the
         # rover is already pointed at the next side, it must confirm the stop
@@ -205,10 +272,44 @@ def main():
         node._latest_vel_time = now()
         node._control_segment_profile(1.0, 0.0, math.pi / 2, 0.0, 1.0)
         assert node._corner_stop_complete is True
+        assert node._stop_certificate is not None
+        assert node._stop_certificate.reason == StopReason.INTRA_RUN_CORNER
         node._latest_vel_time = now()
         node._control_segment_profile(1.0, 0.0, math.pi / 2, 0.0, 1.0)
         assert node._segment_idx == 1, "confirmed stop must allow non-extension square to advance"
         print("PASS non-extension square: stop confirmation preserved, then corner advances")
+
+        # Final DONE requires physical settle certificate; fresh moving
+        # telemetry must hold APPROACH even at the endpoint.
+        node._runs = [run([_pose(0.0, 0.0), _pose(1.0, 0.0)])]
+        node._apply_run(0)
+        node._path_travel_m = 1.0
+        P(min_goal_travel_m=0.0, segment_stop_dwell_s=0.0, xy_goal_tolerance=0.05)
+        node._latest_vel_time = now(); node._latest_vel_ned = (0.20, 0.0)
+        node._control_segment_profile(1.0, 0.0, 0.0, 0.0, 0.0)
+        assert node._path_done is False
+        assert node._final_stop_certificate is None
+        node._latest_vel_time = now(); node._latest_vel_ned = (0.0, 0.0)
+        node._control_segment_profile(0.97, 0.0, 0.0, 0.0, 0.03)
+        assert node._path_done is False
+        assert node._final_stop_certificate is None, "3cm endpoint error must not certify with 2cm stop tolerance"
+        node._latest_vel_time = now(); node._latest_vel_ned = (0.0, 0.0)
+        node._control_segment_profile(1.0, 0.0, 0.0, 0.0, 0.0)
+        assert node._path_done is True
+        assert node._final_stop_certificate is not None
+        assert node._final_stop_certificate.reason == StopReason.FINAL_ENDPOINT
+        assert node._final_stop_certificate.source == CertificateSource.FRESH_TELEMETRY
+        assert node._final_stop_certificate_valid_for(
+            1.0, 0.0, run_idx=0, segment_idx=0
+        )
+        assert not node._final_stop_certificate_valid_for(
+            1.1, 0.0, run_idx=0, segment_idx=0
+        )
+        assert not node._final_stop_certificate_valid_for(
+            1.0, 0.0, run_idx=1, segment_idx=0
+        )
+        P(segment_stop_dwell_s=0.30, xy_goal_tolerance=0.02)
+        print("PASS final DONE: requires in-tolerance FinalStopCertificate after physical settle")
 
         node.destroy_node()
         print("\n=== ALL CORNER-STOP / BRAKE TESTS PASSED ===")

@@ -21,8 +21,6 @@ def split_leading_entry_transit(
         return None, list(points), list(flags)
 
     for i in range(1, len(points)):
-        if not flags[i]:
-            continue
         if flags[i - 1]:
             break
         duplicate = (
@@ -40,9 +38,11 @@ def split_leading_entry_transit(
             >= 1e-6
         )
         leading_off = not any(flags[:i])
-        if duplicate and moved and leading_off:
+        mark_or_pre_boundary = bool(flags[i] or any(flags[i:]))
+        if duplicate and moved and leading_off and mark_or_pre_boundary:
             entry_pts = list(points[:i])
             entry = (entry_pts, [False] * len(entry_pts))
             return entry, list(points[i:]), list(flags[i:])
-        break
+        if flags[i]:
+            break
     return None, list(points), list(flags)
