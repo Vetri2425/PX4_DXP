@@ -498,15 +498,15 @@ class RPPControllerNode(Node):
         # residual error into forward TRACK acceleration. Tightened to 3° for
         # precision (per-line extension) missions where MARK entry must be <2 cm.
         self.declare_parameter("segment_pivot_release_max_deg",        3.0)    # deg
-        # Runtime-entry OFF->MARK boundaries are artificial helper geometry.
-        # The 2026-07-07 Line_2m field bag showed the normal 75deg forward-cone
-        # pivot creeping down the MARK leg for ~1.9 m while still in ALIGN.
-        # Keep generic hard corners unchanged, but make this helper-boundary
-        # pivot slower and closer to the rover nose so alignment cannot become
-        # a hidden MARK-line drive with spray OFF.
-        self.declare_parameter("runtime_entry_pivot_speed_m_s",        0.05)   # m/s
-        self.declare_parameter("runtime_entry_pivot_max_bearing_offset_deg", 20.0)  # deg
-        self.declare_parameter("runtime_entry_pivot_start_tolerance_m", 0.01)  # m
+        # NOTE (2026-07-07): the runtime-entry OFF->MARK pivot was previously
+        # special-cased with a slow speed (0.05 m/s), a tight ±20° cone, and a
+        # 1 cm position-recovery servo. Field bags 15-09 (233 s oscillating
+        # pivot) and 15-19 (0.73 m backward runaway, operator abort) proved that
+        # special case was the failure: the recovery servo drove ~0.18 m/s while
+        # PX4 was trying to spot-turn, and the ±20° cone stalled the spin. With
+        # the clean corner stop now guaranteed (approach deceleration fix
+        # d1e84c7), the MARK entry uses the SAME validated segment-corner pivot
+        # (full ±75° forward cone → PX4 SPOT_TURNING, no recovery servo).
         # Phase 1 production FSM migration: require explicit stop/alignment/
         # final certificates before pivot, next-leg tracking, or DONE. The
         # certificates wrap the existing physical gates; debug publishing stays
@@ -1863,12 +1863,6 @@ class RPPControllerNode(Node):
         position_ok = self._corner_position_ok(
             pos_n, pos_e, a.x, a.y, b.x - a.x, b.y - a.y
         )
-        pivot_position_ok = position_ok
-        if stop_reason == StopReason.RUNTIME_ENTRY_TO_MARK:
-            pivot_position_ok = pos_error <= min(
-                float(self.get_parameter("corner_position_tolerance_m").value),
-                float(self.get_parameter("runtime_entry_pivot_start_tolerance_m").value),
-            )
         heading_tol = math.radians(
             float(self.get_parameter("segment_heading_tolerance_deg").value)
         )
@@ -1980,46 +1974,6 @@ class RPPControllerNode(Node):
 
         final = self._path[-1].pose.position
         dist_to_goal = self._dist(pos_n, pos_e, final.x, final.y)
-
-        if (
-            self._corner_stop_complete
-            and stop_reason == StopReason.RUNTIME_ENTRY_TO_MARK
-            and not pivot_position_ok
-        ):
-            self._last_speed_cmd = 0.0
-            hold_n, hold_e = self._corner_hold_velocity(
-                pos_n, pos_e, a.x, a.y, b.x - a.x, b.y - a.y, yaw_ned,
-                stop_tolerance_m=float(
-                    self.get_parameter("runtime_entry_pivot_start_tolerance_m").value
-                ),
-            )
-            self._publish_velocity(hold_n, hold_e)
-            self._publish_yaw_rate(0.0)
-            self._publish_debug(
-                cross_track=0.0,
-                heading_err=heading_err,
-                lookahead=float("nan"),
-                speed=math.hypot(hold_n, hold_e),
-                kappa=0.0,
-                dist_goal=dist_to_goal,
-                pose_age_ms=pose_age_s * 1000.0,
-                state=StateCode.TRACKING,
-                l_d_raw=float("nan"),
-                kappa_speed=0.0,
-                yaw_rate=0.0,
-                spray_active=False,
-            )
-            self._publish_segment_debug(
-                SegmentStateCode.CORNER_ALIGN, 0, float("nan"), float("nan"),
-                float("nan"), target_heading, heading_err, 0.0,
-            )
-            self._publish_stop_debug(
-                StopDebugPhase.ALIGNING, stop_reason, a.x, a.y,
-                pos_error, heading_err,
-                self._certificate_dwell_s(self._align_settle_since, None),
-                transition_code=1.0,
-            )
-            return True
 
         # As soon as heading enters the release band, remove the pivot vector
         # and physically settle. Continuing to command corner_speed here would
@@ -2158,34 +2112,19 @@ class RPPControllerNode(Node):
             )
             self._corner_stop_complete = True
 
-        # Firmware-aware pivot (see segment CORNER_ALIGN for the full
-        # rationale): the differential rover turns by chasing the velocity-
-        # vector bearing, not the MAVROS yaw_rate field, and freezes heading
-        # below 0.01 m/s. Command a small velocity vector at the run's initial
-        # heading (forward-cone clamped) so the firmware spot-turns in place
-        # the short way to it, then rolls out.
+        # Firmware-aware pivot (identical to the validated segment CORNER_ALIGN,
+        # see _control_segment_profile for the full rationale): the differential
+        # rover turns by chasing the velocity-vector bearing, not the MAVROS
+        # yaw_rate field, and freezes heading below 0.01 m/s. Command a small
+        # velocity vector at the run's initial heading, clamped to the ±75°
+        # forward cone, so PX4 enters SPOT_TURNING (zero forward throttle) and
+        # rotates in place the short way, then rolls out. Magnitude only sets
+        # the post-turn drive-out speed — it does NOT affect the spin, so no
+        # runtime-entry-specific slow/tight-cone override is used here.
         corner_speed = max(
             0.05, float(self.get_parameter("segment_min_corner_speed").value)
         )
-        max_bearing_offset_rad: float | None = None
-        if stop_reason == StopReason.RUNTIME_ENTRY_TO_MARK:
-            corner_speed = max(
-                0.02,
-                float(self.get_parameter("runtime_entry_pivot_speed_m_s").value),
-            )
-            max_bearing_offset_rad = math.radians(
-                self._clamp(
-                    float(self.get_parameter(
-                        "runtime_entry_pivot_max_bearing_offset_deg"
-                    ).value),
-                    10.0,
-                    math.degrees(self._CORNER_MAX_BEARING_OFFSET_RAD),
-                )
-            )
-        v_n, v_e = self._corner_pivot_velocity(
-            yaw_ned, heading_err, corner_speed,
-            max_bearing_offset_rad=max_bearing_offset_rad,
-        )
+        v_n, v_e = self._corner_pivot_velocity(yaw_ned, heading_err, corner_speed)
 
         self._last_speed_cmd = corner_speed
         self._publish_velocity(v_n, v_e)

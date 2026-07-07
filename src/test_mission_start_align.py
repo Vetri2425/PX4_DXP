@@ -202,7 +202,13 @@ def main():
 
         node.destroy_node()
 
-        # ---- runtime-entry MARK pivot must not creep down the MARK line ----
+        # ---- runtime-entry MARK pivot uses the validated segment-corner pivot -
+        # 2026-07-07 regression: the MARK pivot was special-cased with a slow
+        # 0.05 m/s speed, a tight ±20° cone, and a 1 cm recovery servo. Field
+        # bags 15-09 (233 s oscillation) and 15-19 (0.73 m backward runaway)
+        # proved that special case was the failure. The MARK pivot must instead
+        # be the SAME firmware-aware SPOT_TURNING pivot as a hard segment corner:
+        # full ±75° forward cone at the standard corner speed, no recovery servo.
         from rpp_controller_node import StopReason
 
         node = RPPControllerNode()
@@ -232,6 +238,12 @@ def main():
         node._latest_vel_ned = (0.0, 0.0)
         node._latest_yaw_rate_ned = 0.0
 
+        # MARK leg bears 0° (North); rover parked at -84° NED → +84° short-way
+        # turn. heading_err (84°) exceeds the ±75° cone, so the command clamps
+        # to exactly +75° off the nose (never reverse-flips), toward the target.
+        corner_speed = max(
+            0.05, float(node.get_parameter("segment_min_corner_speed").value)
+        )
         yaw_ned = math.radians(-84.0)
         caps["vel"].messages.clear()
         held = node._run_alignment_hold(0.0, 0.0, yaw_ned, 0.0)
@@ -239,24 +251,31 @@ def main():
         v = caps["vel"].last.vector
         speed = math.hypot(v.x, v.y)
         bearing = math.atan2(v.y, v.x)
-        offset = abs(node._angle_wrap(bearing - yaw_ned))
-        assert speed <= 0.051, f"runtime-entry pivot speed must stay small, got {speed:.3f}"
-        assert offset <= math.radians(20.0) + 1e-6, (
-            f"runtime-entry pivot must use tight forward cone, got {math.degrees(offset):.1f}°"
+        step = node._angle_wrap(bearing - yaw_ned)
+        assert abs(speed - corner_speed) < 1e-3, (
+            f"MARK pivot must use the standard corner speed {corner_speed:.3f}, "
+            f"got {speed:.3f}"
         )
-        assert v.x < 0.04, (
-            f"runtime-entry pivot must not command a large MARK-forward component, got {v.x:.3f}"
+        assert abs(step - node._CORNER_MAX_BEARING_OFFSET_RAD) < math.radians(0.5), (
+            f"MARK pivot must clamp to the +75° forward cone toward the target, "
+            f"got {math.degrees(step):+.1f}°"
+        )
+        assert v.x > 0.0, (
+            f"MARK pivot short-way turn must point forward toward the MARK "
+            f"(North) leg, got v_n={v.x:.3f}"
         )
 
+        # Inside the 2 cm stop tolerance there is NO recovery servo any more:
+        # the command is the same forward SPOT_TURNING pivot, never a reverse.
         caps["vel"].messages.clear()
         held = node._run_alignment_hold(0.015, 0.0, yaw_ned, 0.0)
         assert held is True
         v = caps["vel"].last.vector
-        assert v.x < 0.0, (
-            "inside the normal 2 cm stop gate but outside the stricter "
-            "runtime-entry pivot-start gate, command recovery back to MARK start"
+        assert v.x > 0.0, (
+            "inside the 2 cm stop gate the MARK pivot must keep spot-turning "
+            "forward, not command a reverse recovery servo"
         )
-        print("PASS: runtime-entry MARK pivot uses anti-creep limits and strict start recovery")
+        print("PASS: runtime-entry MARK pivot matches the validated segment-corner pivot")
 
         node.destroy_node()
         print("\n=== ALL MISSION-START ALIGN TESTS PASSED ===")
