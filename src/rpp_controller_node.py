@@ -1931,10 +1931,21 @@ class RPPControllerNode(Node):
             timed_out=timed_out,
             yaw_rate_tol=yaw_rate_tol,
         )
+        # Run-boundary pivot (RUNTIME_ENTRY_TO_MARK / RUN_BOUNDARY): PX4's
+        # velocity-vector pivot inherently translates the rover by ~corner_speed
+        # over the pivot duration.  For intra-run corners that translation is
+        # small (short turn, same speed).  For a large run-boundary turn (e.g.
+        # 91.56° entry-to-MARK), the creep accumulates to several cm and knocks
+        # position_ok out of spec every cycle, preventing the settle clock from
+        # ever reaching align_settle_s.  The RPP lookahead corrects any residual
+        # position offset as soon as normal tracking resumes, so strict
+        # position accuracy at the run-boundary waypoint is not required for
+        # safe release.  Omit position_ok from the settle gate here; it is
+        # retained in _control_segment_profile for intra-run corners where the
+        # corner point must be hit precisely.
         if (
             self._corner_stop_complete
             and stop_cert_ok
-            and position_ok
             and heading_ok
             and yaw_rate_ok
             and speed_ok
@@ -2011,38 +2022,11 @@ class RPPControllerNode(Node):
             )
             return True
 
-        if self._corner_stop_complete and not position_ok:
-            self._last_speed_cmd = 0.0
-            hold_n, hold_e = self._corner_hold_velocity(
-                pos_n, pos_e, a.x, a.y, b.x - a.x, b.y - a.y, yaw_ned
-            )
-            self._publish_velocity(hold_n, hold_e)
-            self._publish_yaw_rate(0.0)
-            self._publish_debug(
-                cross_track=0.0,
-                heading_err=heading_err,
-                lookahead=float("nan"),
-                speed=math.hypot(hold_n, hold_e),
-                kappa=0.0,
-                dist_goal=dist_to_goal,
-                pose_age_ms=pose_age_s * 1000.0,
-                state=StateCode.TRACKING,
-                l_d_raw=float("nan"),
-                kappa_speed=0.0,
-                yaw_rate=0.0,
-                spray_active=False,
-            )
-            self._publish_segment_debug(
-                SegmentStateCode.CORNER_ALIGN, 0, float("nan"), float("nan"),
-                float("nan"), target_heading, heading_err, 0.0,
-            )
-            self._publish_stop_debug(
-                StopDebugPhase.ALIGNING, stop_reason, a.x, a.y,
-                pos_error, heading_err,
-                self._certificate_dwell_s(self._align_settle_since, None),
-                transition_code=1.0,
-            )
-            return True
+        # (Position-recovery hold intentionally omitted for run-boundary pivots.
+        # During the velocity-vector pivot, commanding _corner_hold_velocity()
+        # opposes the pivot bearing and causes heading oscillation.  Any residual
+        # position offset after the pivot is corrected by RPP lookahead once
+        # normal tracking of the new run begins.  See settle gate comment above.)
 
         # Stop-and-spin: hold zero velocity at the corner until the rover is
         # physically stopped (approach momentum gone), THEN pivot. Without
