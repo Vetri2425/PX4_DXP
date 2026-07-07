@@ -98,6 +98,8 @@ class TwistToSetpointNode(Node):
     """Bridges /rpp/velocity_ned to /mavros/setpoint_raw/local at 50 Hz."""
 
     STREAM_HZ = 50
+    SEGMENT_STATE_TRACK = 1
+    SEGMENT_STATE_CORNER_ALIGN = 3
     SEGMENT_STATE_CORNER_STOP = 5
     HEADING_MODE_FROM_VELOCITY = 0.0
     HEADING_MODE_HOLD_LAST = 1.0
@@ -301,6 +303,21 @@ class TwistToSetpointNode(Node):
             and segment_state_fresh
             and segment_state == self.SEGMENT_STATE_CORNER_STOP
         )
+        # TRACK and CORNER_ALIGN always command forward-cone velocity — the
+        # velocity bearing IS the intended travel/pivot heading. Disable
+        # reverse_hold in both states:
+        #   TRACK (seg=1): post-pivot MARK release — stale entry yaw would latch
+        #     HOLD_LAST forever (14:26 bag: ~0.6 m backward on MARK).
+        #   CORNER_ALIGN (seg=3): pivot spot-turn — stale entry yaw freezes the
+        #     setpoint and the rover translates/oscillates instead of spinning
+        #     (15-09 bag: 233 s pivot creep).
+        velocity_heading_follow = (
+            segment_state_fresh
+            and segment_state in (
+                self.SEGMENT_STATE_TRACK,
+                self.SEGMENT_STATE_CORNER_ALIGN,
+            )
+        )
 
         if speed > 0.01:
             velocity_yaw_enu = math.atan2(v_n, v_e)  # ENU: 0=East, CCW+
@@ -312,6 +329,7 @@ class TwistToSetpointNode(Node):
                 reverse_hold = (
                     source == "rpp"
                     and self._last_motion_yaw_valid
+                    and not velocity_heading_follow
                     and abs(self._angle_wrap(velocity_yaw_enu - self._last_yaw_cmd)) >= hold_angle
                 )
 

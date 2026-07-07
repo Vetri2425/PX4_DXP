@@ -119,5 +119,64 @@ class TestExplicitYaw(unittest.TestCase):
         self.assertAlmostEqual(yaw_enu, math.pi / 2 - yaw_ned, places=5)
 
 
+class TestVelocityHeadingFollowGate(unittest.TestCase):
+    """Regression for 2026-07-07 runtime-entry MARK pivot/exit yaw-hold leaks.
+
+    reverse_brake_yaw_hold must stay active for CORNER_STOP braking, but must
+    NOT latch during TRACK (post-pivot MARK drive) or CORNER_ALIGN (pivot spin).
+    """
+
+    SEGMENT_STATE_TRACK = 1
+    SEGMENT_STATE_CORNER_ALIGN = 3
+    SEGMENT_STATE_CORNER_STOP = 5
+
+    @staticmethod
+    def _angle_wrap(a):
+        return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+    def _reverse_hold(self, velocity_yaw_enu, last_yaw_cmd, segment_state, *,
+                      hold_angle_deg=100.0, last_motion_yaw_valid=True,
+                      source="rpp", segment_state_fresh=True):
+        velocity_heading_follow = (
+            segment_state_fresh
+            and segment_state in (
+                self.SEGMENT_STATE_TRACK,
+                self.SEGMENT_STATE_CORNER_ALIGN,
+            )
+        )
+        hold_angle = math.radians(hold_angle_deg)
+        return (
+            source == "rpp"
+            and last_motion_yaw_valid
+            and not velocity_heading_follow
+            and abs(self._angle_wrap(velocity_yaw_enu - last_yaw_cmd)) >= hold_angle
+        )
+
+    def test_track_release_breaks_reverse_hold(self):
+        vel_yaw_enu = math.radians(90.0)
+        stale_yaw = math.radians(-88.0)
+        self.assertTrue(
+            self._reverse_hold(vel_yaw_enu, stale_yaw, self.SEGMENT_STATE_CORNER_STOP),
+        )
+        self.assertFalse(
+            self._reverse_hold(vel_yaw_enu, stale_yaw, self.SEGMENT_STATE_TRACK),
+        )
+
+    def test_corner_align_release_breaks_reverse_hold(self):
+        """Pivot velocity bearing must follow during CORNER_ALIGN (seg=3)."""
+        vel_yaw_enu = math.radians(45.0)
+        stale_yaw = math.radians(-88.0)
+        self.assertFalse(
+            self._reverse_hold(vel_yaw_enu, stale_yaw, self.SEGMENT_STATE_CORNER_ALIGN),
+            "CORNER_ALIGN pivot must not latch reverse_hold on stale entry yaw",
+        )
+
+    def test_stale_segment_state_keeps_guard(self):
+        self.assertTrue(
+            self._reverse_hold(math.radians(90.0), math.radians(-88.0),
+                               self.SEGMENT_STATE_TRACK, segment_state_fresh=False),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

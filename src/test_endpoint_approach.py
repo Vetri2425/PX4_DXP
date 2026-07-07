@@ -27,6 +27,43 @@ def _pose(n, e):
     return ps
 
 
+def _mavros_pose(n, e, yaw_ned=0.0):
+    """MAVROS ENU pose: x=East, y=North; yaw_enu = pi/2 - yaw_ned."""
+    from geometry_msgs.msg import PoseStamped
+    ps = PoseStamped()
+    ps.pose.position.x = float(e)
+    ps.pose.position.y = float(n)
+    yaw_enu = math.pi / 2.0 - yaw_ned
+    ps.pose.orientation.z = math.sin(yaw_enu / 2.0)
+    ps.pose.orientation.w = math.cos(yaw_enu / 2.0)
+    return ps
+
+
+def _runtime_entry_two_run_path(entry_len, mark_len):
+    """Collinear runtime-entry(OFF) → MARK(ON) path, both north (NED)."""
+    from geometry_msgs.msg import PoseStamped
+    from nav_msgs.msg import Path
+    p = Path()
+    p.header.frame_id = "local_ned"
+
+    def wp(n, e, z):
+        ps = PoseStamped()
+        ps.pose.position.x = float(n)
+        ps.pose.position.y = float(e)
+        ps.pose.position.z = float(z)
+        ps.pose.orientation.w = 1.0
+        return ps
+
+    a = wp(0.0, 0.0, 0.0)
+    a.pose.orientation.x = 1.0  # runtime-entry marker
+    a.pose.orientation.w = 0.0
+    b = wp(entry_len, 0.0, 0.0)               # entry end == boundary
+    c = wp(entry_len, 0.0, 1.0)               # MARK start (duplicate vertex)
+    d = wp(entry_len + mark_len, 0.0, 1.0)    # MARK end
+    p.poses = [a, b, c, d]
+    return p
+
+
 def main():
     rclpy.init(args=["--ros-args", "-p", "require_rtk_fix:=false"])
     ok = True
@@ -37,9 +74,9 @@ def main():
 
         # ---- decoupling: the three approach floors are distinct params -------
         assert node.get_parameter("segment_endpoint_approach_speed").value == 0.03, "endpoint floor default 0.03"
-        assert node.get_parameter("min_approach_linear_velocity").value == 0.1, "smooth/arc floor unchanged (0.10)"
+        assert node.get_parameter("min_approach_linear_velocity").value == 0.05, "smooth/arc floor default 0.05"
         assert node.get_parameter("segment_min_corner_speed").value == 0.08, "pivot rollout speed unchanged (0.08)"
-        print("PASS decoupling: endpoint/hard-corner=0.03, smooth/arc=0.10, pivot rollout=0.08 are separate")
+        print("PASS decoupling: endpoint/hard-corner=0.03, smooth/arc=0.05, pivot rollout=0.08 are separate")
 
         # ---- functional: the endpoint floor controls final-segment speed -----
         captured = {}
@@ -97,6 +134,55 @@ def main():
             f"speed; got {sp_corner:.3f}"
         )
         print(f"PASS hard-corner approach uses stop floor: {sp_corner:.3f} m/s")
+
+        node.destroy_node()
+
+        # ---- smooth runtime-entry leg decelerates before the run boundary ----
+        node = RPPControllerNode()
+        node.set_parameters([
+            Parameter("require_rtk_fix", value=False),
+            Parameter("tracking_profile", value="smooth"),
+            Parameter("mission_speed", value=0.35),
+        ])
+        node._gps_fix_type = 6
+        cap = {}
+        node._publish_velocity = lambda vn, ve: cap.update(sp=math.hypot(vn, ve))
+
+        entry_len, mark_len = 1.4, 2.0
+        node._pose_cb(_mavros_pose(0.0, 0.0, 0.0))
+        node._path_cb(_runtime_entry_two_run_path(entry_len, mark_len))
+        assert len(node._runs) == 2
+        assert node._runs[0].get("runtime_entry") is True
+        assert node._runs[0]["profile"] != "segment"
+
+        endpoint_floor = float(node.get_parameter("segment_endpoint_approach_speed").value)
+
+        def converged_speed_at(dist_before_boundary):
+            n = entry_len - dist_before_boundary
+            node._run_idx = 0
+            node._last_speed_cmd = 0.35
+            node._path_travel_m = max(0.0, n)
+            sp = float("nan")
+            for _ in range(150):
+                cap.clear()
+                node._pose_cb(_mavros_pose(n, 0.0, 0.0))
+                node._control_loop()
+                sp = cap.get("sp", sp)
+            return sp
+
+        sp_far = converged_speed_at(1.2)
+        sp_near = converged_speed_at(0.15)
+        assert sp_far == sp_far and sp_near == sp_near
+        assert sp_near < sp_far, (
+            f"entry leg must slow approaching the boundary (far={sp_far:.3f} near={sp_near:.3f})"
+        )
+        assert sp_near <= endpoint_floor + 0.01, (
+            f"near-boundary must use endpoint floor {endpoint_floor:.3f}, got {sp_near:.3f}"
+        )
+        print(
+            f"PASS runtime-entry leg decelerates into boundary: "
+            f"far={sp_far:.3f} m/s → near={sp_near:.3f} m/s (floor={endpoint_floor:.3f})"
+        )
 
         node.destroy_node()
         print("\n=== ALL ENDPOINT-APPROACH TESTS PASSED ===")
