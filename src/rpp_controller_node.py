@@ -1916,11 +1916,12 @@ class RPPControllerNode(Node):
         # bounded fallback: pose heading is still fresh (enforced by the outer
         # control loop), so allow the settle dwell after the timeout instead of
         # deadlocking CORNER_ALIGN forever on an unavailable velocity sample.
-        yaw_rate_ok = (
-            abs(self._latest_yaw_rate_ned) < yaw_rate_tol
-            if vel_fresh else timed_out
+        yaw_rate_ok, speed_ok = self._align_release_motion_ok(
+            heading_ok=heading_ok,
+            vel_fresh=vel_fresh,
+            timed_out=timed_out,
+            yaw_rate_tol=yaw_rate_tol,
         )
-        speed_ok = self._align_speed_ok() if vel_fresh else timed_out
         if (
             self._corner_stop_complete
             and stop_cert_ok
@@ -2988,11 +2989,12 @@ class RPPControllerNode(Node):
                     transition_code=9.0,
                 )
                 return
-            yaw_rate_ok = (
-                abs(self._latest_yaw_rate_ned) < yaw_rate_tol
-                if vel_fresh else timed_out
+            yaw_rate_ok, speed_ok = self._align_release_motion_ok(
+                heading_ok=heading_ok,
+                vel_fresh=vel_fresh,
+                timed_out=timed_out,
+                yaw_rate_tol=yaw_rate_tol,
             )
-            speed_ok = self._align_speed_ok() if vel_fresh else timed_out
             if (
                 self._corner_stop_complete
                 and stop_cert_ok
@@ -3563,16 +3565,25 @@ class RPPControllerNode(Node):
         if self._run0_align_decision_pending:
             self._run0_align_decision_pending = False
             if self._run_idx == 0 and len(self._path) > 1:
-                n0 = self._path[0].pose.position
-                n1 = self._path[1].pose.position
-                h1 = math.atan2(n1.y - n0.y, n1.x - n0.x)
-                threshold = math.radians(
-                    float(self.get_parameter("segment_corner_threshold_deg").value)
-                )
-                turn = abs(self._heading_delta(yaw_ned, h1))
-                if turn >= threshold:
-                    self._run_align_pending = True
-                    self._run_align_turn_rad = turn
+                # GPS_SURVEYED runtime entry is a separate OFF leg whose
+                # bearing is often a large offset from the rover's parked
+                # heading and from the MARK geometry. Pivoting to that
+                # transit heading at mission start wastes minutes; drive the
+                # entry leg with the forward-cone clamp and pivot once at the
+                # RUNTIME_ENTRY_TO_MARK boundary instead.
+                if self._runs and self._runs[0].get("runtime_entry"):
+                    pass
+                else:
+                    n0 = self._path[0].pose.position
+                    n1 = self._path[1].pose.position
+                    h1 = math.atan2(n1.y - n0.y, n1.x - n0.x)
+                    threshold = math.radians(
+                        float(self.get_parameter("segment_corner_threshold_deg").value)
+                    )
+                    turn = abs(self._heading_delta(yaw_ned, h1))
+                    if turn >= threshold:
+                        self._run_align_pending = True
+                        self._run_align_turn_rad = turn
 
         # ---- Run-transition alignment (per-entity profile switching) ----
         # After advancing to a new run, pivot toward its initial heading
@@ -4217,6 +4228,31 @@ class RPPControllerNode(Node):
         return math.hypot(v_n, v_e) < float(
             self.get_parameter("segment_align_speed_threshold").value
         )
+
+    def _align_release_motion_ok(
+        self,
+        *,
+        heading_ok: bool,
+        vel_fresh: bool,
+        timed_out: bool,
+        yaw_rate_tol: float,
+    ) -> tuple[bool, bool]:
+        """Yaw-rate and speed gates for alignment release.
+
+        Velocity-vector pivots (PX4 rover_differential) derive heading from
+        the commanded velocity bearing, so measured yaw-rate can ring while
+        |heading_err| is already inside the release band. In that case settle
+        on low linear speed only; keep the strict yaw-rate gate while still
+        turning toward the target heading.
+        """
+        speed_ok = self._align_speed_ok() if vel_fresh else timed_out
+        if heading_ok:
+            return True, speed_ok
+        yaw_rate_ok = (
+            abs(self._latest_yaw_rate_ned) < yaw_rate_tol
+            if vel_fresh else timed_out
+        )
+        return yaw_rate_ok, speed_ok
 
     def _certificate_enforced(self) -> bool:
         return bool(self.get_parameter("require_stop_certificates").value)

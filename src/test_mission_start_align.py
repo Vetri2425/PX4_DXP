@@ -48,6 +48,27 @@ def _straight_path(n0, e0, n1, e1):
     return p
 
 
+def _runtime_entry_path(n_entry, e_entry, n_mark, e_mark, n1, e1):
+    from geometry_msgs.msg import PoseStamped
+    from nav_msgs.msg import Path
+    p = Path()
+    p.header.frame_id = "local_ned"
+    a = PoseStamped()
+    a.pose.position.x = n_entry
+    a.pose.position.y = e_entry
+    a.pose.orientation.x = 1.0
+    a.pose.orientation.w = 0.0
+    b = PoseStamped()
+    b.pose.position.x = n_mark
+    b.pose.position.y = e_mark
+    c = PoseStamped()
+    c.pose.position.x = n1
+    c.pose.position.y = e1
+    c.pose.position.z = 1.0
+    p.poses = [a, b, c]
+    return p
+
+
 def main():
     rclpy.init(args=["--ros-args", "-p", "require_rtk_fix:=false"])
     ok = True
@@ -95,6 +116,54 @@ def main():
             "an already-aligned mission start must not pivot"
         )
         print("PASS: already-aligned mission start does not trigger a spurious pivot")
+
+        node.destroy_node()
+
+        # ---- runtime entry must NOT pre-align to the transit leg ------------
+        # Reproduces 2026-07-07 Line_2m GPS_SURVEYED: rover parked on MARK
+        # facing ~0° while the injected PRE entry leg bears ~63°. Aligning to
+        # that transit heading at mission start wastes minutes; drive the entry
+        # leg with forward-cone and pivot at RUNTIME_ENTRY_TO_MARK instead.
+        node = RPPControllerNode()
+        node.set_parameters([Parameter("require_rtk_fix", value=False)])
+        node._gps_fix_type = 6
+        node._pose_cb(_pose(0.0, 0.0, 0.0))
+        node._path_cb(_runtime_entry_path(-2.0, -4.0, 0.0, 0.0, 2.0, 0.0))
+        assert node._runs[0].get("runtime_entry") is True
+        assert node._run0_align_decision_pending is True
+        node._control_loop()
+        assert node._run0_align_decision_pending is False
+        assert node._run_align_pending is False, (
+            "runtime entry must not trigger run-0 pre-align to the transit leg"
+        )
+        print("PASS: runtime entry skips run-0 pre-align (forward-cone on entry leg)")
+
+        node.destroy_node()
+
+        # ---- align release ignores yaw-rate once heading is in band ----------
+        node = RPPControllerNode()
+        node.set_parameters([Parameter("require_rtk_fix", value=False)])
+        node._gps_fix_type = 6
+        node._latest_vel_time = node.get_clock().now()
+        node._latest_vel_ned = (0.0, 0.0)
+        node._latest_yaw_rate_ned = 0.25
+        yr_ok, sp_ok = node._align_release_motion_ok(
+            heading_ok=True,
+            vel_fresh=True,
+            timed_out=False,
+            yaw_rate_tol=0.05,
+        )
+        assert yr_ok is True, "heading in band must bypass yaw-rate settle gate"
+        assert sp_ok is True
+        yr_ok, sp_ok = node._align_release_motion_ok(
+            heading_ok=False,
+            vel_fresh=True,
+            timed_out=False,
+            yaw_rate_tol=0.05,
+        )
+        assert yr_ok is False, "still turning: yaw-rate gate must stay strict"
+        assert sp_ok is True
+        print("PASS: align release bypasses yaw-rate when heading already OK")
 
         node.destroy_node()
         print("\n=== ALL MISSION-START ALIGN TESTS PASSED ===")

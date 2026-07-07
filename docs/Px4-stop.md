@@ -2904,3 +2904,86 @@ Proof required
 ```
 
 This would turn the document from a long design narrative into an actionable build checklist.
+
+## FLAG-01 Addendum: Runtime Path Identity Vs Stop-Only Testing
+
+Date: 2026-07-07
+
+Detailed note:
+
+- `docs/after_stop_Fix.md`
+
+### Verdict
+
+```text
+DOES NOT BLOCK STOP-ONLY
+BLOCKS FULL PIPELINE ONLY
+```
+
+FLAG-01 is real:
+
+```text
+staged mission fingerprint can describe staged waypoints + spray_flags,
+while GPS_SURVEYED runtime placement and runtime-entry geometry can change
+the actual published /path.
+```
+
+If `/path/identity` still publishes the old staged fingerprint, then
+`/rpp/conditioned_path_identity` can carry a fingerprint that does not honestly
+describe the runtime geometry. The spray controller may then reject the mission
+or stay OFF because the conditioned geometry does not match the configured
+staged fingerprint.
+
+That is mainly a full pipeline blocker:
+
+```text
+DXF -> GPS_SURVEYED placement -> runtime path -> spray binding -> paint output
+```
+
+It is not, by itself, a blocker for Phase 1.1 stop-certificate dry-run testing.
+
+RPP stop certificates are based on the actual runtime geometry and telemetry:
+
+```text
+actual /path
+actual /rpp/conditioned_path
+position
+velocity
+yaw rate
+heading error
+dwell timing
+```
+
+They are not certified from the staged fingerprint.
+
+### Required Constraint
+
+For Phase 1.1 stop-only field validation, do not use staged DXF geometry as the
+sole truth source. Validate stop targets and transitions against:
+
+```text
+/path
+/rpp/conditioned_path
+/rpp/stop_debug
+/rpp/segment_debug
+```
+
+Preferred clean test:
+
+```text
+LOCAL_NED path
+no runtime-entry rewrite
+spray disabled or not required
+require_stop_certificates=true
+```
+
+Acceptable dry-run test:
+
+```text
+GPS_SURVEYED/runtime-entry allowed
+spray not required
+bag analysis uses actual runtime path geometry
+```
+
+Do not claim full production validation until FLAG-01 is fixed and a bag proves
+the full DXF/GPS_SURVEYED/spray identity chain.
