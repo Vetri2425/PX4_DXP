@@ -908,7 +908,25 @@ class RPPControllerNode(Node):
                 and is_collinear_straight_leg(run_pts)
                 and (is_runtime_entry_run or not any(run_flags))
             )
-            if point_leg_densified:
+            if is_runtime_entry_run:
+                # Runtime GPS-surveyed entry: keep it SMOOTH so the rover curves
+                # onto the leg from its arbitrary parked heading via the forward-
+                # cone drive (no wasteful start pivot). With the aligned run-in
+                # standoff (server ENTRY_RUNIN_DIST_M) the leg has a single bend;
+                # corner-smooth it so the rover rounds onto the mark-line bearing
+                # and reaches wp0 aligned. A straight entry has no bend to round,
+                # so this matches the old point-leg resample.
+                profile = "smooth"
+                c_pts, c_flags = run_pts, run_flags
+                if corner_r > 0.0 and len(c_pts) >= 3:
+                    c_pts, c_flags = self._smooth_corners(
+                        c_pts, corner_r, max(2, arc_pts), c_flags
+                    )
+                if resample_dx > 0.0 and len(c_pts) >= 2:
+                    c_pts, c_flags = self._resample_path(
+                        c_pts, resample_dx, c_flags
+                    )
+            elif point_leg_densified:
                 # Point-mode straight leg: smooth resample only — intermediates
                 # are projection geometry, not segment corner goals.
                 profile = "smooth"
@@ -1604,7 +1622,15 @@ class RPPControllerNode(Node):
             h1 = math.atan2(n1.y - n0.y, n1.x - n0.x)
             threshold = math.radians(float(self.get_parameter("segment_corner_threshold_deg").value))
             turn = abs(self._heading_delta(h0, h1))
-            if turn >= threshold or self._runtime_entry_to_mark_boundary(prev_run, run):
+            # Pivot only when the heading actually steps by a hard corner. The
+            # entry->mark boundary previously forced a pivot unconditionally
+            # (via _runtime_entry_to_mark_boundary) because the GPS-surveyed entry
+            # arrived at wp0 misaligned; with the aligned run-in it arrives on the
+            # mark bearing, so gating on the measured turn skips the drift-inducing
+            # pivot when it is already aligned and still fires it when it is not.
+            # The STOP at wp0 is unaffected — it is gated separately by
+            # _next_run_requires_alignment, which still stops at this boundary.
+            if turn >= threshold:
                 self._run_align_pending = True
                 self._run_align_turn_rad = turn   # angle-aware pivot budget
         elif idx == 0:

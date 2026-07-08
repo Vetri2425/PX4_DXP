@@ -66,6 +66,17 @@ ENTRY_COINCIDENT_TOLERANCE_M = 1e-6
 # lookahead, so the lookahead resolves past wp0 onto the first mission side and
 # the rover cuts the wp0 corner instead of arriving on it.
 ENTRY_DENSIFY_SPACING_M = 0.05
+# Aligned run-in length (m). The runtime entry leg becomes rover -> standoff ->
+# wp0, with the standoff this far behind wp0 on the first mark segment (wp0->wp1),
+# so the rover arrives at wp0 already pointing down the mark and needs no drift-
+# inducing pivot there — the entry point then behaves like a clean segment
+# corner. Keep it comfortably longer than corner_smooth_radius_m (RPP, 0.5 m) so
+# a straight aligned stretch survives after the standoff bend. The big parked->
+# line turn happens at the standoff (a PX4 spot-turn, forward-cone clamped) where
+# it is spray-OFF and harmless; keep this longer than that spot-turn's drift plus
+# the boundary capture radius (~0.25 + 0.5 m) so the run-in into wp0 is clean and
+# aligned. 0 disables (leg reverts to a straight rover->wp0 shot).
+ENTRY_RUNIN_DIST_M = 1.0
 
 
 def _densify_leg(
@@ -102,8 +113,14 @@ def _build_runtime_entry_path(
     points: list[tuple[float, float]],
     spray_flags: list[bool] | None,
     rover_ned: tuple[float, float],
+    runin_dist_m: float = 0.0,
 ) -> tuple[list[tuple[float, float]], list[bool] | None, dict[str, Any]]:
-    """Prepend a spray-OFF acquisition leg without changing mission data."""
+    """Prepend a spray-OFF acquisition leg without changing mission data.
+
+    When ``runin_dist_m`` > 0 and a mark direction is available, the leg runs in
+    to wp0 along the first mark segment (wp0->wp1) via a standoff point, so the
+    rover arrives aligned. Otherwise it is a straight rover->wp0 shot.
+    """
     original_first = points[0]
     distance_m = math.hypot(
         rover_ned[0] - original_first[0], rover_ned[1] - original_first[1]
@@ -125,7 +142,31 @@ def _build_runtime_entry_path(
     # original_first, which the following *points also starts with — that duplicate
     # marks the end of the runtime-only entry run. For MARK-first it is also the
     # zero-distance OFF->ON boundary; PRE-first stays OFF->OFF.
-    entry_leg = _densify_leg(rover_ned, original_first)
+    # Aligned run-in: approach wp0 along the first mark segment (wp0->wp1) so the
+    # rover arrives already pointing down the mark and the entry->mark pivot is
+    # ~0 (the controller skips it). Leg becomes rover -> standoff -> wp0 with the
+    # standoff runin_dist_m behind wp0 on the mark line; the [:-1] drops the
+    # duplicated standoff point at the join. wp0 stays the exact final point (the
+    # entry-run boundary duplicate the split contract depends on). Falls back to a
+    # straight shot when disabled or no mark direction exists.
+    standoff = None
+    if runin_dist_m > 0.0 and len(points) >= 2:
+        bn = points[1][0] - original_first[0]
+        be = points[1][1] - original_first[1]
+        blen = math.hypot(bn, be)
+        if blen > 1e-6:
+            standoff = (
+                original_first[0] - runin_dist_m * bn / blen,
+                original_first[1] - runin_dist_m * be / blen,
+            )
+    if standoff is not None:
+        entry_leg = _densify_leg(rover_ned, standoff)[:-1] + _densify_leg(
+            standoff, original_first
+        )
+    else:
+        entry_leg = _densify_leg(rover_ned, original_first)
+    evidence["entry_standoff_ned"] = list(standoff) if standoff is not None else None
+    evidence["entry_runin_dist_m"] = runin_dist_m if standoff is not None else 0.0
     evidence["entry_leg_point_count"] = len(entry_leg)
     entry_off = [False] * len(entry_leg)
     if spray_flags is None:
@@ -682,6 +723,7 @@ class OffboardController:
                         list(resolved_mission_pts),
                         spray_flags_to_publish,
                         rover_ned,
+                        runin_dist_m=ENTRY_RUNIN_DIST_M,
                     )
                 )
                 self._log_entry(
