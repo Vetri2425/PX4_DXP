@@ -453,25 +453,34 @@ class RPPControllerNode(Node):
         # overshoot in the first place.
         self.declare_parameter("segment_pivot_damp_start_deg",         20.0)   # deg; begin damping inside this heading error
         self.declare_parameter("segment_pivot_damp_floor_m_s",         0.03)   # m/s; floor, stays > p4_zero_vel_threshold (no freeze)
-        # Smooth-run terminal capture radius (2026-07-08, real-hardware bag
-        # 2026-07-08_11-31-17). A smooth/pure-pursuit run that ends at a pivot
-        # boundary (e.g. the GPS-surveyed entry transit → first MARK point)
-        # captured its endpoint only when the rover physically entered the
-        # xy_goal_tolerance (2 cm) ball. But near the run end the lookahead
-        # collapses onto the goal and the command bearing sweeps through 180°
-        # as the rover skims past, while the approach speed-scaling (speed ∝
-        # dist_to_goal) then RE-ACCELERATES the rover away as that distance
-        # grows — a positive-feedback limit cycle. In the bag the rover's
-        # closest first-pass approach was 2.5 cm (missing the 2 cm ball by
-        # 5 mm), then it was flung ~1 m past the point and wandered ~46 s
-        # before a later loop happened to clip the ball. Fix: once a smooth run
-        # is within this radius of a boundary that needs a pivot, hand the
-        # final approach to the segment corner-hold (servos straight to the
-        # exact point and brakes — the same sub-2 cm capture the segment A→B
-        # legs already use), and latch _run_boundary_stop_pending so the
-        # re-accel can't run. Keep this > the flip zone (~3 cm) and small
-        # enough that corner-hold entry speed is gentle. Set 0 to disable.
-        self.declare_parameter("segment_boundary_capture_radius_m",    0.10)   # m
+        # Smooth-run terminal capture (2026-07-08, real-hardware bags
+        # 2026-07-08_11-31-17 / _11-57-19 + PX4 ulog log_3). A smooth/pure-
+        # pursuit run that ends at a pivot boundary (e.g. the GPS-surveyed
+        # entry transit → first MARK point) never stopped cleanly at its
+        # endpoint. Two coupled failures: (1) near the run end the pure-pursuit
+        # lookahead collapses onto the goal and the command bearing sweeps
+        # through 180° as the rover skims past; (2) that swinging velocity-
+        # vector bearing puts the PX4 rover differential controller into its
+        # spot-turn / large-heading-error state, where it HOLDS forward speed
+        # (~0.27 m/s) and ignores the commanded deceleration — the ulog shows
+        # differential_velocity_setpoint.speed pinned at 0.27 while the OFFBOARD
+        # setpoint fell to 0.18, so the rover drove ~0.7 m past the point before
+        # reverse-braking. The clean run-boundary / final stops in the same log
+        # prove PX4 DOES track the decel to <0.03 m/s when the rover approaches
+        # with a STEADY bearing aligned to its heading. Fix: within this radius
+        # of a pivot boundary, latch the boundary stop and drive a fixed bearing
+        # STRAIGHT at the goal point (forward-cone clamped) at a low, distance-
+        # scaled speed (see _smooth_capture_velocity) — a steady bearing PX4
+        # tracks down to a stop, no lookahead flip, no re-accel. Sized so the
+        # rover reaches ~segment_min_corner_speed by ~0.3 m out (given the gentle
+        # RO_DECEL_LIM) and stops exactly at the point, mirroring the segment
+        # A→B corner stop. Set 0 to disable (reverts to pure-pursuit capture).
+        self.declare_parameter("segment_boundary_capture_radius_m",    0.50)   # m
+        # Hand-off radius inside the capture zone: below this the final settle
+        # uses the segment corner-hold (tangent-frame servo + brake to <2 cm);
+        # above it the fixed-bearing decel approach runs. Keep below the capture
+        # radius and above xy_goal_tolerance.
+        self.declare_parameter("segment_boundary_corner_handoff_m",    0.05)   # m
         # Final-segment (run-endpoint) goal-approach floor. A per-line PRE/AFT
         # run ends AT a corner, so the rover must arrive slow enough for active
         # braking to stop it within the corner point. The old endpoint floor was
@@ -1770,11 +1779,26 @@ class RPPControllerNode(Node):
 
         self._segment_state = SegmentStateCode.CORNER_STOP
         self._last_speed_cmd = 0.0
-        brake_n, brake_e = self._corner_hold_velocity(
-            pos_n, pos_e, stop_pt.x, stop_pt.y,
-            stop_pt.x - prev_pt.x, stop_pt.y - prev_pt.y,
-            yaw_ned,
+        handoff_r = float(
+            self.get_parameter("segment_boundary_corner_handoff_m").value
         )
+        if self._active_tracking_profile != "segment" and pos_error > handoff_r:
+            # Smooth-run terminal approach: hold a fixed bearing straight at the
+            # stop point at a low decel speed so PX4 tracks it down (see
+            # _smooth_capture_velocity). The segment corner-hold's tangent-frame
+            # servo swings the bearing and, entered while the rover is still
+            # fast, drove it into PX4's speed-holding turn-state. Hand to the
+            # corner-hold only for the final settle inside handoff_r, where the
+            # rover is already slow and aligned.
+            brake_n, brake_e = self._smooth_capture_velocity(
+                pos_n, pos_e, stop_pt.x, stop_pt.y, yaw_ned, pos_error
+            )
+        else:
+            brake_n, brake_e = self._corner_hold_velocity(
+                pos_n, pos_e, stop_pt.x, stop_pt.y,
+                stop_pt.x - prev_pt.x, stop_pt.y - prev_pt.y,
+                yaw_ned,
+            )
         brake_speed = math.hypot(brake_n, brake_e)
         self._publish_velocity(brake_n, brake_e)
         self._publish_yaw_rate(0.0)
@@ -3650,18 +3674,19 @@ class RPPControllerNode(Node):
                 pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
             )
             return
-        # ---- Smooth-run terminal capture (overshoot latch + creep clamp) ----
+        # ---- Smooth-run terminal capture (fixed-bearing decel approach) ----
         # A smooth/pure-pursuit run that ends at a pivot boundary would fly past
-        # its endpoint in a limit cycle (see segment_boundary_capture_radius_m
-        # declaration for the field evidence). Once inside the capture radius of
-        # such a boundary, arm the run-boundary stop early: _hold_before_run_
-        # advance servos to the exact point via the segment corner-hold and
-        # certifies within corner_position_tolerance_m (2 cm), and latching
-        # _run_boundary_stop_pending makes the control return here every cycle —
-        # before the Step-6 approach speed-scaling can re-accelerate the rover
-        # (the creep clamp) and before the lookahead can flip the bearing (the
-        # overshoot latch). Scoped to smooth runs so the validated segment
-        # endpoint capture (which arrives slow and on-line) is untouched, and to
+        # its endpoint: the lookahead flips the command bearing at the run end
+        # and PX4's rover controller holds speed through the resulting turn-state
+        # (see segment_boundary_capture_radius_m declaration for the ulog
+        # evidence). Once inside the capture radius of such a boundary, latch the
+        # run-boundary stop and hand every subsequent cycle to _hold_before_run_
+        # advance, which drives a fixed bearing straight at the goal at a low,
+        # distance-scaled speed (steady bearing → PX4 tracks the decel to a stop)
+        # and then certifies within corner_position_tolerance_m (2 cm) via the
+        # corner-hold final settle. Latching also stops the Step-6 speed-scaling
+        # re-accel (the control returns above before it runs). Scoped to smooth
+        # runs so the validated segment endpoint capture is untouched, and to
         # pivot boundaries so a collinear smooth→smooth hop is not advanced early.
         capture_r = float(
             self.get_parameter("segment_boundary_capture_radius_m").value
@@ -4272,6 +4297,48 @@ class RPPControllerNode(Node):
             pos_n, pos_e, stop_n, stop_e, tangent_n, tangent_e
         )
         return dist <= float(self.get_parameter("corner_position_tolerance_m").value)
+
+    def _smooth_capture_velocity(
+        self,
+        pos_n: float,
+        pos_e: float,
+        goal_n: float,
+        goal_e: float,
+        yaw_ned: float,
+        dist: float,
+    ) -> tuple[float, float]:
+        """Fixed-bearing decelerating approach to a smooth-run stop point.
+
+        Steers the velocity vector STRAIGHT at the goal (a steady bearing,
+        forward-cone clamped) at a low, distance-scaled speed so PX4's rover
+        differential controller tracks the deceleration to a stop — the way it
+        already does at the run-boundary / final stops. The corner-hold's
+        tangent-frame along/cross servo instead swings the commanded bearing,
+        and entered while the rover was still fast it drove PX4 into its spot-
+        turn speed-hold (ulog log_3 2026-07-08: differential_velocity_setpoint.
+        speed pinned at 0.27 while the OFFBOARD setpoint fell to 0.18, carrying
+        the rover ~0.7 m past the point). Speed ramps from segment_min_corner_
+        speed at the capture radius down to segment_endpoint_approach_speed at
+        the corner-hold hand-off, and is capped at segment_min_corner_speed so
+        it can never re-accelerate the rover.
+        """
+        if dist <= 1e-6:
+            return (0.0, 0.0)
+        hold_v = float(self.get_parameter("segment_min_corner_speed").value)
+        floor_v = float(self.get_parameter("segment_endpoint_approach_speed").value)
+        capture_r = float(
+            self.get_parameter("segment_boundary_capture_radius_m").value
+        )
+        handoff_r = float(
+            self.get_parameter("segment_boundary_corner_handoff_m").value
+        )
+        top_v = max(hold_v, floor_v)
+        span = max(1e-6, capture_r - handoff_r)
+        frac = self._clamp((dist - handoff_r) / span, 0.0, 1.0)
+        speed = floor_v + frac * (top_v - floor_v)
+        v_n = speed * (goal_n - pos_n) / dist
+        v_e = speed * (goal_e - pos_e) / dist
+        return self._clamp_velocity_to_forward_cone(v_n, v_e, yaw_ned, speed)
 
     def _corner_hold_velocity(
         self,
