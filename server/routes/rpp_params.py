@@ -274,6 +274,22 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
         "min": 0.0,
         "max": 1.0,
     },
+    "segment_pivot_damp_start_deg": {
+        "type": "float",
+        "default": 20.0,
+        "group": "Tracking Profile",
+        "description": "Begin damping pivot speed once heading error is inside this angle, to prevent rotational-momentum overshoot past the target heading (deg)",
+        "min": 0.0,
+        "max": 75.0,
+    },
+    "segment_pivot_damp_floor_m_s": {
+        "type": "float",
+        "default": 0.03,
+        "group": "Tracking Profile",
+        "description": "Minimum pivot speed while damping near the target heading (m/s); stays above p4_zero_vel_threshold to avoid PX4's zero-velocity heading freeze",
+        "min": 0.0,
+        "max": 0.5,
+    },
     "segment_endpoint_approach_speed": {
         "type": "float",
         "default": 0.03,

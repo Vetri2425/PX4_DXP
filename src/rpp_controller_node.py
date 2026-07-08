@@ -435,6 +435,24 @@ class RPPControllerNode(Node):
         self.declare_parameter("segment_corner_threshold_deg",         45.0)
         self.declare_parameter("segment_slowdown_dist",               1.00)
         self.declare_parameter("segment_min_corner_speed",             0.08)
+        # Pivot overshoot damping (2026-07-08, real-hardware bags/8-8-2026).
+        # _corner_pivot_velocity always pointed the velocity vector at the
+        # EXACT target heading, at constant segment_min_corner_speed, for the
+        # whole pivot — convergence was left entirely to PX4's own
+        # SPOT_TURNING/DRIVING hysteresis (RD_TRANS_DRV_TRN=10 / RD_TRANS_TRN_
+        # DRV=5), with no commanded braking as heading_err shrank. Rotational
+        # momentum then carried the nose past the target: bag 10-44-56
+        # overshot ~3deg and self-corrected (10.8cm peak position error), bag
+        # 10-41-39 overshot ~8.7deg — landing in the 5-10deg dead-band where
+        # PX4 neither re-enters SPOT_TURN nor keeps driving straight — and
+        # never corrected back, driving the rover 62cm past the run-boundary
+        # stop point before release. Fix: scale corner_speed down as
+        # heading_err shrinks inside damp_start, so the rover is nearly
+        # stopped (not coasting at full pivot speed) by the time PX4 would
+        # switch out of SPOT_TURNING, removing the momentum that causes the
+        # overshoot in the first place.
+        self.declare_parameter("segment_pivot_damp_start_deg",         20.0)   # deg; begin damping inside this heading error
+        self.declare_parameter("segment_pivot_damp_floor_m_s",         0.03)   # m/s; floor, stays > p4_zero_vel_threshold (no freeze)
         # Final-segment (run-endpoint) goal-approach floor. A per-line PRE/AFT
         # run ends AT a corner, so the rover must arrive slow enough for active
         # braking to stop it within the corner point. The old endpoint floor was
@@ -4062,7 +4080,10 @@ class RPPControllerNode(Node):
 
         Points at the exit heading, but no more than ±75° off the current nose
         so PX4's reverse-detection never flips the turn. heading_err is the
-        wrapped (target_heading - yaw_ned).
+        wrapped (target_heading - yaw_ned). Speed is damped down as heading_err
+        shrinks inside segment_pivot_damp_start_deg so rotational momentum
+        doesn't carry the nose past the target while PX4 switches out of
+        SPOT_TURNING (see param declaration for the field evidence).
         """
         max_offset = (
             self._CORNER_MAX_BEARING_OFFSET_RAD
@@ -4077,6 +4098,13 @@ class RPPControllerNode(Node):
             max_offset,
         )
         cmd_bearing = yaw_ned + step
+        damp_start = math.radians(
+            float(self.get_parameter("segment_pivot_damp_start_deg").value)
+        )
+        if damp_start > 1e-6:
+            damp_floor = float(self.get_parameter("segment_pivot_damp_floor_m_s").value)
+            scale = self._clamp(abs(heading_err) / damp_start, 0.0, 1.0)
+            corner_speed = max(damp_floor, corner_speed * scale)
         return corner_speed * math.cos(cmd_bearing), corner_speed * math.sin(cmd_bearing)
 
     def _clamp_velocity_to_forward_cone(
