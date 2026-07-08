@@ -453,6 +453,25 @@ class RPPControllerNode(Node):
         # overshoot in the first place.
         self.declare_parameter("segment_pivot_damp_start_deg",         20.0)   # deg; begin damping inside this heading error
         self.declare_parameter("segment_pivot_damp_floor_m_s",         0.03)   # m/s; floor, stays > p4_zero_vel_threshold (no freeze)
+        # Smooth-run terminal capture radius (2026-07-08, real-hardware bag
+        # 2026-07-08_11-31-17). A smooth/pure-pursuit run that ends at a pivot
+        # boundary (e.g. the GPS-surveyed entry transit → first MARK point)
+        # captured its endpoint only when the rover physically entered the
+        # xy_goal_tolerance (2 cm) ball. But near the run end the lookahead
+        # collapses onto the goal and the command bearing sweeps through 180°
+        # as the rover skims past, while the approach speed-scaling (speed ∝
+        # dist_to_goal) then RE-ACCELERATES the rover away as that distance
+        # grows — a positive-feedback limit cycle. In the bag the rover's
+        # closest first-pass approach was 2.5 cm (missing the 2 cm ball by
+        # 5 mm), then it was flung ~1 m past the point and wandered ~46 s
+        # before a later loop happened to clip the ball. Fix: once a smooth run
+        # is within this radius of a boundary that needs a pivot, hand the
+        # final approach to the segment corner-hold (servos straight to the
+        # exact point and brakes — the same sub-2 cm capture the segment A→B
+        # legs already use), and latch _run_boundary_stop_pending so the
+        # re-accel can't run. Keep this > the flip zone (~3 cm) and small
+        # enough that corner-hold entry speed is gentle. Set 0 to disable.
+        self.declare_parameter("segment_boundary_capture_radius_m",    0.10)   # m
         # Final-segment (run-endpoint) goal-approach floor. A per-line PRE/AFT
         # run ends AT a corner, so the rover must arrive slow enough for active
         # braking to stop it within the corner point. The old endpoint floor was
@@ -3627,6 +3646,34 @@ class RPPControllerNode(Node):
         final = self._path[-1].pose.position
         dist_to_goal = self._dist(pos_n, pos_e, final.x, final.y)
         if self._run_boundary_stop_pending:
+            self._hold_before_run_advance(
+                pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
+            )
+            return
+        # ---- Smooth-run terminal capture (overshoot latch + creep clamp) ----
+        # A smooth/pure-pursuit run that ends at a pivot boundary would fly past
+        # its endpoint in a limit cycle (see segment_boundary_capture_radius_m
+        # declaration for the field evidence). Once inside the capture radius of
+        # such a boundary, arm the run-boundary stop early: _hold_before_run_
+        # advance servos to the exact point via the segment corner-hold and
+        # certifies within corner_position_tolerance_m (2 cm), and latching
+        # _run_boundary_stop_pending makes the control return here every cycle —
+        # before the Step-6 approach speed-scaling can re-accelerate the rover
+        # (the creep clamp) and before the lookahead can flip the bearing (the
+        # overshoot latch). Scoped to smooth runs so the validated segment
+        # endpoint capture (which arrives slow and on-line) is untouched, and to
+        # pivot boundaries so a collinear smooth→smooth hop is not advanced early.
+        capture_r = float(
+            self.get_parameter("segment_boundary_capture_radius_m").value
+        )
+        if (
+            capture_r > goal_tol
+            and self._active_tracking_profile != "segment"
+            and self._run_idx + 1 < len(self._runs)
+            and dist_to_goal <= capture_r
+            and self._path_travel_m >= min_travel
+            and self._next_run_requires_alignment()
+        ):
             self._hold_before_run_advance(
                 pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
             )

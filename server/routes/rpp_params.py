@@ -290,6 +290,14 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
         "min": 0.0,
         "max": 0.5,
     },
+    "segment_boundary_capture_radius_m": {
+        "type": "float",
+        "default": 0.10,
+        "group": "Tracking Profile",
+        "description": "Radius from a smooth-run pivot boundary (e.g. entry transit → first MARK point) where the final approach hands off to the segment corner-hold, giving a clean sub-2cm stop and preventing the pure-pursuit overshoot limit cycle (m). 0 disables.",
+        "min": 0.0,
+        "max": 0.5,
+    },
     "segment_endpoint_approach_speed": {
         "type": "float",
         "default": 0.03,
