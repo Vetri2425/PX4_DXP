@@ -348,9 +348,9 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "segment_entry_pivot_recenter": {
         "type": "bool",
-        "default": False,
+        "default": True,
         "group": "Tracking Profile",
-        "description": "Give the runtime-entry/run-boundary pivot the same position-recovery hold + strict position gate as the segment corner, so it caps in-turn drift (~2-3cm) instead of drifting 52-203cm off the point. Default off; enable for field validation, roll back via this param.",
+        "description": "Give the runtime-entry/run-boundary pivot the same position-recovery hold + strict position gate as the segment corner, so it caps in-turn drift (~2-3cm) instead of drifting 52-203cm off the point. Default on (production). Set false to restore legacy unbounded pivot / timeout position waive without redeploy.",
     },
     "segment_entry_true_stop_dist_m": {
         "type": "float",
@@ -360,29 +360,13 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
         "min": 0.0,
         "max": 0.5,
     },
-    "segment_entry_pure_stop_dist_m": {
+    "segment_entry_stop_speed_m_s": {
         "type": "float",
-        "default": 0.10,
+        "default": 0.03,
         "group": "Tracking Profile",
-        "description": "Distance from the runtime-entry -> MARK boundary point within which the rover commands EXACTLY zero velocity every cycle -- no brake, no position hold, no capture setpoint -- and only certifies the stop (unblocking the pivot) once measured speed stays under segment_entry_pure_stop_speed_m_s for segment_entry_pure_stop_dwell_s. 0 disables (falls back to the true-stop/capture/corner-hold branches).",
-        "min": 0.0,
-        "max": 0.5,
-    },
-    "segment_entry_pure_stop_speed_m_s": {
-        "type": "float",
-        "default": 0.005,
-        "group": "Tracking Profile",
-        "description": "Measured speed ceiling (m/s) for the runtime-entry pure zero-command stop to certify. EKF/GPS/odom noise means measured speed will essentially never read exactly 0.000, so this is a small epsilon, not zero. Raise toward 0.01 if EKF noise makes 0.005 too strict to ever settle.",
-        "min": 0.001,
-        "max": 0.05,
-    },
-    "segment_entry_pure_stop_dwell_s": {
-        "type": "float",
-        "default": 1.0,
-        "group": "Tracking Profile",
-        "description": "Continuous time (s) measured speed must stay <= segment_entry_pure_stop_speed_m_s (and position stay inside corner_position_tolerance_m) before the runtime-entry pure zero-command stop certifies and the pivot is allowed to start.",
-        "min": 0.0,
-        "max": 5.0,
+        "description": "Parked-cert speed gate (m/s) for the runtime-entry -> MARK boundary. The entry stop runs the same active-brake true-stop machinery as a smooth run boundary but certifies on THIS tighter gate instead of segment_stop_speed_threshold (0.08), which certified while the rover still crept 5-7 cm/s and the pivot walked past wp0. 0.03 = the at-rest definition, just above this rover's 0.5-2 cm/s noise floor and reachable because the rover is actively braked through it. Tighten to 0.02 if bags still show walk-past; set 0.08 to revert to the segment default.",
+        "min": 0.005,
+        "max": 0.08,
     },
     "segment_stop_speed_threshold": {
         "type": "float",

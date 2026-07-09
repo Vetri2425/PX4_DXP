@@ -234,9 +234,13 @@ def test_B_settle_ignores_position_creep(node, caps):
     which was reset every cycle when pivot creep drove pos_error > 0.02 m.
     The fix removes position_ok from the settle gate so the dwell can
     accumulate as long as heading, speed, and yaw_rate are satisfied.
+
+    Uses segment_entry_pivot_recenter=False (legacy) so timeout/legacy release
+    may still complete off-position; production default is True (see B4).
     """
     from rpp_controller_node import StopReason
 
+    node.set_parameters([Parameter("segment_entry_pivot_recenter", value=False)])
     mark_heading_ned = math.radians(2.72)
 
     node._path_cb(_runtime_entry_path(
@@ -458,9 +462,13 @@ def test_C_settle_clock_does_not_start_while_pivoting(node, caps):
 def test_C2_position_ok_false_does_not_block_settle(node, caps):
     """C2: heading in tolerance, speed/yaw_rate OK, but position_ok=False
     → settle clock MUST start (this was the bug: position_ok blocked it).
+
+    Uses segment_entry_pivot_recenter=False (legacy). With the production
+    default (True), position_ok is required for release (see B4).
     """
     from rpp_controller_node import StopReason
 
+    node.set_parameters([Parameter("segment_entry_pivot_recenter", value=False)])
     mark_heading_ned = math.radians(2.72)
 
     node._path_cb(_runtime_entry_path(
