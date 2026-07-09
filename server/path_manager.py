@@ -180,7 +180,7 @@ def read_qgc_waypoints(filepath: str) -> list[tuple[float, float]]:
         else:
             raise ValueError(f"No waypoints in {filepath}")
 
-    pts: list[tuple[float, float]] = []
+    pts: list[tuple[float, float]] = [(0.0, 0.0)]
     for lat, lon in wps:
         r = geod.Inverse(home_lat, home_lon, lat, lon)
         bearing = math.radians(r["azi1"])
