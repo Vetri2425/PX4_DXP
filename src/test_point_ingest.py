@@ -11,8 +11,11 @@ import types
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from point_ingest import (
+    GPS_SURVEYED_FRAME,
+    gps_point_mission_parse_payload,
     parse_dxf_point_entities,
     parse_point_csv_text,
+    parse_point_gps_csv_text,
     points_from_staged_dict,
     points_to_staged_dict,
 )
@@ -164,6 +167,73 @@ def test_dxf_point_entities():
     assert len(pts) == 1
     assert pts[0].dwell_s == 1.5
     assert pts[0].mark is True
+
+
+def test_gps_csv_valid_two_points():
+    csv_text = (
+        "lat,lon,dwell_s,mark\n"
+        "13.0,80.0,2.0,true\n"
+        "13.00005,80.00005,3.0,true\n"
+    )
+    parsed = parse_point_gps_csv_text(csv_text)
+    assert parsed.anchor_lat == 13.0
+    assert parsed.anchor_lon == 80.0
+    assert len(parsed.points) == 2
+    assert abs(parsed.points[0].north_m) < 1e-6
+    assert abs(parsed.points[0].east_m) < 1e-6
+    assert math.hypot(parsed.points[1].north_m, parsed.points[1].east_m) > 0.5
+
+
+def test_gps_csv_payload_uses_gps_surveyed_frame():
+    parsed = parse_point_gps_csv_text("lat,lon\n13.0,80.0\n")
+    payload = gps_point_mission_parse_payload(parsed)
+    assert payload["point_source_frame"] == GPS_SURVEYED_FRAME
+    assert payload["anchor"] == {"lat": 13.0, "lon": 80.0}
+    assert payload["num_points"] == 1
+
+
+def test_gps_csv_default_dwell_and_mark():
+    parsed = parse_point_gps_csv_text("lat,lon\n13.0,80.0\n")
+    assert parsed.points[0].dwell_s == 2.0
+    assert parsed.points[0].mark is True
+
+
+def test_gps_csv_mark_column_without_dwell():
+    parsed = parse_point_gps_csv_text("lat,lon,mark\n13.0,80.0,false\n")
+    assert parsed.points[0].mark is False
+    assert parsed.points[0].dwell_s == 2.0
+
+
+def test_gps_csv_missing_lat_lon_rejected():
+    try:
+        parse_point_gps_csv_text("lat,lon\n13.0\n")
+        assert False
+    except ValueError as exc:
+        assert "expected 2 column(s)" in str(exc)
+
+
+def test_gps_csv_invalid_lat_rejected():
+    try:
+        parse_point_gps_csv_text("lat,lon\n91.0,80.0\n")
+        assert False
+    except ValueError as exc:
+        assert "lat must be within [-90, 90]" in str(exc)
+
+
+def test_gps_csv_invalid_lon_rejected():
+    try:
+        parse_point_gps_csv_text("lat,lon\n13.0,181.0\n")
+        assert False
+    except ValueError as exc:
+        assert "lon must be within [-180, 180]" in str(exc)
+
+
+def test_gps_csv_requires_header():
+    try:
+        parse_point_gps_csv_text("13.0,80.0\n")
+        assert False
+    except ValueError as exc:
+        assert "expected lat,lon CSV header" in str(exc)
 
 
 def main():
