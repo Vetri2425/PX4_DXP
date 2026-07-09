@@ -1038,10 +1038,6 @@ def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
     # the global anchor header before the waypoint stream.
     spray_defaults = staged_spray_defaults()
     configuration_revision = next_configuration_revision()
-    path_fingerprint = path_geometry_fingerprint(
-        [(float(p[0]), float(p[1])) for p in result.get("merged_waypoints", [])],
-        [bool(f) for f in result.get("spray_flags", [])],
-    )
 
     # Spray field resolution:
     #   req.spray_mode is None  → use per-path sidecar written by /spray-mode endpoints
@@ -1128,6 +1124,20 @@ def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
         point_source_frame = GPS_SURVEYED
     elif point_rows and point_source_frame == GPS_SURVEYED and anchor is None:
         raise PlacementError("GPS_SURVEYED Point coordinates require a mission anchor")
+
+    # Point missions have no MARK line geometry (merged_waypoints/spray_flags
+    # are empty by design), so the identity fingerprint binds to the final
+    # (possibly DESIGN-aligned) point coordinates + mark flags instead.
+    if result.get("merged_waypoints"):
+        path_fingerprint = path_geometry_fingerprint(
+            [(float(p[0]), float(p[1])) for p in result.get("merged_waypoints", [])],
+            [bool(f) for f in result.get("spray_flags", [])],
+        )
+    else:
+        path_fingerprint = path_geometry_fingerprint(
+            [(float(row["north_m"]), float(row["east_m"])) for row in point_rows],
+            [bool(row.get("mark", True)) for row in point_rows],
+        )
 
     staged_payload = {
         "anchor": anchor,
@@ -1627,41 +1637,76 @@ async def plan_and_stage(name: str, req: PathPlanRequest):
     ref_points_dxf = [(pt.dxf_y, pt.dxf_x) for pt in req.ref_points] if req.ref_points is not None else None
     ref_points_gps = [(pt.lat, pt.lon) for pt in req.ref_points] if req.ref_points is not None else None
 
-    try:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(
-                path_mgr.plan_path,
-                safe,
-                summary_only=False,
-                line_spacing=req.line_spacing,
-                transit_spacing=req.transit_spacing,
-                marking_speed=req.marking_speed,
-                transit_speed=req.transit_speed,
-                layer_mapping=req.layer_mapping,
-                optimize=req.optimize,
-                compensate_spray=req.compensate_spray,
-                corner_smooth_radius_m=req.corner_smooth_radius_m,
-                corner_smooth_arc_pts=req.corner_smooth_arc_pts,
-                use_two_opt=req.use_two_opt,
-                max_two_opt_segments=req.max_two_opt_segments,
-                max_waypoints=req.max_waypoints,
-                max_segments=req.max_segments,
-                origin=origin,
-                start_position=start_position,
-                origin_gps=origin_gps,
-                rotation_deg=req.rotation_deg,
-                ref_points_dxf=ref_points_dxf,
-                ref_points_gps=ref_points_gps,
-                close_loop=req.close_loop,
-            ),
-            timeout=15.0,
-        )
-    except FileNotFoundError as exc:
-        raise HTTPException(404, str(exc))
-    except asyncio.TimeoutError:
-        raise HTTPException(504, "Planning timed out (15s limit)")
-    except Exception as exc:
-        raise HTTPException(422, f"Planning error: {exc}")
+    # Point missions carry their waypoints directly in point_mission_points —
+    # there is no file-based line geometry to plan. path_mgr.plan_path() reads
+    # whatever was persisted under `name` and parses it as NED/DXF line
+    # geometry; for a point CSV that raises (wrong column count / non-numeric
+    # header row) before this handler ever looks at point_mission_points. Skip
+    # planning entirely for this case instead of routing it through the
+    # file-geometry engine.
+    is_point_mission = bool(
+        req.point_mission_points
+        and req.point_source_frame == GPS_SURVEYED
+        and req.origin_gps
+    )
+
+    if is_point_mission:
+        result = {
+            "source": safe,
+            "num_waypoints": len(req.point_mission_points),
+            "num_segments": 0,
+            "mark_length_m": 0.0,
+            "transit_length_m": 0.0,
+            "total_length_m": 0.0,
+            "segments": [],
+            "merged_waypoints": [],
+            "spray_flags": [],
+            "alignment_metadata": {
+                "method": "gps_origin",
+                "origin_gps": list(req.origin_gps),
+                "rotation_deg": req.rotation_deg,
+                "scale": 1.0,
+                "rmse": 0.0,
+            },
+            "planning_metadata": {},
+            "warnings": [],
+        }
+    else:
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    path_mgr.plan_path,
+                    safe,
+                    summary_only=False,
+                    line_spacing=req.line_spacing,
+                    transit_spacing=req.transit_spacing,
+                    marking_speed=req.marking_speed,
+                    transit_speed=req.transit_speed,
+                    layer_mapping=req.layer_mapping,
+                    optimize=req.optimize,
+                    compensate_spray=req.compensate_spray,
+                    corner_smooth_radius_m=req.corner_smooth_radius_m,
+                    corner_smooth_arc_pts=req.corner_smooth_arc_pts,
+                    use_two_opt=req.use_two_opt,
+                    max_two_opt_segments=req.max_two_opt_segments,
+                    max_waypoints=req.max_waypoints,
+                    max_segments=req.max_segments,
+                    origin=origin,
+                    start_position=start_position,
+                    origin_gps=origin_gps,
+                    rotation_deg=req.rotation_deg,
+                    ref_points_dxf=ref_points_dxf,
+                    ref_points_gps=ref_points_gps,
+                    close_loop=req.close_loop,
+                ),
+                timeout=15.0,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc))
+        except asyncio.TimeoutError:
+            raise HTTPException(504, "Planning timed out (15s limit)")
+        except Exception as exc:
+            raise HTTPException(422, f"Planning error: {exc}")
 
     alignment_meta = result.get("alignment_metadata") or {}
     rmse = alignment_meta.get("rmse", 0.0)
@@ -1676,34 +1721,9 @@ async def plan_and_stage(name: str, req: PathPlanRequest):
     mission_summary = None
     if result.get("merged_waypoints"):
         mission_summary = _stage_mission(req, result, alignment_meta, rmse)
-    elif (
-        req.point_mission_points
-        and req.point_source_frame == GPS_SURVEYED
-        and req.origin_gps
-    ):
-        point_alignment = dict(alignment_meta)
-        if not point_alignment.get("origin_gps"):
-            point_alignment = {
-                **point_alignment,
-                "method": "gps_origin",
-                "origin_gps": list(req.origin_gps),
-                "rotation_deg": req.rotation_deg,
-                "scale": 1.0,
-                "rmse": 0.0,
-            }
-        synthetic_result = {
-            "source": result["source"],
-            "merged_waypoints": [],
-            "spray_flags": [],
-            "num_waypoints": len(req.point_mission_points),
-            "mark_length_m": 0.0,
-            "transit_length_m": 0.0,
-            "total_length_m": 0.0,
-        }
+    elif is_point_mission:
         try:
-            mission_summary = _stage_mission(
-                req, synthetic_result, point_alignment, 0.0,
-            )
+            mission_summary = _stage_mission(req, result, alignment_meta, rmse)
         except PlacementError as exc:
             raise HTTPException(422, str(exc)) from exc
 
