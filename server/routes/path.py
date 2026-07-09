@@ -9,6 +9,8 @@ POST   /api/path/{name}/extensions — save DXF extension config
 POST   /api/path/upload        — upload .waypoints, .csv, or .dxf
 POST   /api/path/publish       — publish named path to /path topic
 POST   /api/path/parse-dxf     — parse DXF file, return entity list
+POST   /api/path/parse-point-csv     — parse north,east point-mission CSV
+POST   /api/path/parse-point-gps-csv — parse lat,lon point-mission CSV
 POST   /api/path/plan          — run full planning pipeline, return PlannedPath
 POST   /api/path/{name}/align          — alignment only (coords + residuals)
 GET    /api/path/{name}/segments       — verification segments (MARK/TRANSIT/ext)
@@ -685,6 +687,33 @@ async def parse_point_csv(file: UploadFile = File(...)):
     }
 
 
+@path_router.post("/parse-point-gps-csv")
+async def parse_point_gps_csv(file: UploadFile = File(...)):
+    """Parse a GPS point-mission CSV (lat,lon[,dwell_s][,mark]) into staged-ready points."""
+    import sys
+    from pathlib import Path as FsPath
+
+    src = FsPath(__file__).resolve().parents[2] / "src"
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    from point_ingest import gps_point_mission_parse_payload, parse_point_gps_csv_text
+    from spray_config import staged_spray_defaults
+
+    content = (await file.read()).decode("utf-8", errors="replace")
+    defaults = staged_spray_defaults()
+    try:
+        parsed = parse_point_gps_csv_text(
+            content,
+            default_dwell_s=float(defaults["point_default_dwell_s"]),
+            max_dwell_s=float(defaults["point_max_dwell_s"]),
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    except ImportError as exc:
+        raise HTTPException(500, str(exc))
+    return gps_point_mission_parse_payload(parsed)
+
+
 # ── Upload ────────────────────────────────────────────────────────────────────
 
 @path_router.post("/upload")
@@ -986,6 +1015,16 @@ def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
     # Gap E: definitive global anchor header for the controller / microcontroller.
     anchor = None
     origin_gps = alignment_meta.get("origin_gps")
+    if origin_gps is None and req.origin_gps is not None:
+        origin_gps = tuple(req.origin_gps)
+        alignment_meta = {
+            **alignment_meta,
+            "origin_gps": list(origin_gps),
+            "method": alignment_meta.get("method") or "gps_origin",
+            "rotation_deg": alignment_meta.get("rotation_deg", req.rotation_deg),
+            "scale": alignment_meta.get("scale", 1.0),
+            "rmse": alignment_meta.get("rmse", 0.0),
+        }
     if origin_gps:
         anchor = {
             "frame": "local_ned",
@@ -1637,6 +1676,36 @@ async def plan_and_stage(name: str, req: PathPlanRequest):
     mission_summary = None
     if result.get("merged_waypoints"):
         mission_summary = _stage_mission(req, result, alignment_meta, rmse)
+    elif (
+        req.point_mission_points
+        and req.point_source_frame == GPS_SURVEYED
+        and req.origin_gps
+    ):
+        point_alignment = dict(alignment_meta)
+        if not point_alignment.get("origin_gps"):
+            point_alignment = {
+                **point_alignment,
+                "method": "gps_origin",
+                "origin_gps": list(req.origin_gps),
+                "rotation_deg": req.rotation_deg,
+                "scale": 1.0,
+                "rmse": 0.0,
+            }
+        synthetic_result = {
+            "source": result["source"],
+            "merged_waypoints": [],
+            "spray_flags": [],
+            "num_waypoints": len(req.point_mission_points),
+            "mark_length_m": 0.0,
+            "transit_length_m": 0.0,
+            "total_length_m": 0.0,
+        }
+        try:
+            mission_summary = _stage_mission(
+                req, synthetic_result, point_alignment, 0.0,
+            )
+        except PlacementError as exc:
+            raise HTTPException(422, str(exc)) from exc
 
     # Parity with /api/path/plan: the extension trio is sidecar-driven now.
     warnings = list(result.get("warnings") or [])

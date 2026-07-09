@@ -13,6 +13,15 @@ _CSV_HEADER_SCHEMAS: dict[tuple[str, ...], tuple[str, ...]] = {
     ("north", "east", "dwell_s", "mark"): ("north", "east", "dwell_s", "mark"),
 }
 
+_GPS_CSV_HEADER_SCHEMAS: dict[tuple[str, ...], tuple[str, ...]] = {
+    ("lat", "lon"): ("lat", "lon"),
+    ("lat", "lon", "dwell_s"): ("lat", "lon", "dwell_s"),
+    ("lat", "lon", "mark"): ("lat", "lon", "mark"),
+    ("lat", "lon", "dwell_s", "mark"): ("lat", "lon", "dwell_s", "mark"),
+}
+
+GPS_SURVEYED_FRAME = "GPS_SURVEYED"
+
 
 @dataclass(frozen=True)
 class SprayPoint:
@@ -23,6 +32,13 @@ class SprayPoint:
     mark: bool = True
 
 
+@dataclass(frozen=True)
+class GpsPointMissionParseResult:
+    anchor_lat: float
+    anchor_lon: float
+    points: list[SprayPoint]
+
+
 def _finite_coord(name: str, value: Any) -> float:
     try:
         num = float(value)
@@ -31,6 +47,37 @@ def _finite_coord(name: str, value: Any) -> float:
     if not math.isfinite(num):
         raise ValueError(f"{name} must be finite")
     return num
+
+
+def _finite_lat(name: str, value: Any) -> float:
+    lat = _finite_coord(name, value)
+    if not -90.0 <= lat <= 90.0:
+        raise ValueError(f"{name} must be within [-90, 90]")
+    return lat
+
+
+def _finite_lon(name: str, value: Any) -> float:
+    lon = _finite_coord(name, value)
+    if not -180.0 <= lon <= 180.0:
+        raise ValueError(f"{name} must be within [-180, 180]")
+    return lon
+
+
+def _latlon_to_ned(
+    lat: float,
+    lon: float,
+    anchor_lat: float,
+    anchor_lon: float,
+) -> tuple[float, float]:
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from path_engine.ned import latlon_to_ned
+
+    return latlon_to_ned(lat, lon, anchor_lat, anchor_lon)
 
 
 def _normalize_header_cell(cell: str) -> str:
@@ -67,6 +114,18 @@ def _resolve_header(row: list[str], line_no: int) -> tuple[str, ...] | None:
         raise ValueError(
             f"line {line_no}: unknown CSV header columns {', '.join(cells)}; "
             "expected north,east[,dwell_s[,mark]]"
+        )
+    return cells
+
+
+def _resolve_gps_header(row: list[str], line_no: int) -> tuple[str, ...] | None:
+    cells = tuple(_normalize_header_cell(cell) for cell in row)
+    if cells[0] != "lat" or cells[1] != "lon":
+        return None
+    if cells not in _GPS_CSV_HEADER_SCHEMAS:
+        raise ValueError(
+            f"line {line_no}: unknown CSV header columns {', '.join(cells)}; "
+            "expected lat,lon[,dwell_s][,mark]"
         )
     return cells
 
@@ -151,6 +210,171 @@ def _parse_csv_row(
         source_index=line_no,
         mark=mark,
     )
+
+
+@dataclass(frozen=True)
+class _GpsCsvRow:
+    lat: float
+    lon: float
+    dwell_s: float | None
+    mark: bool
+    source_index: int
+
+
+def _parse_gps_csv_row(
+    row: list[str],
+    line_no: int,
+    *,
+    columns: tuple[str, ...],
+) -> _GpsCsvRow:
+    if not row or row[0].strip().startswith("#"):
+        raise ValueError("empty row")
+    if len(row) < len(columns):
+        raise ValueError(
+            f"line {line_no}: expected {len(columns)} column(s) "
+            f"({', '.join(columns)}), got {len(row)}"
+        )
+    if len(row) > len(columns):
+        raise ValueError(
+            f"line {line_no}: unknown extra column(s); expected {', '.join(columns)}"
+        )
+
+    lat = _finite_lat("lat", row[0].strip())
+    lon = _finite_lon("lon", row[1].strip())
+    dwell: float | None = None
+    mark = True
+
+    if "dwell_s" in columns:
+        dwell_text = row[columns.index("dwell_s")].strip()
+        if dwell_text:
+            dwell = _finite_coord("dwell_s", dwell_text)
+            if dwell < 0.0:
+                raise ValueError(f"line {line_no}: dwell_s must be >= 0")
+    if "mark" in columns:
+        mark = _parse_mark(row[columns.index("mark")], line_no)
+
+    return _GpsCsvRow(
+        lat=lat,
+        lon=lon,
+        dwell_s=dwell,
+        mark=mark,
+        source_index=line_no,
+    )
+
+
+def _gps_rows_to_spray_points(
+    rows: list[_GpsCsvRow],
+    *,
+    default_dwell_s: float,
+    max_dwell_s: float,
+    duplicate_tolerance_m: float,
+) -> GpsPointMissionParseResult:
+    if not rows:
+        raise ValueError("point mission must contain at least one point")
+
+    anchor_lat = rows[0].lat
+    anchor_lon = rows[0].lon
+    points: list[SprayPoint] = []
+    for row in rows:
+        north_m, east_m = _latlon_to_ned(row.lat, row.lon, anchor_lat, anchor_lon)
+        points.append(
+            SprayPoint(
+                north_m=north_m,
+                east_m=east_m,
+                dwell_s=row.dwell_s,
+                source_index=row.source_index,
+                mark=row.mark,
+            )
+        )
+
+    return GpsPointMissionParseResult(
+        anchor_lat=anchor_lat,
+        anchor_lon=anchor_lon,
+        points=_finalize_points(
+            points,
+            default_dwell_s=default_dwell_s,
+            max_dwell_s=max_dwell_s,
+            duplicate_tolerance_m=duplicate_tolerance_m,
+        ),
+    )
+
+
+def parse_point_gps_csv_text(
+    text: str,
+    *,
+    default_dwell_s: float = 2.0,
+    max_dwell_s: float = 60.0,
+    duplicate_tolerance_m: float = 1e-3,
+) -> GpsPointMissionParseResult:
+    """Parse CSV rows with header: lat,lon[,dwell_s][,mark].
+
+    The first data row defines the GPS survey anchor. Every row, including the
+    anchor row, is converted to anchor-relative NED metres via Karney geodesic.
+    """
+    if default_dwell_s <= 0.0 or not math.isfinite(default_dwell_s):
+        raise ValueError("default_dwell_s must be finite and > 0")
+    if max_dwell_s <= 0.0 or not math.isfinite(max_dwell_s):
+        raise ValueError("max_dwell_s must be finite and > 0")
+
+    rows = list(csv.reader(text.splitlines()))
+    data_rows: list[tuple[int, list[str]]] = []
+    columns: tuple[str, ...] | None = None
+
+    for line_no, row in enumerate(rows, 1):
+        if not row or row[0].strip().startswith("#"):
+            continue
+        if columns is None:
+            header = _resolve_gps_header(row, line_no)
+            if header is None:
+                raise ValueError(
+                    f"line {line_no}: expected lat,lon CSV header "
+                    "(lat,lon[,dwell_s][,mark])"
+                )
+            columns = header
+            continue
+        data_rows.append((line_no, row))
+
+    if columns is None:
+        raise ValueError("point mission must contain at least one point")
+
+    gps_rows: list[_GpsCsvRow] = []
+    for line_no, row in data_rows:
+        try:
+            gps_rows.append(_parse_gps_csv_row(row, line_no, columns=columns))
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+
+    return _gps_rows_to_spray_points(
+        gps_rows,
+        default_dwell_s=default_dwell_s,
+        max_dwell_s=max_dwell_s,
+        duplicate_tolerance_m=duplicate_tolerance_m,
+    )
+
+
+def parse_point_gps_csv_file(
+    filepath: str,
+    *,
+    default_dwell_s: float = 2.0,
+    max_dwell_s: float = 60.0,
+    duplicate_tolerance_m: float = 1e-3,
+) -> GpsPointMissionParseResult:
+    with open(filepath, "r", encoding="utf-8", errors="replace") as handle:
+        return parse_point_gps_csv_text(
+            handle.read(),
+            default_dwell_s=default_dwell_s,
+            max_dwell_s=max_dwell_s,
+            duplicate_tolerance_m=duplicate_tolerance_m,
+        )
+
+
+def gps_point_mission_parse_payload(result: GpsPointMissionParseResult) -> dict[str, Any]:
+    return {
+        "num_points": len(result.points),
+        "anchor": {"lat": result.anchor_lat, "lon": result.anchor_lon},
+        "point_source_frame": GPS_SURVEYED_FRAME,
+        "point_mission_points": points_to_staged_dict(result.points),
+    }
 
 
 def parse_point_csv_text(
