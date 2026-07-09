@@ -565,6 +565,18 @@ class RPPControllerNode(Node):
         # (legacy behaviour below) until field-validated on the arbitrary-heading
         # entry arrival; roll back via this param, no redeploy.
         self.declare_parameter("segment_entry_pivot_recenter",         False)
+        # Runtime-entry / smooth run-boundary TRUE-STOP window (m). Inside this
+        # distance of the stop point the terminal approach brakes STRAIGHT along
+        # the body axis (_corner_brake_velocity) to physically halt on the point
+        # -- the segment _publish_zero parity -- instead of holding a live
+        # capture setpoint (_smooth_capture_velocity, 0.03-0.08 toward the goal),
+        # which on the coasting rover (PX4 drives, does not brake) drove it ~1.1m
+        # PAST the point before looping back (bag 13-07-59). Body-axis brake only,
+        # so no off-nose bearing to arc on. Once slow inside the window it hands
+        # to a low-capped corner-hold to servo the final cm. Applies to smooth
+        # runs only (segment corners already have their own zero-stop). 0 disables
+        # (reverts to pure capture). Keep >= corner_position_tolerance_m.
+        self.declare_parameter("segment_entry_true_stop_dist_m",       0.10)   # m
         # NOTE (2026-07-07): the runtime-entry OFF->MARK pivot was previously
         # special-cased with a slow speed (0.05 m/s), a tight ±20° cone, and a
         # 1 cm position-recovery servo. Field bags 15-09 (233 s oscillating
@@ -1796,7 +1808,36 @@ class RPPControllerNode(Node):
         handoff_r = float(
             self.get_parameter("segment_boundary_corner_handoff_m").value
         )
-        if self._active_tracking_profile != "segment" and pos_error > handoff_r:
+        true_stop_dist = float(
+            self.get_parameter("segment_entry_true_stop_dist_m").value
+        )
+        stop_speed = float(
+            self.get_parameter("segment_stop_speed_threshold").value
+        )
+        meas_speed = (
+            math.hypot(*self._latest_vel_ned) if self._vel_is_fresh() else 0.0
+        )
+        if (
+            self._active_tracking_profile != "segment"
+            and true_stop_dist > 0.0
+            and pos_error <= true_stop_dist
+        ):
+            # True-stop gate (segment _publish_zero parity). Inside the stop
+            # window: while still coasting, brake STRAIGHT along the body axis to
+            # physically halt on the point instead of driving past it with a live
+            # capture setpoint (bag 13-07-59 coasted 1.1 m past). _corner_brake_
+            # velocity is longitudinal only -> no off-nose bearing to arc on. Once
+            # slow, hand to a low-capped corner-hold to servo the final cm.
+            if meas_speed > stop_speed:
+                brake_n, brake_e = self._corner_brake_velocity(yaw_ned)
+            else:
+                brake_n, brake_e = self._corner_hold_velocity(
+                    pos_n, pos_e, stop_pt.x, stop_pt.y,
+                    stop_pt.x - prev_pt.x, stop_pt.y - prev_pt.y,
+                    yaw_ned,
+                    max_speed_cap=stop_speed,
+                )
+        elif self._active_tracking_profile != "segment" and pos_error > handoff_r:
             # Smooth-run terminal approach: hold a fixed bearing straight at the
             # stop point at a low decel speed so PX4 tracks it down (see
             # _smooth_capture_velocity). The segment corner-hold's tangent-frame

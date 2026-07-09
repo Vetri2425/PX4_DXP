@@ -352,6 +352,14 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
         "group": "Tracking Profile",
         "description": "Give the runtime-entry/run-boundary pivot the same position-recovery hold + strict position gate as the segment corner, so it caps in-turn drift (~2-3cm) instead of drifting 52-203cm off the point. Default off; enable for field validation, roll back via this param.",
     },
+    "segment_entry_true_stop_dist_m": {
+        "type": "float",
+        "default": 0.10,
+        "group": "Tracking Profile",
+        "description": "Distance from a smooth run-boundary stop point within which the terminal approach brakes straight to a true stop (segment _publish_zero parity) instead of holding a capture setpoint that drives the coasting rover past the point. 0 disables (pure capture). Keep >= corner_position_tolerance_m.",
+        "min": 0.0,
+        "max": 0.5,
+    },
     "segment_stop_speed_threshold": {
         "type": "float",
         "default": 0.08,
