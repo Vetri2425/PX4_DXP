@@ -304,6 +304,90 @@ def test_B_settle_ignores_position_creep(node, caps):
           f"(released after {iters} iters / {elapsed*1000:.0f} ms)")
 
 
+def test_B4_gate_on_blocks_off_position_release(node, caps):
+    """B4 (gate ON): with segment_entry_pivot_recenter=True the run-boundary
+    pivot must NOT certify while position_ok is False, even with heading/speed/
+    yaw_rate OK — segment CORNER_ALIGN parity, the inverse of legacy test_B.
+    Guards the observed 52 cm off-point certification."""
+    from rpp_controller_node import StopReason
+
+    node.set_parameters([Parameter("segment_entry_pivot_recenter", value=True)])
+    mark_heading_ned = math.radians(2.72)
+    node._path_cb(_runtime_entry_path(
+        -0.5, 0.0, 0.0, 0.0,
+        2.0 * math.cos(mark_heading_ned), 2.0 * math.sin(mark_heading_ned),
+    ))
+    boundary = node._runs[0]["poses"][-1].pose.position
+    boundary_seg_idx = max(0, len(node._runs[0]["poses"]) - 2)
+    node._make_stop_certificate(
+        StopReason.RUNTIME_ENTRY_TO_MARK, boundary.x, boundary.y,
+        0.005, 0.0, segment_idx=boundary_seg_idx,
+    )
+    assert node._advance_run(pre_stopped=True)
+    assert node._corner_stop_complete is True
+
+    drift_n, drift_e = 0.03, 0.04    # ~5 cm → position_ok False
+    node._latest_vel_time = node.get_clock().now()
+    node._latest_vel_ned = (0.005, 0.003)
+    node._latest_yaw_rate_ned = 0.02
+    aligned_yaw_ned = mark_heading_ned    # heading OK; position NOT ok
+
+    released = False
+    for _ in range(40):
+        held = node._run_alignment_hold(drift_n, drift_e, aligned_yaw_ned, 0.0)
+        if not held:
+            released = True
+            break
+        time.sleep(0.005)
+    assert not released, (
+        "gate-on: must NOT certify while position_ok=False (5 cm drift); the "
+        "strict position gate (segment parity) was bypassed"
+    )
+    assert node._run_align_pending is True, "must remain in pivot/hold"
+    print("PASS B4: gate-on blocks off-position release")
+
+
+def test_B5_gate_on_recenter_drives_toward_point(node, caps):
+    """B5 (gate ON): heading still misaligned + drifted off point → the
+    position-recovery hold fires, driving _corner_hold_velocity back toward the
+    boundary (capping in-turn drift) and NOT certifying."""
+    from rpp_controller_node import StopReason
+
+    node.set_parameters([Parameter("segment_entry_pivot_recenter", value=True)])
+    mark_heading_ned = math.radians(2.72)
+    node._path_cb(_runtime_entry_path(
+        -0.5, 0.0, 0.0, 0.0,
+        2.0 * math.cos(mark_heading_ned), 2.0 * math.sin(mark_heading_ned),
+    ))
+    boundary = node._runs[0]["poses"][-1].pose.position
+    boundary_seg_idx = max(0, len(node._runs[0]["poses"]) - 2)
+    node._make_stop_certificate(
+        StopReason.RUNTIME_ENTRY_TO_MARK, boundary.x, boundary.y,
+        0.005, 0.0, segment_idx=boundary_seg_idx,
+    )
+    assert node._advance_run(pre_stopped=True)
+
+    drift_n, drift_e = 0.07, 0.07    # ~10 cm off the boundary (0,0)
+    node._latest_vel_time = node.get_clock().now()
+    node._latest_vel_ned = (0.0, 0.0)
+    node._latest_yaw_rate_ned = 0.0
+    misaligned_yaw = mark_heading_ned - math.radians(90.0)   # heading NOT ok
+
+    caps["vel"].clear()
+    held = node._run_alignment_hold(drift_n, drift_e, misaligned_yaw, 0.0)
+    assert held is True, "must hold (not certify) while heading is off"
+    v = caps["vel"].last
+    assert v is not None, "recenter must publish a velocity toward the point"
+    # Boundary at (0,0), rover at (drift_n, drift_e): recenter must have a
+    # positive component toward the point (a - pos).
+    dot = v.vector.x * (-drift_n) + v.vector.y * (-drift_e)
+    assert dot > 0.0, (
+        f"recenter velocity must drive toward the boundary point; "
+        f"dot={dot:.4f}, v=({v.vector.x:.3f},{v.vector.y:.3f})"
+    )
+    print("PASS B5: recenter drives toward point when heading off")
+
+
 # ---------------------------------------------------------------------------
 # Test C — heading out of tolerance: settle clock must NOT start
 # ---------------------------------------------------------------------------
@@ -533,6 +617,8 @@ def main():
         for test_fn, label in [
             (test_A_pivot_velocity_nonzero_and_in_cone, "A"),
             (test_B_settle_ignores_position_creep, "B"),
+            (test_B4_gate_on_blocks_off_position_release, "B4"),
+            (test_B5_gate_on_recenter_drives_toward_point, "B5"),
             (test_C_settle_clock_does_not_start_while_pivoting, "C"),
             (test_C2_position_ok_false_does_not_block_settle, "C2"),
             (test_E_stop_certificate_unaffected, "E"),

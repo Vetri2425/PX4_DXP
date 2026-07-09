@@ -551,6 +551,20 @@ class RPPControllerNode(Node):
         # residual error into forward TRACK acceleration. Tightened to 3° for
         # precision (per-line extension) missions where MARK entry must be <2 cm.
         self.declare_parameter("segment_pivot_release_max_deg",        3.0)    # deg
+        # Runtime-entry / run-boundary pivot parity with the segment corner.
+        # When true, _run_alignment_hold matches _control_segment_profile
+        # CORNER_ALIGN: (a) it runs the position-recovery hold DURING the pivot
+        # (`not position_ok` -> _corner_hold_velocity), which caps in-turn drift
+        # continuously (~2-3cm, as on segment corners) instead of letting it
+        # accrue to 52-203cm; and (b) it requires strict position_ok to certify
+        # (drops the `or timed_out` escape that certified the entry off-point).
+        # Because the recovery caps drift, the strict gate converges the same way
+        # the segment does — no deadlock, nothing to "recover from". Runs on the
+        # ±75° forward cone the entry already uses (NOT the abandoned ±20° cone +
+        # 0.05 m/s variant that oscillated, bags 15-09/15-19). Default false
+        # (legacy behaviour below) until field-validated on the arbitrary-heading
+        # entry arrival; roll back via this param, no redeploy.
+        self.declare_parameter("segment_entry_pivot_recenter",         False)
         # NOTE (2026-07-07): the runtime-entry OFF->MARK pivot was previously
         # special-cased with a slow speed (0.05 m/s), a tight ±20° cone, and a
         # 1 cm position-recovery servo. Field bags 15-09 (233 s oscillating
@@ -2011,7 +2025,14 @@ class RPPControllerNode(Node):
         # still 5-24cm off. Bounded by the same angle-aware pivot watchdog
         # used for heading (timed_out) so a recenter that can't fully converge
         # (gain/EKF noise floor) doesn't deadlock the mission in the field.
-        position_release_ok = position_ok or timed_out
+        recenter_on = bool(
+            self.get_parameter("segment_entry_pivot_recenter").value
+        )
+        # With the recenter active, in-turn drift is capped, so certify only on
+        # strict position_ok (segment CORNER_ALIGN semantics). The `or timed_out`
+        # escape — which let the entry certify 52cm off the point — applies only
+        # to the legacy no-recenter path.
+        position_release_ok = position_ok or (timed_out and not recenter_on)
         if (
             self._corner_stop_complete
             and stop_cert_ok
@@ -2092,11 +2113,49 @@ class RPPControllerNode(Node):
             )
             return True
 
-        # (Position-recovery hold intentionally omitted for run-boundary pivots.
-        # During the velocity-vector pivot, commanding _corner_hold_velocity()
-        # opposes the pivot bearing and causes heading oscillation.  Any residual
-        # position offset after the pivot is corrected by RPP lookahead once
-        # normal tracking of the new run begins.  See settle gate comment above.)
+        # Position-recovery hold DURING the pivot (segment CORNER_ALIGN parity;
+        # gated by segment_entry_pivot_recenter, default false). Reachable only
+        # while heading is NOT yet in the release band — the heading_ok settle
+        # branch above returns first, so this cannot fire once aligned (the
+        # ordering that avoids the pivot-vs-recenter oscillation). When the
+        # velocity-vector pivot has drifted the rover off the boundary point,
+        # drive _corner_hold_velocity toward the point instead of the pivot; this
+        # caps in-turn drift continuously the way segment corners stay ~2-3cm, so
+        # the strict position gate converges. Legacy behaviour (param off): no
+        # recovery — residual left for RPP lookahead once tracking resumes, which
+        # the bags show is far too large (52-203cm) on runtime-entry pivots.
+        if recenter_on and self._corner_stop_complete and not position_ok:
+            self._last_speed_cmd = 0.0
+            hold_n, hold_e = self._corner_hold_velocity(
+                pos_n, pos_e, a.x, a.y, b.x - a.x, b.y - a.y, yaw_ned
+            )
+            self._publish_velocity(hold_n, hold_e)
+            self._publish_yaw_rate(0.0)
+            self._publish_debug(
+                cross_track=0.0,
+                heading_err=heading_err,
+                lookahead=float("nan"),
+                speed=math.hypot(hold_n, hold_e),
+                kappa=0.0,
+                dist_goal=dist_to_goal,
+                pose_age_ms=pose_age_s * 1000.0,
+                state=StateCode.TRACKING,
+                l_d_raw=float("nan"),
+                kappa_speed=0.0,
+                yaw_rate=0.0,
+                spray_active=False,
+            )
+            self._publish_segment_debug(
+                SegmentStateCode.CORNER_ALIGN, 0, float("nan"), float("nan"),
+                float("nan"), target_heading, heading_err, 0.0,
+            )
+            self._publish_stop_debug(
+                StopDebugPhase.ALIGNING, stop_reason, a.x, a.y,
+                pos_error, heading_err,
+                self._certificate_dwell_s(self._align_settle_since, None),
+                transition_code=1.0,
+            )
+            return True
 
         # Stop-and-spin: hold zero velocity at the corner until the rover is
         # physically stopped (approach momentum gone), THEN pivot. Without

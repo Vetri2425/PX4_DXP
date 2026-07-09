@@ -346,6 +346,12 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
         "min": 0.1,
         "max": 45.0,
     },
+    "segment_entry_pivot_recenter": {
+        "type": "bool",
+        "default": False,
+        "group": "Tracking Profile",
+        "description": "Give the runtime-entry/run-boundary pivot the same position-recovery hold + strict position gate as the segment corner, so it caps in-turn drift (~2-3cm) instead of drifting 52-203cm off the point. Default off; enable for field validation, roll back via this param.",
+    },
     "segment_stop_speed_threshold": {
         "type": "float",
         "default": 0.08,
