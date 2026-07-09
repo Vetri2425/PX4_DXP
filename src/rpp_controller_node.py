@@ -1831,11 +1831,18 @@ class RPPControllerNode(Node):
             if meas_speed > stop_speed:
                 brake_n, brake_e = self._corner_brake_velocity(yaw_ned)
             else:
+                # Cap strictly below the certification threshold itself, else
+                # the hold is permitted to certify STOP_CERTIFIED while still
+                # driving at up to stop_speed -- that ~0.07 m/s residual then
+                # flips position_ok false on ALIGN's first tick and diverts
+                # into the unclamped recenter servo (bag 13-37-30, 72-78cm
+                # excursion). Halving it lets the hold actually decay toward
+                # rest before certifying.
                 brake_n, brake_e = self._corner_hold_velocity(
                     pos_n, pos_e, stop_pt.x, stop_pt.y,
                     stop_pt.x - prev_pt.x, stop_pt.y - prev_pt.y,
                     yaw_ned,
-                    max_speed_cap=stop_speed,
+                    max_speed_cap=stop_speed * 0.5,
                 )
         elif self._active_tracking_profile != "segment" and pos_error > handoff_r:
             # Smooth-run terminal approach: hold a fixed bearing straight at the
