@@ -4527,7 +4527,13 @@ class RPPControllerNode(Node):
             scale = cap / speed
             v_n *= scale
             v_e *= scale
-        return (v_n, v_e)
+        final_speed = min(speed, cap)
+        # Unlike _smooth_capture_velocity, this along/cross servo was never
+        # cone-clamped -- when heading error is large (runtime entry) it can
+        # command a bearing far off the nose, and the rover coasts straight
+        # along its stale heading instead of correcting (field: 83cm/35s
+        # entry-ALIGN excursion, bag 2026-07-09_14-47-11).
+        return self._clamp_velocity_to_forward_cone(v_n, v_e, yaw_ned, final_speed)
 
     def _align_speed_ok(self) -> bool:
         """Require fresh velocity and low linear speed for alignment release."""
