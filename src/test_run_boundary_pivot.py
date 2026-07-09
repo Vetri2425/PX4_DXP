@@ -385,7 +385,16 @@ def test_B5_gate_on_recenter_drives_toward_point(node, caps):
         f"recenter velocity must drive toward the boundary point; "
         f"dot={dot:.4f}, v=({v.vector.x:.3f},{v.vector.y:.3f})"
     )
-    print("PASS B5: recenter drives toward point when heading off")
+    # Speed cap: at ~10cm drift the raw servo (~1.5*0.10=0.15 m/s) would exceed
+    # the pivot speed; the entry recenter must clamp it to segment_min_corner_
+    # speed (~0.08), NOT the 0.18 brake cap that flung the rover in bag 12-35-10.
+    cap = float(node.get_parameter("segment_min_corner_speed").value)
+    speed = math.hypot(v.vector.x, v.vector.y)
+    assert speed <= cap + 1e-6, (
+        f"entry recenter speed {speed:.3f} m/s must be capped at pivot speed "
+        f"{cap:.3f} m/s (not the 0.18 brake cap)"
+    )
+    print(f"PASS B5: recenter drives toward point (capped {speed:.3f}<= {cap:.3f})")
 
 
 # ---------------------------------------------------------------------------

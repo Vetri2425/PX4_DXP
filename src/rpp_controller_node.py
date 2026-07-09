@@ -2126,8 +2126,17 @@ class RPPControllerNode(Node):
         # the bags show is far too large (52-203cm) on runtime-entry pivots.
         if recenter_on and self._corner_stop_complete and not position_ok:
             self._last_speed_cmd = 0.0
+            # Cap the recenter at the pivot speed (segment_min_corner_speed,
+            # ~0.08) rather than the 0.18 brake cap: at an O(90deg) entry-arrival
+            # heading error the hold vector points far off the nose, so the
+            # differential firmware turn-and-drives it — a lower cap keeps that
+            # arc gentle instead of flinging the rover ~0.84m off (bag 12-35-10).
+            entry_recenter_cap = float(
+                self.get_parameter("segment_min_corner_speed").value
+            )
             hold_n, hold_e = self._corner_hold_velocity(
-                pos_n, pos_e, a.x, a.y, b.x - a.x, b.y - a.y, yaw_ned
+                pos_n, pos_e, a.x, a.y, b.x - a.x, b.y - a.y, yaw_ned,
+                max_speed_cap=entry_recenter_cap,
             )
             self._publish_velocity(hold_n, hold_e)
             self._publish_yaw_rate(0.0)
@@ -4410,6 +4419,7 @@ class RPPControllerNode(Node):
         yaw_ned: float,
         *,
         stop_tolerance_m: float | None = None,
+        max_speed_cap: float | None = None,
     ) -> tuple[float, float]:
         """Bounded velocity command that holds/recovers the exact stop point.
 
@@ -4417,8 +4427,17 @@ class RPPControllerNode(Node):
         the body-axis brake so residual measured speed is bled off without
         inventing a new travel bearing. Outside tolerance, servo toward the
         vertex in the segment frame and damp with EKF velocity when fresh.
+
+        ``max_speed_cap`` (default None) further caps the command magnitude below
+        segment_brake_velocity_cap_m_s. Used by the runtime-entry recenter so a
+        large position error does not command the full 0.18 m/s brake cap (which
+        turn-and-drives the rover in a wide arc at an off-nose bearing); a lower
+        cap (~pivot speed) keeps the recenter gentle. None leaves every existing
+        caller (segment corners, run-boundary stop) unchanged.
         """
         cap = float(self.get_parameter("segment_brake_velocity_cap_m_s").value)
+        if max_speed_cap is not None:
+            cap = min(cap, max(0.0, float(max_speed_cap)))
         if cap <= 0.0:
             return (0.0, 0.0)
 
