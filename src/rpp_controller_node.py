@@ -577,6 +577,19 @@ class RPPControllerNode(Node):
         # runs only (segment corners already have their own zero-stop). 0 disables
         # (reverts to pure capture). Keep >= corner_position_tolerance_m.
         self.declare_parameter("segment_entry_true_stop_dist_m",       0.10)   # m
+        # Pure zero-command stop at the runtime-entry -> MARK boundary. Inside
+        # this distance, _hold_before_run_advance commands EXACTLY zero
+        # velocity -- no _corner_brake_velocity, no _corner_hold_velocity, no
+        # _smooth_capture_velocity -- instead of holding/correcting toward the
+        # point. EKF/GPS/odom noise means the measured speed will essentially
+        # never read mathematically 0.000, so certification requires it stay
+        # <= segment_entry_pure_stop_speed_m_s (not exactly zero) for a
+        # continuous segment_entry_pure_stop_dwell_s window before the pivot
+        # is allowed to start. 0 disables (falls back to the true-stop/
+        # capture/corner-hold branches below).
+        self.declare_parameter("segment_entry_pure_stop_dist_m",       0.10)   # m
+        self.declare_parameter("segment_entry_pure_stop_speed_m_s",    0.005)  # m/s
+        self.declare_parameter("segment_entry_pure_stop_dwell_s",      1.0)    # s
         # NOTE (2026-07-07): the runtime-entry OFF->MARK pivot was previously
         # special-cased with a slow speed (0.05 m/s), a tight ±20° cone, and a
         # 1 cm position-recovery servo. Field bags 15-09 (233 s oscillating
@@ -677,6 +690,13 @@ class RPPControllerNode(Node):
         self._corner_stop_entered: RclTime | None = None      # when CORNER_STOP began
         self._corner_stop_settle_since: RclTime | None = None # speed+yaw-rate both OK since
         self._corner_stop_complete: bool = False               # stop confirmed; pivoting now
+        # Runtime-entry pure zero-command stop dwell (separate from the
+        # generic corner-stop settle timer above -- see _entry_pure_stop_hold).
+        self._entry_pure_stop_since: RclTime | None = None
+        # Latches once the rover has entered the pure-stop zone so a coast-out
+        # (pos_error creeping back above segment_entry_pure_stop_dist_m) can
+        # never hand control back to the nonzero capture/hold/brake branches.
+        self._entry_pure_stop_latched: bool = False
         self._pivot_started: RclTime | None = None             # when CORNER_ALIGN actuation began
         self._pivot_timeout_warned: bool = False
         self._pivot_turn_angle_rad: float = 0.0                # corner magnitude this pivot must cover
@@ -1772,6 +1792,40 @@ class RPPControllerNode(Node):
             stop_pt.x - prev_pt.x, stop_pt.y - prev_pt.y,
         )
 
+        # Pure zero-command stop at the runtime-entry -> MARK boundary. Takes
+        # over BEFORE the generic _corner_stop_satisfied gate (which certifies
+        # on the much looser segment_stop_speed_threshold, e.g. 0.08 m/s) so
+        # this boundary never certifies on a coasting rover, and BEFORE the
+        # true-stop/capture/corner-hold velocity branches below, so nothing
+        # ever commands a nonzero correction/hold/brake velocity once inside
+        # the pure-stop zone.
+        #
+        # Latched: once pos_error dips inside segment_entry_pure_stop_dist_m
+        # the first time, stay in the pure-stop branch even if the rover
+        # coasts back out past that radius (it is still decelerating/
+        # settling under zero command, not tracking) -- otherwise a coast-out
+        # would hand control back to _corner_hold_velocity/_corner_brake_
+        # velocity/_smooth_capture_velocity, exactly the nonzero correction
+        # this feature exists to prevent. The latch only clears via
+        # _reset_corner_pivot_state() -- on STOP_CERTIFIED + _advance_run,
+        # on entering a new boundary-stop context, or on mission reset/new
+        # path (_path_cb -> _apply_run(0)).
+        entry_pure_stop_dist = float(
+            self.get_parameter("segment_entry_pure_stop_dist_m").value
+        )
+        if (
+            stop_reason == StopReason.RUNTIME_ENTRY_TO_MARK
+            and entry_pure_stop_dist > 0.0
+            and pos_error <= entry_pure_stop_dist
+        ):
+            self._entry_pure_stop_latched = True
+        if stop_reason == StopReason.RUNTIME_ENTRY_TO_MARK and self._entry_pure_stop_latched:
+            return self._entry_pure_stop_hold(
+                stop_reason, stop_pt, pos_error, heading_err, position_ok,
+                pose_age_s, dist_to_goal,
+            )
+        self._entry_pure_stop_since = None
+
         if self._corner_stop_satisfied(position_ok=position_ok):
             boundary_seg_idx = max(0, len(self._path) - 2)
             self._make_stop_certificate(
@@ -1887,6 +1941,96 @@ class RPPControllerNode(Node):
             self._certificate_dwell_s(
                 self._corner_stop_settle_since, self._corner_stop_entered
             ),
+            transition_code=1.0,
+        )
+        return True
+
+    def _entry_pure_stop_hold(
+        self,
+        stop_reason: StopReason,
+        stop_pt,
+        pos_error: float,
+        heading_err: float,
+        position_ok: bool,
+        pose_age_s: float,
+        dist_to_goal: float,
+    ) -> bool:
+        """Pure zero-command stop/dwell at the runtime-entry -> MARK boundary.
+
+        Called for as long as _entry_pure_stop_latched is set (see the latch
+        logic in _hold_before_run_advance): once entered, this is the ONLY
+        thing that may run, even if pos_error later coasts back out past
+        segment_entry_pure_stop_dist_m -- command exactly (0, 0) velocity,
+        every cycle, for the whole dwell. No _corner_brake_velocity, no
+        _corner_hold_velocity, no _smooth_capture_velocity -- no position
+        servo, no correction, no braking pulse. The rover simply coasts to a
+        physical stop under zero command.
+
+        Certification (STOP_CERTIFIED -> pivot may start) requires BOTH the
+        position gate (position_ok, corner_position_tolerance_m) AND the
+        measured speed at/under segment_entry_pure_stop_speed_m_s, held
+        continuously for segment_entry_pure_stop_dwell_s. EKF/GPS/odom noise
+        means measured speed will essentially never read exactly 0.000, so
+        the speed gate is a small epsilon (default 0.005 m/s), not zero.
+        Any violation during the dwell (still moving, or drifted back outside
+        position tolerance) resets the dwell timer to zero -- no partial
+        credit.
+        """
+        self._segment_state = SegmentStateCode.CORNER_STOP
+        self._last_speed_cmd = 0.0
+        # Command must be exactly zero for the entire pure-stop phase --
+        # published unconditionally, before the dwell/certify check below.
+        self._publish_zero(
+            StateCode.APPROACH,
+            pose_age_ms=pose_age_s * 1000.0,
+            dist_to_goal=dist_to_goal,
+        )
+
+        speed_limit = float(
+            self.get_parameter("segment_entry_pure_stop_speed_m_s").value
+        )
+        dwell_s = float(
+            self.get_parameter("segment_entry_pure_stop_dwell_s").value
+        )
+        measured_speed = self._measured_speed() if self._vel_is_fresh() else None
+        speed_ok = measured_speed is not None and measured_speed <= speed_limit
+
+        now = self.get_clock().now()
+        if position_ok and speed_ok:
+            if self._entry_pure_stop_since is None:
+                self._entry_pure_stop_since = now
+            held = (now - self._entry_pure_stop_since).nanoseconds * 1e-9
+            if held >= dwell_s:
+                boundary_seg_idx = max(0, len(self._path) - 2)
+                self._make_stop_certificate(
+                    stop_reason, stop_pt.x, stop_pt.y, pos_error, heading_err,
+                    segment_idx=boundary_seg_idx,
+                )
+                if not self._stop_certificate_valid_for(
+                    stop_reason, stop_pt.x, stop_pt.y,
+                    run_idx=self._run_idx, segment_idx=boundary_seg_idx,
+                ):
+                    self._publish_stop_debug(
+                        StopDebugPhase.BLOCKED, stop_reason, stop_pt.x, stop_pt.y,
+                        pos_error, heading_err, held, transition_code=9.0,
+                    )
+                    return True
+                self._publish_stop_debug(
+                    StopDebugPhase.STOP_CERTIFIED, stop_reason, stop_pt.x, stop_pt.y,
+                    pos_error, heading_err, held, transition_code=2.0,
+                )
+                self._entry_pure_stop_since = None
+                self._entry_pure_stop_latched = False
+                self._run_boundary_stop_pending = False
+                self._advance_run(pre_stopped=True)
+                return True
+        else:
+            self._entry_pure_stop_since = None
+
+        self._publish_stop_debug(
+            StopDebugPhase.HOLDING, stop_reason, stop_pt.x, stop_pt.y,
+            pos_error, heading_err,
+            self._certificate_dwell_s(self._entry_pure_stop_since, None),
             transition_code=1.0,
         )
         return True
@@ -4806,6 +4950,8 @@ class RPPControllerNode(Node):
         self._align_settle_since = None
         self._stop_certificate = None
         self._alignment_certificate = None
+        self._entry_pure_stop_since = None
+        self._entry_pure_stop_latched = False
 
     def _reset_completion_settle_state(self):
         self._completion_settle_entered = None
