@@ -315,11 +315,8 @@ def main():
         assert node._run_idx == 1, "stale-velocity fallback must certify at the 2 s cap"
         print("PASS test 5: stale-velocity fallback certifies at 2 s cap (no deadlock)")
 
-        # ---- TEST 6: early reverse brake inside capture radius (0.50 m) while
-        #      still hot. Pre-fix, only true_stop_dist (0.10 m) engaged reverse;
-        #      outside that, smooth_capture commanded ~5–8 cm/s FORWARD into a
-        #      0.35 m/s approach → 1.5 m entry overshoot (M2 bag). At 0.30 m off
-        #      the point at 0.20 m/s the command must be reverse, not capture.
+        # ---- TEST 6: reverse ONLY inside true_stop_dist (0.10 m), not 0.50 m.
+        #      At 30 cm: forward capture (no reverse). At 7 cm + 0.20 m/s: reverse.
         node._runs = [
             _run([_pose(0.0, 0.0), _pose(1.0, 0.0)], runtime_entry=True),
             _run([_pose(1.0, 0.0), _pose(2.0, 0.0)], flags=[True, True]),
@@ -328,18 +325,39 @@ def main():
         node._active_tracking_profile = "smooth"
         node._run_boundary_stop_pending = False
         node._latest_vel_time = now()
-        node._latest_vel_ned = (0.20, 0.0)          # 0.20 m/s toward +N
+        node._latest_vel_ned = (0.20, 0.0)
         node._latest_yaw_rate_ned = 0.0
         vel_cap.clear()
-        handled = node._hold_before_run_advance(0.70, 0.0, 0.0, 0.0, 0.30)  # 30 cm out
-        assert handled is True
-        assert node._run_idx == 0
+        handled = node._hold_before_run_advance(0.70, 0.0, 0.0, 0.0, 0.30)  # 30 cm
+        assert handled is True and node._run_idx == 0
         v = vel_cap.last
-        assert v is not None and v.vector.x < -1e-6 and abs(v.vector.y) < 1e-9, (
-            f"at 30 cm / 0.20 m/s must reverse-brake (capture envelope), got "
+        assert v is not None and v.vector.x > 1e-6, (
+            f"at 30 cm must NOT reverse (capture toward point), got "
             f"{(v.vector.x, v.vector.y) if v else None}"
         )
-        print("PASS test 6: early reverse brake at 30 cm (capture envelope), not forward capture")
+        vel_cap.clear()
+        handled = node._hold_before_run_advance(0.93, 0.0, 0.0, 0.0, 0.07)  # 7 cm
+        assert handled is True and node._run_idx == 0
+        v = vel_cap.last
+        assert v is not None and v.vector.x < -1e-6, (
+            f"at 7 cm / 0.20 m/s must reverse, got "
+            f"{(v.vector.x, v.vector.y) if v else None}"
+        )
+        print("PASS test 6: reverse only inside 10 cm; capture at 30 cm")
+
+        # ---- TEST 7: slow inside 10 cm but 4 cm off point → hold toward point
+        #      (not reverse, not cert) so we can still reach the 2 cm gate.
+        node._latest_vel_ned = (0.01, 0.0)  # below park 0.03
+        node._corner_stop_settle_since = None
+        node._corner_stop_entered = now()
+        vel_cap.clear()
+        handled = node._hold_before_run_advance(0.96, 0.0, 0.0, 0.0, 0.04)
+        assert handled is True and node._run_idx == 0
+        v = vel_cap.last
+        assert v is not None and math.hypot(v.vector.x, v.vector.y) > 1e-6, (
+            "4 cm off while slow must still command hold toward the point"
+        )
+        print("PASS test 7: slow + 4 cm off → hold toward 2 cm gate (no cert)")
 
         node.destroy_node()
     finally:

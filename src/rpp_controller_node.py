@@ -1892,26 +1892,21 @@ class RPPControllerNode(Node):
         true_stop_dist = float(
             self.get_parameter("segment_entry_true_stop_dist_m").value
         )
-        capture_r = float(
-            self.get_parameter("segment_boundary_capture_radius_m").value
-        )
         meas_speed = (
             math.hypot(*self._latest_vel_ned) if self._vel_is_fresh() else 0.0
         )
-        # Brake envelope: at least true_stop_dist, and up to capture_r so a
-        # hot approach (entry HOLD often arms ~0.5 m out at ~0.35 m/s — bags
-        # M1/M2) bleeds speed with reverse BEFORE the last 10 cm, instead of
-        # commanding forward capture at 5–8 cm/s while still doing 35 cm/s.
-        brake_window = (
-            max(true_stop_dist, capture_r) if true_stop_dist > 0.0 else 0.0
-        )
-        if true_stop_dist > 0.0 and pos_error <= brake_window and meas_speed > park_speed:
-            # Still moving above the parked gate inside the capture/true-stop
-            # envelope → body-axis reverse only (no off-nose bearing).
+        # Reverse ONLY inside true_stop_dist (default 0.10 m) — not the 0.50 m
+        # capture radius (field: reverse from 50 cm never reached the 2 cm
+        # park). Outside 10 cm: smooth capture / corner-hold toward the point.
+        # Inside 10 cm + still > park_speed: body-axis reverse until ≤ 3 cm/s.
+        # Inside 10 cm + slow: low-cap hold servos the last cm to the 2 cm
+        # corner_position_tolerance (cert never fires until position_ok).
+        if true_stop_dist > 0.0 and pos_error <= true_stop_dist and meas_speed > park_speed:
+            # Still moving inside 10 cm → reverse brake (creep deadband = park 0.03).
             brake_n, brake_e = self._corner_brake_velocity(yaw_ned)
         elif true_stop_dist > 0.0 and pos_error <= true_stop_dist:
-            # Slow enough inside the true-stop window: low-capped hold servos
-            # the final centimetres without re-accelerating past the point.
+            # Slow inside 10 cm: hold toward the stop point (cap park_speed) so
+            # we finish into the 2 cm cert gate instead of freezing short.
             brake_n, brake_e = self._corner_hold_velocity(
                 pos_n, pos_e, stop_pt.x, stop_pt.y,
                 stop_pt.x - prev_pt.x, stop_pt.y - prev_pt.y,
@@ -3428,29 +3423,19 @@ class RPPControllerNode(Node):
                     true_stop_dist = float(
                         self.get_parameter("segment_entry_true_stop_dist_m").value
                     )
-                    capture_r = float(
-                        self.get_parameter("segment_boundary_capture_radius_m").value
-                    )
                     meas_speed = (
                         math.hypot(*self._latest_vel_ned)
                         if self._vel_is_fresh() else 0.0
                     )
-                    brake_window = (
-                        max(true_stop_dist, capture_r)
-                        if true_stop_dist > 0.0 else 0.0
-                    )
+                    # Reverse only inside true_stop_dist (0.10 m), not capture_r.
                     if (
                         true_stop_dist > 0.0
-                        and pos_error <= brake_window
+                        and pos_error <= true_stop_dist
                         and meas_speed > park_speed
                     ):
-                        # Hot approach inside capture/true-stop: reverse
-                        # longitudinal brake (same envelope as run-boundary /
-                        # runtime-entry HOLD). Deadband is park 0.03 so the
-                        # 3–8 cm/s creep band is not a zero-cmd coast.
                         brake_n, brake_e = self._corner_brake_velocity(yaw_ned)
                     elif true_stop_dist > 0.0 and pos_error <= true_stop_dist:
-                        # Slow inside true-stop window: low-capped hold.
+                        # Slow: hold into 2 cm cert gate.
                         brake_n, brake_e = self._corner_hold_velocity(
                             pos_n, pos_e, b.x, b.y, b.x - a.x, b.y - a.y,
                             yaw_ned, max_speed_cap=park_speed,
