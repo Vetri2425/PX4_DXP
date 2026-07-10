@@ -24,6 +24,21 @@ def _pose(n, e):
     return ps
 
 
+class _CapturePub:
+    def __init__(self):
+        self.messages = []
+
+    def publish(self, msg):
+        self.messages.append(msg)
+
+    @property
+    def last(self):
+        return self.messages[-1] if self.messages else None
+
+    def clear(self):
+        self.messages.clear()
+
+
 def main():
     rclpy.init(args=["--ros-args", "-p", "require_rtk_fix:=false"])
     ok = True
@@ -36,6 +51,8 @@ def main():
         node = RPPControllerNode()
         P = lambda **kw: node.set_parameters([Parameter(k, value=v) for k, v in kw.items()])
         now = lambda: node.get_clock().now()
+        vel_cap = _CapturePub()
+        node._vel_pub = vel_cap
 
         # ---- default params (per the patch) -------------------------------
         assert node.get_parameter("segment_heading_tolerance_deg").value == 2.0, "strict aim must stay 2°"
@@ -278,6 +295,107 @@ def main():
         node._control_segment_profile(1.0, 0.0, math.pi / 2, 0.0, 1.0)
         assert node._segment_idx == 1, "confirmed stop must allow non-extension square to advance"
         print("PASS non-extension square: stop confirmation preserved, then corner advances")
+
+        # ---- PR-C (2026-07-10): INTRA_RUN_CORNER gets the same true-stop
+        #      unification (PR-A) and recenter hysteresis (PR-B) that
+        #      RUN_BOUNDARY/_run_alignment_hold already got. This path is
+        #      reached whenever a corner does not split into its own run
+        #      (e.g. a forced tracking_profile=segment mission, or -- as
+        #      here -- any test/caller that builds node._runs as a single
+        #      run spanning the corner, bypassing _split_run_at_corners).
+
+        def _pcs_square():
+            r = run([_pose(0.0, 0.0), _pose(1.0, 0.0), _pose(1.0, 1.0)])
+            r["length"] = 2.0
+            r["cum_s"] = [0.0, 1.0, 2.0]
+            node._runs = [r]
+            node._apply_run(0)
+            node._path_travel_m = 1.0
+
+        # PR-C-1a: arrival fast (12.5 cm/s) 3cm short of the corner (inside
+        # both segment_corner_acceptance_radius=0.05 and true_stop_dist=0.10),
+        # still heading along segment 0 (yaw=0, +N) -- the rover has not
+        # pivoted yet at this point, only stopped -- and moving in that same
+        # +N direction -> ACTIVE longitudinal brake (_corner_brake_velocity),
+        # not the old bare uncapped tangent-frame servo. Mirrors M1 bag
+        # corner C1 (HOLD start 1.9cm@12.5cm/s -> 133cm arc) under the
+        # pre-PR-A/C gating.
+        _pcs_square()
+        node._latest_vel_time = now(); node._latest_vel_ned = (0.125, 0.0)
+        node._latest_yaw_rate_ned = 0.0
+        P(segment_stop_dwell_s=0.30, segment_align_settle_s=0.0)
+        vel_cap.clear()
+        node._control_segment_profile(0.97, 0.0, 0.0, 0.0, 1.0)
+        assert node._corner_stop_complete is False, "must not certify moving at 12.5 cm/s"
+        v = vel_cap.last
+        assert v is not None
+        expected_n, expected_e = node._corner_brake_velocity(0.0)
+        assert abs(v.vector.x - expected_n) < 1e-9 and abs(v.vector.y - expected_e) < 1e-9, (
+            f"INTRA_RUN_CORNER inside true_stop_dist must use the active "
+            f"longitudinal brake, got ({v.vector.x:.4f},{v.vector.y:.4f}) "
+            f"vs expected ({expected_n:.4f},{expected_e:.4f})"
+        )
+        assert v.vector.x < -1e-6 and abs(v.vector.y) < 1e-9, (
+            "brake must oppose +N motion (pure longitudinal, no lateral component)"
+        )
+        print("PASS PR-C-1a: INTRA_RUN_CORNER gets active longitudinal brake "
+              "(not the old uncapped tangent-frame servo)")
+
+        # PR-C-1b: creeping at 0.05 m/s (above the unified 0.03 parked gate,
+        # below the old 0.08 segment default) must NOT certify -- the
+        # unified-cert half of PR-A, applied here.
+        node._latest_vel_ned = (0.05, 0.0)
+        vel_cap.clear()
+        node._control_segment_profile(1.0, 0.0, 0.0, 0.0, 1.0)
+        assert node._corner_stop_complete is False, (
+            "must NOT certify INTRA_RUN_CORNER creeping at 0.05 m/s "
+            "(> 0.03 unified parked gate)"
+        )
+        print("PASS PR-C-1b: INTRA_RUN_CORNER does not cert while creeping "
+              "at 0.05 m/s (unified parked gate)")
+
+        # PR-C-2: recenter hysteresis wiring. NOTE: the whole corner block
+        # is gated live on dist_to_corner <= segment_corner_acceptance_
+        # radius (0.05 default) -- smaller than align_recenter_arm_m's
+        # production default (0.08), so the shared arm/release thresholds
+        # cannot practically arm at their production defaults inside THIS
+        # path's reachable geometry (flagged separately -- not a test
+        # workaround, a real param-scale question worth a follow-up look).
+        # Lower the thresholds locally, within the acceptance radius, to
+        # exercise the actual wiring deterministically: heading still
+        # misaligned (pivot phase) and drifted beyond the (lowered)
+        # align_recenter_arm_m -> the position-recovery hold fires, capped
+        # at segment_min_corner_speed (not the full 0.18 brake cap the old
+        # bare branch used).
+        _pcs_square()
+        node._latest_vel_time = now(); node._latest_vel_ned = (0.0, 0.0)
+        node._latest_yaw_rate_ned = 0.0
+        P(
+            segment_stop_dwell_s=0.0, segment_align_settle_s=0.0,
+            align_recenter_arm_m=0.03, align_recenter_release_m=0.02,
+        )
+        node._control_segment_profile(1.0, 0.0, math.pi / 2, 0.0, 1.0)
+        assert node._corner_stop_complete is True, "must be stopped before pivot"
+        drift_n, drift_e = 1.0 - 0.03, 0.03   # ~4.2cm off the corner (1.0, 0.0)
+        misaligned_yaw = 0.0                  # not yet turned toward +E
+        vel_cap.clear()
+        node._control_segment_profile(drift_n, drift_e, misaligned_yaw, 0.0, 1.0)
+        v = vel_cap.last
+        assert v is not None, "recenter must publish a velocity toward the corner"
+        cap = float(node.get_parameter("segment_min_corner_speed").value)
+        speed = math.hypot(v.vector.x, v.vector.y)
+        assert speed <= cap + 1e-6, (
+            f"INTRA_RUN_CORNER recenter speed {speed:.3f} m/s must be capped "
+            f"at pivot speed {cap:.3f} m/s (not the 0.18 brake cap)"
+        )
+        dot = v.vector.x * (1.0 - drift_n) + v.vector.y * (0.0 - drift_e)
+        assert dot > 0.0, "recenter velocity must drive toward the corner point"
+        assert node.has_parameter("align_recenter_arm_m") and node.has_parameter(
+            "align_recenter_release_m"
+        ), "INTRA_RUN_CORNER recenter must reuse the shared hysteresis params"
+        P(align_recenter_arm_m=0.08, align_recenter_release_m=0.05)
+        print(f"PASS PR-C-2: INTRA_RUN_CORNER recenter capped at pivot speed "
+              f"({speed:.3f} <= {cap:.3f}), uses shared hysteresis params")
 
         # Final DONE requires physical settle certificate; fresh moving
         # telemetry must hold APPROACH even at the endpoint.
