@@ -1892,41 +1892,36 @@ class RPPControllerNode(Node):
         true_stop_dist = float(
             self.get_parameter("segment_entry_true_stop_dist_m").value
         )
+        capture_r = float(
+            self.get_parameter("segment_boundary_capture_radius_m").value
+        )
         meas_speed = (
             math.hypot(*self._latest_vel_ned) if self._vel_is_fresh() else 0.0
         )
-        if true_stop_dist > 0.0 and pos_error <= true_stop_dist:
-            # True-stop gate (segment _publish_zero parity), now applied to
-            # ALL profiles (2026-07-10): while still coasting inside the stop
-            # window, brake STRAIGHT along the body axis to physically halt on
-            # the point instead of driving past it with a live capture/hold
-            # setpoint (bag 13-07-59 entry coasted 1.1 m past; bag 2026-07-10
-            # M1 square corner C1 walked 133 cm past under the old
-            # segment-only gating, which landed plain RUN_BOUNDARY corners in
-            # the uncapped tangent-frame corner-hold fallback below with no
-            # active brake). _corner_brake_velocity is longitudinal only -> no
-            # off-nose bearing to arc on. Once slow, hand to a low-capped
-            # corner-hold (park_speed) to servo the final cm.
-            if meas_speed > park_speed:
-                brake_n, brake_e = self._corner_brake_velocity(yaw_ned)
-            else:
-                brake_n, brake_e = self._corner_hold_velocity(
-                    pos_n, pos_e, stop_pt.x, stop_pt.y,
-                    stop_pt.x - prev_pt.x, stop_pt.y - prev_pt.y,
-                    yaw_ned,
-                    max_speed_cap=park_speed,
-                )
+        # Brake envelope: at least true_stop_dist, and up to capture_r so a
+        # hot approach (entry HOLD often arms ~0.5 m out at ~0.35 m/s — bags
+        # M1/M2) bleeds speed with reverse BEFORE the last 10 cm, instead of
+        # commanding forward capture at 5–8 cm/s while still doing 35 cm/s.
+        brake_window = (
+            max(true_stop_dist, capture_r) if true_stop_dist > 0.0 else 0.0
+        )
+        if true_stop_dist > 0.0 and pos_error <= brake_window and meas_speed > park_speed:
+            # Still moving above the parked gate inside the capture/true-stop
+            # envelope → body-axis reverse only (no off-nose bearing).
+            brake_n, brake_e = self._corner_brake_velocity(yaw_ned)
+        elif true_stop_dist > 0.0 and pos_error <= true_stop_dist:
+            # Slow enough inside the true-stop window: low-capped hold servos
+            # the final centimetres without re-accelerating past the point.
+            brake_n, brake_e = self._corner_hold_velocity(
+                pos_n, pos_e, stop_pt.x, stop_pt.y,
+                stop_pt.x - prev_pt.x, stop_pt.y - prev_pt.y,
+                yaw_ned,
+                max_speed_cap=park_speed,
+            )
         elif self._active_tracking_profile != "segment" and pos_error > handoff_r:
-            # UNCHANGED — smooth-only far-field capture ramp: hold a fixed
-            # bearing straight at the stop point at a low decel speed so PX4
-            # tracks it down (see _smooth_capture_velocity). The segment
-            # corner-hold's tangent-frame servo swings the bearing and,
-            # entered while the rover is still fast, drove it into PX4's
-            # speed-holding turn-state. Hand to the corner-hold only for the
-            # final settle inside handoff_r, where the rover is already slow
-            # and aligned. Segment profile has no far-field capture leg (its
-            # runs start already inside true_stop_dist/handoff_r), so this
-            # branch stays gated off segment on purpose.
+            # Smooth-only far-field capture when already slow (or outside the
+            # brake window): fixed bearing at a low decel speed. Segment
+            # profile relies on PRE_CORNER_SLOWDOWN instead.
             brake_n, brake_e = self._smooth_capture_velocity(
                 pos_n, pos_e, stop_pt.x, stop_pt.y, yaw_ned, pos_error
             )
@@ -3433,28 +3428,38 @@ class RPPControllerNode(Node):
                     true_stop_dist = float(
                         self.get_parameter("segment_entry_true_stop_dist_m").value
                     )
+                    capture_r = float(
+                        self.get_parameter("segment_boundary_capture_radius_m").value
+                    )
                     meas_speed = (
                         math.hypot(*self._latest_vel_ned)
                         if self._vel_is_fresh() else 0.0
                     )
-                    if true_stop_dist > 0.0 and pos_error <= true_stop_dist:
-                        # True-stop gate (PR-A parity): inside the stop
-                        # window, brake STRAIGHT along the body axis while
-                        # still coasting instead of driving past it with
-                        # the bare tangent-frame servo. Once slow, hand to
-                        # a low-capped corner-hold to servo the final cm.
-                        if meas_speed > park_speed:
-                            brake_n, brake_e = self._corner_brake_velocity(yaw_ned)
-                        else:
-                            brake_n, brake_e = self._corner_hold_velocity(
-                                pos_n, pos_e, b.x, b.y, b.x - a.x, b.y - a.y,
-                                yaw_ned, max_speed_cap=park_speed,
-                            )
+                    brake_window = (
+                        max(true_stop_dist, capture_r)
+                        if true_stop_dist > 0.0 else 0.0
+                    )
+                    if (
+                        true_stop_dist > 0.0
+                        and pos_error <= brake_window
+                        and meas_speed > park_speed
+                    ):
+                        # Hot approach inside capture/true-stop: reverse
+                        # longitudinal brake (same envelope as run-boundary /
+                        # runtime-entry HOLD). Deadband is park 0.03 so the
+                        # 3–8 cm/s creep band is not a zero-cmd coast.
+                        brake_n, brake_e = self._corner_brake_velocity(yaw_ned)
+                    elif true_stop_dist > 0.0 and pos_error <= true_stop_dist:
+                        # Slow inside true-stop window: low-capped hold.
+                        brake_n, brake_e = self._corner_hold_velocity(
+                            pos_n, pos_e, b.x, b.y, b.x - a.x, b.y - a.y,
+                            yaw_ned, max_speed_cap=park_speed,
+                        )
                     else:
                         # Outside the window (rare here -- PRE_CORNER_
                         # SLOWDOWN normally has the rover slow well before
-                        # segment_corner_acceptance_radius): unchanged
-                        # bare tangent-frame servo fallback.
+                        # segment_corner_acceptance_radius): bare tangent-
+                        # frame servo fallback.
                         brake_n, brake_e = self._corner_hold_velocity(
                             pos_n, pos_e, b.x, b.y, b.x - a.x, b.y - a.y, yaw_ned
                         )
@@ -4489,6 +4494,14 @@ class RPPControllerNode(Node):
         unambiguous and does not enter the BUG-T3 wrong-turn region. Returns zero
         for stale data, lateral-dominant motion, disabled braking, or an already
         stopped rover.
+
+        Deadband floor is the *tighter* of ``segment_stop_speed_threshold`` (0.08)
+        and ``segment_entry_stop_speed_m_s`` (0.03 parked gate). Using the loose
+        0.08 floor alone made reverse brake a pure no-op in the 3–8 cm/s creep
+        band: the hold path selected "still moving → brake", brake returned
+        (0,0), and PX4 velocity-OFFBOARD coasted past the point (bags
+        2026-07-10 M1/M2 entry + run-boundary: HOLD cmds at 0 while actual
+        5–8 cm/s, 0.5–1.5 m overshoot).
         """
         if not self._vel_is_fresh():
             return (0.0, 0.0)
@@ -4497,7 +4510,14 @@ class RPPControllerNode(Node):
             return (0.0, 0.0)
         v_n, v_e = self._latest_vel_ned
         speed = math.hypot(v_n, v_e)
-        thresh = float(self.get_parameter("segment_stop_speed_threshold").value)
+        stop_thresh = float(self.get_parameter("segment_stop_speed_threshold").value)
+        park_thresh = float(self.get_parameter("segment_entry_stop_speed_m_s").value)
+        # Parked cert gate is 0.03; keep reverse brake armed until we are at or
+        # below that, otherwise the 3–8 cm/s band only coasts on zero setpoints.
+        if park_thresh > 0.0:
+            thresh = min(stop_thresh, park_thresh)
+        else:
+            thresh = stop_thresh
         if speed < thresh:
             return (0.0, 0.0)
         fwd_n, fwd_e = math.cos(yaw_ned), math.sin(yaw_ned)

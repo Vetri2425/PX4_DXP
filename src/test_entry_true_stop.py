@@ -127,14 +127,22 @@ def main():
         print("PASS test 1: active brake opposing motion (not zero), no certify at 0.20 m/s")
 
         # ---- TEST 2: ON the point but still creeping at 0.05 m/s (above the
-        #      0.03 parked gate, below the old 0.08). This is the bug the fix
-        #      targets: the loose gate certified here and the pivot walked past.
+        #      0.03 parked gate, below the old 0.08). Two bugs the fix targets:
+        #      (a) loose gate certified here and the pivot walked past;
+        #      (b) _corner_brake_velocity used the 0.08 deadband so reverse
+        #      brake was a pure no-op in the 3–8 cm/s band → zero cmd + PX4
+        #      coast (bags M1/M2 entry HOLD: cmd 0 while actual 5–8 cm/s).
         node._latest_vel_ned = (0.05, 0.0)          # 5 cm/s
         vel_cap.clear()
         handled = node._hold_before_run_advance(1.0, 0.0, 0.0, 0.0, 0.0)
         assert handled is True
         assert node._run_idx == 0, "must NOT certify while creeping at 0.05 m/s (> 0.03 parked gate)"
-        print("PASS test 2: no certify while creeping at 0.05 m/s (parked gate blocks it)")
+        v = vel_cap.last
+        assert v is not None and v.vector.x < -1e-6 and abs(v.vector.y) < 1e-9, (
+            f"must ACTIVE-brake the 5 cm/s creep band (not zero), got "
+            f"{(v.vector.x, v.vector.y) if v else None}"
+        )
+        print("PASS test 2: no certify + active reverse brake while creeping at 0.05 m/s")
 
         # ---- TEST 3: parked (speed <= 0.03, on point), dwell satisfied ->
         #      STOP_CERTIFIED + advance into the pivot.
@@ -210,8 +218,7 @@ def main():
 
         # ---- TEST 5c: segment RUN_BOUNDARY creeping at 0.05 m/s (above the
         #      0.03 parked gate, below the old 0.08 segment default) must NOT
-        #      certify. Pre-PR-A, RUN_BOUNDARY certified on the loose 0.08
-        #      gate — this is the unified-cert half of the fix.
+        #      certify AND must reverse-brake (not zero-cmd coast).
         node._latest_vel_ned = (0.05, 0.0)      # 5 cm/s
         vel_cap.clear()
         handled = node._hold_before_run_advance(1.0, 0.0, 0.0, 0.0, 0.0)
@@ -220,8 +227,13 @@ def main():
             "must NOT certify a segment RUN_BOUNDARY creeping at 0.05 m/s "
             "(> 0.03 unified parked gate)"
         )
-        print("PASS test 5c: segment RUN_BOUNDARY does not cert while creeping "
-              "at 0.05 m/s (unified parked gate)")
+        v = vel_cap.last
+        assert v is not None and v.vector.x < -1e-6, (
+            f"segment RUN_BOUNDARY must reverse-brake at 5 cm/s, got "
+            f"{(v.vector.x, v.vector.y) if v else None}"
+        )
+        print("PASS test 5c: segment RUN_BOUNDARY does not cert + reverse-brakes "
+              "while creeping at 0.05 m/s")
 
         # ---- TEST 5d: segment RUN_BOUNDARY arriving already slow
         #      (PRE_CORNER_SLOWDOWN working correctly, <=0.03 m/s) certifies
@@ -302,6 +314,32 @@ def main():
         assert handled is True
         assert node._run_idx == 1, "stale-velocity fallback must certify at the 2 s cap"
         print("PASS test 5: stale-velocity fallback certifies at 2 s cap (no deadlock)")
+
+        # ---- TEST 6: early reverse brake inside capture radius (0.50 m) while
+        #      still hot. Pre-fix, only true_stop_dist (0.10 m) engaged reverse;
+        #      outside that, smooth_capture commanded ~5–8 cm/s FORWARD into a
+        #      0.35 m/s approach → 1.5 m entry overshoot (M2 bag). At 0.30 m off
+        #      the point at 0.20 m/s the command must be reverse, not capture.
+        node._runs = [
+            _run([_pose(0.0, 0.0), _pose(1.0, 0.0)], runtime_entry=True),
+            _run([_pose(1.0, 0.0), _pose(2.0, 0.0)], flags=[True, True]),
+        ]
+        node._apply_run(0)
+        node._active_tracking_profile = "smooth"
+        node._run_boundary_stop_pending = False
+        node._latest_vel_time = now()
+        node._latest_vel_ned = (0.20, 0.0)          # 0.20 m/s toward +N
+        node._latest_yaw_rate_ned = 0.0
+        vel_cap.clear()
+        handled = node._hold_before_run_advance(0.70, 0.0, 0.0, 0.0, 0.30)  # 30 cm out
+        assert handled is True
+        assert node._run_idx == 0
+        v = vel_cap.last
+        assert v is not None and v.vector.x < -1e-6 and abs(v.vector.y) < 1e-9, (
+            f"at 30 cm / 0.20 m/s must reverse-brake (capture envelope), got "
+            f"{(v.vector.x, v.vector.y) if v else None}"
+        )
+        print("PASS test 6: early reverse brake at 30 cm (capture envelope), not forward capture")
 
         node.destroy_node()
     finally:
