@@ -165,6 +165,25 @@ class SprayControllerNode(Node):
         self.declare_parameter("active_timeout_s", 0.5)
         self.declare_parameter("manual_override_timeout_s", 10.0)
         self.declare_parameter("command_service", "/mavros/cmd/command")
+        # _send_command() marks the actuator "pending" BEFORE dispatching
+        # call_async(), and every "already pending, don't resend" guard
+        # (_maybe_retry_off, _reassert_tick, _commit_desired_state) trusts
+        # that flag unconditionally. If the FCU/MAVROS round-trip never
+        # completes -- e.g. PX4 silently drops MAV_CMD_DO_SET_ACTUATOR
+        # instead of NACKing it (observed: disarmed at dispatch time) --
+        # _command_done() never fires, `pending` never clears, and every
+        # future retry attempt is silently suppressed for the rest of the
+        # process's life, even after the vehicle later re-arms. Field-
+        # confirmed 2026-07-10: a single OFF command from process startup
+        # stayed "pending" for 65+ minutes, permanently blocking spray-off
+        # confirmation (and therefore /api/mission/load, gated on it) with
+        # no self-recovery. This bounds how long a pending command is
+        # trusted before _clear_stale_pending_command() (called every
+        # _watchdog_tick, 50 Hz) discards it and lets a fresh attempt
+        # through. 5.0s matches the existing spray-off confirmation
+        # attempt timeout used server-side (spray_startup_reconciliation
+        # _OFF_TIMEOUT_S) so the two layers' timeout expectations agree.
+        self.declare_parameter("spray_command_pending_timeout_s", 5.0)
         self.declare_parameter("use_distance_aware_spray", True)
         self.declare_parameter("nozzle_forward_offset_m", 0.0)
         self.declare_parameter("nozzle_lateral_offset_m", 0.0)
@@ -1397,6 +1416,7 @@ class SprayControllerNode(Node):
         self._commit_desired_state()
 
     def _watchdog_tick(self) -> None:
+        self._clear_stale_pending_command()
         # Manual override hard expiry — never latches, independent of /spray/active.
         if self._manual_active and self._manual_deadline_ns is not None:
             if self.get_clock().now().nanoseconds >= self._manual_deadline_ns:
@@ -1752,6 +1772,40 @@ class SprayControllerNode(Node):
             self._maybe_retry_off(f"failsafe: {reason}", force=force)
         else:
             self._publish_state(False)
+
+    def _clear_stale_pending_command(self) -> None:
+        """Recover from a hung command-service future.
+
+        See the spray_command_pending_timeout_s declaration for the full
+        rationale. Called once per _watchdog_tick (50 Hz) so a stuck
+        command is discarded within one timeout window regardless of which
+        guard (_maybe_retry_off / _reassert_tick / _commit_desired_state)
+        would otherwise keep deferring to it.
+        """
+        if not self._actuator_state.pending:
+            return
+        started = (
+            self._actuator_state.last_on_timestamp_s
+            if self._actuator_state.pending_on
+            else self._actuator_state.last_off_timestamp_s
+        )
+        if started <= 0.0:
+            return
+        now_s = self.get_clock().now().nanoseconds * 1e-9
+        age_s = now_s - started
+        timeout_s = float(self.get_parameter("spray_command_pending_timeout_s").value)
+        if age_s < timeout_s:
+            return
+        self.get_logger().warn(
+            f"spray command stuck pending {age_s:.1f}s "
+            f"(seq={self._actuator_state.pending_sequence}, "
+            f"pending_on={self._actuator_state.pending_on}) — "
+            "clearing stale state so retries can proceed",
+            throttle_duration_sec=5.0,
+        )
+        self._actuator_state.pending = False
+        self._actuator_state.pending_on = None
+        self._actuator_state.pending_sequence = 0
 
     def _maybe_retry_off(self, reason: str, force: bool = False) -> None:
         now_ns = self.get_clock().now().nanoseconds

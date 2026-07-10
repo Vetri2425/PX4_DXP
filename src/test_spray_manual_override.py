@@ -261,6 +261,7 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "require_offboard": _Param(require_offboard),
         "active_timeout_s": _Param(0.5),
         "manual_override_timeout_s": _Param(10.0),
+        "spray_command_pending_timeout_s": _Param(5.0),
         "use_distance_aware_spray": _Param(False),
         "nozzle_forward_offset_m": _Param(0.0),
         "nozzle_lateral_offset_m": _Param(0.0),

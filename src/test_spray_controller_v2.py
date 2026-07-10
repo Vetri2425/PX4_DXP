@@ -755,6 +755,75 @@ def test_rejected_off_leaves_acknowledgement_flags_false():
     assert status["confirmed_off"] is False
 
 
+def test_hung_off_command_stays_pending_before_timeout():
+    """A command whose future never resolves must NOT be cleared early --
+    _clear_stale_pending_command() only discards it once
+    spray_command_pending_timeout_s has genuinely elapsed."""
+    node = make_node()
+    node._command_cli = _Cli(deferred=True)   # future never auto-completes
+    node._send_command(False, reason="edge")
+    assert node._actuator_state.pending is True
+    assert node._actuator_state.pending_on is False
+
+    node._clock.ns += int(2.0 * 1e9)   # 2s < 5.0s default timeout
+    node._clear_stale_pending_command()
+    assert node._actuator_state.pending is True, (
+        "must not clear a pending command before the timeout elapses"
+    )
+
+
+def test_hung_off_command_recovers_after_timeout():
+    """Field bug (2026-07-10): a command whose MAVROS/FCU round-trip never
+    completes (_command_done() never fires) left `pending` latched forever,
+    and _maybe_retry_off()'s `pending and pending_on is False: return` guard
+    then silently suppressed every future retry -- for the rest of the
+    process's life, even across later arm-state changes. This confirms the
+    fix: past spray_command_pending_timeout_s, the stale pending state is
+    discarded and a subsequent retry actually dispatches a new command."""
+    node = make_node()
+    node._command_cli = _Cli(deferred=True)
+    node._send_command(False, reason="edge")
+    assert len(node._command_cli.requests) == 1
+
+    node._clock.ns += int(6.0 * 1e9)   # past the 5.0s default timeout
+    node._clear_stale_pending_command()
+    assert node._actuator_state.pending is False
+    assert node._actuator_state.pending_on is None
+    assert node._actuator_state.pending_sequence == 0
+
+    # Without the fix this would silently no-op forever (guard at
+    # spray_controller_node.py's _maybe_retry_off: `pending and pending_on
+    # is False: return`); with pending cleared, a fresh command dispatches.
+    node._maybe_retry_off("retry after stale clear", force=True)
+    assert len(node._command_cli.requests) == 2, (
+        "retry must actually dispatch a new command once stale pending is cleared"
+    )
+
+
+def test_watchdog_tick_clears_stale_pending():
+    """Same recovery, but exercised through the real 50 Hz entrypoint
+    (_watchdog_tick) rather than calling the helper directly, so the wiring
+    itself is covered, not just the helper's logic in isolation. Whether a
+    fresh command dispatches in the same tick depends on unrelated
+    desired-state re-evaluation (dwell/distance-aware/legacy paths), which
+    is out of scope here -- test_hung_off_command_recovers_after_timeout
+    already covers that a cleared pending state lets _maybe_retry_off
+    through."""
+    node = make_node()
+    node._command_cli = _Cli(deferred=True)
+    node._send_command(False, reason="edge")
+
+    node._clock.ns += int(2.0 * 1e9)
+    node._watchdog_tick()
+    assert node._actuator_state.pending is True, "must not clear before timeout"
+
+    node._clock.ns += int(4.0 * 1e9)   # cumulative 6s > 5.0s timeout
+    node._watchdog_tick()
+    assert node._actuator_state.pending is False, (
+        "watchdog tick must clear the stale pending state once it ages out"
+    )
+
+
 def test_confirmed_off_false_when_commanded_on():
     node = make_node()
     node._actuator_state.off_confirmed = True

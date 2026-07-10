@@ -371,6 +371,21 @@ SPRAY_PARAM_SCHEMA: dict[str, dict] = {
         "min": 1.0,
         "max": 60.0,
     },
+    "spray_command_pending_timeout_s": {
+        "type": "float",
+        "default": 5.0,
+        "group": "Safety",
+        "description": (
+            "Max time (s) an in-flight actuator command is trusted before being "
+            "treated as a hung command-service future and discarded so retries can "
+            "proceed. Recovers from PX4/MAVROS never acknowledging a command (e.g. "
+            "silently dropped while disarmed) instead of permanently latching every "
+            "OFF-retry guard. Matches the server-side spray-off confirmation "
+            "attempt timeout so both layers agree."
+        ),
+        "min": 1.0,
+        "max": 30.0,
+    },
     "debounce_samples": {
         "type": "int",
         "default": 3,
