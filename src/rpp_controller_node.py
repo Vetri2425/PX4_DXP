@@ -381,6 +381,16 @@ class RPPControllerNode(Node):
         # still spinning or drifting.
         self.declare_parameter("segment_align_settle_s",               0.20)   # s
         self.declare_parameter("segment_align_speed_threshold",        0.02)   # m/s (release gate)
+        # Dwell at rest after a corner stop is confirmed and before the pivot or
+        # run advance begins. _corner_stop_satisfied only proves the rover held
+        # below threshold for segment_stop_dwell_s; this keeps a zero setpoint on
+        # it a while longer so the turn starts from a genuinely static pose, not
+        # a decaying transient. Applies at every hard (>= segment_corner_
+        # threshold_deg) corner and at the runtime-entry boundary. Collinear
+        # PRE/MARK/AFT junctions never reach the stop gate — they are fused by
+        # _merge_collinear_runs or advance on the sub-threshold branch — so this
+        # cannot reintroduce the spray-boundary speed dip fixed in cd44884.
+        self.declare_parameter("corner_stop_hold_s",                   1.0)    # s
         # Pivot watchdog: after this long, relax the heading tolerance but
         # still require yaw-rate settling. Never launch onto the next line
         # merely because the timer expired while the rover is still turning.
@@ -493,6 +503,7 @@ class RPPControllerNode(Node):
         self._pivot_timeout_warned: bool = False
         self._pivot_turn_angle_rad: float = 0.0                # corner magnitude this pivot must cover
         self._align_settle_since: RclTime | None = None        # heading+yaw-rate both OK since
+        self._corner_stop_hold_since: RclTime | None = None    # at-rest dwell before the pivot begins
         self._run_align_turn_rad: float = 0.0                  # run-transition corner magnitude (for budget)
         self._last_segment_debug: tuple[float, ...] = (
             0.0, 0.0, 0.0, float("nan"), float("nan"),
@@ -1555,7 +1566,7 @@ class RPPControllerNode(Node):
         target_heading = math.atan2(n1.y - n0.y, n1.x - n0.x)
         heading_err = self._angle_wrap(target_heading - yaw_ned)
 
-        if self._corner_stop_satisfied():
+        if self._corner_stop_hold_satisfied():
             self._run_boundary_stop_pending = False
             self._advance_run(pre_stopped=True)
             return True
@@ -1663,13 +1674,20 @@ class RPPControllerNode(Node):
         """
         if not self._run_align_pending:
             return False
+        # Both bail-outs must clear the pivot state, not just the pending flag.
+        # _apply_run(pre_stopped=True) hands _corner_stop_complete across the run
+        # boundary; leaving it set here makes the NEXT corner skip its CORNER_STOP
+        # phase entirely (see the `if not self._corner_stop_complete` gate in
+        # _control_segment_profile) and pivot while still rolling.
         if len(self._path) < 2:
             self._run_align_pending = False
+            self._reset_corner_pivot_state()
             return False
         a = self._path[0].pose.position
         b = self._path[1].pose.position
         if self._dist(a.x, a.y, b.x, b.y) < 1e-6:
             self._run_align_pending = False
+            self._reset_corner_pivot_state()
             return False
 
         target_heading = math.atan2(b.y - a.y, b.x - a.x)
@@ -1759,7 +1777,7 @@ class RPPControllerNode(Node):
         # this the residual ~0.09 m/s arrival speed carries the rover past
         # the corner point during the first part of the turn.
         if not self._corner_stop_complete:
-            if not self._corner_stop_satisfied():
+            if not self._corner_stop_hold_satisfied():
                 # Active braking: PX4 coasts on a zero setpoint, so command a
                 # small velocity opposing the rover's motion to truly stop it at
                 # the corner point before pivoting. (0,0) when already stopped or
@@ -2594,9 +2612,12 @@ class RPPControllerNode(Node):
                 return
 
             # Stop-and-spin: confirm the rover is physically stopped at the
-            # corner before pivoting (see _run_alignment_hold for the twin).
+            # corner AND held at rest for corner_stop_hold_s before pivoting
+            # (see _run_alignment_hold for the twin). Only reachable when
+            # path_corner_deg >= segment_corner_threshold_deg — collinear
+            # junctions already advanced above, keeping their momentum.
             if not self._corner_stop_complete:
-                if not self._corner_stop_satisfied():
+                if not self._corner_stop_hold_satisfied():
                     self._segment_state = SegmentStateCode.CORNER_STOP
                     # Active braking (see _run_alignment_hold twin): drive a
                     # small velocity opposing the rover's motion so it physically
@@ -3167,20 +3188,42 @@ class RPPControllerNode(Node):
         # (run_length − path_travel): full speed around the loop, decelerate
         # only in the final approach_d metres back to the seam.
         state_code = StateCode.TRACKING
-        run_closed = bool(self._runs and self._runs[self._run_idx].get("closed"))
+        active_run = self._runs[self._run_idx] if self._runs else {}
+        run_closed = bool(active_run.get("closed"))
+        # The runtime GPS_SURVEYED entry leg ENDS AT waypoint 0 and must come to
+        # rest there, so it is a run endpoint in the sense of
+        # segment_endpoint_approach_speed — not an arc seam that keeps rolling.
+        # min_approach_linear_velocity (0.10) exists to stop circles crawling the
+        # seam; arriving at wp0 that fast overshoots 3-4.6 cm (see 487ebbe, which
+        # fixed exactly this for the segment profile and left smooth untouched).
+        run_entry = bool(active_run.get("runtime_entry"))
+        if run_entry:
+            approach_v = float(
+                self.get_parameter("segment_endpoint_approach_speed").value
+            )
         if run_closed:
-            run_len = float(self._runs[self._run_idx]["length"])
+            run_len = float(active_run["length"])
             remaining = max(0.0, run_len - self._path_travel_m)
             if remaining < approach_d:
                 scale = self._clamp(remaining / approach_d, 0.0, 1.0)
                 speed = min(speed, max(approach_v, speed * scale))
                 state_code = StateCode.APPROACH
-        elif dist_to_goal < approach_d and self._path_travel_m >= approach_d:
-            # Linearly scale speed from full → approach_v as dist → 0
-            scale = self._clamp(dist_to_goal / approach_d, 0.0, 1.0)
-            approach_speed = max(approach_v, speed * scale)
-            speed = min(speed, approach_speed)
-            state_code = StateCode.APPROACH
+        else:
+            # The travel guard stops an open run from flooring speed before it has
+            # been traced. On a run shorter than 2·approach_d it can never be met,
+            # which would disable deceleration outright — an entry leg that starts
+            # under 0.6 m from wp0 would arrive at full mission speed. Cap the
+            # guard at half the run so a short leg still brakes (mirrors the
+            # 0.5·length cap in _run_min_travel).
+            approach_gate = approach_d
+            if run_entry:
+                approach_gate = min(approach_d, 0.5 * float(active_run["length"]))
+            if dist_to_goal < approach_d and self._path_travel_m >= approach_gate:
+                # Linearly scale speed from full → approach_v as dist → 0
+                scale = self._clamp(dist_to_goal / approach_d, 0.0, 1.0)
+                approach_speed = max(approach_v, speed * scale)
+                speed = min(speed, approach_speed)
+                state_code = StateCode.APPROACH
 
         # ---- Step 6.5: Accel-UP ramp (mission-start motor-jerk guard) ----
         # Cap how fast `speed` can RAMP UP relative to the previous cycle.
@@ -3504,6 +3547,26 @@ class RPPControllerNode(Node):
         self._pivot_timeout_warned = False
         self._pivot_turn_angle_rad = 0.0
         self._align_settle_since = None
+        self._corner_stop_hold_since = None
+
+    def _corner_stop_hold_satisfied(self) -> bool:
+        """Stop confirmed AND held at rest for corner_stop_hold_s.
+
+        Wraps _corner_stop_satisfied so every caller pivots (or advances) from a
+        settled pose. Any speed/yaw-rate violation restarts the dwell, so the
+        rover cannot creep out of the stop and still be treated as parked.
+        """
+        if not self._corner_stop_satisfied():
+            self._corner_stop_hold_since = None
+            return False
+        hold_s = float(self.get_parameter("corner_stop_hold_s").value)
+        if hold_s <= 0.0:
+            return True
+        now = self.get_clock().now()
+        if self._corner_stop_hold_since is None:
+            self._corner_stop_hold_since = now
+            return False
+        return (now - self._corner_stop_hold_since).nanoseconds * 1e-9 >= hold_s
 
     def _reset_completion_settle_state(self):
         self._completion_settle_entered = None
