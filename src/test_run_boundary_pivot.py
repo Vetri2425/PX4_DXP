@@ -31,6 +31,16 @@ These tests verify:
      twist_to_setpoint_node selects TYPE_MASK_VEL_YAW_YAWRATE (455) not 2503.
      (This is unchanged behavior; the test pins it as a regression guard.)
 
+PR-B (2026-07-10, BOUNDARY_TRUE_STOP_AND_ALIGN_STABILITY_PLAN.md §6): the
+recenter-vs-pivot choice (_run_alignment_hold, gated by
+segment_entry_pivot_recenter=True) used a bare `not position_ok` (single 2cm
+on/off switch) that the pivot's own rotation is expected to trip every
+cycle, fighting PX4's velocity-vector heading (bag-confirmed 90s align
+fight). Fixed with arm(0.08m)/release(0.05m) hysteresis via a new
+_recenter_armed() helper. Tests PRB1/PRB2 below cover it; the B/B4/B5/C/C2
+tests above are unaffected (they exercise the settle-gate's strict
+position_ok, which PR-B does not touch).
+
 Run on a ROS2-sourced host:
     python3 -X utf8 src/test_run_boundary_pivot.py
 """
@@ -562,6 +572,82 @@ def test_D_bridge_type_mask_selection():
 
 
 # ---------------------------------------------------------------------------
+# PR-B — recenter arm/release hysteresis (BOUNDARY_TRUE_STOP_AND_ALIGN_
+# STABILITY_PLAN.md §6). Replaces the bare `not position_ok` (single 2cm
+# on/off switch) gating the recenter-vs-pivot choice in _run_alignment_hold
+# with a two-threshold band: arm only past align_recenter_arm_m (0.08),
+# release only back under align_recenter_release_m (0.05).
+# ---------------------------------------------------------------------------
+
+def test_PRB1_recenter_hysteresis_no_chatter(node, caps):
+    """PR-B test 1: hysteresis does not chatter across a repeated 6-9cm
+    oscillation (simulated pivot-induced drift, plan §6's own scenario).
+
+    A bare single-threshold check (e.g. corner_position_tolerance_m=2cm, or
+    any single line inside this 6-9cm band) would flip every sample. The
+    arm(8cm)/release(5cm) band must instead pin the state: once armed, stay
+    armed until drift drops under the release radius; once released, stay
+    released until drift exceeds the arm radius.
+    """
+    node.set_parameters([
+        Parameter("align_recenter_arm_m", value=0.08),
+        Parameter("align_recenter_release_m", value=0.05),
+    ])
+    node._reset_corner_pivot_state()
+    assert node._recenter_active is False
+
+    # Phase 1: oscillate 6cm/9cm (both above the 5cm release radius) --
+    # once armed (first >8cm sample) must stay armed the whole phase.
+    seq1 = [0.06, 0.09, 0.06, 0.09, 0.06, 0.09, 0.06]
+    states1 = [node._recenter_armed(d) for d in seq1]
+    assert states1 == [False, True, True, True, True, True, True], (
+        f"expected a single arm transition then sticky-True, got {states1}"
+    )
+
+    # Phase 2: drop to 4cm (releases), then oscillate 4cm/6cm (both below
+    # the 8cm arm radius) -- must stay released the whole phase.
+    seq2 = [0.04, 0.06, 0.04, 0.06, 0.04]
+    states2 = [node._recenter_armed(d) for d in seq2]
+    assert states2 == [False, False, False, False, False], (
+        f"expected sticky-False after release, got {states2}"
+    )
+
+    print("PASS PRB1: hysteresis sticks armed past the release radius, "
+          "sticks released past the arm radius (no chatter on a 6-9cm "
+          "oscillation)")
+
+
+def test_PRB2_recenter_hysteresis_uses_dedicated_params(node, caps):
+    """PR-B test 2: align_recenter_arm_m / align_recenter_release_m are
+    declared with their documented defaults, and _run_alignment_hold gates
+    the recenter branch through _recenter_armed (NOT a reuse of
+    segment_boundary_corner_handoff_m -- that reuse idea was raised,
+    adversarially checked, and rejected; see plan doc §10.2). This is a
+    regression guard against the rejected idea resurfacing later.
+    """
+    import inspect
+
+    from rpp_controller_node import RPPControllerNode
+
+    assert node.has_parameter("align_recenter_arm_m")
+    assert node.has_parameter("align_recenter_release_m")
+    assert float(node.get_parameter("align_recenter_arm_m").value) == 0.08
+    assert float(node.get_parameter("align_recenter_release_m").value) == 0.05
+
+    src = inspect.getsource(RPPControllerNode._run_alignment_hold)
+    assert "segment_boundary_corner_handoff_m" not in src, (
+        "rejected reuse idea resurfaced: _run_alignment_hold must not "
+        "reference segment_boundary_corner_handoff_m (plan doc §10.2)"
+    )
+    assert "_recenter_armed" in src, (
+        "_run_alignment_hold must gate the recenter branch via _recenter_armed"
+    )
+    print("PASS PRB2: align_recenter_arm_m/release_m declared (0.08/0.05), "
+          "_run_alignment_hold uses _recenter_armed, no reuse of "
+          "segment_boundary_corner_handoff_m")
+
+
+# ---------------------------------------------------------------------------
 # Test E — stop certificate is preserved unchanged
 # ---------------------------------------------------------------------------
 
@@ -639,6 +725,8 @@ def main():
             (test_C_settle_clock_does_not_start_while_pivoting, "C"),
             (test_C2_position_ok_false_does_not_block_settle, "C2"),
             (test_E_stop_certificate_unaffected, "E"),
+            (test_PRB1_recenter_hysteresis_no_chatter, "PRB1"),
+            (test_PRB2_recenter_hysteresis_uses_dedicated_params, "PRB2"),
         ]:
             node = RPPControllerNode()
             node.set_parameters([

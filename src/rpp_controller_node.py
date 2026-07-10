@@ -565,36 +565,69 @@ class RPPControllerNode(Node):
         # (production: segment-corner pivot parity). Set false to restore legacy
         # unbounded pivot / timeout position waive without redeploy.
         self.declare_parameter("segment_entry_pivot_recenter",         True)
-        # Runtime-entry / smooth run-boundary TRUE-STOP window (m). Inside this
+        # Recenter arm/release hysteresis (m), run-boundary CORNER_ALIGN only
+        # (_run_alignment_hold, gated by segment_entry_pivot_recenter=True).
+        # PX4's velocity-vector pivot inherently translates the rover by
+        # ~corner_speed over the pivot duration, so a single hard threshold on
+        # position_ok flaps in and out every cycle the pivot's own rotation
+        # nudges position past it -- each flap yanks the commanded velocity
+        # between "rotate toward heading" (_corner_pivot_velocity) and "drive
+        # toward the point" (_corner_hold_velocity), a DIFFERENT bearing that
+        # PX4 (heading = commanded velocity-vector bearing only) chases,
+        # undoing rotational progress. Bag-confirmed (2026-07-10, M2 C2):
+        # heading reached -6.75deg at t+5s then wandered back out to
+        # 68/100/103deg for ~90s before settling. Replace the single 2cm
+        # gate with a two-threshold band: arm recenter only once drift
+        # exceeds align_recenter_arm_m, release back to pivot-only once
+        # drift drops under align_recenter_release_m -- never toggling on
+        # every crossing of one line. Dedicated params, NOT a reuse of
+        # segment_boundary_corner_handoff_m: that param's only two read
+        # sites are both hard-gated `!= "segment"` (a no-op for exactly the
+        # segment-profile corners this targets) and it is a smooth-run
+        # decel-ramp shaping knob anchored to segment_boundary_capture_
+        # radius_m (0.5m scale) that SPD-T1 (high-speed tuning backlog) may
+        # widen later for its original purpose -- reusing it here would
+        # silently balloon the align-recenter release radius with nothing
+        # pointing back at this mechanism. arm_m kept comfortably below the
+        # corner geometry seen in bags (natural drift typically <=6cm).
+        self.declare_parameter("align_recenter_arm_m",                 0.08)   # m
+        self.declare_parameter("align_recenter_release_m",             0.05)   # m
+        # Hard-boundary TRUE-STOP window (m), ALL profiles. Inside this
         # distance of the stop point the terminal approach brakes STRAIGHT along
         # the body axis (_corner_brake_velocity) to physically halt on the point
-        # -- the segment _publish_zero parity -- instead of holding a live
-        # capture setpoint (_smooth_capture_velocity, 0.03-0.08 toward the goal),
-        # which on the coasting rover (PX4 drives, does not brake) drove it ~1.1m
-        # PAST the point before looping back (bag 13-07-59). Body-axis brake only,
-        # so no off-nose bearing to arc on. Once slow inside the window it hands
-        # to a low-capped corner-hold to servo the final cm. Applies to smooth
-        # runs only (segment corners already have their own zero-stop). 0 disables
-        # (reverts to pure capture). Keep >= corner_position_tolerance_m.
+        # instead of coasting/servoing past it with a live setpoint. Originally
+        # entry/smooth-only; widened (2026-07-10) to every RUN_BOUNDARY and
+        # RUNTIME_ENTRY_TO_MARK stop -- bag-confirmed square corners (segment
+        # profile) walked past the same way entry did (bag 13-07-59 entry 1.1m,
+        # bag 2026-07-10_12-52 M1 corner C1 133cm) because they landed in the
+        # bare tangent-frame corner-hold with no active brake. Body-axis brake
+        # only, so no off-nose bearing to arc on. Once slow inside the window it
+        # hands to a low-capped corner-hold (park_speed) to servo the final cm.
+        # 0 disables (reverts to pure capture, smooth profile only -- segment
+        # falls through to the bare corner-hold fallback). Keep >=
+        # corner_position_tolerance_m.
         self.declare_parameter("segment_entry_true_stop_dist_m",       0.10)   # m
-        # Parked-cert speed gate for the runtime-entry -> MARK boundary. The
-        # entry stop now runs the SAME segment true-stop machinery as a smooth
-        # RUN_BOUNDARY (active _corner_brake_velocity inside
+        # Parked-cert speed gate for ALL hard-boundary stops (entry and
+        # run-boundary alike, segment or smooth profile) -- NOT entry-only in
+        # meaning, only in original scope. Every hard-boundary stop runs the
+        # same true-stop machinery (active _corner_brake_velocity inside
         # segment_entry_true_stop_dist_m, then a low-capped _corner_hold_velocity
-        # for the final cm), and certifies via _corner_stop_satisfied with THIS
+        # for the final cm) and certifies via _corner_stop_satisfied with THIS
         # tighter speed threshold instead of the loose segment_stop_speed_
         # threshold (0.08). The old pure-zero stop (command exactly (0,0), coast
         # down to 0.005 m/s, 1.0 s dwell, no stale fallback) certified inside the
         # RTK/EKF noise floor and deadlocked; the generic 0.08 gate certified
-        # while the rover still crept 5-7 cm/s and the pivot walked past wp0.
-        # 0.03 m/s = the codebase's existing at-rest definition
-        # (MISSION_COMPLETE_REST_SPEED_M_S); it sits just above this rover's
-        # 0.5-2 cm/s noise floor and is reachable because the rover is actively
-        # braked through it. Combined with corner_position_tolerance_m (0.02),
-        # segment_stop_yaw_rate_threshold, segment_stop_dwell_s (0.30 s), and the
-        # 2 s stale-velocity fallback (_CORNER_STOP_MAX_HOLD_S). If bags still
-        # show walk-past, tighten to 0.02. Set to segment_stop_speed_threshold
-        # (0.08) to revert the entry cert to the segment default.
+        # while the rover still crept 5-7 cm/s and the pivot walked past the
+        # boundary point -- bag-confirmed on plain segment RUN_BOUNDARY square
+        # corners too (2026-07-10), not just entry, since they took the exact
+        # same code path minus the active brake and tight cert. 0.03 m/s = the
+        # codebase's existing at-rest definition (MISSION_COMPLETE_REST_SPEED_
+        # M_S); it sits just above this rover's 0.5-2 cm/s noise floor and is
+        # reachable because the rover is actively braked through it. Combined
+        # with corner_position_tolerance_m (0.02), segment_stop_yaw_rate_
+        # threshold, segment_stop_dwell_s (0.30 s), and the 2 s stale-velocity
+        # fallback (_CORNER_STOP_MAX_HOLD_S). If bags still show walk-past,
+        # tighten to 0.02.
         self.declare_parameter("segment_entry_stop_speed_m_s",         0.03)   # m/s
         # NOTE (2026-07-07): the runtime-entry OFF->MARK pivot was previously
         # special-cased with a slow speed (0.05 m/s), a tight ±20° cone, and a
@@ -1791,22 +1824,19 @@ class RPPControllerNode(Node):
             stop_pt.x - prev_pt.x, stop_pt.y - prev_pt.y,
         )
 
-        # Certification gate. The runtime-entry -> MARK boundary runs the SAME
-        # true-stop machinery as a smooth RUN_BOUNDARY (active brake + corner-
-        # hold in the HOLD tail below; run 0 is smooth so it enters the true-
-        # stop branch automatically), but certifies on the tighter PARKED speed
-        # gate (segment_entry_stop_speed_m_s, default 0.03) instead of the loose
-        # segment_stop_speed_threshold (0.08). The loose gate certified while
-        # the rover still crept 5-7 cm/s, so the pivot walked past wp0; the old
+        # Certification gate. Every hard-boundary stop (RUN_BOUNDARY and
+        # RUNTIME_ENTRY_TO_MARK alike) runs the SAME true-stop machinery
+        # (active brake + corner-hold in the HOLD tail below) and certifies on
+        # the same tighter PARKED speed gate (segment_entry_stop_speed_m_s,
+        # default 0.03) instead of the loose segment_stop_speed_threshold
+        # (0.08). The loose gate certified while the rover still crept
+        # 5-7 cm/s, so the pivot walked past the boundary point (bag-confirmed
+        # on plain segment RUN_BOUNDARY corners too, not just entry); the old
         # pure-zero stop (0.005 gate, no active brake) deadlocked inside the
         # noise floor. Active brake + parked gate + 2 s stale fallback converge.
-        entry_cert = stop_reason == StopReason.RUNTIME_ENTRY_TO_MARK
-        speed_override = (
-            float(self.get_parameter("segment_entry_stop_speed_m_s").value)
-            if entry_cert else None
-        )
+        park_speed = float(self.get_parameter("segment_entry_stop_speed_m_s").value)
         if self._corner_stop_satisfied(
-            position_ok=position_ok, speed_threshold_override=speed_override
+            position_ok=position_ok, speed_threshold_override=park_speed
         ):
             boundary_seg_idx = max(0, len(self._path) - 2)
             self._make_stop_certificate(
@@ -1846,40 +1876,41 @@ class RPPControllerNode(Node):
         true_stop_dist = float(
             self.get_parameter("segment_entry_true_stop_dist_m").value
         )
-        stop_speed = float(
-            self.get_parameter("segment_stop_speed_threshold").value
-        )
         meas_speed = (
             math.hypot(*self._latest_vel_ned) if self._vel_is_fresh() else 0.0
         )
-        if (
-            self._active_tracking_profile != "segment"
-            and true_stop_dist > 0.0
-            and pos_error <= true_stop_dist
-        ):
-            # True-stop gate (segment _publish_zero parity). Inside the stop
-            # window: while still coasting, brake STRAIGHT along the body axis to
-            # physically halt on the point instead of driving past it with a live
-            # capture setpoint (bag 13-07-59 coasted 1.1 m past). _corner_brake_
-            # velocity is longitudinal only -> no off-nose bearing to arc on. Once
-            # slow, hand to a low-capped corner-hold to servo the final cm.
-            if meas_speed > stop_speed:
+        if true_stop_dist > 0.0 and pos_error <= true_stop_dist:
+            # True-stop gate (segment _publish_zero parity), now applied to
+            # ALL profiles (2026-07-10): while still coasting inside the stop
+            # window, brake STRAIGHT along the body axis to physically halt on
+            # the point instead of driving past it with a live capture/hold
+            # setpoint (bag 13-07-59 entry coasted 1.1 m past; bag 2026-07-10
+            # M1 square corner C1 walked 133 cm past under the old
+            # segment-only gating, which landed plain RUN_BOUNDARY corners in
+            # the uncapped tangent-frame corner-hold fallback below with no
+            # active brake). _corner_brake_velocity is longitudinal only -> no
+            # off-nose bearing to arc on. Once slow, hand to a low-capped
+            # corner-hold (park_speed) to servo the final cm.
+            if meas_speed > park_speed:
                 brake_n, brake_e = self._corner_brake_velocity(yaw_ned)
             else:
                 brake_n, brake_e = self._corner_hold_velocity(
                     pos_n, pos_e, stop_pt.x, stop_pt.y,
                     stop_pt.x - prev_pt.x, stop_pt.y - prev_pt.y,
                     yaw_ned,
-                    max_speed_cap=stop_speed,
+                    max_speed_cap=park_speed,
                 )
         elif self._active_tracking_profile != "segment" and pos_error > handoff_r:
-            # Smooth-run terminal approach: hold a fixed bearing straight at the
-            # stop point at a low decel speed so PX4 tracks it down (see
-            # _smooth_capture_velocity). The segment corner-hold's tangent-frame
-            # servo swings the bearing and, entered while the rover is still
-            # fast, drove it into PX4's speed-holding turn-state. Hand to the
-            # corner-hold only for the final settle inside handoff_r, where the
-            # rover is already slow and aligned.
+            # UNCHANGED — smooth-only far-field capture ramp: hold a fixed
+            # bearing straight at the stop point at a low decel speed so PX4
+            # tracks it down (see _smooth_capture_velocity). The segment
+            # corner-hold's tangent-frame servo swings the bearing and,
+            # entered while the rover is still fast, drove it into PX4's
+            # speed-holding turn-state. Hand to the corner-hold only for the
+            # final settle inside handoff_r, where the rover is already slow
+            # and aligned. Segment profile has no far-field capture leg (its
+            # runs start already inside true_stop_dist/handoff_r), so this
+            # branch stays gated off segment on purpose.
             brake_n, brake_e = self._smooth_capture_velocity(
                 pos_n, pos_e, stop_pt.x, stop_pt.y, yaw_ned, pos_error
             )
@@ -2200,7 +2231,16 @@ class RPPControllerNode(Node):
         # the strict position gate converges. Legacy behaviour (param off): no
         # recovery — residual left for RPP lookahead once tracking resumes, which
         # the bags show is far too large (52-203cm) on runtime-entry pivots.
-        if recenter_on and self._corner_stop_complete and not position_ok:
+        #
+        # Arm/release hysteresis (align_recenter_arm_m / align_recenter_
+        # release_m) replaces a bare `not position_ok` (a single 2cm on/off
+        # switch): the pivot's own rotation is EXPECTED to nudge position past
+        # a single fixed line every cycle, which flapped this branch on/off
+        # against the pivot branch above and fought PX4's velocity-vector
+        # heading (bag-confirmed, 2026-07-10: M2 C2 reached -6.75deg then
+        # wandered 68/100/103deg for ~90s before settling). Hysteresis makes
+        # entry/exit sticky instead.
+        if recenter_on and self._corner_stop_complete and self._recenter_armed(pos_error):
             self._last_speed_cmd = 0.0
             # Cap the recenter at the pivot speed (segment_min_corner_speed,
             # ~0.08) rather than the 0.18 brake cap: at an O(90deg) entry-arrival
@@ -4442,6 +4482,23 @@ class RPPControllerNode(Node):
         )
         return dist <= float(self.get_parameter("corner_position_tolerance_m").value)
 
+    def _recenter_armed(self, dist: float) -> bool:
+        """Sticky arm/release gate for the run-boundary CORNER_ALIGN recenter.
+
+        Replaces a bare `dist > corner_position_tolerance_m` check (a single
+        line the pivot's own rotation is expected to cross every cycle) with
+        a hysteresis band: arm only past align_recenter_arm_m, release only
+        back under align_recenter_release_m. See _run_alignment_hold for the
+        bag evidence this fixes (M2 C2 align fight, 2026-07-10).
+        """
+        arm_r = float(self.get_parameter("align_recenter_arm_m").value)
+        release_r = float(self.get_parameter("align_recenter_release_m").value)
+        if self._recenter_active and dist <= release_r:
+            self._recenter_active = False
+        elif not self._recenter_active and dist > arm_r:
+            self._recenter_active = True
+        return self._recenter_active
+
     def _smooth_capture_velocity(
         self,
         pos_n: float,
@@ -4839,6 +4896,7 @@ class RPPControllerNode(Node):
         self._pivot_timeout_warned = False
         self._pivot_turn_angle_rad = 0.0
         self._align_settle_since = None
+        self._recenter_active = False
         self._stop_certificate = None
         self._alignment_certificate = None
 

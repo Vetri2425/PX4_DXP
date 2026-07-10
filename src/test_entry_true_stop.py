@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Tests for the runtime-entry (OFF -> MARK) TRUE-STOP.
+"""Tests for the unified hard-boundary TRUE-STOP (entry + segment RUN_BOUNDARY).
 
-The entry->MARK boundary now runs the SAME segment true-stop machinery as a
-smooth RUN_BOUNDARY -- active _corner_brake_velocity inside
-segment_entry_true_stop_dist_m, then a low-capped _corner_hold_velocity for the
-final cm -- and certifies via _corner_stop_satisfied with the tighter PARKED
-speed gate segment_entry_stop_speed_m_s (0.03) instead of the loose
+Every hard-boundary stop -- runtime-entry (OFF -> MARK) AND a plain segment
+RUN_BOUNDARY (e.g. a square corner) alike -- runs the SAME true-stop
+machinery: active _corner_brake_velocity inside segment_entry_true_stop_dist_m,
+then a low-capped _corner_hold_velocity for the final cm -- and certifies via
+_corner_stop_satisfied with the tighter PARKED speed gate
+segment_entry_stop_speed_m_s (0.03) instead of the loose
 segment_stop_speed_threshold (0.08). This replaces the old pure-zero stop
 (_entry_pure_stop_hold), which commanded exactly (0,0), let PX4 coast, and
-certified at 0.005 m/s inside the noise floor (deadlock).
+certified at 0.005 m/s inside the noise floor (deadlock). PR-A (2026-07-10)
+widened this from entry-only to every hard boundary, since segment
+RUN_BOUNDARY corners were bag-confirmed to take the exact same code path
+minus the active brake and the tight cert (M1 square corner C1: 133.71cm arc).
 
 Invariants under test:
   * inside the stop window while moving -> nonzero brake opposing motion, NOT (0,0)
@@ -17,6 +21,9 @@ Invariants under test:
   * position gate still blocks cert off-point
   * stale velocity -> 2 s fallback cap certifies (no deadlock)
   * the pure-stop branch/latch/params are gone
+  * segment-profile RUN_BOUNDARY corners get the identical active brake +
+    unified parked-speed cert (not the old segment-only-excluded uncapped
+    tangent-frame fallback)
 
 Run on a ROS2-sourced host (needs rclpy):
     python3 -X utf8 src/test_entry_true_stop.py
@@ -162,6 +169,123 @@ def main():
         assert handled is True
         assert node._run_idx == 0, "must not certify while 4 cm off the point"
         print("PASS test 4: position gate (2 cm) blocks cert off-point")
+
+        # ---- TEST 5b: segment-profile RUN_BOUNDARY (square corner) now gets
+        #      the SAME active brake as entry (PR-A, 2026-07-10). Position
+        #      error 7cm — inside true_stop_dist (0.10m default) but OUTSIDE
+        #      corner_position_tolerance_m (0.02m), so pre-PR-A this landed in
+        #      the bare, uncapped tangent-frame _corner_hold_velocity()
+        #      fallback (segment_brake_velocity_cap_m_s=0.18, arbitrary
+        #      bearing) instead of the longitudinal-only brake. Bag-confirmed:
+        #      M1's square corner C1 (HOLD start 1.9cm@12.5cm/s) rode that
+        #      fallback into a 133.71cm arc before parking.
+        node._runs = [
+            _run([_pose(0.0, 0.0), _pose(1.0, 0.0)], runtime_entry=False, profile="segment"),
+            _run([_pose(1.0, 0.0), _pose(1.0, 1.0)], profile="segment"),
+        ]
+        node._apply_run(0)
+        node._active_tracking_profile = "segment"
+        node._run_boundary_stop_pending = False
+        node._latest_vel_time = now()
+        node._latest_vel_ned = (0.125, 0.0)     # 12.5 cm/s toward the boundary (+N)
+        node._latest_yaw_rate_ned = 0.0
+        vel_cap.clear()
+        handled = node._hold_before_run_advance(0.93, 0.0, 0.0, 0.0, 0.07)  # pos_error=0.07
+        assert handled is True
+        assert node._run_idx == 0, "must not certify a segment corner moving at 12.5 cm/s"
+        v = vel_cap.last
+        assert v is not None
+        expected_n, expected_e = node._corner_brake_velocity(0.0)
+        assert abs(v.vector.x - expected_n) < 1e-9 and abs(v.vector.y - expected_e) < 1e-9, (
+            f"segment RUN_BOUNDARY inside true_stop_dist must use the active "
+            f"longitudinal brake (_corner_brake_velocity), got "
+            f"({v.vector.x:.4f},{v.vector.y:.4f}) vs expected "
+            f"({expected_n:.4f},{expected_e:.4f})"
+        )
+        assert v.vector.x < -1e-6 and abs(v.vector.y) < 1e-9, (
+            "brake must oppose +N motion (pure longitudinal, no lateral component)"
+        )
+        print("PASS test 5b: segment RUN_BOUNDARY gets active longitudinal brake "
+              "(not the old uncapped tangent-frame servo)")
+
+        # ---- TEST 5c: segment RUN_BOUNDARY creeping at 0.05 m/s (above the
+        #      0.03 parked gate, below the old 0.08 segment default) must NOT
+        #      certify. Pre-PR-A, RUN_BOUNDARY certified on the loose 0.08
+        #      gate — this is the unified-cert half of the fix.
+        node._latest_vel_ned = (0.05, 0.0)      # 5 cm/s
+        vel_cap.clear()
+        handled = node._hold_before_run_advance(1.0, 0.0, 0.0, 0.0, 0.0)
+        assert handled is True
+        assert node._run_idx == 0, (
+            "must NOT certify a segment RUN_BOUNDARY creeping at 0.05 m/s "
+            "(> 0.03 unified parked gate)"
+        )
+        print("PASS test 5c: segment RUN_BOUNDARY does not cert while creeping "
+              "at 0.05 m/s (unified parked gate)")
+
+        # ---- TEST 5d: segment RUN_BOUNDARY arriving already slow
+        #      (PRE_CORNER_SLOWDOWN working correctly, <=0.03 m/s) certifies
+        #      promptly once parked for the dwell — confirms PR-A adds no
+        #      added latency when the slowdown profile already delivers a
+        #      slow arrival.
+        node._latest_vel_ned = (0.02, 0.0)      # 2 cm/s <= 0.03 parked gate
+        node._hold_before_run_advance(1.0, 0.0, 0.0, 0.0, 0.0)   # arm dwell timer
+        assert node._run_idx == 0, "one satisfying cycle is not enough (0.30 s dwell)"
+        node._corner_stop_settle_since = now() - Duration(seconds=0.4)
+        node._corner_stop_entered = now() - Duration(seconds=0.4)
+        handled = node._hold_before_run_advance(1.0, 0.0, 0.0, 0.0, 0.0)
+        assert handled is True
+        assert node._run_idx == 1, "must advance once parked for the full dwell"
+        assert node._run_align_pending is True, "run-boundary pivot must be armed"
+        assert node._stop_certificate.reason == StopReason.RUN_BOUNDARY
+        print("PASS test 5d: segment RUN_BOUNDARY certifies promptly once "
+              "parked (<=0.03 m/s) for the dwell, no added latency")
+
+        # ---- TEST 5e: M1-style regression bound. Forward-simulate (simple
+        #      point-mass, perfect velocity tracking, 50 Hz control loop) from
+        #      the exact bag-observed HOLD-start condition — M1 square corner
+        #      C1, 1.9cm off the boundary at 12.5 cm/s — and assert the
+        #      position error stays bounded instead of ballooning the way the
+        #      pre-fix bag showed (peak 133.71cm). This is a coarse
+        #      point-mass regression net around the fixed code path, not a
+        #      firmware-accurate reproduction of the PX4 differential-drive
+        #      arc dynamics that produced the original overshoot — the
+        #      structural mechanism guard is test 5b above.
+        node._runs = [
+            _run([_pose(0.0, 0.0), _pose(1.0, 0.0)], runtime_entry=False, profile="segment"),
+            _run([_pose(1.0, 0.0), _pose(1.0, 1.0)], profile="segment"),
+        ]
+        node._apply_run(0)
+        node._active_tracking_profile = "segment"
+        node._run_boundary_stop_pending = False
+
+        dt = 1.0 / 50.0
+        pos_n, pos_e = 1.0 - 0.019, 0.0    # 1.9 cm short of the boundary
+        vel_n, vel_e = 0.125, 0.0          # 12.5 cm/s toward it
+        node._latest_vel_time = now()
+        node._latest_vel_ned = (vel_n, vel_e)
+        node._latest_yaw_rate_ned = 0.0
+        max_err = 0.0
+        for _ in range(250):   # 5 s of simulated approach
+            dist = math.hypot(pos_n - 1.0, pos_e)
+            max_err = max(max_err, dist)
+            vel_cap.clear()
+            node._latest_vel_time = now()
+            node._hold_before_run_advance(pos_n, pos_e, 0.0, 0.0, dist)
+            if node._run_idx != 0:
+                break
+            v = vel_cap.last
+            vn = v.vector.x if v else 0.0
+            ve = v.vector.y if v else 0.0
+            pos_n += vn * dt
+            pos_e += ve * dt
+            node._latest_vel_ned = (vn, ve)
+        assert max_err < 0.15, (
+            f"peak simulated position error {max_err * 100:.1f} cm exceeded "
+            f"the 15 cm regression bound (pre-fix bag: 133.71 cm)"
+        )
+        print(f"PASS test 5e: M1-style forward sim bounded at "
+              f"{max_err * 100:.1f} cm (< 15 cm)")
 
         # ---- TEST 5: stale velocity -> 2 s fallback cap certifies (no deadlock).
         node._runs = [
