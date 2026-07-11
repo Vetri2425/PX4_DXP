@@ -4,6 +4,7 @@ POST /api/mission/load    — load path by name or file
 POST /api/mission/start   — arm → OFFBOARD → publish path
 POST /api/mission/stop    — publish stop-path (stay armed)
 POST /api/mission/abort   — hard abort (stop-path + MANUAL + disarm)
+POST /api/mission/clear   — clear the resident mission (in-memory only)
 GET  /api/mission/status  — current state + RPP snapshot
 """
 from __future__ import annotations
@@ -21,6 +22,7 @@ from mission_loading import (
 from mission_placement import PlacementError
 from models import (
     LoadedPathResponse,
+    MissionClearResponse,
     MissionLoadRequest,
     MissionStartRequest,
     MissionStatus,
@@ -130,6 +132,26 @@ async def abort_mission():
     if offboard_ctrl is None:
         raise HTTPException(503, "Controller not ready")
     return await offboard_ctrl.abort_async()
+
+
+@router.post("/clear", response_model=MissionClearResponse, dependencies=[Depends(require_token)])
+async def clear_mission():
+    """Clear an idle/completed resident mission without deleting artifacts.
+
+    In-memory only. Reduced from fix/runtime-entry-stop: this baseline has no
+    point_mission / hold_owner, so only the controller's resident mission is
+    cleared. A live mission returns 409 — stop or abort it first.
+    """
+    from main import offboard_ctrl
+    from offboard_controller import MissionClearConflict
+
+    if offboard_ctrl is None:
+        raise HTTPException(503, "Controller not ready")
+    try:
+        status = await offboard_ctrl.clear_mission_async()
+    except MissionClearConflict as exc:
+        raise HTTPException(409, str(exc))
+    return MissionClearResponse(cleared=True, status=LoadedPathResponse(**status))
 
 
 @router.get(

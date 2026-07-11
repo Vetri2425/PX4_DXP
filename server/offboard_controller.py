@@ -46,7 +46,19 @@ ABORT_NOOP_STATES = {
     MissionState.COMPLETED,
     MissionState.ABORTED,
 }
+# Resident mission may be cleared only from idle/terminal states — never
+# mid-flight. Matches CLEAR_ALLOWED_STATES on fix/runtime-entry-stop.
+CLEAR_ALLOWED_STATES = {
+    MissionState.IDLE,
+    MissionState.COMPLETED,
+    MissionState.ABORTED,
+    MissionState.ERROR,
+}
 STOP_SETTLE_S = 0.1
+
+
+class MissionClearConflict(Exception):
+    """Raised when resident mission state cannot be cleared safely."""
 
 
 class OffboardController:
@@ -123,6 +135,39 @@ class OffboardController:
             "origin_gps": list(self._origin_gps) if self._origin_gps else None,
             "is_staged": self._is_staged_mission,
         }
+
+    async def clear_mission_async(self) -> dict[str, Any]:
+        """Clear the resident mission without deleting its source artifact.
+
+        In-memory only: wipes the loaded path + placement so a fresh mission can
+        be loaded. Guarded to idle/terminal states — a live mission must be
+        stopped or aborted first. Ported from fix/runtime-entry-stop, reduced to
+        this baseline's controller state (the reference also reset mission_id /
+        fingerprint / dash / spray-config fields that do not exist here).
+        """
+        async with self._lifecycle_lock():
+            if self._state not in CLEAR_ALLOWED_STATES:
+                raise MissionClearConflict(
+                    f"Cannot clear mission while controller state is "
+                    f"{self._state.value}; stop or abort the mission first"
+                )
+            cleared_name = self._path_name
+            self._loaded_pts = None
+            self._loaded_spray_flags = None
+            self._path_name = None
+            self._placement_mode = LOCAL_NED
+            self._origin_gps = None
+            self._is_staged_mission = False
+            self._state = MissionState.IDLE
+            # Optional path-topic clear if this branch's node grows the hook;
+            # baseline has publish_stop_path only, so this self-skips (clear is
+            # in-memory only and runs from idle/terminal states anyway).
+            if self._node is not None and hasattr(self._node, "publish_path_clear"):
+                self._node.publish_path_clear()
+            self._log_entry(
+                "info", f"Resident mission cleared: {cleared_name or 'none'}"
+            )
+            return self.loaded_path_summary()
 
     # ── Path management ───────────────────────────────────────────────────────
 

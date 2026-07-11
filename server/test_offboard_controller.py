@@ -156,3 +156,30 @@ def test_surveyed_start_publishes_live_ekf_points():
         assert ctrl._loaded_pts == source
     finally:
         offboard_module.SETPOINT_STREAM_GRACE_S = old_grace
+
+
+def test_clear_mission_resets_resident_state():
+    ctrl = OffboardController(FakeNode([{"connected": True, "rpp_state": RPP_IDLE}]), deque())
+    ctrl.load_path([(1.0, 2.0), (3.0, 4.0)], name="sq")
+    assert ctrl._loaded_pts == [(1.0, 2.0), (3.0, 4.0)]
+
+    status = run(ctrl.clear_mission_async())
+
+    assert ctrl.state == MissionState.IDLE
+    assert ctrl._loaded_pts is None
+    assert ctrl.loaded_path_name is None
+    assert status["loaded"] is False
+    assert status["num_waypoints"] == 0
+
+
+def test_clear_mission_rejected_while_running():
+    ctrl = OffboardController(FakeNode([{"connected": True, "rpp_state": RPP_IDLE}]), deque())
+    ctrl.load_path([(1.0, 2.0), (3.0, 4.0)], name="sq")
+    ctrl.state = MissionState.RUNNING
+
+    with pytest.raises(offboard_module.MissionClearConflict):
+        run(ctrl.clear_mission_async())
+
+    # A rejected clear leaves state and resident path untouched.
+    assert ctrl.state == MissionState.RUNNING
+    assert ctrl._loaded_pts == [(1.0, 2.0), (3.0, 4.0)]
