@@ -51,40 +51,28 @@ Not your job: PX4 firmware, waypoint gen, log analysis — those live on Mac GCS
 | SSH to Jetson | `ssh flash@192.168.1.102` |
 | QGC | QGroundControl on macOS |
 
-## Current status (2026-06-17)
+## Current status (2026-07-11) — TRUSTED BASELINE
+
+> **Pin:** branch `test/colinear-fix` @ **`3b7841a`** (`coliner test fix`). Controller code = **`cd44884`** (collinear spray-boundary momentum). All further companion work starts from this tree. July mainline stop/pivot param doublings, `corner_stop_hold_s`, completion latch, and twist reverse-yaw-hold are **not** in this branch — do not reintroduce without a named A/B.
 
 - Phase 2 OFFBOARD stack running; FastAPI + mobile frontend built
-- **Controller + tuning phase CLOSED & VALIDATED** — frozen at validated config (`@510be9b`+ bug fixes). Production tracking = **segment / stop-pivot profile**. Do not re-open arc PID/lookahead tuning unless a regression appears.
-- **All 3 priority bugs FIXED + VALIDATED (2026-06-15)** via 11-bag campaign + `tools/validate_build.py`:
-  - **BUG-T3** wrong-initial-turn — `fix(rpp): forward-cone clamp` (`510be9b`). PASS on all 11 incl. ~90° mis-headed starts (correct turn, no reverse).
-  - **BUG-T2** stop-and-go at smooth/tangent junctions — `1af51ac` (`_apply_run` heading-delta gate + intrinsic `_segment_angle_deg`). U-turn flows continuously (0 stops, 0.97cm RMS).
-  - **BUG-T1** stop-pivot oscillation — `036f116` (yaw-rate settle gates; `segment_debug` 9→10, `[9]`=actual yaw-rate). Validated `square_2x2_20260615_144019`: clean single-direction pivots, **1 significant reversal (>0.1)/0 large** (was 8/2 on 06-13). xtrack 0.53cm RMS.
-- **Tracking @0.35 m/s — all shapes sub-2cm RMS:** arc 1.46 / lshape 0.90 / square 0.87 / U-turn 1.06 cm. ulogs clean (no clipping).
-- **Arc (smooth RPP) — structural floor, DEFERRED** (not blocking; segment profile is production): velocity OFFBOARD discards `trajectory_setpoint.yawspeed`; pure-P attitude loop → following err `≈ ω/RO_YAW_P`. `RO_YAW_P` now **1.5** (lag ~9°). To beat 2cm on smooth curves: raise `RO_YAW_P` (QGC) OR `body_rate` offboard. Companion `yaw_rate_feedback_gain` is a NO-OP in velocity mode.
-- Validated RPP params: `max_yaw_rate_body=0.45`, `a_lat_max=0.3`, `corner_smooth_radius_m=0.5`, `segment_heading_tolerance_deg=2.0`, `segment_stop_yaw_rate_threshold=0.05`, `segment_align_settle_s=0.10`. PX4: `RO_YAW_P=1.5`, `RO_YAW_RATE_LIM=30`, `EKF2_WENC_CTRL=1`, `RBCLW_COUNTS_REV=148000` (encoder fusion validated log_150). Full as-flown set in `PX4_DXP_Tracker.xlsx` → "PX4 FCU Params".
-- **FUTURE — high-speed tuning (SPD-T1, backlog):** target 1.0 m/s line / 0.6 m/s arc (now 0.35). Prereq: `RO_MAX_THR_SPEED=0.9` ⇒ full throttle ≈0.9-0.95 m/s, so 1.0 has NO headroom — verify RoboClaw top speed first. Line/arc split is free via `a_lat_max` regulator (mission_speed=1.0 + a_lat_max≈0.24 → 1.0 straight / ~0.6 on R1.5). Watch: corner braking dist (slowdown_dist 0.5m too short at 1 m/s), arc heading lag grows (~15° at 0.6/R1.5), speed-loop overshoot. See tracker SPD-T1.
-- Known minor (not blocking): pivots ~6s near 5s align watchdog, 2/3 exit ~0.17 rad/s residual; speed loop overshoots (~0.42 vs 0.35) — tighten `RO_SPEED_P/I` when convenient.
-- **Auto-bag recorder LIVE** — `bag-autorecord.service` captures every API-started mission to `~/bags_jet` (start→complete). Validate via `tools/validate_build.py <dir>`.
-- Tracking profiles live: `tracking_profile=auto|segment|smooth` — auto splits missions per-entity (spray-flag + hard-corner splits), lines→segment, arcs/circles→smooth, pivot-align at transitions.
-- Phase 3 spray: **built, live & hardware-validated (2026-06-17)** — `spray_controller_node.py` drives PX4 AUX1 via `MAV_CMD_DO_SET_ACTUATOR` cmd 187 (MAVROS), safety-gated (armed+OFFBOARD, staleness watchdog, debounce); manual test via `POST /api/spray/test`.
-  - **Validated spray config (SmartFLEX DC motor driver on AUX1):**
-    - `actuator_backend = mavlink_actuator` (cmd 187, normalized)
-    - `on_value = 1.0` → 3000 µs (full flow, field-confirmed)
-    - `off_value = -1.0` → 0 µs (motor fully stopped, field-confirmed)
-  - **Required QGC FCU params (source of truth — set via QGC, not Jetson):**
-    - `PWM_AUX_FUNC1 = 301` (RC AUX passthrough)
-    - `PWM_AUX_MIN1 = 0` (was 1000 — changed so OFF idles at 0 µs, not 1000 µs)
-    - `PWM_AUX_MAX1 = 3000` (SmartFLEX accepts 0–3000 µs range)
-    - `PWM_AUX_DIS1 = 0` (disarmed output = 0 µs)
-  - **Why not cmd 183 (DO_SET_SERVO):** PX4 denies cmd 183 with `PWM_AUX_FUNC1=301` (RC passthrough). Switching to `mavlink_servo_pwm` backend requires changing FUNC1 to Generic Actuator in QGC — deferred, not needed.
-  - **Bench test command (armed, no OFFBOARD needed):** `MAV_CMD_DO_SET_ACTUATOR` cmd 187 is accepted while armed in any mode. cmd 183 requires OFFBOARD.
-- robot_localization fusion: not yet built
+- **Controller + tuning CLOSED** at this baseline. Production tracking = **segment / stop-pivot**. Do not re-open arc PID/lookahead unless a regression appears.
+- **Lineage still included:** BUG-T3 `510be9b` / BUG-T2 `1af51ac` / BUG-T1 `036f116` (validated 2026-06-15) + collinear momentum `cd44884` (2026-06-19).
+- **Tracking @0.35 m/s — shapes sub-2cm RMS (06-15 bags):** arc 1.46 / lshape 0.90 / square 0.87 / U-turn 1.06 cm.
+- **Arc (smooth RPP) — structural floor, DEFERRED:** velocity OFFBOARD discards `trajectory_setpoint.yawspeed`; pure-P → following err `≈ ω/RO_YAW_P`. `RO_YAW_P=1.5`. Companion `yaw_rate_feedback_gain` is a NO-OP in velocity mode.
+- **Frozen RPP corner-stop defaults (this tree):** `segment_slowdown_dist=0.50`, `segment_brake_velocity_cap_m_s=0.08`, `segment_min_corner_speed=0.08` (PRE_CORNER floor), `segment_endpoint_approach_speed=0.03` (final-segment only), `segment_heading_tolerance_deg=2.0`, `segment_stop_yaw_rate_threshold=0.05`, `segment_align_settle_s=0.20`, `segment_stop_dwell_s=0.30`. Also: `max_yaw_rate_body=0.45`, `a_lat_max=0.3`, `corner_smooth_radius_m=0.5`. PX4: `RO_YAW_P=1.5`, `RO_YAW_RATE_LIM=30`, `EKF2_WENC_CTRL=1`, `RBCLW_COUNTS_REV=148000`. Full FCU set in `PX4_DXP_Tracker.xlsx` → "PX4 FCU Params".
+- **FUTURE — SPD-T1 (backlog):** 1.0 m/s line / 0.6 m/s arc. Prereq: verify RoboClaw top speed vs `RO_MAX_THR_SPEED=0.9`.
+- Tracking profiles live: `tracking_profile=auto|segment|smooth`.
+- Phase 3 spray: **live on this tree** — `spray_controller_node.py` → PX4 AUX1 via cmd 187; `on_value=1.0` / `off_value=-1.0` (normalized). QGC: `PWM_AUX_FUNC1=301`, `PWM_AUX_MIN1=0`, `PWM_AUX_MAX1=3000` (as documented in this tree), `PWM_AUX_DIS1=0`. Manual: `POST /api/spray/test`.
+- Plan doc on branch: `docs/OFFBOARD_POSITION_MODE_PLAN.md` (future position-mode stop architecture — not implemented in controller yet).
+- robot_localization fusion: not pursued (EKF2 wheel-encoder fusion supersedes).
 
-### Active focus (Phase 3 — moved on from controller)
+### Active focus (from this baseline)
 1. **Path engine + trajectory planning** — mission/path generation, segment splitting, corner handling
-2. **CRS / coordinate handling** — coordinate reference system + geodesic conversion for path import
-3. **Spray control logic** — validate flag conditioning, timing, safety gates end-to-end
-4. **Full-pipeline validation** — CAD/DXF → path → mission → drive → spray, on hardware
+2. **CRS / coordinate handling** — CRS + geodesic conversion for path import
+3. **Spray control logic** — flag conditioning, timing, safety gates end-to-end
+4. **Full-pipeline validation** — CAD/DXF → path → mission → drive → spray
+5. Optional: evaluate OFFBOARD position-mode plan without regressing `cd44884` stop/pivot
 
 ## Hard rules
 

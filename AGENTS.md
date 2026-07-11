@@ -39,13 +39,14 @@ Not your job: PX4 firmware, waypoint gen, log analysis — those belong to Lapto
 4. Velocity: `/mavros/setpoint_velocity/cmd_vel` (TwistStamped)
 5. Path/arc: `/mavros/setpoint_raw/local` (PositionTarget)
 
-## Current status (2026-06-04)
+## Current status (2026-07-11) — TRUSTED BASELINE
 
-- Phase 2 OFFBOARD stack running; FastAPI + mobile frontend built
-- Arc tuning at arc_fix_28; arc_fix_16 validated 1.5m arc at **2.57cm median xtrack**
-- Active goal: corner xtrack **≤5cm** (plan: `docs/superpowers/plans/2026-06-02-corner-xtrack-reduction.md`)
-- Validated RPP params: `max_yaw_rate_body=0.45`, `a_lat_max=0.3`, `corner_smooth_radius_m=0.5`
-- Phase 3 (spray GPIO) and robot_localization fusion: not yet built
+- **Pin:** branch `test/colinear-fix` @ **`3b7841a`** (controller = **`cd44884`**). All further work starts here.
+- Phase 2 OFFBOARD + FastAPI running; production tracking = **segment / stop-pivot**
+- Corner ≤5cm MET (06-12/06-15). Collinear PRE/MARK/AFT momentum fix in tree (`cd44884`).
+- Frozen corner knobs: `segment_slowdown_dist=0.50`, `segment_brake_velocity_cap_m_s=0.08`, PRE_CORNER floor `segment_min_corner_speed=0.08`
+- Spray: PX4 AUX1 cmd 187 (not GPIO). robot_localization superseded by EKF2 wheel-encoder fusion.
+- Detail: `CLAUDE.md` Current status + agent memory `baseline_colinear_fix_2026_07_11`
 
 ## Hard rules
 
