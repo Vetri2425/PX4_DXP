@@ -14,13 +14,17 @@ Pure stdlib (urllib + subprocess). Runs under systemd; ROS env is sourced by the
 wrapper `bag_autorecord.sh`.
 
 Env overrides:
-  ROVER_API_BASE     default http://127.0.0.1:5001
-  ROVER_TOKEN_FILE   default ~/.rover_token   (X-Rover-Token; skipped if ROVER_DISABLE_AUTH=1)
-  BAGS_DIR           default ~/bags_jet
-  BAG_RECORD_ALL     "1" → record ALL topics (`-a`) instead of the curated list
-  BAG_POLL_S         default 0.2   (status poll interval)
-  BAG_MAX_S          default 1800  (hard cap on a single recording, safety)
-  BAG_API_GRACE_S    default 8     (stop+finalise if API unreachable this long while recording)
+  ROVER_API_BASE              default http://127.0.0.1:5001
+  ROVER_MACHINE_TOKEN         raw machine token (preferred if set)
+  ROVER_MACHINE_TOKEN_FILE    default <repo>/config/bag_autorecord.token
+  ROVER_TOKEN_FILE            legacy alias for ROVER_MACHINE_TOKEN_FILE
+  ROVER_DISABLE_AUTH /
+  ROVER_AUTH_DISABLED         skip auth header when set
+  BAGS_DIR                    default ~/bags_jet
+  BAG_RECORD_ALL              "1" → record ALL topics (`-a`) instead of the curated list
+  BAG_POLL_S                  default 0.2   (status poll interval)
+  BAG_MAX_S                   default 1800  (hard cap on a single recording, safety)
+  BAG_API_GRACE_S             default 8     (stop+finalise if API unreachable this long while recording)
 """
 from __future__ import annotations
 import json, os, re, signal, subprocess, sys, time, urllib.request
@@ -28,8 +32,16 @@ from datetime import datetime
 
 API_BASE   = os.environ.get("ROVER_API_BASE", "http://127.0.0.1:5001").rstrip("/")
 STATUS_URL = f"{API_BASE}/api/mission/status"
-TOKEN_FILE = os.environ.get("ROVER_TOKEN_FILE", os.path.expanduser("~/.rover_token"))
-AUTH_OFF   = os.environ.get("ROVER_DISABLE_AUTH", "0") == "1"
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_DEFAULT_MACHINE_TOKEN_FILE = os.path.join(_REPO_ROOT, "config", "bag_autorecord.token")
+TOKEN_FILE = os.environ.get(
+    "ROVER_MACHINE_TOKEN_FILE",
+    os.environ.get("ROVER_TOKEN_FILE", _DEFAULT_MACHINE_TOKEN_FILE),
+)
+AUTH_OFF = (
+    os.environ.get("ROVER_AUTH_DISABLED", "").lower() in {"1", "true", "yes"}
+    or os.environ.get("ROVER_DISABLE_AUTH", "").lower() in {"1", "true", "yes"}
+)
 BAGS_DIR   = os.environ.get("BAGS_DIR", os.path.expanduser("~/bags_jet"))
 RECORD_ALL = os.environ.get("BAG_RECORD_ALL", "0") == "1"
 POLL_S     = float(os.environ.get("BAG_POLL_S", "0.2"))
@@ -67,9 +79,12 @@ def log(msg: str) -> None:
 def _token() -> str | None:
     if AUTH_OFF:
         return None
+    env_tok = os.environ.get("ROVER_MACHINE_TOKEN")
+    if env_tok:
+        return env_tok.strip() or None
     try:
         with open(TOKEN_FILE) as f:
-            return f.read().strip()
+            return f.read().strip() or None
     except OSError:
         return None
 

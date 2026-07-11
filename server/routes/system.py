@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import time
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
+from auth import require_operator_or_machine
 from config import MAX_ACTIVITY_LOG
 
 router = APIRouter(tags=["system"])
@@ -59,11 +60,15 @@ async def health_bridge():
     }
 
 
-@router.get("/activity")
+@router.get(
+    "/activity",
+    dependencies=[Depends(require_operator_or_machine("activity:read"))],
+)
 async def activity():
     from main import activity_log
     # activity_log is a deque(maxlen=MAX_ACTIVITY_LOG); slice as a list
     return list(activity_log)[-MAX_ACTIVITY_LOG:]
+
 
 @router.post("/discover")
 async def discover():
@@ -79,4 +84,3 @@ async def discover():
         "beacons": beacons,
         "count": len(beacons),
     }
-

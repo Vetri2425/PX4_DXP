@@ -2,7 +2,7 @@
 
 Lifespan order (startup → ready → shutdown):
   1. Configure logging
-  2. Initialise auth (load or create rover token)
+  2. Initialise auth (load password hash + machine token records)
   3. rclpy.init() + RosBridgeNode + MultiThreadedExecutor in daemon thread
   4. Build shared singletons (PathManager, OffboardController, EmergencyHandler)
   5. Register Socket.IO handlers
@@ -32,8 +32,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 
-from auth import init_auth
+from auth import authenticated_sids, init_auth, is_configured
 from config import (
+    AUTH_DISABLED,
     BEACON_INTERVAL,
     BEACON_PORT,
     CORS_ALLOW_CREDENTIALS,
@@ -155,6 +156,7 @@ async def lifespan(app: FastAPI):
         interval=BEACON_INTERVAL,
         rover_id=ROVER_ID,
         server_port=DEFAULT_PORT,
+        auth_required=(not AUTH_DISABLED) and is_configured(),
     )
     _beacon.start()
     _listener = BeaconListener(port=BEACON_PORT)
@@ -234,6 +236,7 @@ def create_app() -> FastAPI:
 
     # REST routers
     from routes.system import router as sys_router
+    from routes.auth import router as auth_router
     from routes.vehicle import router as veh_router
     from routes.mission import router as mis_router
     from routes.path import paths_router, path_router
@@ -245,6 +248,7 @@ def create_app() -> FastAPI:
     from routes.spray_params import router as spray_par_router
 
     app.include_router(sys_router, prefix="/api")
+    app.include_router(auth_router, prefix="/api")
     app.include_router(veh_router, prefix="/api")
     app.include_router(mis_router, prefix="/api")
     app.include_router(paths_router, prefix="/api")  # → /api/paths
@@ -277,6 +281,12 @@ def _sanitize(d: dict) -> dict:
         k: (None if isinstance(v, float) and not math.isfinite(v) else v)
         for k, v in d.items()
     }
+
+
+async def _emit_authenticated(event: str, data: dict) -> None:
+    """Push an event only to Socket.IO SIDs that passed connect-time auth."""
+    for sid in authenticated_sids():
+        await sio.emit(event, data, to=sid)
 
 
 async def _telemetry_loop() -> None:
@@ -341,7 +351,7 @@ async def _telemetry_loop() -> None:
                     "lon": s.get("lon"),
                     "alt": s.get("alt"),
                 }
-                await sio.emit("telemetry", _sanitize(telem))
+                await _emit_authenticated("telemetry", _sanitize(telem))
 
                 mission_status = {
                     "state": (offboard_ctrl.state.value if offboard_ctrl else "idle"),
@@ -351,7 +361,7 @@ async def _telemetry_loop() -> None:
                     "speed": s.get("speed_m_s"),
                     "xtrack": s.get("xtrack_m"),
                 }
-                await sio.emit("mission_status", _sanitize(mission_status))
+                await _emit_authenticated("mission_status", _sanitize(mission_status))
 
                 # ── 2. Auto-completion: RUNNING + DONE settled → COMPLETED ─────
                 if (
@@ -360,7 +370,7 @@ async def _telemetry_loop() -> None:
                     and ros_node.get_rpp_monitor().is_done()
                 ):
                     offboard_ctrl.mark_completed()
-                    await sio.emit(
+                    await _emit_authenticated(
                         "mission_completed",
                         {
                             "state": offboard_ctrl.state.value,
@@ -396,7 +406,7 @@ async def _telemetry_loop() -> None:
                                 s.get("connected"),
                             )
                             await emergency_handler.estop_async()
-                            await sio.emit(
+                            await _emit_authenticated(
                                 "safety_abort",
                                 {
                                     "reason": "pose stale or FCU disconnected",
@@ -415,7 +425,7 @@ async def _telemetry_loop() -> None:
                 # ── 4. Disconnect notification (transition: was connected) ─────
                 connected = bool(s.get("connected", False))
                 if prev_connected is True and not connected:
-                    await sio.emit("rover_disconnected", {})
+                    await _emit_authenticated("rover_disconnected", {})
                     _record("warning", "FCU disconnected")
                 prev_connected = connected
 

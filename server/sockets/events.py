@@ -1,14 +1,14 @@
 """Socket.IO event handlers — client → server commands.
 
-All control events require an `auth` field with a valid token. Telemetry is
-broadcast to all connected sids unconditionally; control commands are
-rejected with a `socket_error` event when auth fails.
+Socket.IO authenticates once at connect with the operator session token. After
+that, control events trust the authenticated SID state rather than passwords or
+per-event secrets.
 """
 from __future__ import annotations
 
 import datetime
 
-from auth import check_socket_token
+from auth import bind_socket_sid, socket_authenticated, unbind_socket_sid
 from logging_setup import get_logger
 
 log = get_logger("server.socket")
@@ -18,10 +18,8 @@ def _now() -> str:
     return datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 
-def _auth_ok(data) -> bool:
-    if not isinstance(data, dict):
-        return check_socket_token(None)
-    return check_socket_token(data.get("auth"))
+def _auth_ok(sid: str) -> bool:
+    return socket_authenticated(sid)
 
 
 async def _emit_unauth(sio, sid):
@@ -34,12 +32,20 @@ def register_handlers(sio) -> None:
     @sio.event
     async def connect(sid, environ, auth=None):
         from main import activity_log
+        token = None
+        if isinstance(auth, dict):
+            token = auth.get("token") or auth.get("auth")
+        elif isinstance(auth, str):
+            token = auth
+        if bind_socket_sid(sid, token) is None:
+            raise ConnectionRefusedError("unauthorised")
         activity_log.append({"timestamp": _now(), "level": "info",
                               "message": f"Socket connected: {sid}"})
 
     @sio.event
     async def disconnect(sid):
         from main import activity_log
+        unbind_socket_sid(sid)
         activity_log.append({"timestamp": _now(), "level": "info",
                               "message": f"Socket disconnected: {sid}"})
 
@@ -48,7 +54,7 @@ def register_handlers(sio) -> None:
     @sio.on("arm")
     async def on_arm(sid, data):
         from main import ros_node, activity_log
-        if not _auth_ok(data):
+        if not _auth_ok(sid):
             return await _emit_unauth(sio, sid)
         if ros_node is None:
             return
@@ -65,7 +71,7 @@ def register_handlers(sio) -> None:
     @sio.on("set_mode")
     async def on_set_mode(sid, data):
         from main import ros_node, activity_log
-        if not _auth_ok(data):
+        if not _auth_ok(sid):
             return await _emit_unauth(sio, sid)
         if ros_node is None:
             return
@@ -81,7 +87,7 @@ def register_handlers(sio) -> None:
     @sio.on("emergency_stop")
     async def on_estop(sid, data=None):
         from main import emergency_handler
-        if not _auth_ok(data):
+        if not _auth_ok(sid):
             return await _emit_unauth(sio, sid)
         if emergency_handler is None:
             return
@@ -93,7 +99,7 @@ def register_handlers(sio) -> None:
     @sio.on("mission_load")
     async def on_mission_load(sid, data):
         from main import offboard_ctrl, path_mgr
-        if not _auth_ok(data):
+        if not _auth_ok(sid):
             return await _emit_unauth(sio, sid)
         name = (data.get("path_name") or data.get("mission_file")
                 if isinstance(data, dict) else None)
@@ -115,7 +121,7 @@ def register_handlers(sio) -> None:
     async def on_mission_start(sid, data=None):
         from main import offboard_ctrl
         from mission_placement import PlacementError
-        if not _auth_ok(data):
+        if not _auth_ok(sid):
             return await _emit_unauth(sio, sid)
         try:
             ok, msg = await offboard_ctrl.start_async()
@@ -129,7 +135,7 @@ def register_handlers(sio) -> None:
     @sio.on("mission_stop")
     async def on_mission_stop(sid, data=None):
         from main import offboard_ctrl
-        if not _auth_ok(data):
+        if not _auth_ok(sid):
             return await _emit_unauth(sio, sid)
         result = await offboard_ctrl.stop_async()
         await sio.emit("mission_status_update", result, to=sid)
@@ -137,7 +143,7 @@ def register_handlers(sio) -> None:
     @sio.on("mission_abort")
     async def on_mission_abort(sid, data=None):
         from main import offboard_ctrl
-        if not _auth_ok(data):
+        if not _auth_ok(sid):
             return await _emit_unauth(sio, sid)
         result = await offboard_ctrl.abort_async()
         await sio.emit("mission_status_update", result, to=sid)
@@ -145,7 +151,7 @@ def register_handlers(sio) -> None:
     @sio.on("request_params")
     async def on_request_params(sid, data):
         from main import ros_node
-        if not _auth_ok(data):
+        if not _auth_ok(sid):
             return await _emit_unauth(sio, sid)
         if ros_node is None:
             return

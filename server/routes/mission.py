@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from auth import require_token
+from auth import require_operator_or_machine, require_token
 from config import RPP_STALE, RPP_STATE_NAMES
 from mission_loading import (
     MissionLoadConflict,
@@ -26,11 +26,14 @@ from models import (
     MissionStatus,
 )
 
-router = APIRouter(prefix="/mission", tags=["mission"],
-                   dependencies=[Depends(require_token)])
+router = APIRouter(prefix="/mission", tags=["mission"])
 
 
-@router.get("/loaded-path", response_model=LoadedPathResponse)
+@router.get(
+    "/loaded-path",
+    response_model=LoadedPathResponse,
+    dependencies=[Depends(require_operator_or_machine("mission:loaded-path"))],
+)
 async def loaded_path():
     """Stage 10 — confirm the coordinates currently resident in the controller."""
     from main import offboard_ctrl
@@ -39,7 +42,7 @@ async def loaded_path():
     return LoadedPathResponse(**offboard_ctrl.loaded_path_summary())
 
 
-@router.post("/load")
+@router.post("/load", dependencies=[Depends(require_token)])
 async def load_mission(req: MissionLoadRequest):
     from main import offboard_ctrl, path_mgr
     if offboard_ctrl is None:
@@ -58,7 +61,7 @@ async def load_mission(req: MissionLoadRequest):
     return {"loaded": name, "num_points": len(pts)}
 
 
-@router.post("/start")
+@router.post("/start", dependencies=[Depends(require_token)])
 async def start_mission(req: MissionStartRequest | None = None):
     from main import offboard_ctrl, path_mgr, ros_node
     if offboard_ctrl is None:
@@ -113,7 +116,7 @@ async def start_mission(req: MissionStartRequest | None = None):
     return {"state": offboard_ctrl.state.value, "message": msg}
 
 
-@router.post("/stop")
+@router.post("/stop", dependencies=[Depends(require_token)])
 async def stop_mission():
     from main import offboard_ctrl
     if offboard_ctrl is None:
@@ -121,7 +124,7 @@ async def stop_mission():
     return await offboard_ctrl.stop_async()
 
 
-@router.post("/abort")
+@router.post("/abort", dependencies=[Depends(require_token)])
 async def abort_mission():
     from main import offboard_ctrl
     if offboard_ctrl is None:
@@ -129,7 +132,11 @@ async def abort_mission():
     return await offboard_ctrl.abort_async()
 
 
-@router.get("/status", response_model=MissionStatus)
+@router.get(
+    "/status",
+    response_model=MissionStatus,
+    dependencies=[Depends(require_operator_or_machine("mission:status"))],
+)
 async def mission_status():
     from main import offboard_ctrl, ros_node
     state = offboard_ctrl.state if offboard_ctrl else "idle"

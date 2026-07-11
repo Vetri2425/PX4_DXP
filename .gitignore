@@ -22,6 +22,10 @@ baseline/**/bag/
 *.local
 secrets/
 config/*.env
+config/rover_password.json
+config/rover_machine_tokens.json
+config/bag_autorecord.token
+config/*.token
 
 # OS
 .DS_Store

@@ -118,18 +118,35 @@ BRIDGE_RECOVERY_COOLDOWN_S = 30.0   # suppress detection after a recovery (MAVRO
 BRIDGE_AUTO_RECOVER = os.environ.get("ROVER_BRIDGE_AUTO_RECOVER", "0") == "1"
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
+TOKEN_HEADER_NAME = "X-Rover-Token"
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+AUTH_PASSWORD_FILE = os.environ.get(
+    "ROVER_PASSWORD_FILE",
+    os.path.join(_REPO_ROOT, "config", "rover_password.json"),
+)
+AUTH_MACHINE_TOKENS_FILE = os.environ.get(
+    "ROVER_MACHINE_TOKENS_FILE",
+    os.path.join(_REPO_ROOT, "config", "rover_machine_tokens.json"),
+)
+AUTH_SESSION_TTL_S = float(os.environ.get("ROVER_SESSION_TTL_S", str(12 * 3600)))
+AUTH_PBKDF2_ITERATIONS = int(os.environ.get("ROVER_AUTH_PBKDF2_ITERATIONS", "260000"))
+# Accept both names: baseline ROVER_DISABLE_AUTH and ref ROVER_AUTH_DISABLED.
+AUTH_DISABLED = (
+    os.environ.get("ROVER_AUTH_DISABLED", "").lower() in {"1", "true", "yes"}
+    or os.environ.get("ROVER_DISABLE_AUTH", "").lower() in {"1", "true", "yes"}
+)
+# Legacy path name for bag tooling; machine tokens live in AUTH_MACHINE_TOKENS_FILE.
 TOKEN_FILE_DEFAULT = os.environ.get(
     "ROVER_TOKEN_FILE",
-    os.path.expanduser("~/.rover_token"),
+    os.path.join(_REPO_ROOT, "config", "bag_autorecord.token"),
 )
-TOKEN_HEADER_NAME = "X-Rover-Token"
 
 # ── File upload limits ────────────────────────────────────────────────────────
 ALLOWED_UPLOAD_EXTENSIONS = {".waypoints", ".csv", ".dxf"}
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MiB (DXF files can be large)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-if os.environ.get("ROVER_DISABLE_AUTH"):
+if AUTH_DISABLED:
     CORS_ALLOW_ORIGINS = [
         "http://localhost:3000", "http://127.0.0.1:3000",
         "http://localhost:5001", "http://127.0.0.1:5001",

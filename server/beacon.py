@@ -93,6 +93,7 @@ class RoverBeacon:
         interval: float  = 2.0,
         rover_id: str    = "drawing_rover_1",
         server_port: int = 5001,
+        auth_required: bool = True,
     ) -> None:
         self._port     = port
         self._interval = interval
@@ -106,9 +107,10 @@ class RoverBeacon:
             "port":     server_port,
             "type":     "drawing",
             "version":  "1.0.0",
+            "auth_required": bool(auth_required),
         }).encode()
-        log.info("beacon configured: %s:%d → broadcast :%d every %.1fs",
-                 ip, server_port, port, interval)
+        log.info("beacon configured: %s:%d → broadcast :%d every %.1fs (auth_required=%s)",
+                 ip, server_port, port, interval, auth_required)
 
     def start(self) -> None:
         if self._thread is not None:

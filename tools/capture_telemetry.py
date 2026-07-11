@@ -27,6 +27,7 @@ import argparse
 import asyncio
 import json
 import math
+import os
 import signal
 import sys
 from datetime import datetime, timezone
@@ -74,7 +75,14 @@ def _dumps(event: str, data) -> str:
     return json.dumps(_clean(frame))
 
 
-async def capture(host: str, port: int, count: int, duration: float, events: list) -> None:
+async def capture(
+    host: str,
+    port: int,
+    count: int,
+    duration: float,
+    events: list,
+    token: str | None = None,
+) -> None:
     url = f"http://{host}:{port}"
     received = 0
     stop = asyncio.Event()
@@ -113,7 +121,10 @@ async def capture(host: str, port: int, count: int, duration: float, events: lis
 
     timer: asyncio.TimerHandle | None = None
     try:
-        await sio.connect(url, transports=["websocket"])
+        connect_kwargs = {"transports": ["websocket"]}
+        if token:
+            connect_kwargs["auth"] = {"token": token}
+        await sio.connect(url, **connect_kwargs)
         if duration > 0:
             timer = loop.call_later(duration, stop.set)
         await stop.wait()
@@ -134,16 +145,21 @@ def main() -> None:
         epilog=(
             "Examples:\n"
             "  # all events for 5 s (typical debug session)\n"
-            "  python3 tools/capture_telemetry.py -t 5\n\n"
+            "  python3 tools/capture_telemetry.py -t 5 --token \"$SESSION\"\n\n"
             "  # 10 telemetry-only frames\n"
-            "  python3 tools/capture_telemetry.py -n 10\n\n"
+            "  python3 tools/capture_telemetry.py -n 10 --token \"$SESSION\"\n\n"
             "  # pipe to jq for GPS fields\n"
-            "  python3 tools/capture_telemetry.py -t 5 2>/dev/null"
+            "  python3 tools/capture_telemetry.py -t 5 --token \"$SESSION\" 2>/dev/null"
             " | jq 'select(._event==\"telemetry\") | {gps_fix_name,hrms,vrms}'\n"
         ),
     )
     parser.add_argument("--host", default="192.168.1.102", help="Rover server host")
     parser.add_argument("--port", type=int, default=5001, help="Rover server port")
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("ROVER_SESSION_TOKEN"),
+        help="Operator session token (or set ROVER_SESSION_TOKEN). Required unless AUTH_DISABLED.",
+    )
     parser.add_argument(
         "-n", "--count", type=int, default=0,
         metavar="N",
@@ -169,7 +185,7 @@ def main() -> None:
     if count == 0 and args.time == 0 and not capture_all:
         count = 1  # plain invocation with no flags → one telemetry frame
 
-    asyncio.run(capture(args.host, args.port, count, args.time, events))
+    asyncio.run(capture(args.host, args.port, count, args.time, events, token=args.token))
 
 
 if __name__ == "__main__":
