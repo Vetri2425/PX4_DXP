@@ -551,6 +551,14 @@ class LoadedPathResponse(BaseModel):
     has_spray_flags: bool = False
     sample_coords: list[list[float]] = Field(default_factory=list)
     sample_truncated: bool = False
+    # Staged-mission identity fields the operator app matches post-load
+    # (verifyStagedLoadedMission): without these declared, response_model strips
+    # them and the client sees mission_id=null → "does not match staged path".
+    placement_mode: Optional[str] = None
+    origin_gps: Optional[list[float]] = None
+    is_staged: bool = False
+    protected: bool = False
+    mission_id: Optional[str] = None
 
 
 class MissionClearResponse(BaseModel):

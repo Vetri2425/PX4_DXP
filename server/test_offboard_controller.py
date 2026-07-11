@@ -183,3 +183,29 @@ def test_clear_mission_rejected_while_running():
     # A rejected clear leaves state and resident path untouched.
     assert ctrl.state == MissionState.RUNNING
     assert ctrl._loaded_pts == [(1.0, 2.0), (3.0, 4.0)]
+
+
+def test_loaded_path_summary_exposes_staged_identity():
+    # A staged surveyed load, exactly as POST /load-to-controller does
+    # (name == the staged mission_id). The operator app's post-load
+    # verifyStagedLoadedMission reads mission_id/is_staged/protected/placement_mode.
+    ctrl = OffboardController(FakeNode([{"connected": True, "rpp_state": RPP_IDLE}]), deque())
+    ctrl.load_path(
+        [(1.0, 2.0), (3.0, 4.0)],
+        name="stg_abc123_1700",
+        placement_mode="GPS_SURVEYED",
+        origin_gps=(12.9716, 80.1946),
+        is_staged=True,
+    )
+    s = ctrl.loaded_path_summary()
+    assert s["mission_id"] == "stg_abc123_1700"
+    assert s["is_staged"] is True
+    assert s["protected"] is True
+    assert s["placement_mode"] == "GPS_SURVEYED"
+
+    # A plain (non-staged) path must NOT masquerade as a staged mission.
+    ctrl2 = OffboardController(FakeNode([{"connected": True, "rpp_state": RPP_IDLE}]), deque())
+    ctrl2.load_path([(0.0, 0.0), (1.0, 1.0)], name="square_2x2")
+    s2 = ctrl2.loaded_path_summary()
+    assert s2["mission_id"] is None
+    assert s2["protected"] is False

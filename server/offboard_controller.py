@@ -134,6 +134,14 @@ class OffboardController:
             "placement_mode": self._placement_mode,
             "origin_gps": list(self._origin_gps) if self._origin_gps else None,
             "is_staged": self._is_staged_mission,
+            # Staged missions load with name=<stg mission_id> (see
+            # /load-to-controller), so _path_name IS the staged id here. Expose it
+            # as mission_id + mark protected so the operator app's post-load
+            # verifyStagedLoadedMission can match staged↔loaded instead of failing
+            # "does not match staged path".
+            "mission_id": self._path_name if self._is_staged_mission else None,
+            "protected": self._is_staged_mission
+            or self._placement_mode == GPS_SURVEYED,
         }
 
     async def clear_mission_async(self) -> dict[str, Any]:
