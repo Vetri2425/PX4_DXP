@@ -83,6 +83,11 @@ STAGING_DIR = os.path.join(MISSION_DIR, "staging")
 # Max allowable least-squares RMSE (metres) for multi-point DXF→NED alignment.
 # Plans whose residual exceeds this are rejected (422) and never staged.
 RMSE_MAX = float(os.environ.get("ROVER_ALIGN_RMSE_MAX", "0.05"))
+# Max allowable |scale - 1.0| for multi-point DXF→NED alignment. Ref points and
+# geometry share a metric frame, so a healthy fit lands scale≈1.0. A 2-point fit
+# has RMSE≈0 and cannot catch unit/frame mismatch (e.g. double-scaled cm → ~100);
+# this gate is the defense. 0.25 → accept scale in [0.75, 1.25].
+SCALE_FIT_TOLERANCE = float(os.environ.get("ROVER_ALIGN_SCALE_TOL", "0.25"))
 # Staged-mission lifetime (seconds). Older staging files are pruned on each plan.
 STAGING_TTL_S = float(os.environ.get("ROVER_STAGING_TTL_S", "3600"))
 # Litres of marking material consumed per metre of MARK path (site-tunable).
@@ -92,6 +97,11 @@ SPRAY_DEFAULT_ON = os.environ.get("ROVER_SPRAY_DEFAULT_ON", "1") == "1"
 
 # ── Safety / watchdog thresholds ──────────────────────────────────────────────
 POSE_STALE_MS = 500.0  # consider pose stale above this
+# Placement freshness (GPS_SURVEYED live EKF re-bind). Defaults match pose gate
+# unless overridden — keep global/GPS slightly looser than local pose.
+GLOBAL_POSITION_STALE_MS = float(os.environ.get("ROVER_GLOBAL_POS_STALE_MS", "500"))
+GPS_FIX_STALE_MS = float(os.environ.get("ROVER_GPS_FIX_STALE_MS", "500"))
+POSE_GLOBAL_MAX_SKEW_MS = float(os.environ.get("ROVER_POSE_GLOBAL_SKEW_MS", "100"))
 SAFETY_STALE_GRACE_S = 1.0  # auto-abort after this long in STALE
 DONE_SETTLE_S = 1.0  # require this much DONE before auto-completing
 SETPOINT_STREAM_GRACE_S = 0.5  # path/setpoint settle time before OFFBOARD request

@@ -34,11 +34,13 @@ from config import (
     MAX_UPLOAD_BYTES,
     MISSION_DIR,
     RMSE_MAX,
+    SCALE_FIT_TOLERANCE,
     SPRAY_DEFAULT_ON,
     SPRAY_LITERS_PER_METER,
     STAGING_DIR,
     STAGING_TTL_S,
 )
+from mission_placement import PlacementError
 from models import (
     AlignRequest,
     AlignResponse,
@@ -342,6 +344,61 @@ def _entity_preview_tuples(ent, max_points: int = 200) -> list[tuple[float, floa
         pts = []
 
     return _subsample_points([(float(n), float(e)) for n, e in pts], max_points=max_points)
+
+
+# Known GCS / test fixture anchors that must never stage a surveyed mission.
+_PLACEHOLDER_ORIGINS = frozenset({
+    (13.0, 80.0),
+})
+
+
+def _assert_alignment_scale(alignment_meta: dict) -> None:
+    """Reject an alignment whose least-squares scale strays too far from unity.
+
+    Ref points and segment geometry share a metric frame, so a healthy multi-point
+    fit lands scale≈1.0. A large deviation signals a unit/frame mismatch (e.g. the
+    historical double-scaling of cm ref points → scale≈100). A 2-point fit is
+    exactly determined so its RMSE is ~0 and the RMSE gate cannot catch this —
+    this scale gate is the only defense. single_point/gps_origin modes report
+    scale=1.0 and pass by definition.
+    """
+    scale = alignment_meta.get("scale", 1.0)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise HTTPException(
+            422,
+            f"Alignment produced a non-physical scale ({scale}). "
+            "Re-verify the reference points.",
+        )
+    if abs(scale - 1.0) > SCALE_FIT_TOLERANCE:
+        raise HTTPException(
+            422,
+            f"Alignment scale {scale:.4f} is outside the safe range "
+            f"[{1.0 - SCALE_FIT_TOLERANCE:.2f}, {1.0 + SCALE_FIT_TOLERANCE:.2f}] — "
+            "likely a unit/frame mismatch between reference points and geometry. "
+            "Re-verify the reference points.",
+        )
+
+
+def _assert_origin_gps_usable(origin_gps) -> None:
+    """Reject missing-bounds or known placeholder survey anchors."""
+    if origin_gps is None:
+        return
+    try:
+        lat = float(origin_gps[0])
+        lon = float(origin_gps[1])
+    except (TypeError, ValueError, IndexError):
+        raise HTTPException(422, "origin_gps is missing or invalid")
+    if not (math.isfinite(lat) and math.isfinite(lon)):
+        raise HTTPException(422, "origin_gps contains non-finite values")
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        raise HTTPException(422, "origin_gps is outside valid latitude/longitude bounds")
+    key = (round(lat, 6), round(lon, 6))
+    if key in _PLACEHOLDER_ORIGINS or (lat, lon) in _PLACEHOLDER_ORIGINS:
+        raise HTTPException(
+            422,
+            "origin_gps looks like a GCS placeholder/fixture coordinate — "
+            "re-survey or omit the fake anchor before staging.",
+        )
 
 
 def _jsonable_geometry(geometry: dict) -> dict:
@@ -838,6 +895,9 @@ async def plan_path(req: PathPlanRequest):
             f"Alignment error too high (rmse={rmse:.3f} m, max {RMSE_MAX:.3f} m). "
             "Re-verify the reference points.",
         )
+    if alignment_meta.get("method"):
+        _assert_alignment_scale(alignment_meta)
+        _assert_origin_gps_usable(alignment_meta.get("origin_gps") or origin_gps)
 
     # Gaps C & E: stage the fully-aligned mission so the operator can confirm and
     # load exactly what was previewed. Scoped to the aligned-DXF flow only — built-in
@@ -910,6 +970,9 @@ def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
         "anchor": anchor,
         "mission_id": mission_id,
         "created_at": time.time(),
+        # Surveyed staged missions must re-bind into the live EKF at start.
+        "placement_mode": "GPS_SURVEYED" if origin_gps else "LOCAL_NED",
+        "origin_gps": list(origin_gps) if origin_gps else None,
         "waypoints": result.get("merged_waypoints", []),
         "spray_flags": result.get("spray_flags", []),
         "alignment_metadata": alignment_meta,
@@ -1002,7 +1065,22 @@ async def load_mission_to_controller(req: LoadMissionRequest):
 
     try:
         spray_flags = [bool(f) for f in staged.get("spray_flags", [])]
-        offboard_ctrl.load_path(waypoints, name=safe_id, spray_flags=spray_flags)
+        placement_mode = staged.get("placement_mode") or (
+            "GPS_SURVEYED" if staged.get("origin_gps") else "LOCAL_NED"
+        )
+        origin_gps = staged.get("origin_gps")
+        if origin_gps is not None:
+            origin_gps = (float(origin_gps[0]), float(origin_gps[1]))
+        offboard_ctrl.load_path(
+            waypoints,
+            name=safe_id,
+            spray_flags=spray_flags,
+            placement_mode=placement_mode,
+            origin_gps=origin_gps,
+            is_staged=True,
+        )
+    except PlacementError as exc:
+        raise HTTPException(422, str(exc))
     except Exception as exc:
         raise HTTPException(409, f"Controller load failed: {exc}")
 
@@ -1011,6 +1089,8 @@ async def load_mission_to_controller(req: LoadMissionRequest):
         "mission_id": safe_id,
         "num_waypoints": len(waypoints),
         "anchor_loaded": anchor is not None,
+        "placement_mode": placement_mode,
+        "origin_gps": list(origin_gps) if origin_gps else None,
     }
 
 
@@ -1100,6 +1180,8 @@ async def align_path(name: str, req: AlignRequest):
     meta = result.get("alignment_metadata") or {}
     if not meta.get("method"):
         raise HTTPException(422, "No alignment produced — check ref_points / origin_gps.")
+    _assert_alignment_scale(meta)
+    _assert_origin_gps_usable(meta.get("origin_gps") or origin_gps)
 
     waypoints = result.get("merged_waypoints", [])
     sample = [list(p) for p in waypoints[:req.sample_points]] if req.sample_points else []
@@ -1274,6 +1356,9 @@ async def plan_and_stage(name: str, req: PathPlanRequest):
             f"Alignment error too high (rmse={rmse:.3f} m, max {RMSE_MAX:.3f} m). "
             "Re-verify the reference points.",
         )
+    if alignment_meta.get("method"):
+        _assert_alignment_scale(alignment_meta)
+        _assert_origin_gps_usable(alignment_meta.get("origin_gps") or origin_gps)
 
     mission_summary = None
     if result.get("merged_waypoints"):

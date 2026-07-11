@@ -931,7 +931,7 @@ async def test_plan_api_dxf_ref_points():
             RefPoint(dxf_x=0.0, dxf_y=0.0, lat=13.0, lon=80.0),
             RefPoint(dxf_x=10.0, dxf_y=0.0, lat=13.0001, lon=80.0),
         ],
-        origin_gps=[13.0, 80.0]
+        origin_gps=[13.072066, 80.261956]
     )
     
     data = await plan_path(req)
@@ -965,7 +965,7 @@ async def test_plan_api_dxf_simple_rotation():
         transit_speed=0.6,
         close_loop=False,
         rotation_deg=45.0,
-        origin_gps=[13.0, 80.0]
+        origin_gps=[13.072066, 80.261956]
     )
     
     data = await plan_path(req)
@@ -997,7 +997,7 @@ async def test_plan_api_single_point_heading():
         ref_points=[
             RefPoint(dxf_x=5.0, dxf_y=5.0, lat=13.0001, lon=80.0001),
         ],
-        origin_gps=[13.0, 80.0]
+        origin_gps=[13.072066, 80.261956]
     )
 
     data = await plan_path(req)
@@ -1026,7 +1026,7 @@ async def test_plan_api_coincident_ref_points():
             RefPoint(dxf_x=0.0, dxf_y=0.0, lat=13.0, lon=80.0),
             RefPoint(dxf_x=0.0, dxf_y=0.0, lat=13.0, lon=80.0),
         ],
-        origin_gps=[13.0, 80.0]
+        origin_gps=[13.072066, 80.261956]
     )
     
     with pytest.raises(HTTPException) as exc:
@@ -1038,11 +1038,12 @@ async def test_plan_api_coincident_ref_points():
 # ── Gap A: unit-scale frame consistency ───────────────────────────────────────
 
 def test_affine_scale_is_unity_when_ref_points_share_metric_frame():
-    """Gap A regression.
+    """Gap A regression — affine math contract.
 
-    A cm-unit DXF square whose ref points are 10 m apart in GPS must yield an
-    affine scale ≈ 1.0 once the ref points are scaled into the metric frame —
-    not ≈100 (raw cm fed against metric NED) or ≈0.01.
+    This exercises ``dxf_to_ned_affine`` in isolation. The engine no longer
+    applies unit scaling to ref points: they arrive pre-scaled in local-NED
+    metres from the /entities preview. Metric-frame refs → scale ≈ 1.0;
+    raw cm vs metric NED → wrong scale.
     """
     from path_engine.ned import dxf_to_ned_affine
 
@@ -1083,7 +1084,8 @@ async def test_plan_api_rmse_gate_rejects_high_residual(monkeypatch):
                 "alignment_metadata": {
                     "method": "least_squares",
                     "rmse": RMSE_MAX + 0.10,
-                    "origin_gps": (13.0, 80.0),
+                    "scale": 1.0,
+                    "origin_gps": (13.072066, 80.261956),
                 },
                 "warnings": [],
             }
@@ -1095,6 +1097,110 @@ async def test_plan_api_rmse_gate_rejects_high_residual(monkeypatch):
         await plan_path(req)
     assert exc.value.status_code == 422
     assert "rmse" in exc.value.detail.lower()
+
+
+def _fake_pm_with_alignment(meta: dict):
+    """Path-manager stub returning a fixed alignment_metadata for gate tests."""
+    class FakePathManager:
+        def plan_path(self, source, summary_only=False, **kwargs):
+            return {
+                "source": source,
+                "num_waypoints": 2,
+                "num_segments": 1,
+                "mark_length_m": 1.0,
+                "transit_length_m": 0.0,
+                "total_length_m": 1.0,
+                "segments": [],
+                "merged_waypoints": [(0.0, 0.0), (1.0, 0.0)],
+                "spray_flags": [True, True],
+                "alignment_metadata": meta,
+                "warnings": [],
+            }
+    return FakePathManager()
+
+
+@pytest.mark.anyio
+async def test_plan_api_scale_gate_rejects_double_scaled_refpoints(monkeypatch):
+    """Unit/frame mismatch → scale ~100; RMSE≈0 so only the scale gate rejects."""
+    meta = {
+        "method": "least_squares",
+        "scale": 100.0,
+        "rmse": 0.0,
+        "origin_gps": (13.072066, 80.261956),
+    }
+    monkeypatch.setattr(main, "path_mgr", _fake_pm_with_alignment(meta))
+    req = PathPlanRequest(source="soccer_field_penalty_area.dxf")
+
+    with pytest.raises(HTTPException) as exc:
+        await plan_path(req)
+    assert exc.value.status_code == 422
+    assert "scale" in exc.value.detail.lower()
+
+
+@pytest.mark.anyio
+async def test_plan_api_scale_gate_accepts_unity_scale(monkeypatch):
+    """Healthy fit (scale≈1.0) passes the scale gate."""
+    meta = {
+        "method": "least_squares",
+        "scale": 1.002,
+        "rmse": 0.0,
+        "origin_gps": (13.072066, 80.261956),
+    }
+    monkeypatch.setattr(main, "path_mgr", _fake_pm_with_alignment(meta))
+    req = PathPlanRequest(source="soccer_field_penalty_area.dxf", include_waypoints=False)
+
+    result = await plan_path(req)
+    assert result is not None
+
+
+@pytest.mark.anyio
+async def test_plan_api_rejects_placeholder_origin_gps(monkeypatch):
+    """Known GCS fixture (13.0, 80.0) must not stage a surveyed mission."""
+    meta = {
+        "method": "least_squares",
+        "scale": 1.0,
+        "rmse": 0.0,
+        "origin_gps": (13.0, 80.0),
+    }
+    monkeypatch.setattr(main, "path_mgr", _fake_pm_with_alignment(meta))
+    req = PathPlanRequest(source="soccer_field_penalty_area.dxf", include_waypoints=False)
+
+    with pytest.raises(HTTPException) as exc:
+        await plan_path(req)
+    assert exc.value.status_code == 422
+    assert "placeholder" in exc.value.detail.lower()
+
+
+def test_engine_does_not_rescale_metric_ref_points():
+    """Engine: metric refs feed affine unchanged; ref_unit_scale removed."""
+    import inspect
+    import math
+    from path_engine.engine import PathEngine
+    from path_engine.core import PathSegment, SegmentType
+
+    sig = inspect.signature(PathEngine._plan_from_segments)
+    assert "ref_unit_scale" not in sig.parameters
+
+    engine = PathEngine()
+    seg = PathSegment(
+        segment_type=SegmentType.MARK,
+        points=[(0.0, 0.0), (0.0, 10.0)],
+        speed=0.4,
+        segment_id="seg0",
+        source_entity="LINE_0",
+    )
+    ref_dxf = [(0.0, 0.0), (0.0, 10.0)]
+    ref_gps = [(13.0, 80.0), (13.0, 80.0 + 10.0 / (111320.0 * math.cos(math.radians(13.0))))]
+
+    plan = engine._plan_from_segments(
+        [seg],
+        origin_gps=(13.072066, 80.261956),
+        ref_points_dxf=ref_dxf,
+        ref_points_gps=ref_gps,
+    )
+    scale = (plan.alignment_metadata or {}).get("scale")
+    assert scale is not None
+    assert abs(scale - 1.0) < 0.02
 
 
 # ── Gaps C & E: staging + load-to-controller round-trip ────────────────────────
@@ -1128,7 +1234,7 @@ async def test_plan_then_load_to_controller_round_trip(monkeypatch, tmp_path):
                     "rmse": 0.004,
                     "rotation_deg": 12.0,
                     "scale": 1.0,
-                    "origin_gps": (13.0, 80.0),
+                    "origin_gps": (13.072066, 80.261956),
                 },
                 "warnings": [],
             }
@@ -1138,8 +1244,8 @@ async def test_plan_then_load_to_controller_round_trip(monkeypatch, tmp_path):
             self.loaded = None
             self.state = MissionState.IDLE
 
-        def load_path(self, points, name=None, spray_flags=None):
-            self.loaded = (list(points), name, spray_flags)
+        def load_path(self, points, name=None, spray_flags=None, **kwargs):
+            self.loaded = (list(points), name, spray_flags, kwargs)
 
     fake_ctrl = FakeController()
     monkeypatch.setattr(main, "path_mgr", FakePathManager())
@@ -1160,10 +1266,10 @@ async def test_plan_then_load_to_controller_round_trip(monkeypatch, tmp_path):
     assert resp["anchor_loaded"] is True
     # Controller received the exact aligned waypoints.
     assert fake_ctrl.loaded[0] == waypoints
-
-
-@pytest.mark.anyio
-async def test_load_to_controller_missing_mission_is_404(monkeypatch, tmp_path):
+    assert fake_ctrl.loaded[3]["placement_mode"] == "GPS_SURVEYED"
+    assert fake_ctrl.loaded[3]["origin_gps"] == (13.072066, 80.261956)
+    assert fake_ctrl.loaded[3]["is_staged"] is True
+    assert resp["placement_mode"] == "GPS_SURVEYED"
     import routes.path as path_routes
     from models import LoadMissionRequest
 

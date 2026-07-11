@@ -18,6 +18,7 @@ from mission_loading import (
     pose_origin_or_error,
     spray_flags_for_path,
 )
+from mission_placement import PlacementError
 from models import (
     LoadedPathResponse,
     MissionLoadRequest,
@@ -101,9 +102,12 @@ async def start_mission(req: MissionStartRequest | None = None):
             raise HTTPException(400, f"Path load failed: {exc}")
         origin_pre_applied = auto_origin
 
-    ok, msg = await offboard_ctrl.start_async(
-        auto_origin=auto_origin and not origin_pre_applied
-    )
+    try:
+        ok, msg = await offboard_ctrl.start_async(
+            auto_origin=auto_origin and not origin_pre_applied
+        )
+    except PlacementError as exc:
+        raise HTTPException(422, str(exc))
     if not ok:
         raise HTTPException(409, f"Mission start failed: {msg}")
     return {"state": offboard_ctrl.state.value, "message": msg}

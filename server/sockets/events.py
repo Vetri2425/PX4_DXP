@@ -114,9 +114,13 @@ def register_handlers(sio) -> None:
     @sio.on("mission_start")
     async def on_mission_start(sid, data=None):
         from main import offboard_ctrl
+        from mission_placement import PlacementError
         if not _auth_ok(data):
             return await _emit_unauth(sio, sid)
-        ok, msg = await offboard_ctrl.start_async()
+        try:
+            ok, msg = await offboard_ctrl.start_async()
+        except PlacementError as exc:
+            ok, msg = False, str(exc)
         await sio.emit("mission_status_update",
                        {"state":   offboard_ctrl.state.value,
                         "success": ok,

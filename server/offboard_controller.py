@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import math
 from collections import deque
 from typing import Any, Optional
 
@@ -25,6 +26,12 @@ from config import (
 )
 from logging_setup import get_logger
 from mission_loading import pose_origin_or_error
+from mission_placement import (
+    GPS_SURVEYED,
+    LOCAL_NED,
+    PlacementError,
+    resolve_surveyed_points,
+)
 from models import MissionState
 
 log = get_logger("server.offboard")
@@ -50,6 +57,9 @@ class OffboardController:
         self._loaded_pts: list[tuple[float, float]] | None = None
         self._loaded_spray_flags: list[bool] | None = None
         self._path_name: str | None = None
+        self._placement_mode = LOCAL_NED
+        self._origin_gps: tuple[float, float] | None = None
+        self._is_staged_mission = False
         # Serialises lifecycle calls. Created lazily on first use: on
         # Python 3.9 asyncio.Lock() binds an event loop at construction,
         # and the controller is built at server startup outside any loop.
@@ -75,6 +85,10 @@ class OffboardController:
     @property
     def loaded_path_name(self) -> Optional[str]:
         return self._path_name
+
+    @property
+    def placement_mode(self) -> str:
+        return self._placement_mode
 
     def loaded_path_summary(self, sample: int = 20) -> dict:
         """Read-only snapshot of the path currently resident in the controller.
@@ -105,6 +119,9 @@ class OffboardController:
             "has_spray_flags": flags is not None,
             "sample_coords": sample_coords,
             "sample_truncated": sample_truncated,
+            "placement_mode": self._placement_mode,
+            "origin_gps": list(self._origin_gps) if self._origin_gps else None,
+            "is_staged": self._is_staged_mission,
         }
 
     # ── Path management ───────────────────────────────────────────────────────
@@ -114,7 +131,13 @@ class OffboardController:
         points: list[tuple[float, float]],
         name: Optional[str] = None,
         spray_flags: Optional[list[bool]] = None,
+        *,
+        placement_mode: str = LOCAL_NED,
+        origin_gps: tuple[float, float] | None = None,
+        is_staged: bool = False,
     ) -> None:
+        if placement_mode not in (LOCAL_NED, GPS_SURVEYED):
+            raise ValueError(f"unsupported placement mode: {placement_mode!r}")
         if self._state == MissionState.RUNNING:
             self._log_entry(
                 "warning",
@@ -132,7 +155,17 @@ class OffboardController:
             )
         else:
             self._loaded_spray_flags = None
-        self._path_name  = name or "unknown"
+        self._path_name = name or "unknown"
+        self._placement_mode = placement_mode
+        self._is_staged_mission = bool(is_staged)
+        if origin_gps is not None:
+            lat = float(origin_gps[0])
+            lon = float(origin_gps[1])
+            if not math.isfinite(lat) or not math.isfinite(lon):
+                raise ValueError("origin_gps must contain finite latitude/longitude")
+            self._origin_gps = (lat, lon)
+        else:
+            self._origin_gps = None
         if self._state in (MissionState.COMPLETED, MissionState.ABORTED, MissionState.ERROR):
             self._state = MissionState.IDLE
         # Reset RPP done-settle timer so a leftover DONE from the previous
@@ -142,7 +175,11 @@ class OffboardController:
                 self._node.get_rpp_monitor().reset()
             except Exception:
                 pass
-        self._log_entry("info", f"Path loaded: {self._path_name} ({len(points)} pts)")
+        self._log_entry(
+            "info",
+            f"Path loaded: {self._path_name} ({len(points)} pts, "
+            f"placement={self._placement_mode})",
+        )
 
     # ── Lifecycle (async) ─────────────────────────────────────────────────────
 
@@ -190,12 +227,40 @@ class OffboardController:
                 self._log_entry("error", msg)
                 return False, msg
 
+            if self._placement_mode == GPS_SURVEYED and auto_origin:
+                msg = "start: GPS_SURVEYED missions are incompatible with auto_origin"
+                self._log_entry("error", msg)
+                raise PlacementError(msg)
+
             fcu = self._node.get_state()
             if not fcu.get("connected", False):
                 self._state = MissionState.ERROR
                 msg = "start: FCU not connected"
                 self._log_entry("error", msg)
                 return False, msg
+
+            pts_to_publish = list(self._loaded_pts)
+            spray_flags_to_publish = self._loaded_spray_flags
+
+            # Surveyed placement first so RTK/pose/skew failures keep a typed
+            # PlacementError (HTTP 422) instead of being masked by RPP STALE.
+            if self._placement_mode == GPS_SURVEYED:
+                try:
+                    pts_to_publish, translation = resolve_surveyed_points(
+                        self._loaded_pts,
+                        self._origin_gps,
+                        fcu,
+                    )
+                except (PlacementError, ImportError) as exc:
+                    self._state = MissionState.ERROR
+                    msg = f"start: surveyed placement failed: {exc}"
+                    self._log_entry("error", msg)
+                    raise PlacementError(msg) from exc
+                self._log_entry(
+                    "info",
+                    "survey placement offset: "
+                    f"{translation[0]:+.3f}N {translation[1]:+.3f}E",
+                )
 
             # Pre-stream / pre-conditions check.
             # B2: any unhealthy code blocks OFFBOARD start.
@@ -209,9 +274,7 @@ class OffboardController:
                 self._log_entry("error", msg)
                 return False, msg
 
-            pts_to_publish = self._loaded_pts
-            spray_flags_to_publish = self._loaded_spray_flags
-            if auto_origin:
+            if self._placement_mode != GPS_SURVEYED and auto_origin:
                 pose_origin = pose_origin_or_error(self._node.get_state())
                 if isinstance(pose_origin, str):
                     self._state = MissionState.ERROR

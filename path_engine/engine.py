@@ -261,7 +261,6 @@ class PathEngine:
             ref_points_dxf=ref_points_dxf,
             ref_points_gps=ref_points_gps,
             close_loop=close_loop,
-            ref_unit_scale=detected_unit_scale or 1.0,
             anchor=anchor,
         )
         plan.planning_metadata["source"] = {
@@ -318,7 +317,6 @@ class PathEngine:
             ref_points_dxf=ref_points_dxf,
             ref_points_gps=ref_points_gps,
             close_loop=close_loop,
-            ref_unit_scale=(entities[0].unit_scale if entities else 1.0),
             anchor=anchor,
         )
         plan.planning_metadata["source"] = {
@@ -402,7 +400,6 @@ class PathEngine:
         ref_points_dxf: list[tuple[float, float]] | None = None,
         ref_points_gps: list[tuple[float, float]] | None = None,
         close_loop: bool = False,
-        ref_unit_scale: float = 1.0,
         anchor: str = "drawing_origin",
     ) -> PlannedPath:
         """Run the full pipeline on a list of segments.
@@ -422,14 +419,12 @@ class PathEngine:
             start_position: (north, east) rover position for TSP. None → fallback chain.
             origin_gps: WGS84 lat/lon origin coordinates.
             rotation_deg: Rotation to align DXF north with True north (clockwise).
-            ref_points_dxf: List of control points in DXF coordinates.
+            ref_points_dxf: Control points in local-NED metres. They arrive
+                pre-scaled from the /entities preview (DXF parser already applied
+                $INSUNITS), same metric frame as segment geometry — no unit
+                scaling here (re-applying unit_scale double-scales and corrupts fit).
             ref_points_gps: List of control points in WGS84 lat/lon.
             close_loop: True to close open loop paths.
-            ref_unit_scale: Metres per DXF unit for ref_points_dxf. The clicked
-                reference points arrive in raw DXF units while segment geometry
-                has already been scaled to metres by the parser, so the points
-                must be scaled by this factor before the affine solve to keep
-                both in the same metric frame (Gap A).
             anchor: "drawing_origin" (default) anchors the DXF drawing origin
                 (0,0) at ``origin``; "first_waypoint" anchors the first driven
                 merged waypoint at ``origin`` (extension-aware auto-origin).
@@ -461,13 +456,8 @@ class PathEngine:
         has_alignment = False
         scale_val, theta_val, offset_n_val, offset_e_val = 1.0, 0.0, 0.0, 0.0
 
-        # Gap A: bring clicked reference points into the same metric frame as the
-        # already-scaled segment geometry before fitting/applying the transform.
-        metric_ref_points_dxf = None
-        if ref_points_dxf:
-            metric_ref_points_dxf = [
-                (pt[0] * ref_unit_scale, pt[1] * ref_unit_scale) for pt in ref_points_dxf
-            ]
+        # Refs already in local-NED metres — feed affine solve unchanged.
+        metric_ref_points_dxf = list(ref_points_dxf) if ref_points_dxf else None
 
         if metric_ref_points_dxf and ref_points_gps and len(metric_ref_points_dxf) >= 2 and len(ref_points_gps) >= 2:
             # Multi-point least-squares alignment. Rotation is derived from the

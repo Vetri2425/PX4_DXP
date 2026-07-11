@@ -3,10 +3,13 @@ import os
 import sys
 from collections import deque
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(__file__))
 
 import offboard_controller as offboard_module
 from config import RPP_IDLE, RPP_TRACKING
+from mission_placement import PlacementError
 from models import MissionState
 from offboard_controller import OffboardController
 
@@ -91,5 +94,65 @@ def test_start_disarms_if_rpp_stays_idle_after_path_publish():
             ("arm", True),
             ("arm", False),
         ]
+    finally:
+        offboard_module.SETPOINT_STREAM_GRACE_S = old_grace
+
+
+def _healthy_survey_state(rpp_state=RPP_TRACKING):
+    return {
+        "connected": True,
+        "rpp_state": rpp_state,
+        "pose_received": True,
+        "global_position_received": True,
+        "gps_fix_received": True,
+        "local_pose_age_ms": 20.0,
+        "global_position_age_ms": 15.0,
+        "gps_fix_age_ms": 100.0,
+        "pose_global_skew_ms": 5.0,
+        "gps_fix": 6,
+        "pos_n": 7.4629,
+        "pos_e": -0.9070,
+        "lat": 13.0720864,
+        "lon": 80.2619557,
+    }
+
+
+def test_surveyed_start_rejects_auto_origin():
+    ctrl = OffboardController(FakeNode([_healthy_survey_state()]), deque())
+    ctrl.load_path(
+        [(0.0, -0.035), (1.0, -0.035)],
+        name="surveyed",
+        placement_mode="GPS_SURVEYED",
+        origin_gps=(13.072066, 80.261956),
+    )
+    with pytest.raises(PlacementError, match="incompatible with auto_origin"):
+        run(ctrl.start_async(auto_origin=True))
+
+
+def test_surveyed_start_publishes_live_ekf_points():
+    old_grace = offboard_module.SETPOINT_STREAM_GRACE_S
+    offboard_module.SETPOINT_STREAM_GRACE_S = 0.0
+    try:
+        state = _healthy_survey_state()
+        node = FakeNode([state, dict(state)])
+        ctrl = OffboardController(node, deque())
+        source = [(0.0, -0.035), (1.0, -0.035)]
+        ctrl.load_path(
+            source,
+            name="surveyed",
+            placement_mode="GPS_SURVEYED",
+            origin_gps=(13.072066, 80.261956),
+        )
+
+        ok, msg = run(ctrl.start_async())
+
+        assert ok is True
+        assert msg == "running"
+        published = node.calls[0]
+        assert published[0] == "publish_path"
+        # Live placement shifts source uniformly; first point near field golden.
+        assert published[1][0] == pytest.approx((5.192, -0.910), abs=0.02)
+        # Source resident path remains anchor-relative (not mutated).
+        assert ctrl._loaded_pts == source
     finally:
         offboard_module.SETPOINT_STREAM_GRACE_S = old_grace
