@@ -17,6 +17,12 @@ Restart=on-failure
 RestartSec=5
 StartLimitInterval=300
 StartLimitBurst=10
+# rpp_start.sh traps SIGTERM/SIGINT and exits 143/130 after cleanly tearing down
+# its child nodes. Without this, systemd flags those as 'Failed (exit-code)' and
+# Restart=on-failure resurrects the service on every `systemctl stop` — the pipeline
+# becomes impossible to stop and every `restart` routes through a failed state.
+# Treat the signal-induced exits as clean stops so stop/restart behave correctly.
+SuccessExitStatus=143 130
 
 # Security hardening (same as px4-dxp)
 NoNewPrivileges=yes
