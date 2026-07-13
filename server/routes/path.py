@@ -1026,6 +1026,7 @@ async def load_mission_to_controller(req: LoadMissionRequest):
     # must stop/abort first. (load_path itself only warns — make it an explicit 409.)
     _load_blocked = {
         MissionState.RUNNING,
+        MissionState.ENTRY,
         MissionState.LOADING,
         MissionState.ARMING,
         MissionState.SWITCHING_OFFBOARD,

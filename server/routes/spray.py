@@ -168,7 +168,9 @@ async def spray_on():
     _check_spray_enabled()
     if ros_node is None:
         raise HTTPException(503, "ROS bridge not ready")
-    if offboard_ctrl is not None and offboard_ctrl.state == MissionState.RUNNING:
+    if offboard_ctrl is not None and offboard_ctrl.state in (
+        MissionState.RUNNING, MissionState.ENTRY
+    ):
         raise HTTPException(409, "Manual spray is blocked while a mission is RUNNING")
     state = ros_node.get_state()
     if not bool(state.get("armed", False)):
@@ -216,7 +218,9 @@ async def spray_test(req: SprayTestRequest):
         return {"manual": False}
 
     _check_spray_enabled()
-    if offboard_ctrl is not None and offboard_ctrl.state == MissionState.RUNNING:
+    if offboard_ctrl is not None and offboard_ctrl.state in (
+        MissionState.RUNNING, MissionState.ENTRY
+    ):
         raise HTTPException(409, "Manual spray is blocked while a mission is RUNNING")
     state = ros_node.get_state()
     if not bool(state.get("armed", False)):

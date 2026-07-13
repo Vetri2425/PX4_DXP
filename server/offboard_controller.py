@@ -38,9 +38,14 @@ log = get_logger("server.offboard")
 
 STOP_ALLOWED_STATES = {
     MissionState.RUNNING,
+    MissionState.ENTRY,          # D1: entry leg is stoppable like a running mission
     MissionState.ARMING,
     MissionState.SWITCHING_OFFBOARD,
 }
+# D1: if the live rover is already within this of the first mission point, skip
+# the entry leg and publish the marking path directly (degenerate entry —
+# e.g. LOCAL_NED auto-origin places wp0 at the rover). Metres.
+ENTRY_SKIP_DIST_M = 0.20
 ABORT_NOOP_STATES = {
     MissionState.IDLE,
     MissionState.COMPLETED,
@@ -72,6 +77,11 @@ class OffboardController:
         self._placement_mode = LOCAL_NED
         self._origin_gps: tuple[float, float] | None = None
         self._is_staged_mission = False
+        # D1: marking path + flags stashed while the ENTRY leg drives to the
+        # first point; the telemetry loop publishes them via
+        # advance_entry_to_marking() once the entry stop is confirmed (RPP DONE).
+        self._entry_marking_pts: list[tuple[float, float]] | None = None
+        self._entry_marking_flags: list[bool] | None = None
         # Serialises lifecycle calls. Created lazily on first use: on
         # Python 3.9 asyncio.Lock() binds an event loop at construction,
         # and the controller is built at server startup outside any loop.
@@ -166,6 +176,8 @@ class OffboardController:
             self._placement_mode = LOCAL_NED
             self._origin_gps = None
             self._is_staged_mission = False
+            self._entry_marking_pts = None
+            self._entry_marking_flags = None
             self._state = MissionState.IDLE
             # Optional path-topic clear if this branch's node grows the hook;
             # baseline has publish_stop_path only, so this self-skips (clear is
@@ -198,6 +210,8 @@ class OffboardController:
                 f"Stop the mission first if this is unintentional.",
             )
         self._loaded_pts = points
+        self._entry_marking_pts = None       # D1: wipe any stale entry stash
+        self._entry_marking_flags = None
         if spray_flags is not None and len(spray_flags) == len(points):
             self._loaded_spray_flags = [bool(f) for f in spray_flags]
         elif spray_flags is not None:
@@ -256,10 +270,10 @@ class OffboardController:
             if self._node is None:
                 return False, "ROS node not available"
 
-            # Guard: re-starting while already running re-arms and re-switches
-            # OFFBOARD, which is wrong. Operator must stop first.
-            if self._state == MissionState.RUNNING:
-                msg = "start: mission already running — call stop first"
+            # Guard: re-starting while already running/entering re-arms and
+            # re-switches OFFBOARD, which is wrong. Operator must stop first.
+            if self._state in (MissionState.RUNNING, MissionState.ENTRY):
+                msg = f"start: mission already {self._state.value} — call stop first"
                 self._log_entry("warning", msg)
                 return False, msg
 
@@ -342,14 +356,53 @@ class OffboardController:
                     "info", f"auto_origin offset: +{off_n:.3f}N +{off_e:.3f}E"
                 )
 
+            # ── D1: runtime-entry two-phase decision ──────────────────────────
+            # For a GPS-surveyed mission the placed path's first point is almost
+            # never where the rover is sitting. Rather than let RPP acquire the
+            # shape from an arbitrary offset (uncontrolled, not spray-safe — E2E
+            # audit gap 9), drive a spray-OFF entry leg [live_pose → first point],
+            # stop there (D3 completion latch), then publish the marking path
+            # (advance_entry_to_marking, from the telemetry loop on RPP DONE).
+            # Skipped when the rover is already on the first point (degenerate,
+            # e.g. LOCAL_NED auto-origin) — then it's a normal single publish.
+            entry_two_phase = False
+            publish_pts = pts_to_publish
+            publish_flags = spray_flags_to_publish
+            self._entry_marking_pts = None
+            self._entry_marking_flags = None
+            if self._placement_mode == GPS_SURVEYED and len(pts_to_publish) >= 2:
+                live_n, live_e = fcu.get("pos_n"), fcu.get("pos_e")
+                tgt_n, tgt_e = pts_to_publish[0]
+                if (
+                    live_n is not None and live_e is not None
+                    and all(math.isfinite(v) for v in (live_n, live_e, tgt_n, tgt_e))
+                    and math.hypot(tgt_n - live_n, tgt_e - live_e) > ENTRY_SKIP_DIST_M
+                ):
+                    entry_two_phase = True
+                    self._entry_marking_pts = list(pts_to_publish)
+                    self._entry_marking_flags = (
+                        list(spray_flags_to_publish) if spray_flags_to_publish else None
+                    )
+                    publish_pts = [
+                        (float(live_n), float(live_e)),
+                        (float(tgt_n), float(tgt_e)),
+                    ]
+                    publish_flags = [False, False]   # entry leg is spray-OFF
+                    self._log_entry(
+                        "info",
+                        f"entry leg: ({live_n:+.3f}N,{live_e:+.3f}E) → first point "
+                        f"({tgt_n:+.3f}N,{tgt_e:+.3f}E), "
+                        f"{math.hypot(tgt_n - live_n, tgt_e - live_e):.2f} m, spray OFF",
+                    )
+
             armed_here = False
             try:
-                # Publish the mission path before the OFFBOARD request so the
-                # 50 Hz setpoint stream carries mission setpoints, not just the
-                # streamer's zero-velocity bootstrap, when PX4 evaluates entry.
+                # Publish the (entry or marking) path before the OFFBOARD request
+                # so the 50 Hz setpoint stream carries setpoints when PX4
+                # evaluates entry.
                 self._node.publish_path(
-                    pts_to_publish,
-                    spray_flags=spray_flags_to_publish,
+                    publish_pts,
+                    spray_flags=publish_flags,
                 )
 
                 # ── Arm ───────────────────────────────────────────────────────
@@ -391,6 +444,12 @@ class OffboardController:
                     await self._node.arm_async(False)
                     return False, f"OFFBOARD failed: {why}"
 
+                if entry_two_phase:
+                    self._state = MissionState.ENTRY
+                    self._log_entry(
+                        "info", f"entry: driving to first point ({self._path_name})"
+                    )
+                    return True, "entry"
                 self._state = MissionState.RUNNING
                 self._log_entry("info", f"mission running: {self._path_name}")
                 return True, "running"
@@ -599,6 +658,38 @@ class OffboardController:
         if self._state == MissionState.RUNNING:
             self._state = MissionState.COMPLETED
             self._log_entry("info", f"mission completed: {self._path_name}")
+
+    # Called from telemetry loop when state==ENTRY and RPP has settled DONE at
+    # the entry point (D1 phase 2). Publishes the stashed marking path and
+    # transitions ENTRY→RUNNING. No async lock (mirrors mark_completed) — it
+    # only publishes a path + resets the monitor. Returns True if it advanced.
+    def advance_entry_to_marking(self) -> bool:
+        if self._state != MissionState.ENTRY:
+            return False
+        pts = self._entry_marking_pts
+        if not pts:
+            # No stash (should not happen) — fail safe to RUNNING so the
+            # watchdog/auto-complete take over rather than sticking in ENTRY.
+            self._state = MissionState.RUNNING
+            self._log_entry("warning", "entry complete but no marking path stashed")
+            return False
+        flags = self._entry_marking_flags
+        self._entry_marking_pts = None
+        self._entry_marking_flags = None
+        if self._node is not None:
+            self._node.publish_path(pts, spray_flags=flags)
+            # Clear the entry-leg DONE so RUNNING does not instantly auto-complete
+            # on the stale settle before RPP re-latches on the marking path.
+            try:
+                self._node.get_rpp_monitor().reset()
+            except Exception:
+                pass
+        self._state = MissionState.RUNNING
+        self._log_entry(
+            "info",
+            f"entry complete — marking path published ({len(pts)} pts): {self._path_name}",
+        )
+        return True
 
     # ── Internal ──────────────────────────────────────────────────────────────
 

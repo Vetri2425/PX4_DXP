@@ -147,13 +147,60 @@ def test_surveyed_start_publishes_live_ekf_points():
         ok, msg = run(ctrl.start_async())
 
         assert ok is True
-        assert msg == "running"
-        published = node.calls[0]
-        assert published[0] == "publish_path"
-        # Live placement shifts source uniformly; first point near field golden.
-        assert published[1][0] == pytest.approx((5.192, -0.910), abs=0.02)
+        # D1: a surveyed start with the rover off the first point drives a
+        # spray-OFF entry leg first, so start returns "entry" (not "running").
+        assert msg == "entry"
+        assert ctrl.state == MissionState.ENTRY
+        name, entry_pts, entry_flags = node.calls[0]
+        assert name == "publish_path"
+        # Entry leg = [live pose, first placed point]; spray OFF.
+        assert entry_pts[0] == pytest.approx((7.4629, -0.9070), abs=1e-3)  # live pose
+        assert entry_pts[1] == pytest.approx((5.192, -0.910), abs=0.02)    # entry target
+        assert entry_flags == [False, False]
+        # The full marking path (live-placed) is stashed for phase 2.
+        assert ctrl._entry_marking_pts[0] == pytest.approx((5.192, -0.910), abs=0.02)
         # Source resident path remains anchor-relative (not mutated).
         assert ctrl._loaded_pts == source
+
+        # Phase 2: entry stop confirmed (RPP DONE) → publish the marking path.
+        advanced = ctrl.advance_entry_to_marking()
+        assert advanced is True
+        assert ctrl.state == MissionState.RUNNING
+        name2, mark_pts, _flags = node.calls[-1]
+        assert name2 == "publish_path"
+        assert mark_pts[0] == pytest.approx((5.192, -0.910), abs=0.02)   # placed wp0
+        assert ctrl._entry_marking_pts is None                           # stash consumed
+    finally:
+        offboard_module.SETPOINT_STREAM_GRACE_S = old_grace
+
+
+def test_surveyed_start_skips_entry_when_on_first_point():
+    """D1 degenerate: rover already within ENTRY_SKIP_DIST of the first point →
+    single publish, state RUNNING, no entry leg (no stash)."""
+    old_grace = offboard_module.SETPOINT_STREAM_GRACE_S
+    offboard_module.SETPOINT_STREAM_GRACE_S = 0.0
+    try:
+        anchor = (13.072066, 80.261956)
+        state = _healthy_survey_state()
+        state["lat"], state["lon"] = anchor      # rover AT the survey anchor → R_anchor ≈ 0
+        node = FakeNode([state, dict(state)])
+        ctrl = OffboardController(node, deque())
+        # source[0] is 3.5 cm from the anchor origin — inside ENTRY_SKIP_DIST_M.
+        source = [(0.0, -0.035), (1.0, -0.035)]
+        ctrl.load_path(source, name="surveyed",
+                       placement_mode="GPS_SURVEYED", origin_gps=anchor)
+
+        ok, msg = run(ctrl.start_async())
+
+        assert ok is True
+        assert msg == "running"                  # no entry leg
+        assert ctrl.state == MissionState.RUNNING
+        assert ctrl._entry_marking_pts is None   # nothing stashed
+        name, pts, _ = node.calls[0]
+        assert name == "publish_path"
+        # First publish is the placed MARKING path (wp0 = live pose + source[0]),
+        # not a [live_pose, target] entry leg.
+        assert pts[0] == pytest.approx((7.4629, -0.9420), abs=0.02)
     finally:
         offboard_module.SETPOINT_STREAM_GRACE_S = old_grace
 

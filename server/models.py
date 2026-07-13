@@ -18,6 +18,10 @@ class MissionState(str, Enum):
     LOADING = "loading"
     ARMING = "arming"
     SWITCHING_OFFBOARD = "switching_offboard"
+    # D1/D4: driving the spray-OFF entry leg (arbitrary start → first mission
+    # point) before the marking path is published. Distinct from RUNNING so
+    # spray stays denied, auto-complete is ignored, and telemetry shows entry.
+    ENTRY = "entry"
     RUNNING = "running"
     STOPPING = "stopping"
     DISARMING = "disarming"

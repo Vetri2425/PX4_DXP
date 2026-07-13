@@ -311,7 +311,7 @@ async def _telemetry_loop() -> None:
                 spraying = bool(s.get("spraying", False))
                 mission_running = (
                     offboard_ctrl is not None
-                    and offboard_ctrl.state == MissionState.RUNNING
+                    and offboard_ctrl.state in (MissionState.RUNNING, MissionState.ENTRY)
                     and bool(s.get("armed", False))
                 )
                 if not mission_running:
@@ -363,6 +363,24 @@ async def _telemetry_loop() -> None:
                 }
                 await _emit_authenticated("mission_status", _sanitize(mission_status))
 
+                # ── 1b. D1 entry phase 2: ENTRY + DONE settled → publish mark ──
+                # The rover has driven the spray-OFF entry leg and stopped on the
+                # first point (D3 completion latch → RPP DONE). Publish the
+                # stashed marking path and transition ENTRY→RUNNING.
+                if (
+                    offboard_ctrl is not None
+                    and offboard_ctrl.state == MissionState.ENTRY
+                    and ros_node.get_rpp_monitor().is_done()
+                ):
+                    if offboard_ctrl.advance_entry_to_marking():
+                        await _emit_authenticated(
+                            "entry_complete",
+                            {
+                                "state": offboard_ctrl.state.value,
+                                "name": offboard_ctrl.loaded_path_name,
+                            },
+                        )
+
                 # ── 2. Auto-completion: RUNNING + DONE settled → COMPLETED ─────
                 if (
                     offboard_ctrl is not None
@@ -385,7 +403,7 @@ async def _telemetry_loop() -> None:
                 pose_age = s.get("pose_age_ms") or 0.0
                 running = (
                     offboard_ctrl is not None
-                    and offboard_ctrl.state == MissionState.RUNNING
+                    and offboard_ctrl.state in (MissionState.RUNNING, MissionState.ENTRY)
                 )
                 unhealthy = (
                     code in RPP_UNHEALTHY_CODES
