@@ -329,6 +329,13 @@ class RPPControllerNode(Node):
         # `sharp` is accepted as a runtime alias for `segment`.
         self.declare_parameter("tracking_profile",                    "auto")
         self.declare_parameter("segment_corner_threshold_deg",         45.0)
+        # D2 (runtime entry): when true, run 0 pivots in place to its first
+        # heading before tracking (spray OFF via _run_alignment_hold) instead of
+        # the emergent forward-cone arc at tracking speed. Default OFF — enabling
+        # it is the D2 field-validation A/B; it does not change the validated
+        # auto-origin square/line missions until flipped on. See
+        # docs/RUNTIME_ENTRY_VELOCITY_PLAN.md §4 D2.
+        self.declare_parameter("entry_prealign_enabled",             False)
         self.declare_parameter("segment_slowdown_dist",               0.50)
         self.declare_parameter("segment_min_corner_speed",             0.08)
         # Final-segment (run-endpoint) goal-approach floor. A per-line PRE/AFT
@@ -1360,6 +1367,18 @@ class RPPControllerNode(Node):
             if turn >= threshold:
                 self._run_align_pending = True
                 self._run_align_turn_rad = turn   # angle-aware pivot budget
+        elif idx == 0 and len(run["poses"]) > 1 and bool(
+            self.get_parameter("entry_prealign_enabled").value
+        ):
+            # D2 — runtime-entry pre-align. Run 0 has no prev_run, so the block
+            # above is skipped and the rover would ARC onto the first heading at
+            # tracking speed (E2E audit gap 9). When enabled, pivot in place to
+            # the first-segment heading first — spray is forced OFF throughout
+            # by _run_alignment_hold. The live heading error is computed each
+            # cycle there (and releases immediately if already aligned), so no
+            # pose is needed here; budget the pivot watchdog for the worst case.
+            self._run_align_pending = True
+            self._run_align_turn_rad = math.pi
         self._reset_corner_pivot_state()
         # A hard run boundary is stopped before _advance_run(). Carry that
         # confirmation into the new run so _run_alignment_hold pivots directly
