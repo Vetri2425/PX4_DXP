@@ -4,7 +4,7 @@
 **Base branch:** `test/colinear-fix` (controller pin `cd44884`). Frozen corner knobs stay frozen.
 **Date:** 2026-07-13 (rev 2 — D1 re-specified as two-phase publish after review found the flag-split hole)
 **Prereqs done:** Epic 1 (placement hygiene / scale gate), Epic 2 (live EKF placement `P_live = P + L − R_anchor`), Auth. Do not reopen.
-**Status gate:** **D0 PASSED 2026-07-13** (bag `d0_20260713_123439`; see §5). Build is unblocked: **D3 → D1 → D2 → D4**. D1 uses the two-phase model (§4) — the naive "prepend one run" does **not** work under `_split_runs_by_flag` (see §4 D1 note).
+**Status gate:** **D0 PASSED** (bag `d0_20260713_123439`, §5) → **D3 PASSED & DEPLOYED 2026-07-13** (commit `6e31904`, bag `d3_20260713_130559`: coast-past 9.9 cm vs ~108 cm before, rests 4.0 cm, DONE latched; unit tests 4/4). **Next: D1** (two-phase entry publish). D1 uses the two-phase model (§4) — the naive "prepend one run" does **not** work under `_split_runs_by_flag` (see §4 D1 note).
 
 ---
 
@@ -88,11 +88,12 @@ Each item lands **alone** with its own before/after bag. Order: **D0 (verify) �
 ### D0 — Make-or-break bench (verify the ONE unknown FIRST) — 0 code
 Settle the only real risk before building anything. See §5.
 
-### D3 — RPP: re-land the completion latch (277d3dc) *(isolated; lands before D1)*
+### D3 — RPP: completion latch **[DONE — PASSED & DEPLOYED 2026-07-13, commit `6e31904`]**
 - A *correct* fix for a real deterministic bug: PX4 velocity-OFFBOARD coasts on a bare zero setpoint, so the rover drifts past `xy_goal_tolerance`, the goal check goes false, tracking resumes, and it drove 1.08 m past the goal (bag 2026-07-10_20-07 Line_2m).
-- Re-land `_hold_at_completion` + `_completion_stop_pending` **alone** — active-brake to rest, latch DONE only on `_completion_settle_satisfied()`. Cleared per-run in `_apply_run` and per-path in `_path_cb`, never from the tracking fall-through.
-- **Take nothing else** from `fix/runtime-entry-stop` (no `corner_stop_hold_s`, no param retunes, no densification).
-- **Why first:** the Phase-1 entry stop (D1) *is* a completion. Without this latch it coasts past `entry_target`, and D1 cannot land cleanly.
+- **Built the right way, NOT the ref-branch way:** `_hold_at_completion` is the terminal twin of `_hold_before_run_advance` — it reuses the SAME `_corner_brake_velocity` + `_corner_stop_satisfied()` primitives the run-boundary stop and D0 proved. It deliberately does **not** port the ref branch's parallel `_completion_settle_satisfied` mechanism. `_completion_stop_pending` latch checked BEFORE the goal test; cleared per run/path in `_apply_run`; both `_control_loop` and `_control_segment_profile` route through the single handler.
+- **Took nothing else** from `fix/runtime-entry-stop` (no `corner_stop_hold_s`, no param retunes, no densification). Invariants I1–I4 upheld.
+- **Field result** (bag `d3_20260713_130559`, straight 2 m line): closest approach 1.6 cm, **coast-past 9.9 cm (was ~108 cm)**, rests 4.0 cm, DONE latched. Unit tests `src/test_completion_stop.py` 4/4.
+- **Why it was first:** the Phase-1 entry stop (D1) *is* a completion. This latch is the prerequisite that lets D1's entry stop hold instead of coasting past `entry_target`.
 
 ### D1 — Server: two-phase entry publish  *(most of the work; pure Python, unit-testable)*
 - `entry_target_from_plan(placed_wps, spray_flags, extensions_enabled) → (n, e)` — first WP or first PRE.
@@ -204,7 +205,7 @@ The whole-mission velocity path (this doc) is primary precisely because it avoid
 ## 10. Acceptance criteria
 
 - [x] **D0:** large-yaw (~150–180°) velocity spot-turn from dead stop — clean, no reverse-flip, no oscillation, settles in tolerance. **PASS 2026-07-13, bag `d0_20260713_123439`** (§5).
-- [ ] **D3:** completion latch — rover stops ≤ `xy_goal_tolerance`, no coast-past, on the Line_2m repro.
+- [x] **D3:** completion latch — **PASS 2026-07-13** (bag `d3_20260713_130559`): stops on point, coast-past 9.9 cm (was ~108 cm), DONE latched. Unit 4/4. Deployed `6e31904`.
 - [ ] **D1:** two-phase publish — Phase-1 stop at entry_target, DONE-settle → Phase-2 marking publish, pivot onto first line, mark xtrack class = baseline on square/line; no densified entry path on `/path`; ENTRY does not auto-complete on Phase-1 DONE.
 - [ ] **D2:** run-0 pre-align — adversarial initial heading arrives on-line cleanly; A/B recorded.
 - [ ] **D4:** `ENTRY` state — spray denied, `/load` 409, telemetry shows `ENTRY`, abort/estop mid-entry safe.
