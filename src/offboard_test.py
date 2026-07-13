@@ -98,10 +98,18 @@ class OffboardTestNode(Node):
         self.declare_parameter("mode", "position")  # "position" or "velocity"
         self.declare_parameter("forward_dist", self.FORWARD_DIST)
         self.declare_parameter("forward_speed", self.FORWARD_SPEED)
+        # Position mode drives to an ABSOLUTE local-NED point. To make the drive
+        # relative to wherever the rover currently sits (a bounded N-metre hop up a
+        # known-clear corridor), the target is captured from live pose at drive start.
+        self.declare_parameter("direction", "north")  # "north" or "east"
 
         self.mode = self.get_parameter("mode").value
         self.target_dist = self.get_parameter("forward_dist").value
         self.target_speed = self.get_parameter("forward_speed").value
+        self.direction = self.get_parameter("direction").value
+        # Absolute NED target, resolved from live pose when the drive phase begins.
+        self._tgt_n = None
+        self._tgt_e = None
 
         # --- State ---
         self.current_state = State()
@@ -336,8 +344,8 @@ class OffboardTestNode(Node):
             self.sp_pub.publish(msg)
 
         elif self.phase == "run_position":
-            # During position-mode mission: stream target position
-            msg = self._make_position_setpoint(self.target_dist, 0.0)
+            # During position-mode mission: stream the resolved absolute NED target
+            msg = self._make_position_setpoint(self._tgt_n, self._tgt_e)
             self.sp_pub.publish(msg)
 
         elif self.phase == "run_velocity_forward":
@@ -421,8 +429,23 @@ class OffboardTestNode(Node):
             self._shutdown()
             return
 
-        # Step 4: Drive forward
-        self.get_logger().info(f"Step 4: Driving forward {self.target_dist}m...")
+        # Step 4: Drive forward — resolve ABSOLUTE NED target relative to live pose.
+        # MAVROS pose is ENU: pos_n = pose.y, pos_e = pose.x.
+        if self.current_pose is None:
+            self.get_logger().error("No pose at drive start — aborting")
+            self._set_mode("MANUAL")
+            self._shutdown()
+            return
+        start_n = self.current_pose.pose.position.y
+        start_e = self.current_pose.pose.position.x
+        if self.direction == "east":
+            self._tgt_n, self._tgt_e = start_n, start_e + self.target_dist
+        else:  # north (default)
+            self._tgt_n, self._tgt_e = start_n + self.target_dist, start_e
+        self.get_logger().info(
+            f"Step 4: Driving {self.target_dist}m {self.direction.upper()} — "
+            f"start NED=({start_n:.2f},{start_e:.2f}) → target NED=({self._tgt_n:.2f},{self._tgt_e:.2f})"
+        )
         self.phase = "run_position"
         drive_time = max(self.target_dist / self.target_speed * 1.5, 3.0)  # generous timeout
         self._spin_for(drive_time)

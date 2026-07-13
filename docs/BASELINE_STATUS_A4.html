@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Baseline Status — Completed vs Pending</title>
+<style>
+  @page { size: A4 portrait; margin: 9mm; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: #14171c;
+    font-size: 10.4px;
+    line-height: 1.3;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  /* Fill the printable A4 area exactly: 297 - 2*9 = 279mm tall, 210 - 18 = 192mm wide */
+  .page {
+    width: 192mm;
+    height: 279mm;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    border-bottom: 2.5px solid #1a2b4a;
+    padding-bottom: 5px;
+    margin-bottom: 8px;
+    display: flex; justify-content: space-between; align-items: flex-end;
+  }
+  header h1 { font-size: 19px; color: #1a2b4a; letter-spacing: .2px; }
+  header .sub { font-size: 10px; color: #52606d; text-align: right; line-height: 1.4; }
+  header .sub b { color: #1a2b4a; }
+
+  .banner {
+    background: #eef3fb; border: 1px solid #c6d6ee; border-radius: 4px;
+    padding: 7px 10px; margin-bottom: 9px; font-size: 10px; color: #24344d; line-height: 1.4;
+  }
+  .banner b { color: #1a2b4a; }
+  .banner code { font-size: 9.3px; background: #dde7f6; padding: 0 3px; border-radius: 2px; }
+
+  .cols { flex: 1; display: flex; gap: 9px; min-height: 0; }
+  .col { flex: 1; display: flex; flex-direction: column; gap: 9px; }
+
+  .card { border: 1px solid #d3dae4; border-radius: 5px; overflow: hidden; }
+  /* the big list in each column grows and distributes its rows so both columns
+     fill to the same bottom line — no single dead gap, no per-card gaps */
+  .card.grow { flex: 1; display: flex; flex-direction: column; }
+  .card.grow ul { flex: 1; display: flex; flex-direction: column; }
+  .card.grow li { flex: 1; }
+  .card > h2 {
+    font-size: 11px; padding: 5px 9px; color: #fff; letter-spacing: .3px;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .card > h2 .n { font-weight: 400; opacity: .85; font-size: 9.5px; }
+  .done  > h2 { background: #1f7a45; }
+  .part  > h2 { background: #b06a12; }
+  .pend  > h2 { background: #5a6472; }
+  .attn  > h2 { background: #a52834; }
+  ul { list-style: none; }
+  li { padding: 5px 9px; border-top: 1px solid #eef1f5; display: flex; gap: 6px; align-items: center; }
+  li:first-child { border-top: none; }
+  li .k { font-weight: 700; color: #1a2b4a; flex: 0 0 auto; }
+  li .d { color: #3b4652; }
+  li .src { color: #8a95a2; font-style: italic; }
+  .attn li .k { color: #a52834; }
+
+  footer {
+    margin-top: 9px; border-top: 1px solid #d3dae4; padding-top: 5px;
+    font-size: 9.3px; color: #52606d; display: flex; justify-content: space-between; align-items: center;
+  }
+  footer b { color: #1a2b4a; }
+  .legend { white-space: nowrap; }
+  .legend span { margin-right: 12px; }
+  footer > div { white-space: nowrap; }
+  .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; vertical-align: -1px; margin-right: 3px; }
+</style>
+</head>
+<body>
+<div class="page">
+  <header>
+    <h1>3WD Rover — Baseline Status</h1>
+    <div class="sub">
+      Branch <b>test/colinear-fix</b> @ <b>7aa005f</b> · controller pin <b>cd44884</b><br>
+      Code-audited 2026-07-13 · Completed vs Pending
+    </div>
+  </header>
+
+  <div class="banner">
+    <b>Control mode:</b> velocity-mode OFFBOARD throughout (runtime drive <i>and</i> two-phase entry).
+    <code>rpp&nbsp;→&nbsp;twist_to_setpoint&nbsp;→&nbsp;setpoint_raw/local (type_mask VELOCITY 3527)&nbsp;→&nbsp;PX4</code>.
+    <b>No position controller in the live path</b> — <code>OFFBOARD_POSITION_MODE_PLAN.md</code> is a deferred plan, not what runs.
+  </div>
+
+  <div class="cols">
+    <!-- LEFT -->
+    <div class="col">
+      <div class="card done grow">
+        <h2>Completed &amp; field-proven <span class="n">verified in-tree</span></h2>
+        <ul>
+          <li><span class="k">Placement</span><span class="d">GPS-surveyed → live EKF (P+L−R_anchor) · <span class="src">mission_placement.py:131</span></span></li>
+          <li><span class="k">Entry</span><span class="d">Two-phase velocity entry, spray-OFF, 2-point · <span class="src">offboard_controller.py:373</span></span></li>
+          <li><span class="k">Pre-align</span><span class="d">Run-0 entry pivot (gated) · <span class="src">rpp_controller_node.py:338</span></span></li>
+          <li><span class="k">Completion</span><span class="d">DONE gated on measured coast-down · <span class="src">rpp:1517 _hold_at_completion</span></span></li>
+          <li><span class="k">Scale gate</span><span class="d">Ref double-scale guard · <span class="src">path_engine/engine.py:422</span></span></li>
+          <li><span class="k">Mission clear</span><span class="d">POST /api/mission/clear (ABORTED/ERROR) · <span class="src">routes/mission.py:137</span></span></li>
+          <li><span class="k">Auth</span><span class="d">Password login + scoped tokens + disable bypass · <span class="src">auth.py:133</span></span></li>
+          <li><span class="k">Spray safety</span><span class="d">Actuator state machine, latency, startup OFF · <span class="src">spray_controller_node.py:803</span></span></li>
+          <li><span class="k">RTK</span><span class="d">NTRIP/LoRa self-heal + watchdog age-gate · <span class="src">rtk_manager.py:224</span></span></li>
+          <li><span class="k">Recorder</span><span class="d">SHA256 bundle + manifest + retention · <span class="src">bag_autorecord.py:255</span></span></li>
+          <li><span class="k">Telemetry</span><span class="d">Read-only monitoring API · <span class="src">routes/telemetry.py:20</span></span></li>
+        </ul>
+      </div>
+
+      <div class="card part">
+        <h2>Partial / differs from main</h2>
+        <ul>
+          <li><span class="k">Densify</span><span class="d">MARK 5 cm but TRANSIT/connectors 15 cm; no global ≤5 cm pass · <span class="src">straight_line.py:52</span></span></li>
+          <li><span class="k">Fail-closed</span><span class="d">Baseline watchdog + D3 latch present; mainline spray-backend pack absent</span></li>
+          <li><span class="k">GPS 8-dp</span><span class="d">Non-gap: float64 passthrough exceeds 8 dp, no explicit round</span></li>
+        </ul>
+      </div>
+
+      <div class="card attn">
+        <h2>Needs attention — promote first</h2>
+        <ul>
+          <li><span class="k">SAFETY</span><span class="d">Spray gate has no GPS_SURVEYED provenance check — degraded-GPS mission can still spray · <span class="src">spray_controller_node.py:775</span></span></li>
+          <li><span class="k">Footgun</span><span class="d">entry_prealign_enabled resets to False every rpp-pipeline restart (P4)</span></li>
+          <li><span class="k">P1</span><span class="d">Arc doesn't flow (~68% stop-pivot); check 5/15 cm densify split, no knob retune</span></li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- RIGHT -->
+    <div class="col">
+      <div class="card pend grow">
+        <h2>Pending — genuinely on main's lineage <span class="n">not here</span></h2>
+        <ul>
+          <li><span class="k">Point-nav</span><span class="d">No point-mission stack (Task_01); DXF/polyline only</span></li>
+          <li><span class="k">GPS CSV</span><span class="d">No lat/lon point-mission ingest (QGC-waypoint→polyline only)</span></li>
+          <li><span class="k">Plan-stage</span><span class="d">Point-mission plan-and-stage E2E (depends on above)</span></li>
+          <li><span class="k">Spray modes</span><span class="d">Only continuous; no dash / point mode</span></li>
+          <li><span class="k">Spray API</span><span class="d">No per-path mode sidecar / hot-apply to live controller</span></li>
+          <li><span class="k">Spray ident</span><span class="d">No path-fingerprint identity binding / strict gating</span></li>
+          <li><span class="k">Spray gate</span><span class="d">No GPS_SURVEYED runtime spray gate (see Attention)</span></li>
+          <li><span class="k">Param contract</span><span class="d">Continuous-mode gps_*/obstacle_*/point_* hardening (N/A — params absent)</span></li>
+          <li><span class="k">Mission ops</span><span class="d">Skip / restart / operation coordinator / terminal cleanup / event journal</span></li>
+          <li><span class="k">Joystick V2</span><span class="d">No joystick_controller / manual-control socket event</span></li>
+          <li><span class="k">MANUAL_CONTROL</span><span class="d">float32 path + rejection logging</span></li>
+          <li><span class="k">Throttle caps</span><span class="d">Joystick steering/throttle tuning caps</span></li>
+          <li><span class="k">Bridge yaw-hold</span><span class="d">Corner-stop / reverse-brake yaw hold for joystick</span></li>
+          <li><span class="k">Swagger</span><span class="d">X-Rover-Token OpenAPI security scheme</span></li>
+          <li><span class="k">Activity CSV</span><span class="d">/activity export (JSON only today)</span></li>
+          <li><span class="k">AsyncAPI</span><span class="d">Socket.IO contract docs</span></li>
+          <li><span class="k">GCS matrix</span><span class="d">Migration compatibility matrix</span></li>
+          <li><span class="k">measured_speed</span><span class="d">Telemetry measured_speed_m_s field</span></li>
+          <li><span class="k">3D label</span><span class="d">3D GPS fix label + plaintext-auth rejection</span></li>
+          <li><span class="k">Capture race</span><span class="d">Bag e-stop→503 retry fix + GPS nuisance e-stop debounce</span></li>
+        </ul>
+      </div>
+
+      <div class="card part">
+        <h2>Do NOT rebuild (frozen by invariant)</h2>
+        <ul>
+          <li><span class="k">#3</span><span class="d">Densified 5 cm entry — velocity 2-point entry is the design</span></li>
+          <li><span class="k">#40</span><span class="d">Corner-stop param retunes — keep 0.50 / 0.08 / no-hold frozen (I2/I4)</span></li>
+          <li><span class="k">Pos-mode</span><span class="d">Whole position-mode entry — demoted; velocity is primary</span></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    <div class="legend">
+      <span><span class="sw" style="background:#1f7a45"></span>Done</span>
+      <span><span class="sw" style="background:#b06a12"></span>Partial</span>
+      <span><span class="sw" style="background:#5a6472"></span>Pending</span>
+      <span><span class="sw" style="background:#a52834"></span>Attention</span>
+    </div>
+    <div><b>Next:</b> P1 arc-flow → P2 analyzer → P3 circle · absent verified via <b>git merge-base</b></div>
+  </footer>
+</div>
+</body>
+</html>
