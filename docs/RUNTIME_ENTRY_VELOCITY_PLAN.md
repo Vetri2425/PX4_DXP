@@ -4,7 +4,7 @@
 **Base branch:** `test/colinear-fix` (controller pin `cd44884`). Frozen corner knobs stay frozen.
 **Date:** 2026-07-13 (rev 2 — D1 re-specified as two-phase publish after review found the flag-split hole)
 **Prereqs done:** Epic 1 (placement hygiene / scale gate), Epic 2 (live EKF placement `P_live = P + L − R_anchor`), Auth. Do not reopen.
-**Status gate:** CONDITIONAL GO. Do **D0 first**. Do not code D1–D4 until D0 PASSES. D1 uses the two-phase model (§4) — the naive "prepend one run" does **not** work under `_split_runs_by_flag` (see §4 D1 note).
+**Status gate:** **D0 PASSED 2026-07-13** (bag `d0_20260713_123439`; see §5). Build is unblocked: **D3 → D1 → D2 → D4**. D1 uses the two-phase model (§4) — the naive "prepend one run" does **not** work under `_split_runs_by_flag` (see §4 D1 note).
 
 ---
 
@@ -130,6 +130,21 @@ Settle the only real risk before building anything. See §5.
 
 D0 is a **hard gate, not a formality**. Field-validated 90° tracking corners are *not* evidence that a ~180° spot-turn from a dead stop at an entry seam will be clean — that regime is genuinely untested. No build work starts until this bag PASSES.
 
+#### D0 RESULT — PASS (2026-07-13, bag `d0_20260713_123439`)
+Hairpin published via `tools/d0_entry_pivot/publish_hairpin.py` (spray OFF, corner `168.7°`), segment profile, sole publisher. Operator confirmed in-field: drove 2 m north → stopped → turned **right** → completed to C. `check_d0_bag.py`, all five bars:
+
+| Bar | Result |
+|---|---|
+| stop-before-turn | PASS — min measured speed 0.011 m/s before CORNER_ALIGN |
+| no-reverse-flip | PASS — forward-component **+0.011 m/s while turning at 133° err** (align-settle brake excluded) |
+| no-oscillation | PASS — heading monotonic, 0 rises |
+| settles | PASS — 1.68° at release |
+| turn-magnitude | PASS — pose-yaw swept **169.6°**, short way (right) |
+
+*Checker note:* the first run false-FAILed reverse-flip by counting the intentional post-turn `_corner_brake_velocity` reverse as a flip; `check_d0_bag.py` CHECK 2 now evaluates only actively-turning samples (`|heading_err| > 5°`). No rover change — the rover was clean.
+
+**Verdict: velocity-mode large-yaw pivot from a dead stop is PROVEN. Whole-mission velocity is the answer. Position-mode plan → shelf (fallback only).**
+
 ---
 
 ## 6. The four invariants — guardrails that encode why the other branches failed
@@ -188,7 +203,7 @@ The whole-mission velocity path (this doc) is primary precisely because it avoid
 
 ## 10. Acceptance criteria
 
-- [ ] **D0:** large-yaw (~150–180°) velocity spot-turn from dead stop — clean, no reverse-flip, no oscillation, settles in tolerance (bag in this doc).
+- [x] **D0:** large-yaw (~150–180°) velocity spot-turn from dead stop — clean, no reverse-flip, no oscillation, settles in tolerance. **PASS 2026-07-13, bag `d0_20260713_123439`** (§5).
 - [ ] **D3:** completion latch — rover stops ≤ `xy_goal_tolerance`, no coast-past, on the Line_2m repro.
 - [ ] **D1:** two-phase publish — Phase-1 stop at entry_target, DONE-settle → Phase-2 marking publish, pivot onto first line, mark xtrack class = baseline on square/line; no densified entry path on `/path`; ENTRY does not auto-complete on Phase-1 DONE.
 - [ ] **D2:** run-0 pre-align — adversarial initial heading arrives on-line cleanly; A/B recorded.

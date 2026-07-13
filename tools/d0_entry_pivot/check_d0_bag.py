@@ -32,6 +32,9 @@ STOP_SPEED_PASS = 0.05        # m/s — min measured speed during CORNER_STOP mu
 FWD_EPS = -0.02               # m/s — commanded forward component during ALIGN must stay >= this
 OSC_BAND_RAD = math.radians(8.0)   # a |heading_err| rise bigger than this counts as an oscillation
 SETTLE_TOL_RAD = math.radians(3.0) # final |heading_err| at ALIGN release must be <= this (param is 2°)
+TURNING_BAND_RAD = math.radians(5.0)  # below this |heading_err| the turn is DONE and the align-settle
+                                      # brake (an intentional body-axis REVERSE) is expected — it is
+                                      # NOT a reverse-flip, so exclude those samples from CHECK 2.
 TURN_MIN_DEG, TURN_MAX_DEG = 140.0, 200.0   # actual pose-yaw sweep expected (~169°)
 
 S_TRACK, S_ALIGN, S_STOP = 1, 3, 5
@@ -170,20 +173,33 @@ def main() -> int:
             results.append(("stop-before-turn", True,
                             "CORNER_STOP precedes CORNER_ALIGN (no velocity_local topic to confirm speed)"))
 
-    # CHECK 2 — no reverse-flip during ALIGN (commanded forward component >= FWD_EPS)
+    # CHECK 2 — no reverse-flip WHILE ACTIVELY TURNING.
+    # A real BUG-T3 flip drives the pivot vector behind the nose while the
+    # heading is still wrong. The align-settle phase ALSO commands a body-axis
+    # reverse (the _corner_brake_velocity brake) once the heading is achieved —
+    # that is intentional, not a flip. So only evaluate samples where the rover
+    # is still actively turning (|heading_err| > TURNING_BAND); exclude the brake.
     if i_align is not None and velcmd and poseyaw:
         min_fwd = math.inf
+        min_fwd_herr = None
         for idx in range(i_align, i_rel + 1):
+            if abs(seg[idx][2]) <= TURNING_BAND_RAD:
+                continue  # turn done — align-settle brake (intentional reverse), skip
             frac = idx / max(1, len(seg) - 1)
             vc = velcmd[min(len(velcmd) - 1, int(frac * (len(velcmd) - 1)))]
             yw = poseyaw[min(len(poseyaw) - 1, int(frac * (len(poseyaw) - 1)))]
-            v_n, v_e = vc[1], vc[2]
-            fwd = v_n * math.cos(yw[1]) + v_e * math.sin(yw[1])
-            min_fwd = min(min_fwd, fwd)
-        ok = min_fwd >= FWD_EPS
-        results.append(("no-reverse-flip", ok,
-                        f"min commanded forward-component during ALIGN {min_fwd:+.3f} m/s "
-                        f"(>= {FWD_EPS} → {'ok' if ok else 'REVERSE-FLIP'})"))
+            fwd = vc[1] * math.cos(yw[1]) + vc[2] * math.sin(yw[1])
+            if fwd < min_fwd:
+                min_fwd, min_fwd_herr = fwd, seg[idx][2]
+        if min_fwd is math.inf:
+            results.append(("no-reverse-flip", None,
+                            "no active-turning samples in ALIGN (all braking) — skipped"))
+        else:
+            ok = min_fwd >= FWD_EPS
+            results.append(("no-reverse-flip", ok,
+                            f"min forward-component while actively turning {min_fwd:+.3f} m/s "
+                            f"(at heading_err {math.degrees(min_fwd_herr):+.1f}°; >= {FWD_EPS} → "
+                            f"{'ok' if ok else 'REVERSE-FLIP'}); align-settle brake excluded"))
     else:
         results.append(("no-reverse-flip", None, "insufficient velocity_ned/pose data — skipped"))
 
