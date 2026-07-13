@@ -27,11 +27,12 @@ Env overrides:
   BAG_API_GRACE_S             default 8     (stop+finalise if API unreachable this long while recording)
 """
 from __future__ import annotations
-import json, os, re, signal, subprocess, sys, time, urllib.request
-from datetime import datetime
+import hashlib, json, os, re, shutil, signal, socket, subprocess, sys, time, urllib.request
+from datetime import datetime, timezone, timedelta
 
 API_BASE   = os.environ.get("ROVER_API_BASE", "http://127.0.0.1:5001").rstrip("/")
 STATUS_URL = f"{API_BASE}/api/mission/status"
+LOADED_URL = f"{API_BASE}/api/mission/loaded-path"
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DEFAULT_MACHINE_TOKEN_FILE = os.path.join(_REPO_ROOT, "config", "bag_autorecord.token")
 TOKEN_FILE = os.environ.get(
@@ -48,28 +49,90 @@ POLL_S     = float(os.environ.get("BAG_POLL_S", "0.2"))
 MAX_S      = float(os.environ.get("BAG_MAX_S", "1800"))
 API_GRACE_S = float(os.environ.get("BAG_API_GRACE_S", "8"))
 
+# ── manifest / integrity / config capture (G2 + G3) ──────────────────────────
+# IST is Asia/Kolkata (UTC+5:30). Computed from UTC so the readable local field
+# is correct regardless of the Jetson's own TZ setting.
+IST = timezone(timedelta(hours=5, minutes=30), name="IST")
+# Best-effort FCU param snapshot (via MAVROS ParamGet) — the exact knobs the plan
+# says behaviour must be attributable to. Capture is bounded + best-effort; any
+# failure records null for that param and never blocks the bundle.
+CAPTURE_FCU_PARAMS = os.environ.get("BAG_FCU_PARAMS", "1") == "1"
+FCU_PARAM_NAMES = [
+    "COM_OF_LOSS_T", "RO_YAW_P", "RO_YAW_RATE_LIM", "RO_MAX_THR_SPEED",
+    "RD_TRANS_TRN_ARM", "RD_TRANS_ARM_TRN",
+    "EKF2_WENC_CTRL", "RBCLW_COUNTS_REV",
+    "NAV_ACC_RAD",
+    "PWM_AUX_FUNC1", "PWM_AUX_MIN1", "PWM_AUX_MAX1", "PWM_AUX_DIS1",
+]
+# The RPP tuning block lives in /rpp/debug[11..38] (see rpp_controller_node.py).
+# index -> readable label, so the manifest names each number.
+RPP_DEBUG_PARAM_LABELS = {
+    11: "max_linear_vel", 12: "min_linear_vel", 13: "min_lookahead_dist",
+    14: "max_lookahead_dist", 15: "lookahead_time", 16: "a_lat_max",
+    17: "regulated_linear_scaling_min_speed", 18: "xy_goal_tolerance",
+    19: "min_goal_travel_m", 20: "approach_velocity_scaling_dist",
+    21: "min_approach_linear_velocity", 22: "p4_zero_vel_threshold",
+    23: "pose_max_age_s", 24: "ekf_jump_threshold_m", 25: "require_rtk_fix",
+    26: "preview_curvature_n", 27: "xtrack_lookahead_gain",
+    28: "path_resample_spacing_m", 29: "corner_smooth_radius_m",
+    30: "corner_smooth_arc_pts", 31: "use_imu_extrapolation",
+    32: "imu_max_extrap_age_s", 33: "use_feedforward_yaw_rate",
+    34: "yaw_rate_feedback_gain", 35: "max_yaw_rate_body",
+    36: "max_linear_accel", 37: "max_linear_decel", 38: "mission_speed",
+}
+# Services whose active-state is recorded in the manifest environment block.
+WATCH_SERVICES = ["rover-server", "rpp-pipeline", "px4-dxp", "bag-autorecord"]
+
+# ── disk management (G4) ─────────────────────────────────────────────────────
+_GiB = 1024 ** 3
+MIN_FREE_BYTES  = int(float(os.environ.get("BAG_MIN_FREE_BYTES",  str(5 * _GiB))))  # refuse to start below this
+LOW_FREE_BYTES  = int(float(os.environ.get("BAG_LOW_FREE_BYTES",  str(2 * _GiB))))  # rotate to reclaim below this
+MAX_TOTAL_BYTES = int(float(os.environ.get("BAG_MAX_TOTAL_BYTES", str(50 * _GiB)))) # rotate when bundles exceed this
+
+# ── auto behaviour analysis on finalise (G6 wiring, P5) ──────────────────────
+# Spawned detached + best-effort: a failed/absent analyser never affects the bag
+# or the rover. Off the mission critical path (mission already terminal).
+AUTO_ANALYZE = os.environ.get("BAG_AUTO_ANALYZE", "1") == "1"
+_ANALYZER = os.path.join(_REPO_ROOT, "tools", "analyze_mission.py")
+
 # Terminal mission states (anything else = active → record).
 TERMINAL = {"idle", "completed", "aborted", "error", "none", ""}
 
 # Curated debug/verification topic set (commanded vs actual, tracking, spray).
+# EXPLICIT, not `-a`: keeps bag size bounded and lets the QoS overrides be
+# targeted. Every entry is verified to exist on THIS tree (test/colinear-fix).
+# main's G7 list also named /path/identity, /rpp/conditioned_path_identity,
+# /rpp/setpoint_bridge_debug and /spray/runtime_status — NONE exist here, so they
+# are deliberately omitted. /mavros/local_position/velocity_body was dropped
+# (verified non-existent on the Jetson pluginlist).
 TOPICS = [
-    "/mavros/local_position/pose",        # actual trajectory + heading
-    "/mavros/local_position/velocity_body",
-    "/mavros/local_position/velocity_local",
-    "/mavros/setpoint_raw/local",         # commanded vel/yaw → FCU
-    "/mavros/setpoint_velocity/cmd_vel",
-    "/mavros/state",                      # armed / mode
+    "/mavros/local_position/pose",        # actual trajectory + heading (ENU)
+    "/mavros/local_position/velocity_local",  # measured ground speed (ENU)
+    "/mavros/setpoint_raw/local",         # commanded vel/yaw → FCU (twist_to_setpoint)
+    "/mavros/setpoint_velocity/cmd_vel",  # legacy vel setpoint (if used)
+    "/mavros/state",                      # armed / mode (OFFBOARD drops)
+    "/mavros/statustext",                 # PX4 failsafe / arm-reject reasons
     "/mavros/imu/data",                   # attitude / heading
     "/mavros/global_position/global",     # lat/lon
-    "/mavros/gpsstatus/gps1/raw",         # RTK fix type
-    "/path",                              # commanded path
+    "/mavros/gpsstatus/gps1/raw",         # RTK fix type / hrms / vrms
+    "/path",                              # commanded path (LATCHED — see QoS override)
+    "/rpp/conditioned_path",              # controller-conditioned path (LATCHED)
     "/rpp/debug",                         # xtrack, heading_err, speed, κ, state, params
     "/rpp/segment_debug",                 # segment FSM (state, seg idx, corner angle)
     "/rpp/velocity_ned",                  # commanded velocity NED
     "/rpp/yaw_rate_body",                 # commanded yaw rate
     "/spray/active",                      # desired MARK (RPP)
+    "/spray/desired",                     # spray-controller desired state
+    "/spray/commanded",                   # what the controller commanded to PX4 AUX
     "/spray/state",                       # actual sprayer state (controller)
+    "/spray/debug",                       # spray timing / boundary metrics
 ]
+
+# QoS profile overrides so the LATCHED (TRANSIENT_LOCAL) topics above are actually
+# captured even though the recorder subscribes after they were published. Without
+# this the bag has no /path and every downstream analysis is worthless (G1).
+_DEFAULT_QOS_OVERRIDES = os.path.join(_REPO_ROOT, "config", "rosbag_qos_overrides.yaml")
+QOS_OVERRIDES = os.environ.get("BAG_QOS_OVERRIDES", _DEFAULT_QOS_OVERRIDES)
 
 
 def log(msg: str) -> None:
@@ -109,11 +172,350 @@ def _safe_name(name: str | None) -> str:
     return base[:60]
 
 
+# ── secret masking (G3 / R5) ─────────────────────────────────────────────────
+# Nothing sensitive should ever reach a manifest, a log line, or a captured
+# statustext. Two shapes: key/value secrets, and credentials embedded in URLs.
+# Match the FULL key (so NTRIP_PASSWORD, X-Rover-Token, api_key all mask) followed
+# by its value. The keyword may sit anywhere inside a longer identifier.
+_SECRET_KV = re.compile(
+    r"(?i)([a-z0-9_.\-]*(?:token|password|passwd|secret|api[_-]?key|authorization)[a-z0-9_.\-]*)"
+    r"\s*[:=]\s*['\"]?([^\s'\",;}]+)"
+)
+_URL_CREDS = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)([^/\s:@]+):([^/\s@]+)@")
+
+
+def _redact(s):
+    """Mask secrets in a single string. Non-strings pass through unchanged."""
+    if not isinstance(s, str) or not s:
+        return s
+    s = _URL_CREDS.sub(r"\1\2:***@", s)
+    s = _SECRET_KV.sub(lambda m: f"{m.group(1)}=***", s)
+    return s
+
+
+def _redact_obj(obj):
+    """Recursively redact every string inside a JSON-able structure."""
+    if isinstance(obj, dict):
+        return {k: _redact_obj(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_redact_obj(v) for v in obj]
+    return _redact(obj)
+
+
+# ── time helpers ─────────────────────────────────────────────────────────────
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _stamp(dt: datetime) -> dict:
+    """UTC ISO + human-readable IST for one instant."""
+    return {
+        "utc": dt.astimezone(timezone.utc).isoformat(timespec="seconds"),
+        "ist": dt.astimezone(IST).strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "epoch": round(dt.timestamp(), 3),
+    }
+
+
+# ── subprocess + integrity helpers ───────────────────────────────────────────
+def _run(cmd: list[str], timeout: float = 5.0) -> str | None:
+    """Best-effort capture of a command's stdout. None on any failure/timeout."""
+    try:
+        out = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+        )
+        if out.returncode != 0:
+            return None
+        return out.stdout
+    except Exception:
+        return None
+
+
+def _sha256_file(path: str) -> str | None:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _dir_bytes(path: str) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def _bundle_integrity(bundle_dir: str, exclude: set[str]) -> dict:
+    """SHA256 every file in the bundle (except the manifest itself)."""
+    files = {}
+    for root, _dirs, names in os.walk(bundle_dir):
+        for name in names:
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, bundle_dir)
+            if rel in exclude:
+                continue
+            files[rel] = {
+                "bytes": (os.path.getsize(full) if os.path.exists(full) else None),
+                "sha256": _sha256_file(full),
+            }
+    return {"file_count": len(files), "files": files}
+
+
+# ── as-run config + environment capture (G2) ─────────────────────────────────
+def _git_sha() -> str | None:
+    out = _run(["git", "-C", _REPO_ROOT, "rev-parse", "--short=12", "HEAD"], timeout=3.0)
+    return out.strip() if out else None
+
+
+def _service_states() -> dict:
+    states = {}
+    for svc in WATCH_SERVICES:
+        out = _run(["systemctl", "is-active", svc], timeout=3.0)
+        states[svc] = (out.strip() if out else "unknown")
+    return states
+
+
+def _environment() -> dict:
+    return {
+        "git_sha": _git_sha(),
+        "services": _service_states(),
+        "ros_domain_id": os.environ.get("ROS_DOMAIN_ID"),
+        "hostname": socket.gethostname(),
+        "recorder_pid": os.getpid(),
+    }
+
+
+def _fcu_params() -> dict:
+    """Best-effort MAVROS ParamGet snapshot of the curated FCU knobs.
+
+    Off the mission critical path (runs at finalise), bounded per-param, and
+    tolerant: a param that can't be read is recorded as null, never an error.
+    """
+    if not CAPTURE_FCU_PARAMS:
+        return {"captured": False, "reason": "disabled", "values": {}}
+    values: dict = {}
+    any_ok = False
+    for pid in FCU_PARAM_NAMES:
+        out = _run(
+            ["ros2", "service", "call", "/mavros/param/get",
+             "mavros_msgs/srv/ParamGet", f"{{param_id: '{pid}'}}"],
+            timeout=4.0,
+        )
+        val = None
+        if out and "success=True" in out.replace(" ", ""):
+            # response embeds mavros_msgs/ParamValue{integer, real}
+            m_int = re.search(r"integer=(-?\d+)", out)
+            m_real = re.search(r"real=(-?\d+\.?\d*(?:e-?\d+)?)", out)
+            iv = int(m_int.group(1)) if m_int else 0
+            rv = float(m_real.group(1)) if m_real else 0.0
+            val = rv if rv != 0.0 else iv
+            any_ok = True
+        values[pid] = val
+    return {"captured": any_ok, "values": values}
+
+
+def _rpp_param_block() -> dict:
+    """One /rpp/debug sample → the RPP tuning block [11..38], labelled.
+
+    Captured while RPP is actively publishing (called right after record start).
+    """
+    out = _run(
+        ["ros2", "topic", "echo", "--once", "--field", "data",
+         "/rpp/debug", "std_msgs/msg/Float32MultiArray"],
+        timeout=6.0,
+    )
+    if not out:
+        return {"captured": False, "values": {}}
+    nums = re.findall(r"-?\d+\.?\d*(?:e-?\d+)?", out)
+    try:
+        arr = [float(x) for x in nums]
+    except ValueError:
+        return {"captured": False, "values": {}}
+    values = {}
+    for idx, label in RPP_DEBUG_PARAM_LABELS.items():
+        values[label] = (round(arr[idx], 6) if idx < len(arr) else None)
+    return {"captured": bool(values) and len(arr) > 38, "values": values}
+
+
+def _loaded_path_identity() -> dict:
+    """Best-effort read-only identity from GET /api/mission/loaded-path.
+
+    Failure → minimal identity (never skip the bag). Never raises.
+    """
+    req = urllib.request.Request(LOADED_URL)
+    tok = _token()
+    if tok:
+        req.add_header("X-Rover-Token", tok)
+    try:
+        with urllib.request.urlopen(req, timeout=2.0) as r:
+            data = json.loads(r.read().decode())
+    except Exception:
+        return {"available": False}
+    keep = ("loaded", "name", "num_waypoints", "num_mark", "num_transit",
+            "has_spray_flags", "placement_mode", "origin_gps", "is_staged",
+            "mission_id")
+    ident = {k: data.get(k) for k in keep if k in data}
+    ident["available"] = True
+    return ident
+
+
+# ── manifest read/write (G2) ─────────────────────────────────────────────────
+MANIFEST_NAME = "manifest.json"
+INCOMPLETE_SENTINEL = "INCOMPLETE"
+
+
+def _write_manifest(bundle_dir: str, manifest: dict) -> None:
+    """Atomically write manifest.json, redacting every string first (G3)."""
+    safe = _redact_obj(manifest)
+    tmp = os.path.join(bundle_dir, MANIFEST_NAME + ".tmp")
+    final = os.path.join(bundle_dir, MANIFEST_NAME)
+    try:
+        with open(tmp, "w") as f:
+            json.dump(safe, f, indent=2, sort_keys=False)
+        os.replace(tmp, final)
+    except OSError as e:
+        log(f"  manifest write failed: {e}")
+
+
+def _read_manifest(bundle_dir: str) -> dict | None:
+    try:
+        with open(os.path.join(bundle_dir, MANIFEST_NAME)) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+# ── disk management (G4) ─────────────────────────────────────────────────────
+def _free_bytes(path: str) -> int:
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return 1 << 62  # unknown → don't block (degrade only on real evidence)
+
+
+def _list_bundles(bags_dir: str) -> list[str]:
+    """Absolute paths of bundle dirs (dirs holding a manifest.json), oldest first."""
+    out = []
+    try:
+        for name in os.listdir(bags_dir):
+            full = os.path.join(bags_dir, name)
+            if os.path.isdir(full) and os.path.exists(os.path.join(full, MANIFEST_NAME)):
+                out.append(full)
+    except OSError:
+        return []
+    out.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0)
+    return out
+
+
+def _preflight_free_space(bags_dir: str) -> bool:
+    """True if there is room to start a capture. Warns + refuses below the floor."""
+    free = _free_bytes(bags_dir)
+    if free < MIN_FREE_BYTES:
+        log(f"WARN low disk: {free/_GiB:.1f} GiB free < floor {MIN_FREE_BYTES/_GiB:.1f} GiB "
+            f"— refusing to start capture (rover services unaffected)")
+        return False
+    return True
+
+
+def _enforce_retention(bags_dir: str) -> None:
+    """Delete oldest bundles until under the byte cap AND above the low-free mark.
+
+    Never touches an in-progress bundle (no end + no manifest outcome) that is the
+    newest; only fully-finalised older bundles are candidates. Degrades the
+    recorder's own store only — never any rover service.
+    """
+    try:
+        bundles = _list_bundles(bags_dir)
+        if not bundles:
+            return
+        total = sum(_dir_bytes(b) for b in bundles)
+        # keep the newest bundle regardless (it may be the one just written)
+        candidates = bundles[:-1]
+        while candidates and (
+            total > MAX_TOTAL_BYTES or _free_bytes(bags_dir) < LOW_FREE_BYTES
+        ):
+            victim = candidates.pop(0)
+            vbytes = _dir_bytes(victim)
+            try:
+                shutil.rmtree(victim)
+                total -= vbytes
+                log(f"  retention: removed oldest bundle {os.path.basename(victim)} "
+                    f"({vbytes/_GiB:.2f} GiB)")
+            except OSError as e:
+                log(f"  retention: could not remove {victim}: {e}")
+                break
+    except Exception as e:
+        log(f"  retention error (ignored): {e}")
+
+
+# ── crash reconciliation (G5) ────────────────────────────────────────────────
+def reconcile_incomplete(bags_dir: str) -> None:
+    """On daemon start, label any bundle that never got an `end` timestamp.
+
+    A power-cut / OOM / kill-9 leaves a bundle whose manifest has no
+    outcome.recorder_end. Mark it INCOMPLETE (+ sentinel file) and finalise the
+    manifest with whatever integrity we can still compute, so evidence is
+    labelled rather than silently corrupt.
+    """
+    for bundle in _list_bundles(bags_dir):
+        manifest = _read_manifest(bundle)
+        if manifest is None:
+            continue
+        outcome = manifest.get("outcome") or {}
+        if outcome.get("recorder_end"):
+            continue  # cleanly finalised
+        log(f"reconcile: unfinalised bundle {os.path.basename(bundle)} → INCOMPLETE")
+        sentinel = os.path.join(bundle, INCOMPLETE_SENTINEL)
+        try:
+            with open(sentinel, "w") as f:
+                f.write(_now_utc().isoformat(timespec="seconds") + "\n")
+        except OSError:
+            pass
+        outcome["status"] = "INCOMPLETE"
+        outcome["recorder_end"] = _stamp(_now_utc())
+        outcome["note"] = "finalised by crash reconciliation on daemon start"
+        outcome["integrity"] = _bundle_integrity(
+            bundle, exclude={MANIFEST_NAME, MANIFEST_NAME + ".tmp"}
+        )
+        manifest["outcome"] = outcome
+        _write_manifest(bundle, manifest)
+
+
+def _spawn_analyzer(bundle_dir: str) -> None:
+    """Fire-and-forget behaviour analysis on a finalised bundle (best-effort).
+
+    Detached (own session), non-blocking; output goes to analyze.log in the
+    bundle. Any failure here is swallowed — the bag and the rover are untouched.
+    """
+    if not AUTO_ANALYZE or not os.path.isfile(_ANALYZER):
+        return
+    try:
+        logpath = os.path.join(bundle_dir, "analyze.log")
+        logf = open(logpath, "w")
+        subprocess.Popen(
+            ["python3", _ANALYZER, bundle_dir, "--quiet"],
+            start_new_session=True, stdout=logf, stderr=subprocess.STDOUT,
+        )
+        log(f"  analyser spawned → {os.path.join(bundle_dir, 'analysis.json')}")
+    except Exception as e:
+        log(f"  analyser spawn failed (ignored): {e}")
+
+
 class Recorder:
     def __init__(self) -> None:
         self.proc: subprocess.Popen | None = None
-        self.outdir: str | None = None
+        self.bundle_dir: str | None = None   # <mission>_<utc>/ holding bag + manifest
+        self.bag_dir: str | None = None       # <bundle>/bag  (ros2 bag -o target)
+        self.manifest: dict | None = None
         self.start_t: float = 0.0
+        self._last_refuse_log: float = 0.0
 
     @property
     def active(self) -> bool:
@@ -121,22 +523,68 @@ class Recorder:
 
     def start(self, path_name: str | None) -> None:
         os.makedirs(BAGS_DIR, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # G4 preflight — a full disk degrades the recorder only, never the rover.
+        if not _preflight_free_space(BAGS_DIR):
+            # throttle the warning so a low-disk mission doesn't spam the journal
+            now = time.time()
+            if now - self._last_refuse_log > 30.0:
+                self._last_refuse_log = now
+            return  # rec stays inactive; mission proceeds unaffected (R1)
+
+        # G4 — reclaim space up front if we're already tight (best-effort).
+        _enforce_retention(BAGS_DIR)
+
+        started = _now_utc()
+        stamp = started.astimezone(IST).strftime("%Y%m%d_%H%M%S")
         name = f"{_safe_name(path_name)}_{stamp}"
-        self.outdir = os.path.join(BAGS_DIR, name)
-        cmd = ["ros2", "bag", "record", "-o", self.outdir]
+        self.bundle_dir = os.path.join(BAGS_DIR, name)
+        os.makedirs(self.bundle_dir, exist_ok=True)
+        self.bag_dir = os.path.join(self.bundle_dir, "bag")
+
+        cmd = ["ros2", "bag", "record", "-o", self.bag_dir]
+        # Capture the latched /path & /rpp/conditioned_path (G1). Only applies to
+        # the curated set; `-a` mode can't target per-topic QoS reliably.
+        if not RECORD_ALL and QOS_OVERRIDES and os.path.isfile(QOS_OVERRIDES):
+            cmd += ["--qos-profile-overrides-path", QOS_OVERRIDES]
+        elif not RECORD_ALL and QOS_OVERRIDES:
+            log(f"WARN qos overrides file missing ({QOS_OVERRIDES}) — latched /path may not be captured")
         cmd += ["-a"] if RECORD_ALL else TOPICS
-        log(f"START recording → {self.outdir}  ({'ALL topics' if RECORD_ALL else f'{len(TOPICS)} topics'})")
+        log(f"START recording → {self.bundle_dir}  ({'ALL topics' if RECORD_ALL else f'{len(TOPICS)} topics'})")
         # own process group so SIGINT targets the whole ros2 bag tree
         self.proc = subprocess.Popen(cmd, start_new_session=True,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
         self.start_t = time.time()
 
+        # Build the initial manifest AFTER the bag is already recording, so none
+        # of this best-effort capture can lose data or block the mission (R1).
+        self.manifest = {
+            "schema": "bag_autorecord/manifest@1",
+            "bundle": name,
+            "identity": _loaded_path_identity(),
+            "timestamps": {
+                "recorder_start": _stamp(started),
+                "mission_start_observed": _stamp(started),
+            },
+            "as_run_config": {
+                "rpp_params": _rpp_param_block(),   # RPP publishing now — capture live
+                "fcu_params": {"captured": False, "values": {}},  # filled at finalise
+                "recorder": {
+                    "topics": ("ALL" if RECORD_ALL else TOPICS),
+                    "qos_overrides": (QOS_OVERRIDES if os.path.isfile(QOS_OVERRIDES or "") else None),
+                },
+            },
+            "environment": _environment(),
+            "outcome": {"status": "RECORDING", "recorder_end": None},
+        }
+        _write_manifest(self.bundle_dir, self.manifest)
+
     def stop(self, reason: str) -> None:
         if not self.active:
             self.proc = None
             return
-        log(f"STOP recording ({reason}) → finalising {os.path.basename(self.outdir or '')}")
+        bundle = self.bundle_dir
+        log(f"STOP recording ({reason}) → finalising {os.path.basename(bundle or '')}")
         try:
             os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)  # rosbag2 writes metadata.yaml on SIGINT
             self.proc.wait(timeout=15)
@@ -149,9 +597,39 @@ class Recorder:
                 os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
         except Exception as e:
             log(f"  stop error: {e}")
-        log(f"  saved: {self.outdir}")
         self.proc = None
-        self.outdir = None
+
+        # Finalise the manifest (G2/G3) — bag is now closed on disk.
+        if bundle and self.manifest is not None:
+            try:
+                ended = _now_utc()
+                # FCU params captured here: mission is terminal, so a few seconds
+                # of ParamGet can't affect it. MAVROS (px4-dxp) is still up.
+                self.manifest["as_run_config"]["fcu_params"] = _fcu_params()
+                self.manifest["timestamps"]["recorder_end"] = _stamp(ended)
+                self.manifest["timestamps"]["mission_end_observed"] = _stamp(ended)
+                self.manifest["outcome"] = {
+                    "status": "COMPLETE",
+                    "mission_end_reason": reason,
+                    "recorder_end": _stamp(ended),
+                    "integrity": _bundle_integrity(
+                        bundle, exclude={MANIFEST_NAME, MANIFEST_NAME + ".tmp"}
+                    ),
+                }
+                _write_manifest(bundle, self.manifest)
+                log(f"  saved: {bundle}  (manifest + integrity written)")
+            except Exception as e:
+                log(f"  finalise-manifest error (bag is safe): {e}")
+            # G6 wiring — kick off the offline behaviour analysis (detached).
+            _spawn_analyzer(bundle)
+            # G4 — keep the store bounded after each capture.
+            _enforce_retention(BAGS_DIR)
+        else:
+            log(f"  saved: {bundle}")
+
+        self.bundle_dir = None
+        self.bag_dir = None
+        self.manifest = None
 
 
 def main() -> int:
@@ -164,6 +642,13 @@ def main() -> int:
     signal.signal(signal.SIGINT, _sig)
 
     log(f"watching {STATUS_URL}  bags→{BAGS_DIR}  auth={'off' if AUTH_OFF else 'on'}")
+
+    # G5 — before watching, label any bundle a previous crash left unfinalised.
+    try:
+        reconcile_incomplete(BAGS_DIR)
+    except Exception as e:
+        log(f"reconcile error (ignored): {e}")
+
     api_fail_since: float | None = None
 
     while not stop_flag["v"]:

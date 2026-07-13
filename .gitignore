@@ -120,3 +120,9 @@ server/missions/.*.dxf.*.json
 
 # Local bag/trajectory analysis output (data + plots, not for tracking)
 analysis/
+
+# Auto-recorder bundles (bag + manifest + analysis) — data, never tracked.
+# Note: config/rosbag_qos_overrides.yaml IS tracked (it is recorder config).
+bags_jet/
+**/analysis.json
+**/analyze.log

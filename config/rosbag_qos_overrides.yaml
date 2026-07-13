@@ -1,0 +1,27 @@
+# rosbag2 QoS profile overrides — capture the latched (TRANSIENT_LOCAL) topics.
+#
+# WHY: /path and /rpp/conditioned_path are published TRANSIENT_LOCAL exactly once
+# at mission start, BEFORE the auto-recorder detects the state change and
+# subscribes. A default `ros2 bag record` subscribes VOLATILE and therefore
+# MISSES the already-latched message — the bag then has no commanded path and
+# cross-track / stop analysis is impossible. Forcing the recorder's subscription
+# to transient_local + reliable makes it fetch the retained sample on join.
+#
+# ONLY the topics that are actually published TRANSIENT_LOCAL on THIS tree
+# (test/colinear-fix) are listed. Verified publishers:
+#   src/path_publisher_node.py:439-451   /path            -> TRANSIENT_LOCAL
+#   src/rpp_controller_node.py:542-562    /rpp/conditioned_path -> TRANSIENT_LOCAL
+# main's list also carried /path/identity + /rpp/conditioned_path_identity which
+# DO NOT EXIST on this tree — deliberately omitted (no blind-merge).
+#
+# Passed to the recorder via: ros2 bag record --qos-profile-overrides-path <this>
+/path:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/rpp/conditioned_path:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local

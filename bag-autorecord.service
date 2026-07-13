@@ -37,6 +37,14 @@ Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/home/flash/PX4_DXP/config/fastdds_no
 Environment=HOME=/home/flash
 Environment=BAGS_DIR=/home/flash/bags_jet
 # Set BAG_RECORD_ALL=1 here to capture ALL topics instead of the curated debug set.
+#
+# Production tunables (defaults live in tools/bag_autorecord.py — override here):
+#   BAG_QOS_OVERRIDES    path to rosbag QoS overrides (default config/rosbag_qos_overrides.yaml)
+#   BAG_MIN_FREE_BYTES   refuse to start a capture below this free space (default 5 GiB)
+#   BAG_LOW_FREE_BYTES   rotate oldest bundles below this free space   (default 2 GiB)
+#   BAG_MAX_TOTAL_BYTES  rotate when total bundle bytes exceed this    (default 50 GiB)
+#   BAG_FCU_PARAMS       1=capture FCU param snapshot at finalise      (default 1)
+#   BAG_AUTO_ANALYZE     1=run analyze_mission.py on finalise          (default 1)
 
 # Output
 StandardOutput=journal
