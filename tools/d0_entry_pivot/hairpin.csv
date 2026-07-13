@@ -1,0 +1,18 @@
+# D0 entry-pivot bench — hairpin path (NED metres: north,east)
+# Forces the ONE unproven regime: a large-yaw spot-turn from a DEAD STOP,
+# exactly like the runtime-entry seam (RUNTIME_ENTRY_VELOCITY_PLAN.md §5).
+#
+# Published through path_publisher_node -> /path -> RPP -> twist_to_setpoint
+# (twist_to_setpoint stays the SOLE publisher — no heartbeat fight).
+# Run with auto_origin:=true so A anchors at the rover's live pose.
+#
+#   A -> B : 2.0 m due north  (rover gets moving, then must brake to rest at B)
+#   B -> C : doubles back ~169°  (heading B->C = atan2(0.4, -2.0) = 168.7°)
+#            => turn at B = 168.7°  ← the make-or-break spot-turn
+#
+# A (start)
+0.0, 0.0
+# B (drive-to + STOP)
+2.0, 0.0
+# C (169° hairpin exit)
+0.0, 0.4
