@@ -466,6 +466,13 @@ class RPPControllerNode(Node):
         # Latched while a completed run is physically stopping before the
         # controller is allowed to switch to the next, differently-headed run.
         self._run_boundary_stop_pending: bool = False
+        # D3: terminal twin of the run-boundary latch. Latched while the rover
+        # brakes to a confirmed physical stop at the FINAL waypoint before DONE
+        # is published. PX4 velocity-OFFBOARD coasts on a bare zero setpoint, so
+        # without this the rover drifts past xy_goal_tolerance, the goal check
+        # flips false, control falls through to tracking, and it drives away
+        # (bag 2026-07-10_20-07 Line_2m: reached at 4 mm, ran 1.08 m past).
+        self._completion_stop_pending: bool = False
         self._segment_idx: int = 0
         self._segment_state: SegmentStateCode = SegmentStateCode.INACTIVE
         # CORNER_STOP / pivot-watchdog state (shared by the segment corner and
@@ -1372,6 +1379,7 @@ class RPPControllerNode(Node):
             else SegmentStateCode.INACTIVE
         )
         self._path_done = False
+        self._completion_stop_pending = False   # D3: clear terminal-stop latch per run/path
         self._path_travel_m = 0.0   # reset along-path progress per run
         # P1.4 — reset hint so search starts from beginning of the run
         self._closest_seg_hint = 0
@@ -1486,6 +1494,89 @@ class RPPControllerNode(Node):
             0.0,
         )
         return True
+
+    def _hold_at_completion(
+        self,
+        pos_n: float,
+        pos_e: float,
+        yaw_ned: float,
+        pose_age_s: float,
+        dist_to_goal: float,
+    ) -> None:
+        """Brake to a confirmed physical stop at the final waypoint, then DONE.
+
+        The terminal twin of _hold_before_run_advance, built from the SAME two
+        primitives the run-boundary stop and the D0 bench both proved:
+        _corner_brake_velocity (body-axis brake only — invariant I1, never an
+        off-nose recenter vector) and _corner_stop_satisfied (measured
+        speed+yaw-rate dwell — invariant I3). It deliberately does NOT introduce
+        a parallel completion-settle mechanism (the ref branch's
+        _completion_settle_satisfied); it reuses the corner-stop confirm the
+        rest of the controller already trusts.
+
+        Why it exists: PX4 velocity-OFFBOARD coasts on a bare zero setpoint.
+        The old completion published zero the instant dist_to_goal <=
+        xy_goal_tolerance, the rover drifted past, the goal check flipped false,
+        control fell through to tracking, and it accelerated away from a goal it
+        had already reached (bag 2026-07-10_20-07 Line_2m: 1.08 m run-past).
+
+        Latch on first entry, brake actively, and publish DONE only once the
+        rover is confirmed stopped. The latch is cleared per run/path in
+        _apply_run and is checked BEFORE the goal test in _control_loop, so a
+        coast can never route control back to tracking.
+        """
+        if not self._completion_stop_pending:
+            self._reset_corner_pivot_state()
+            self._completion_stop_pending = True
+
+        if self._corner_stop_satisfied():
+            goal_tol = float(self.get_parameter("xy_goal_tolerance").value)
+            self.get_logger().info(
+                f"Path complete — settled {dist_to_goal * 100:.1f} cm from the "
+                f"final point (tol={goal_tol * 100:.1f} cm)"
+            )
+            self._path_done = True
+            self._segment_state = SegmentStateCode.DONE
+            self._publish_zero(
+                StateCode.DONE,
+                pose_age_ms=pose_age_s * 1000.0,
+                dist_to_goal=dist_to_goal,
+            )
+            return
+
+        # Not yet stopped: active body-axis brake, exactly as the run-boundary
+        # stop. Publish CORNER_STOP on segment_debug and a non-DONE tracking
+        # state on /rpp/debug so the server's mission-complete watcher does not
+        # latch DONE until the rover is physically stopped. Spray forced OFF.
+        self._segment_state = SegmentStateCode.CORNER_STOP
+        self._last_speed_cmd = 0.0
+        brake_n, brake_e = self._corner_brake_velocity(yaw_ned)
+        self._publish_velocity(brake_n, brake_e)
+        self._publish_yaw_rate(0.0)
+        self._publish_debug(
+            cross_track=0.0,
+            heading_err=0.0,
+            lookahead=dist_to_goal,
+            speed=math.hypot(brake_n, brake_e),
+            kappa=0.0,
+            dist_goal=dist_to_goal,
+            pose_age_ms=pose_age_s * 1000.0,
+            state=StateCode.TRACKING,
+            l_d_raw=float("nan"),
+            kappa_speed=0.0,
+            yaw_rate=0.0,
+            spray_active=False,
+        )
+        self._publish_segment_debug(
+            SegmentStateCode.CORNER_STOP,
+            max(0, len(self._path) - 2),
+            0.0,
+            dist_to_goal,
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            0.0,
+        )
 
     def _is_closed_run(self, pts: list[tuple[float, float]]) -> bool:
         """True when a run is a closed loop (e.g. a circle entity).
@@ -2297,20 +2388,11 @@ class RPPControllerNode(Node):
                     pos_n, pos_e, yaw_ned, pose_age_s, dist_to_corner
                 )
                 return
-            self.get_logger().info(
-                f"Segment path complete — within {dist_to_corner * 100:.1f} cm "
-                f"of final point (tol={goal_tol * 100:.1f} cm)"
-            )
-            self._path_done = True
-            self._segment_state = SegmentStateCode.DONE
-            self._publish_zero(
-                StateCode.DONE,
-                pose_age_ms=pose_age_s * 1000.0,
-                dist_to_goal=dist_to_corner,
-            )
-            self._publish_segment_debug(
-                self._segment_state, seg_idx, dist_to_end_along, dist_to_corner,
-                corner_angle, float("nan"), float("nan"), 0.0,
+            # D3: route the final-run completion through the single stop handler
+            # so the rover brakes to a confirmed stop instead of coasting on a
+            # bare zero setpoint.
+            self._hold_at_completion(
+                pos_n, pos_e, yaw_ned, pose_age_s, dist_to_corner
             )
             return
 
@@ -2815,6 +2897,14 @@ class RPPControllerNode(Node):
                 pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
             )
             return
+        # D3: once the final-waypoint stop is latched, hold it BEFORE the goal
+        # test — a coast back above xy_goal_tolerance must not flip control into
+        # tracking and drive away.
+        if self._completion_stop_pending:
+            self._hold_at_completion(
+                pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
+            )
+            return
         if dist_to_goal <= goal_tol and self._path_travel_m >= min_travel:
             # End of the active run: advance to the next run (per-entity
             # profile switching). The next 20 ms cycle pivots via
@@ -2826,13 +2916,11 @@ class RPPControllerNode(Node):
                     pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
                 )
                 return
-            self.get_logger().info(
-                f"Path complete — within {dist_to_goal * 100:.1f} cm of goal "
-                f"(tol={goal_tol * 100:.1f} cm)"
+            # D3: final waypoint reached — brake to a confirmed physical stop
+            # before DONE instead of publishing a bare zero that PX4 coasts on.
+            self._hold_at_completion(
+                pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
             )
-            self._path_done = True
-            self._publish_zero(StateCode.DONE, pose_age_ms=pose_age_s * 1000,
-                               dist_to_goal=dist_to_goal)
             return
 
         if self._active_tracking_profile == "segment":
