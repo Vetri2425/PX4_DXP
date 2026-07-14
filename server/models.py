@@ -107,6 +107,16 @@ class TelemetryData(BaseModel):
     lat: Optional[float] = None
     lon: Optional[float] = None
     alt: Optional[float] = None
+    # Freshness (measured on receipt, not self-reported). The client should distrust
+    # / grey out any value whose source has gone stale. `rpp_debug_age_ms` is the
+    # liveness of the RPP controller process itself: when it dies, every other rpp_*
+    # field above freezes at its last healthy value, so this is the only field that
+    # reveals the death. None => that source has never been heard from.
+    rpp_debug_age_ms: Optional[float] = None
+    local_pose_age_ms: Optional[float] = None
+    global_position_age_ms: Optional[float] = None
+    gps_fix_age_ms: Optional[float] = None
+    pose_global_skew_ms: Optional[float] = None
 
 
 class PathInfo(BaseModel):

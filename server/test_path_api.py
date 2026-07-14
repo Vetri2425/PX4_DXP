@@ -929,7 +929,13 @@ async def test_plan_api_dxf_ref_points():
         close_loop=True,
         ref_points=[
             RefPoint(dxf_x=0.0, dxf_y=0.0, lat=13.0, lon=80.0),
-            RefPoint(dxf_x=10.0, dxf_y=0.0, lat=13.0001, lon=80.0),
+            # 13.00009039 is exactly 10.000 m north of 13.0 (WGS84 geodesic), matching
+            # the 10.0-unit DXF baseline. The old value (13.0001) is 11.063 m — an 10.6%
+            # disagreement with the drawing. That used to "pass" only because the fit
+            # absorbed it into scale and stretched the geometry 10.6% while reporting
+            # rmse~0. The fit is rigid now, so inconsistent refs are correctly rejected
+            # by the RMSE gate and the fixture has to be physically real.
+            RefPoint(dxf_x=10.0, dxf_y=0.0, lat=13.0000903910, lon=80.0),
         ],
         origin_gps=[13.072066, 80.261956]
     )
@@ -1040,26 +1046,35 @@ async def test_plan_api_coincident_ref_points():
 def test_affine_scale_is_unity_when_ref_points_share_metric_frame():
     """Gap A regression — affine math contract.
 
-    This exercises ``dxf_to_ned_affine`` in isolation. The engine no longer
-    applies unit scaling to ref points: they arrive pre-scaled in local-NED
-    metres from the /entities preview. Metric-frame refs → scale ≈ 1.0;
-    raw cm vs metric NED → wrong scale.
+    The engine no longer applies unit scaling to ref points: they arrive pre-scaled
+    in local-NED metres from the /entities preview. Metric-frame refs → fitted scale
+    ≈ 1.0; raw cm vs metric NED → grossly wrong scale.
+
+    Note this now exercises ``estimate_fit_scale``, the free-scale *diagnostic*. The
+    applied transform (``dxf_to_ned_affine``) is rigid and always reports scale=1.0,
+    so it can no longer be used to detect a unit mismatch — that is exactly the point
+    of locking it (geometry is never resized to fit bad refs). The diagnostic is what
+    ``_assert_alignment_scale`` gates on.
     """
-    from path_engine.ned import dxf_to_ned_affine
+    from path_engine.ned import dxf_to_ned_affine, estimate_fit_scale
 
     unit_scale = 0.01  # cm → m
     # Two ref points 1000 DXF units (= 10 m) apart along DXF-x.
     raw_dxf = [(0.0, 0.0), (0.0, 1000.0)]  # stored as (dxf_y, dxf_x)
     ned = [(0.0, 0.0), (0.0, 10.0)]        # 10 m east
 
-    # Wrong (pre-fix): raw cm points vs metric NED → scale ~0.01.
-    raw_scale = dxf_to_ned_affine(raw_dxf, ned)[0]
-    assert abs(raw_scale - 1.0) > 0.5  # demonstrably off
+    # Unit mismatch: raw cm points vs metric NED → diagnostic scale ~0.01.
+    raw_scale = estimate_fit_scale(raw_dxf, ned)
+    assert abs(raw_scale - 1.0) > 0.5  # demonstrably off → gate rejects
 
-    # Correct (post-fix): scale ref points into metres first.
+    # Correct: scale ref points into metres first.
     metric_dxf = [(p[0] * unit_scale, p[1] * unit_scale) for p in raw_dxf]
-    fixed_scale = dxf_to_ned_affine(metric_dxf, ned)[0]
+    fixed_scale = estimate_fit_scale(metric_dxf, ned)
     assert abs(fixed_scale - 1.0) < 1e-6
+
+    # And regardless of refs, the APPLIED transform never rescales geometry.
+    assert dxf_to_ned_affine(raw_dxf, ned)[0] == 1.0
+    assert dxf_to_ned_affine(metric_dxf, ned)[0] == 1.0
 
 
 # ── Gap D: RMSE quality gate ───────────────────────────────────────────────────

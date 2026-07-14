@@ -2,7 +2,13 @@
 
 import math
 
-from path_engine.ned import latlon_to_ned, dxf_to_ned_affine, apply_affine_transform, _HAS_GEOGRAPHICLIB
+from path_engine.ned import (
+    latlon_to_ned,
+    dxf_to_ned_affine,
+    apply_affine_transform,
+    estimate_fit_scale,
+    _HAS_GEOGRAPHICLIB,
+)
 
 
 # ── latlon_to_ned tests ────────────────────────────────────────────────────────
@@ -62,14 +68,36 @@ def test_affine_identity():
     assert rmse < 0.001
 
 
-def test_affine_scale_only():
-    """Pure scaling (2x) with no rotation or offset."""
+def test_affine_never_scales_geometry():
+    """Ref points implying 2x MUST NOT scale the geometry — the DXF owns the size.
+
+    Previously this asserted the opposite (scale==2.0). That was the defect: a
+    free-scale fit absorbs any survey disagreement into `scale` and silently
+    resizes the drawing, so a 2 m square could be painted at 1.5-2.5 m and still
+    pass every gate. The fit is now rigid.
+    """
+    dxf_pts = [(0.0, 0.0), (1.0, 0.0)]
+    ned_pts = [(0.0, 0.0), (2.0, 0.0)]  # survey says these points are 2 m apart
+    scale, theta, offset_n, offset_e, res, rmse = dxf_to_ned_affine(dxf_pts, ned_pts)
+
+    assert scale == 1.0, "applied scale must be pinned to unity"
+    # The disagreement is now REPORTED rather than absorbed: a rigid 2-point fit has
+    # one residual DOF and it is exactly the baseline-length mismatch. Under the old
+    # free-scale fit this rmse was ~0, which is why the RMSE gate never caught it.
+    assert rmse > 0.4, f"baseline mismatch must surface as rmse, got {rmse}"
+
+    # ...and the free-scale value is still available as a diagnostic.
+    assert abs(estimate_fit_scale(dxf_pts, ned_pts) - 2.0) < 0.001
+
+
+def test_affine_scale_only_legacy_optin():
+    """lock_scale=False restores the old free-scale fit (diagnostics/tests only)."""
     dxf_pts = [(0.0, 0.0), (1.0, 0.0)]
     ned_pts = [(0.0, 0.0), (2.0, 0.0)]
-    scale, theta, offset_n, offset_e, res, rmse = dxf_to_ned_affine(dxf_pts, ned_pts)
+    scale, _, _, _, res, rmse = dxf_to_ned_affine(dxf_pts, ned_pts, lock_scale=False)
     assert abs(scale - 2.0) < 0.001
     assert all(r < 0.001 for r in res)
-    assert rmse < 0.001
+    assert rmse < 0.001  # exactly this blindness is why lock_scale defaults to True
 
 
 def test_affine_translation():
@@ -114,23 +142,44 @@ def test_affine_coincident_points():
 
 
 def test_affine_multipoint_least_squares():
-    """Least-squares alignment with N = 4 points, including noise."""
+    """Least-squares alignment over N=4 noisy points — rigid (translation only here).
+
+    The transform under test is scale=1, rotation=0, translation=(5, 5), with ~1 cm
+    of noise on each target. This is the realistic surveyed case: the operator's ref
+    points carry noise, and the fit must average it into rotation/translation without
+    ever resizing the drawing.
+    """
     dxf_pts = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
-    # Apply exact transform: scale=2, rotation=0, translation=(5, 5)
-    # Then add small noise to the target points
     ref_pts = [
-        (5.01, 5.0),    # target (5, 5) + (0.01, 0)
-        (25.0, 4.99),   # target (25, 5) + (0, -0.01)
-        (24.99, 25.0),  # target (25, 25) + (-0.01, 0)
-        (5.0, 25.01)    # target (5, 25) + (0, 0.01)
+        (5.01, 5.0),    # target (5, 5)   + (0.01, 0)
+        (15.0, 4.99),   # target (15, 5)  + (0, -0.01)
+        (14.99, 15.0),  # target (15, 15) + (-0.01, 0)
+        (5.0, 15.01),   # target (5, 15)  + (0, 0.01)
     ]
     scale, theta, off_n, off_e, res, rmse = dxf_to_ned_affine(dxf_pts, ref_pts)
-    assert abs(scale - 2.0) < 0.01
+    assert scale == 1.0
     assert abs(theta) < 0.01
     assert abs(off_n - 5.0) < 0.05
     assert abs(off_e - 5.0) < 0.05
     assert all(r < 0.02 for r in res)
     assert rmse < 0.02
+
+
+def test_affine_multipoint_does_not_absorb_scale_error():
+    """N=4 ref points implying a uniformly 2x-larger figure must NOT resize the DXF.
+
+    Over-determined fits are not immune: least-squares happily reports scale=2.0 for
+    a consistently-scaled point set. Locking scale means the geometry survives and the
+    disagreement lands in RMSE, where the RMSE gate can reject it.
+    """
+    dxf_pts = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
+    ref_pts = [(5.0, 5.0), (25.0, 5.0), (25.0, 25.0), (5.0, 25.0)]  # 2x the DXF
+
+    scale, _, _, _, _, rmse = dxf_to_ned_affine(dxf_pts, ref_pts)
+    assert scale == 1.0
+    assert rmse > 1.0, "a 2x survey/drawing disagreement must be loudly reported"
+
+    assert abs(estimate_fit_scale(dxf_pts, ref_pts) - 2.0) < 0.01
 
 
 # ── apply_affine_transform tests ────────────────────────────────────────────────

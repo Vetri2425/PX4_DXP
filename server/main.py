@@ -44,6 +44,7 @@ from config import (
     MAX_ACTIVITY_LOG,
     MISSION_DIR,
     POSE_STALE_MS,
+    RPP_DEBUG_STALE_MS,
     ROVER_ID,
     RPP_STATE_NAMES,
     RPP_UNHEALTHY_CODES,
@@ -284,9 +285,18 @@ def _sanitize(d: dict) -> dict:
 
 
 async def _emit_authenticated(event: str, data: dict) -> None:
-    """Push an event only to Socket.IO SIDs that passed connect-time auth."""
+    """Push an event only to Socket.IO SIDs that passed connect-time auth.
+
+    Each emit is isolated: a sid that disconnects between the authenticated_sids()
+    snapshot and its awaited emit raises, and without this guard that exception
+    would abandon the whole tick — dropping telemetry for every *other* connected
+    operator too.
+    """
     for sid in authenticated_sids():
-        await sio.emit(event, data, to=sid)
+        try:
+            await sio.emit(event, data, to=sid)
+        except Exception:
+            log.debug("emit %s to sid=%s failed (client likely gone)", event, sid, exc_info=True)
 
 
 async def _telemetry_loop() -> None:
@@ -350,6 +360,17 @@ async def _telemetry_loop() -> None:
                     "lat": s.get("lat"),
                     "lon": s.get("lon"),
                     "alt": s.get("alt"),
+                    # Freshness. These were already computed but never streamed, so
+                    # the client had no way to tell "RTK_FIXED now" from "was
+                    # RTK_FIXED five minutes ago" — local pose keeps updating from
+                    # wheel odometry after an RTK drop, so everything else still
+                    # looks healthy. rpp_debug_age_ms is the one that reveals a dead
+                    # controller: every other rpp_* field freezes at its last value.
+                    "rpp_debug_age_ms": s.get("rpp_debug_age_ms"),
+                    "local_pose_age_ms": s.get("local_pose_age_ms"),
+                    "global_position_age_ms": s.get("global_position_age_ms"),
+                    "gps_fix_age_ms": s.get("gps_fix_age_ms"),
+                    "pose_global_skew_ms": s.get("pose_global_skew_ms"),
                 }
                 await _emit_authenticated("telemetry", _sanitize(telem))
 
@@ -405,9 +426,31 @@ async def _telemetry_loop() -> None:
                     offboard_ctrl is not None
                     and offboard_ctrl.state in (MissionState.RUNNING, MissionState.ENTRY)
                 )
+                # Controller-death detection. `code` and `pose_age` above are BOTH
+                # self-reported by the RPP controller, so when that process dies they
+                # freeze at their last healthy values and this watchdog would happily
+                # keep trusting a corpse. rpp_debug_age_ms is measured by us, on
+                # receipt, and is the only field the dead process cannot fake.
+                #
+                # This also closes the mid-mission restart hazard: /path is published
+                # TRANSIENT_LOCAL and RPP's _path_cb always _apply_run(0) with no
+                # persisted progress, so a crashed-and-restarted controller would pick
+                # the latched mission back up and re-drive it from run 0 across
+                # already-marked ground. (PX4's own failsafe does NOT save us here:
+                # twist_to_setpoint keeps streaming zero-velocity setpoints, so the
+                # OFFBOARD stream never gaps and the rover stays armed.) Tripping the
+                # watchdog runs estop_async(), which publishes a single-point stop-path
+                # — replacing the latched mission — so a restarting RPP wakes up to a
+                # stop, not a re-run.
+                #
+                # None => never heard from RPP at all; we can't judge, so don't trip
+                # (avoids false aborts where /rpp/debug simply isn't wired).
+                rpp_age = s.get("rpp_debug_age_ms")
+                rpp_dead = rpp_age is not None and rpp_age > RPP_DEBUG_STALE_MS
                 unhealthy = (
                     code in RPP_UNHEALTHY_CODES
                     or pose_age > POSE_STALE_MS
+                    or rpp_dead
                     or s.get("connected") is False
                 )
                 if running and unhealthy:
@@ -416,9 +459,23 @@ async def _telemetry_loop() -> None:
                     elif now - stale_since > SAFETY_STALE_GRACE_S:
                         if emergency_handler is not None:
                             rpp_name = RPP_STATE_NAMES.get(code, f"?{code}")
+                            # Name the actual cause. "controller not responding" and
+                            # "pose stale" call for very different operator responses,
+                            # and a dead controller must not be reported as a bad fix.
+                            if rpp_dead:
+                                reason = "RPP controller not responding (process died?)"
+                            elif s.get("connected") is False:
+                                reason = "FCU disconnected"
+                            elif pose_age > POSE_STALE_MS:
+                                reason = "pose stale"
+                            else:
+                                reason = f"RPP unhealthy: {rpp_name}"
                             log.warning(
-                                "safety abort: stale=%.0fms rpp=%s(%s) connected=%s",
+                                "safety abort: %s | pose_stale=%.0fms rpp_debug_age=%s "
+                                "rpp=%s(%s) connected=%s",
+                                reason,
                                 pose_age,
+                                f"{rpp_age:.0f}ms" if rpp_age is not None else "never",
                                 code,
                                 rpp_name,
                                 s.get("connected"),
@@ -427,8 +484,9 @@ async def _telemetry_loop() -> None:
                             await _emit_authenticated(
                                 "safety_abort",
                                 {
-                                    "reason": "pose stale or FCU disconnected",
+                                    "reason": reason,
                                     "pose_age_ms": pose_age,
+                                    "rpp_debug_age_ms": rpp_age,
                                     "rpp_state": code,
                                     "rpp_state_name": RPP_STATE_NAMES.get(
                                         code, "UNKNOWN"

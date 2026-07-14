@@ -172,16 +172,35 @@ def _chain_component(
 
 
 def _merge_chain(chain: list[PathSegment], tol: float) -> PathSegment:
-    """Concatenate an oriented chain into one composite MARK segment."""
+    """Concatenate an oriented chain into one composite MARK segment.
+
+    Only the *seam* vertex can legitimately be a duplicate: segment k-1 ends at the
+    junction and segment k starts at the same junction, so one copy must be dropped.
+    Interior points are densified samples spaced `mark_spacing` apart and must never
+    be culled.
+
+    The previous implementation applied the `tol` duplicate test to *every* point.
+    Because `tol` (endpoint-coincidence, 0.05 m) equals the default `mark_spacing`
+    (0.05 m), every interior sample tested as `dist <= tol` and every other waypoint
+    was silently dropped — producing alternating 5cm/10cm spacing. Total length and
+    vertex positions were unaffected, so it never showed up as a dimensional error,
+    but it corrupts spray metering. (Same class as the aac121d fix, which did not
+    cover this code path.)
+    """
     if len(chain) == 1:
         return chain[0]
     pts: list[tuple[float, float]] = []
     sources: list[str] = []
-    for seg in chain:
+    for seg_idx, seg in enumerate(chain):
         if seg.source_entity:
             sources.append(seg.source_entity)
-        for pt in seg.points:
-            if pts and math.hypot(pt[0] - pts[-1][0], pt[1] - pts[-1][1]) <= tol:
+        for pt_idx, pt in enumerate(seg.points):
+            is_seam = seg_idx > 0 and pt_idx == 0
+            if (
+                is_seam
+                and pts
+                and math.hypot(pt[0] - pts[-1][0], pt[1] - pts[-1][1]) <= tol
+            ):
                 continue
             pts.append(pt)
     head = chain[0]

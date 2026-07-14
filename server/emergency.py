@@ -66,10 +66,18 @@ class EmergencyHandler:
             errors.append(f"arm(False) raised: {exc}")
             log.exception("arm(False) raised")
 
-        # 4. Update mission state (hold lock only for the write, not around awaits)
+        # 4. Update mission state (hold lock only for the write, not around awaits).
+        # _lock is created lazily, so go through _lifecycle_lock() — reaching for
+        # the raw attribute raises AttributeError when e-stop is the first
+        # lifecycle call after boot. A failure here must never mask steps 1-3,
+        # which are the ones that actually stop the rover.
         if self._controller is not None:
-            async with self._controller._lock:
-                self._controller.state = MissionState.ABORTED
+            try:
+                async with self._controller._lifecycle_lock():
+                    self._controller.state = MissionState.ABORTED
+            except Exception as exc:
+                errors.append(f"set state ABORTED: {exc}")
+                log.exception("failed to set mission state ABORTED after e-stop")
 
         msg = "EMERGENCY STOP executed"
         if errors:

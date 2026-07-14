@@ -199,6 +199,12 @@ class RosBridgeNode(Node):
         self._pose_recv_time: float | None = None  # last /mavros/local_position/pose
         self._global_pos_recv_time: float | None = None
         self._gps_fix_recv_time: float | None = None
+        # Same reasoning applies to the RPP controller: when it dies, its last
+        # /rpp/debug message stays in _state forever — still claiming TRACKING with a
+        # low self-reported pose_age_ms. Anything that reads those fields to judge
+        # health is then reading a dead process's last words. Track when we actually
+        # HEARD from it, which is the only fact the corpse cannot fake.
+        self._rpp_debug_recv_time: float | None = None
         self._MAVROS_STATE_TIMEOUT_S = 2.0  # MAVROS publishes /state ~10 Hz
 
         # Callback groups: subs mutually exclusive, services reentrant
@@ -415,6 +421,7 @@ class RosBridgeNode(Node):
             data = list(msg.data)
             self._rpp_monitor.update(data)
             with self._lock:
+                self._rpp_debug_recv_time = time.monotonic()
                 self._state["xtrack_m"] = data[0]
                 self._state["heading_err_deg"] = math.degrees(data[1])
                 self._state["lookahead_m"] = data[2]
@@ -469,7 +476,16 @@ class RosBridgeNode(Node):
             pose_recv_time = self._pose_recv_time
             global_pos_recv_time = self._global_pos_recv_time
             gps_fix_recv_time = self._gps_fix_recv_time
+            rpp_debug_recv_time = self._rpp_debug_recv_time
         now = time.monotonic()
+        # How long since the RPP controller last spoke. None => never heard from it.
+        # This is independent of the controller's OWN self-reported pose_age_ms, which
+        # freezes at its last value when the process dies.
+        state["rpp_debug_age_ms"] = (
+            (now - rpp_debug_recv_time) * 1000.0
+            if rpp_debug_recv_time is not None
+            else None
+        )
         state["local_pose_age_ms"] = (
             (now - pose_recv_time) * 1000.0 if pose_recv_time is not None else None
         )
