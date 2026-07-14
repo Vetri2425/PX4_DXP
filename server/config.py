@@ -102,6 +102,12 @@ POSE_STALE_MS = 500.0  # consider pose stale above this
 GLOBAL_POSITION_STALE_MS = float(os.environ.get("ROVER_GLOBAL_POS_STALE_MS", "500"))
 GPS_FIX_STALE_MS = float(os.environ.get("ROVER_GPS_FIX_STALE_MS", "500"))
 POSE_GLOBAL_MAX_SKEW_MS = float(os.environ.get("ROVER_POSE_GLOBAL_SKEW_MS", "100"))
+# Liveness of the RPP controller itself, measured on receipt of /rpp/debug (which it
+# publishes every control tick). Distinct from the controller's own self-reported
+# pose_age_ms, which freezes at its last value if the process dies. Generous relative
+# to the tick rate so a scheduling hiccup can't trip it; a real death blows straight
+# past it and is caught within SAFETY_STALE_GRACE_S.
+RPP_DEBUG_STALE_MS = float(os.environ.get("ROVER_RPP_DEBUG_STALE_MS", "1000"))
 SAFETY_STALE_GRACE_S = 1.0  # auto-abort after this long in STALE
 DONE_SETTLE_S = 1.0  # require this much DONE before auto-completing
 SETPOINT_STREAM_GRACE_S = 0.5  # path/setpoint settle time before OFFBOARD request

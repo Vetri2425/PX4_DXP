@@ -353,16 +353,28 @@ _PLACEHOLDER_ORIGINS = frozenset({
 
 
 def _assert_alignment_scale(alignment_meta: dict) -> None:
-    """Reject an alignment whose least-squares scale strays too far from unity.
+    """Reject an alignment whose reference points imply a gross unit/frame mismatch.
 
-    Ref points and segment geometry share a metric frame, so a healthy multi-point
-    fit lands scale≈1.0. A large deviation signals a unit/frame mismatch (e.g. the
-    historical double-scaling of cm ref points → scale≈100). A 2-point fit is
-    exactly determined so its RMSE is ~0 and the RMSE gate cannot catch this —
-    this scale gate is the only defense. single_point/gps_origin modes report
-    scale=1.0 and pass by definition.
+    The applied transform is RIGID (scale pinned to 1.0), so survey noise can no
+    longer stretch the drawing — a 2 m square stays 2 m regardless of what the
+    reference points say. What we still must reject is a *gross* mismatch, e.g. cm
+    ref points against metre geometry (the historical scale≈100 double-scaling),
+    which means the operator supplied the wrong data entirely rather than merely
+    noisy data.
+
+    So this gate reads ``fitted_scale`` — the free-scale value a similarity fit
+    *would* have chosen — as a pure diagnostic. It is never applied to geometry.
+
+    Moderate disagreement (a few %) is no longer a geometry hazard and is allowed
+    through; it surfaces as a non-zero RMSE, which the RMSE gate handles. That gate
+    is only meaningful now *because* scale is locked: a rigid 2-point fit has one
+    residual degree of freedom and it is exactly the baseline-length mismatch,
+    whereas a free-scale 2-point fit is exactly determined and always reports
+    RMSE≈0 no matter how wrong the size is.
+
+    single_point/gps_origin modes carry no fitted_scale and pass by definition.
     """
-    scale = alignment_meta.get("scale", 1.0)
+    scale = alignment_meta.get("fitted_scale", alignment_meta.get("scale", 1.0))
     if not math.isfinite(scale) or scale <= 0.0:
         raise HTTPException(
             422,
@@ -372,10 +384,11 @@ def _assert_alignment_scale(alignment_meta: dict) -> None:
     if abs(scale - 1.0) > SCALE_FIT_TOLERANCE:
         raise HTTPException(
             422,
-            f"Alignment scale {scale:.4f} is outside the safe range "
-            f"[{1.0 - SCALE_FIT_TOLERANCE:.2f}, {1.0 + SCALE_FIT_TOLERANCE:.2f}] — "
-            "likely a unit/frame mismatch between reference points and geometry. "
-            "Re-verify the reference points.",
+            f"Reference points imply a scale of {scale:.4f} vs the DXF's own "
+            f"dimensions — outside the safe range "
+            f"[{1.0 - SCALE_FIT_TOLERANCE:.2f}, {1.0 + SCALE_FIT_TOLERANCE:.2f}]. "
+            "This is a unit/frame mismatch between reference points and geometry "
+            "(geometry is never rescaled to fit). Re-verify the reference points.",
         )
 
 
@@ -744,7 +757,10 @@ async def parse_dxf_file(file: UploadFile = File(...)):
         fpath = tmp.name
 
         from path_engine.parsers.dxf_parser import parse_dxf
-        entities = parse_dxf(fpath)
+        # Offloaded: a large CAD parse otherwise blocks the single event loop, which
+        # stalls the 10Hz telemetry push AND queues Socket.IO emergency_stop behind
+        # it. Every other parse_dxf call site in this module already does this.
+        entities = await asyncio.to_thread(parse_dxf, fpath)
 
         entity_infos = []
         layer_names = set()

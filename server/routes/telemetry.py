@@ -64,4 +64,9 @@ async def telemetry_latest():
         lat             = s.get("lat"),
         lon             = s.get("lon"),
         alt             = s.get("alt"),
+        rpp_debug_age_ms      = s.get("rpp_debug_age_ms"),
+        local_pose_age_ms     = s.get("local_pose_age_ms"),
+        global_position_age_ms= s.get("global_position_age_ms"),
+        gps_fix_age_ms        = s.get("gps_fix_age_ms"),
+        pose_global_skew_ms   = s.get("pose_global_skew_ms"),
     )

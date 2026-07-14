@@ -34,7 +34,17 @@ from .planners.smooth import smooth_corners
 from .optimizers.segment_order import optimize_segment_order
 from .optimizers.shape_grouping import group_connected_segments
 from .spray import apply_spray_latency_compensation
-from .ned import latlon_to_ned, dxf_to_ned_affine, apply_affine_transform
+from .ned import (
+    latlon_to_ned,
+    dxf_to_ned_affine,
+    apply_affine_transform,
+    estimate_fit_scale,
+)
+
+# Survey-quality warning threshold on the *diagnostic* free-scale fit. Geometry is
+# never scaled (the fit is rigid), so this only logs: it means the reference points
+# disagree with the DXF's own dimensions by more than this fraction.
+SURVEY_SCALE_WARN = 0.002  # 0.2%
 
 log = logging.getLogger(__name__)
 
@@ -157,6 +167,10 @@ class PathEngine:
         use_two_opt: bool = True,
         max_two_opt_segments: int = 80,
         group_shapes: bool = True,
+        # Endpoint-coincidence tolerance for deciding whether two shape primitives
+        # meet at the same junction. Stays at 5cm — real CAD exports leave gaps this
+        # big between segments that are meant to connect. This is a *connectivity*
+        # tolerance; it is NOT a point-culling tolerance (see _merge_chain).
         group_join_tol_m: float = 0.05,
     ):
         if mark_spacing <= 0:
@@ -473,12 +487,26 @@ class PathEngine:
                 n, e = latlon_to_ned(gps_pt[0], gps_pt[1], ref_gps_origin[0], ref_gps_origin[1])
                 ref_ned_points.append((n, e))
 
+            # Rigid fit: rotation + translation only. Scale is pinned to 1.0 so the
+            # DXF stays dimensionally authoritative (a 2 m square stays 2 m). The
+            # free-scale value is kept as a *diagnostic* only — it is the signal for
+            # a unit/frame mismatch, and it is never applied to geometry.
             scale_val, theta_val, offset_n_val, offset_e_val, residuals, rmse = dxf_to_ned_affine(
                 metric_ref_points_dxf, ref_ned_points
             )
+            fitted_scale = estimate_fit_scale(metric_ref_points_dxf, ref_ned_points)
+            if abs(fitted_scale - 1.0) > SURVEY_SCALE_WARN:
+                log.warning(
+                    "alignment survey-quality: free-scale fit would be %.5f (%.2f%% off unity) — "
+                    "reference points disagree with DXF dimensions by that much. Scale is LOCKED "
+                    "to 1.0, so geometry is preserved; the disagreement is reported as rmse=%.4f m. "
+                    "Re-check the survey if this is large.",
+                    fitted_scale, (fitted_scale - 1.0) * 100.0, rmse,
+                )
             alignment_meta = {
                 "method": "least_squares",
-                "scale": scale_val,
+                "scale": scale_val,          # applied scale — always 1.0 (rigid)
+                "fitted_scale": fitted_scale,  # diagnostic — what free-scale WOULD have picked
                 "rotation_deg": math.degrees(theta_val),
                 "offset_n": offset_n_val,
                 "offset_e": offset_e_val,
