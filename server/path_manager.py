@@ -851,7 +851,9 @@ class PathManager:
         auto_origin = bool(kwargs.pop("auto_origin", False))
         layer_mapping = kwargs.pop("layer_mapping", None)
         optimize = kwargs.pop("optimize", True)
-        compensate_spray = kwargs.pop("compensate_spray", True)
+        # OFF by default: the spray controller node already compensates for solenoid
+        # latency at runtime, from actual speed. See PathPlanRequest.compensate_spray.
+        compensate_spray = kwargs.pop("compensate_spray", False)
         extension_kwargs_provided = any(
             key in kwargs
             for key in ("enable_path_extensions", "pre_extension_m", "aft_extension_m")

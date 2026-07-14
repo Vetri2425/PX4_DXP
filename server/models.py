@@ -408,7 +408,14 @@ class PathPlanRequest(BaseModel):
     marking_speed: float = 0.35  # MARK speed (m/s)
     transit_speed: float = 0.50  # TRANSIT speed (m/s)
     optimize: bool = True  # Reorder segments for minimal dead-heading
-    compensate_spray: bool = True  # Apply spray latency compensation
+    # Planner-side spray latency compensation. DEFAULT OFF — the spray controller node
+    # already compensates at runtime from the rover's ACTUAL speed
+    # (spray_controller_node.py:276, on_lead = speed * solenoid_open_delay_s +
+    # on_overspray_margin_m). Doing it here too shifted the boundary a further 3.5 cm,
+    # so paint started ~9 cm before the CAD line. The plan now carries the TRUE geometry:
+    # spray ON where the line starts, OFF where it ends. Setting this True restores the
+    # double compensation.
+    compensate_spray: bool = False
     # Deprecated trio: ignored by /api/path/plan (a warning is logged and
     # returned in the response `warnings` when set explicitly). Configure
     # extensions via GET/POST /api/path/{name}/extensions instead.

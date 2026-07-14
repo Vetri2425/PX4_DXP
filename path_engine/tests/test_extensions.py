@@ -1832,3 +1832,167 @@ class TestExtensionSafetyLimits:
         from path_engine.validator import PathValidator
         warnings = PathValidator().validate(plan)
         assert any("beyond the marked geometry" in w for w in warnings)
+
+
+class TestSprayBoundaryIsTheCadBoundary:
+    """The plan must carry the TRUE geometry: spray ON where the CAD line starts, OFF
+    where it ends. No planner-side lead.
+
+    The planner used to shift the MARK boundary 3.5 cm early to compensate for solenoid
+    open time. But spray_controller_node.py:276 ALREADY does that, at runtime, from the
+    rover's ACTUAL speed:
+
+        on_lead = speed_mps * solenoid_open_delay_s + on_overspray_margin_m
+                = 0.35 * 0.10 + 0.02  =  5.5 cm at marking speed
+
+    Doing it in both places meant paint started ~9 cm before the CAD line — double
+    compensated. The controller is the right place for it: its lead stays correct when
+    the profile slows into a corner, or when marking_speed changes. The planner's is a
+    static shift that assumes the rover is always at marking_speed.
+    """
+
+    @staticmethod
+    def _square() -> list[PathSegment]:
+        c = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0)]
+        return [
+            PathSegment(
+                segment_type=SegmentType.MARK,
+                points=[c[i], c[i + 1]],
+                speed=0.35,
+                source_entity=f"LINE_{i}",
+                metadata={"geometry_type": "LINE", "line_like": True},
+            )
+            for i in range(4)
+        ]
+
+    def test_compensation_is_off_by_default(self):
+        assert PathEngine().compensate_spray is False
+
+    def test_mark_length_equals_the_cad_line_exactly(self):
+        eng = PathEngine(enable_path_extensions=True, per_line_extensions=True,
+                         pre_extension_m=0.5, aft_extension_m=0.5,
+                         optimize_order=False, mark_spacing=0.05)
+        plan = eng.plan_segments(self._square())
+        marks = [s for s in plan.segments if s.segment_type == SegmentType.MARK]
+        assert len(marks) == 4
+        for m in marks:
+            length = sum(math.dist(m.points[i], m.points[i + 1])
+                         for i in range(len(m.points) - 1))
+            assert abs(length - 2.0) < 1e-9, (
+                f"MARK is {length:.4f} m, not the CAD line's 2.000 m — the planner is "
+                "still shifting the spray boundary"
+            )
+
+    def test_spray_toggles_exactly_on_the_cad_corners(self):
+        eng = PathEngine(enable_path_extensions=True, per_line_extensions=True,
+                         pre_extension_m=0.5, aft_extension_m=0.5,
+                         optimize_order=True, mark_spacing=0.05)
+        plan = eng.plan_segments(self._square())
+        wps, flags = plan.merged_waypoints, plan.spray_flags
+        corners = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)]
+        for i in range(len(flags) - 1):
+            if flags[i] == flags[i + 1]:
+                continue
+            p = wps[i + 1] if not flags[i] else wps[i]
+            assert min(math.dist(p, c) for c in corners) < 1e-9, (
+                f"spray toggles at {p}, which is not a CAD corner"
+            )
+
+
+class TestPaintAwareRouting:
+    """E3: the transit between two runs must not drive over paint already on the ground.
+
+    The connector is a straight shot from one run's run-out to the next run's run-up, and
+    nothing stopped it crossing finished lines — the wheels go through wet paint.
+
+    The fix is ORDERING, not rerouting, and it turns on one observation: crossing a line
+    that has not been painted YET is free. star_3x3m's crosshairs sit inside both the
+    star and the square, so some connector must cross that geometry — but if the
+    crosshairs are marked first, there is no paint there to cross. Penalising only
+    already-laid paint lets the optimizer find that ordering by itself.
+    """
+
+    @staticmethod
+    def _crossings(plan) -> int:
+        """Count spray-OFF segments that drive over a mark laid EARLIER in the run.
+
+        Tested on the segments, not on the merged 5 cm polyline: a connector is a
+        straight line, so its two endpoints describe it exactly, and a chunk-relative
+        crossing test can miss a hit that lands on a chunk boundary.
+        """
+        def hit(p1, p2, p3, p4) -> bool:
+            d = (p2[0] - p1[0]) * (p4[1] - p3[1]) - (p2[1] - p1[1]) * (p4[0] - p3[0])
+            if abs(d) < 1e-12:
+                return False
+            t = ((p3[0] - p1[0]) * (p4[1] - p3[1]) - (p3[1] - p1[1]) * (p4[0] - p3[0])) / d
+            u = ((p3[0] - p1[0]) * (p2[1] - p1[1]) - (p3[1] - p1[1]) * (p2[0] - p1[0])) / d
+            return 1e-6 < t < 1 - 1e-6 and 1e-6 < u < 1 - 1e-6
+
+        n = 0
+        painted: list[PathSegment] = []
+        for seg in plan.segments:
+            if seg.segment_type == SegmentType.MARK:
+                painted.append(seg)
+                continue
+            if len(seg.points) < 2 or not painted:
+                continue
+            a, b = seg.points[0], seg.points[-1]     # the move, end to end
+            for m in painted:
+                if any(hit(a, b, m.points[k], m.points[k + 1])
+                       for k in range(len(m.points) - 1)):
+                    n += 1
+                    break
+        return n
+
+    @staticmethod
+    def _enclosed_line_in_a_box() -> list[PathSegment]:
+        """A short line inside a closed 3 m box. To mark the line the rover must enter
+        the box; to mark the box it must leave. Ordering decides whether it crosses
+        wet paint: mark the inner line FIRST and there is no paint to cross.
+        """
+        c = [(0.0, 0.0), (3.0, 0.0), (3.0, 3.0), (0.0, 3.0), (0.0, 0.0)]
+        box = [
+            PathSegment(
+                segment_type=SegmentType.MARK,
+                points=[c[i], c[i + 1]],
+                speed=0.35,
+                source_entity=f"BOX_{i}",
+                metadata={"geometry_type": "LINE", "line_like": True},
+            )
+            for i in range(4)
+        ]
+        inner = PathSegment(
+            segment_type=SegmentType.MARK,
+            points=[(1.2, 1.5), (1.8, 1.5)],
+            speed=0.35,
+            source_entity="LINE_INNER",
+            metadata={"geometry_type": "LINE", "line_like": True},
+        )
+        return box + [inner]
+
+    def _plan(self, avoid: bool):
+        eng = PathEngine(
+            enable_path_extensions=True, per_line_extensions=True,
+            pre_extension_m=0.5, aft_extension_m=0.5,
+            optimize_order=True, mark_spacing=0.05, transit_spacing=0.15,
+            group_shapes=True, avoid_wet_paint=avoid,
+        )
+        return eng.plan_segments(self._enclosed_line_in_a_box())
+
+    def test_enclosed_line_is_marked_before_the_shape_enclosing_it(self):
+        plan = self._plan(avoid=True)
+        order = [s.source_entity for s in plan.segments
+                 if s.segment_type == SegmentType.MARK]
+        inner = next(i for i, s in enumerate(order) if "INNER" in str(s))
+        assert inner == 0, (
+            f"the enclosed line is marked {inner + 1}th — it must go FIRST, or the "
+            f"rover drives over the box to reach it. Order: {order}"
+        )
+
+    def test_no_transit_crosses_wet_paint(self):
+        assert self._crossings(self._plan(avoid=True)) == 0
+
+    def test_the_guard_is_what_prevents_it(self):
+        """Without the penalty the same geometry DOES cross wet paint — proving the test
+        is measuring the fix and not a coincidence of this shape."""
+        assert self._crossings(self._plan(avoid=False)) > 0

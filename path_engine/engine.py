@@ -163,7 +163,23 @@ class PathEngine:
         spray_on_latency: float = 0.10,
         spray_off_latency: float = 0.01,
         optimize_order: bool = True,
-        compensate_spray: bool = True,
+        # DEFAULT OFF — the spray CONTROLLER already compensates, and better.
+        #
+        # spray_controller_node.py:276 computes its lead at runtime from the rover's
+        # ACTUAL speed:
+        #     on_lead = speed_mps * solenoid_open_delay_s + on_overspray_margin_m
+        #             = 0.35 * 0.10 + 0.02  =  5.5 cm at marking speed
+        # Doing it here as well shifted the planned MARK boundary another 3.5 cm early
+        # (a static shift that assumes marking_speed), so paint actually started ~9 cm
+        # before the CAD line — double-compensated.
+        #
+        # The controller is the right place for it: it knows the speed the rover is
+        # really doing, so its lead stays correct when the profile slows for a corner or
+        # when marking_speed changes. The planner's job is to emit the TRUE geometry:
+        # spray ON exactly where the CAD line starts, OFF exactly where it ends.
+        #
+        # Turning this back on re-introduces the double compensation.
+        compensate_spray: bool = False,
         enable_path_extensions: bool = False,
         pre_extension_m: float = 0.5,
         aft_extension_m: float = 0.5,
@@ -189,6 +205,14 @@ class PathEngine:
         # against the rest of the drawing and stop short.
         extension_obstacle_clearance_m: float = 0.10,
         extension_min_useful_m: float = 0.10,
+        # E3: penalise, in the segment ordering, connectors that drive over paint the
+        # rover has ALREADY laid. Crossing not-yet-marked geometry costs nothing — which
+        # is what lets an enclosed shape be marked before the shape enclosing it.
+        # The penalty is in metres of equivalent deadhead: 5 m says "a crossing is worth
+        # about 5 m of extra driving to avoid", which dominates local detours without
+        # letting the route wander.
+        avoid_wet_paint: bool = True,
+        wet_paint_penalty_m: float = 5.0,
     ):
         if mark_spacing <= 0:
             raise ValueError(f"mark_spacing must be > 0, got {mark_spacing}")
@@ -232,6 +256,8 @@ class PathEngine:
         self.extension_min_line_length_m = extension_min_line_length_m
         self.extension_obstacle_clearance_m = extension_obstacle_clearance_m
         self.extension_min_useful_m = extension_min_useful_m
+        self.avoid_wet_paint = avoid_wet_paint
+        self.wet_paint_penalty_m = wet_paint_penalty_m
 
     def plan_file(
         self,
@@ -667,6 +693,30 @@ class PathEngine:
                 "runs_merged": before_segs - len(densified),
             })
 
+        # Step 2c: In per-line mode, split composite chains into their edges BEFORE the
+        # TSP, not after it.
+        #
+        # Each edge is an independent PRE/MARK/AFT pass, so the optimizer should be free
+        # to order them individually — and it has to be, to avoid driving over wet paint
+        # (E3). square_circle is a circle inside a square: with the square still fused
+        # into one chain, the TSP only sees two marks and every ordering forces a
+        # connector across finished paint. With the edges visible it can pick the one
+        # square edge reachable from the circle's run-out without crossing anything.
+        #
+        # Grouping still runs first and still matters: it is what establishes the edges'
+        # shared vertices and cyclic order in the first place. This only unfuses the
+        # result for ordering purposes, and only when every edge is getting its own pass
+        # anyway. Chain-ends mode (per_line=False) keeps the chain intact, where
+        # shape-level traversal is the whole point.
+        if self.enable_path_extensions and self.per_line_extensions:
+            unfused: list[PathSegment] = []
+            for seg in densified:
+                unfused.extend(
+                    decompose_line_chain_to_edges(seg)
+                    if seg.segment_type == SegmentType.MARK else [seg]
+                )
+            densified = unfused
+
         # Resolve start position for TSP:
         # If we applied alignment, segments' points are already in the target NED frame.
         # So we do not de-offset the start_position. Otherwise we de-offset it by origin.
@@ -699,6 +749,17 @@ class PathEngine:
                 max_two_opt_segments=self.max_two_opt_segments,
                 stats=optimization_stats,
                 insert_transits=not self.enable_path_extensions,
+                # E3: cost connectors that drive over paint already on the ground, so
+                # the order avoids them where it can. Give the cost model the same
+                # extension lengths the connectors will actually be built from.
+                avoid_wet_paint=self.avoid_wet_paint,
+                wet_paint_penalty_m=self.wet_paint_penalty_m,
+                pre_extension_m=(
+                    self.pre_extension_m if self.enable_path_extensions else 0.0
+                ),
+                aft_extension_m=(
+                    self.aft_extension_m if self.enable_path_extensions else 0.0
+                ),
             )
         else:
             ordered = densified
@@ -730,16 +791,9 @@ class PathEngine:
         # per_line=False keeps the chain whole: one continuous sprayed run, extended at
         # its true open ends only, corners sprayed straight through.
         if self.enable_path_extensions:
-            # Decompose FIRST, so the obstacle set is built from the same geometry the
-            # extensions spring from. (Building it from the un-decomposed chains would
-            # make every edge's own parent chain an obstacle to itself.)
-            decomposed: list[PathSegment] = []
-            for seg in ordered:
-                decomposed.extend(
-                    decompose_line_chain_to_edges(seg)
-                    if self.per_line_extensions and seg.segment_type == SegmentType.MARK
-                    else [seg]
-                )
+            # In per-line mode the chains were already unfused in Step 2c, so the TSP
+            # could order the edges individually. Nothing left to decompose here.
+            decomposed = list(ordered)
 
             # E1: ray-cast every extension against ALL OTHER marked geometry so it can
             # never be laid down across a line the rover paints. Sibling edges of the
