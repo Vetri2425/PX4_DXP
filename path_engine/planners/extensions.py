@@ -56,6 +56,100 @@ def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.hypot(b[0] - a[0], b[1] - a[1])
 
 
+def _ray_first_hit(
+    origin: tuple[float, float],
+    direction: tuple[float, float],
+    max_dist: float,
+    obstacles: list[list[tuple[float, float]]],
+    ignore_near_origin_m: float = 0.03,
+) -> float | None:
+    """Distance along `direction` to the first obstacle, or None if the ray is clear.
+
+    `obstacles` are polylines of MARK geometry. An extension that reaches one of them
+    would be driven straight over a line the rover paints, so the caller shortens (or
+    drops) the extension to stop short of the hit.
+
+    Hits within `ignore_near_origin_m` are ignored. Two reasons, both real:
+
+      * The extension springs FROM a mark endpoint, so it touches its own geometry at
+        t=0 by construction.
+      * Where two entities genuinely TOUCH in the drawing — a line ending on a circle,
+        say — the run-out nicks the circle's chord polyline a few mm from the junction.
+        Curves are discretised to a 5 mm chord error, so even a true tangential
+        departure registers a crossing at millimetre scale. The rover has to drive over
+        that junction to paint both entities anyway; it is not a defect.
+
+    3 cm comfortably absorbs both, and is far below the scale of a real obstruction
+    (star_3x3m's run-outs crossed the square's edges 7 cm out, and are caught).
+    """
+    ox, oy = origin
+    dx, dy = direction
+    best: float | None = None
+
+    for poly in obstacles:
+        for i in range(len(poly) - 1):
+            ax, ay = poly[i]
+            bx, by = poly[i + 1]
+            ex, ey = bx - ax, by - ay
+            denom = dx * ey - dy * ex
+            if abs(denom) < 1e-12:
+                continue  # parallel to this edge
+            # origin + t*dir  ==  a + u*e
+            t = ((ax - ox) * ey - (ay - oy) * ex) / denom
+            u = ((ax - ox) * dy - (ay - oy) * dx) / denom
+            if u < -1e-9 or u > 1 + 1e-9:
+                continue  # crossing point lies off the obstacle edge
+            if t <= ignore_near_origin_m or t > max_dist:
+                continue
+            if best is None or t < best:
+                best = t
+    return best
+
+
+def _clamp_extension(
+    requested_m: float,
+    line_length_m: float,
+    origin: tuple[float, float],
+    direction: tuple[float, float],
+    obstacles: list[list[tuple[float, float]]],
+    max_line_fraction: float,
+    min_line_length_m: float,
+    obstacle_clearance_m: float,
+    min_useful_m: float,
+) -> float:
+    """Resolve how far a run-up/run-out may actually reach.
+
+    Two independent limits, both of which produced real defects in the 14-shape sweep
+    (docs/upgrade_path/03_EXTENSION_GEOMETRY_DEFECTS.md):
+
+    E2 — PROPORTION. `requested_m` is absolute, so a short line gets the same run-up as
+      a long one. star_3x3m's 10 cm crosshair lines were each given 97 cm of extension —
+      7.4x the line they serve; the rover drove nearly a metre to paint a hand's width.
+      Cap the extension at a fraction of the line, and refuse to extend a line that is
+      too short to benefit at all.
+
+    E1 — COLLISION. An extension continues its own line's direction past the endpoint
+      and is laid down wherever that lands, with no view of the rest of the drawing. On
+      star_3x3m the star's tips touch the enclosing square, so six run-ups/run-outs were
+      driven straight across lines the rover paints. Ray-cast and stop short.
+
+    Returns the permitted length in metres — 0.0 means "emit no extension".
+    """
+    if requested_m <= 0.0:
+        return 0.0
+
+    if line_length_m < min_line_length_m:
+        return 0.0  # too short to benefit from a run-up at all
+
+    allowed = min(requested_m, max_line_fraction * line_length_m)
+
+    hit = _ray_first_hit(origin, direction, allowed, obstacles)
+    if hit is not None:
+        allowed = min(allowed, max(0.0, hit - obstacle_clearance_m))
+
+    return allowed if allowed >= min_useful_m else 0.0
+
+
 # Closed-run detection — thresholds match the RPP `_is_closed_run` guard
 # (commit 5677d48) so planner and controller agree on what a closed loop is.
 _CLOSED_RUN_GAP_TOL_M = 0.15   # endpoints within this distance ⇒ coincident
@@ -334,6 +428,11 @@ def split_mark_segment_with_extensions(
     aft_extension_m: float,
     transit_speed: float,
     suppress_closed_loops: bool = True,
+    obstacles: list[list[tuple[float, float]]] | None = None,
+    max_line_fraction: float = 0.5,
+    min_line_length_m: float = 0.30,
+    obstacle_clearance_m: float = 0.10,
+    min_useful_extension_m: float = 0.10,
 ) -> list[PathSegment]:
     """Expand one MARK segment into [PRE-TRANSIT, MARK, AFT-TRANSIT].
 
@@ -367,13 +466,28 @@ def split_mark_segment_with_extensions(
 
     Args:
         segment:          Source PathSegment (expected MARK).
-        pre_extension_m:  Metres before start (0.0 → no PRE segment added).
-        aft_extension_m:  Metres after end    (0.0 → no AFT segment added).
+        pre_extension_m:  Metres before start — a CEILING, not a guarantee (see below).
+        aft_extension_m:  Metres after end    — likewise.
         transit_speed:    Speed (m/s) for PRE and AFT TRANSIT segments.
+        suppress_closed_loops: See the closed-run guard below.
+        obstacles:        Every OTHER MARK polyline in the plan. An extension that would
+                          cross one is shortened to stop `obstacle_clearance_m` short of
+                          it (E1) — otherwise the run-up is driven straight over a line
+                          the rover paints.
+        max_line_fraction: Cap the extension at this fraction of the line it serves (E2).
+                          An absolute extension is nonsense on a short line: a 10 cm mark
+                          was being given 97 cm of run-up + run-out.
+        min_line_length_m: Lines shorter than this get no extension at all.
+        obstacle_clearance_m: Stop this far short of an obstructing mark.
+        min_useful_extension_m: A surviving extension shorter than this is dropped rather
+                          than emitted as a useless stub.
 
     Returns:
         List of 1, 2, or 3 PathSegments:
           [PRE-TRANSIT?] + [MARK] + [AFT-TRANSIT?]
+
+    PRE/AFT carry ``metadata["extension_clamped"]`` = True when the requested length was
+    reduced, so the caller can report it.
     """
     # Guard 1: only MARK segments are extended
     if segment.segment_type != SegmentType.MARK:
@@ -439,13 +553,47 @@ def split_mark_segment_with_extensions(
         )
         return [_copy_segment(segment)]
 
+    # ── Resolve how far each end may ACTUALLY reach ─────────────────────────
+    # The requested lengths are only a ceiling: they are cut down by the line's own
+    # length (E2) and by any marked geometry in the way (E1). See _clamp_extension.
+    obs = obstacles or []
+    line_len = _path_length(segment.points)
+
+    pre_len = _clamp_extension(
+        pre_extension_m, line_len,
+        origin=start,
+        direction=(-start_dir[0], -start_dir[1]),   # PRE runs BACKWARDS from the start
+        obstacles=obs,
+        max_line_fraction=max_line_fraction,
+        min_line_length_m=min_line_length_m,
+        obstacle_clearance_m=obstacle_clearance_m,
+        min_useful_m=min_useful_extension_m,
+    )
+    aft_len = _clamp_extension(
+        aft_extension_m, line_len,
+        origin=end,
+        direction=end_dir,
+        obstacles=obs,
+        max_line_fraction=max_line_fraction,
+        min_line_length_m=min_line_length_m,
+        obstacle_clearance_m=obstacle_clearance_m,
+        min_useful_m=min_useful_extension_m,
+    )
+
+    if pre_extension_m > 0 and pre_len < pre_extension_m - 1e-9:
+        log.info("extension clamped: %s PRE %.3f m -> %.3f m (line %.3f m)",
+                 segment.source_entity, pre_extension_m, pre_len, line_len)
+    if aft_extension_m > 0 and aft_len < aft_extension_m - 1e-9:
+        log.info("extension clamped: %s AFT %.3f m -> %.3f m (line %.3f m)",
+                 segment.source_entity, aft_extension_m, aft_len, line_len)
+
     # ── Build result list ───────────────────────────────────────────────────
 
     result: list[PathSegment] = []
 
     # PRE extension: step backwards from start along start_dir
-    if pre_extension_m > 0:
-        pre_start = _offset_point(start, start_dir, -pre_extension_m)
+    if pre_len > 0:
+        pre_start = _offset_point(start, start_dir, -pre_len)
         result.append(PathSegment(
             segment_type=SegmentType.TRANSIT,
             points=[pre_start, start],
@@ -455,6 +603,7 @@ def split_mark_segment_with_extensions(
             metadata={
                 "extension_role": "pre",
                 "parent_source_entity": segment.source_entity,
+                "extension_clamped": pre_len < pre_extension_m - 1e-9,
             },
         ))
 
@@ -469,8 +618,8 @@ def split_mark_segment_with_extensions(
     ))
 
     # AFT extension: step forward from end along end_dir
-    if aft_extension_m > 0:
-        aft_end = _offset_point(end, end_dir, aft_extension_m)
+    if aft_len > 0:
+        aft_end = _offset_point(end, end_dir, aft_len)
         result.append(PathSegment(
             segment_type=SegmentType.TRANSIT,
             points=[end, aft_end],
@@ -480,6 +629,7 @@ def split_mark_segment_with_extensions(
             metadata={
                 "extension_role": "aft",
                 "parent_source_entity": segment.source_entity,
+                "extension_clamped": aft_len < aft_extension_m - 1e-9,
             },
         ))
 

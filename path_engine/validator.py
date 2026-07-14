@@ -58,7 +58,80 @@ class PathValidator:
         # 5. Self-Intersection Check
         self._check_self_intersections(plan.merged_waypoints, warnings)
 
+        # 6. Does the rover drive over paint it has already laid? (E3)
+        self._check_drives_over_wet_paint(plan, warnings)
+
+        # 7. How far outside the drawing do the extensions reach? (E4)
+        self._check_extension_overshoot(plan, warnings)
+
         return warnings, errors
+
+    @staticmethod
+    def _seg_cross(p1, p2, p3, p4) -> bool:
+        """True if the OPEN segments p1p2 and p3p4 properly cross."""
+        d = (p2[0] - p1[0]) * (p4[1] - p3[1]) - (p2[1] - p1[1]) * (p4[0] - p3[0])
+        if abs(d) < 1e-12:
+            return False
+        t = ((p3[0] - p1[0]) * (p4[1] - p3[1]) - (p3[1] - p1[1]) * (p4[0] - p3[0])) / d
+        u = ((p3[0] - p1[0]) * (p2[1] - p1[1]) - (p3[1] - p1[1]) * (p2[0] - p1[0])) / d
+        return 0.05 < t < 0.95 and 0.05 < u < 0.95
+
+    def _check_drives_over_wet_paint(self, plan: PlannedPath, warnings: list[str]) -> None:
+        """Warn when a spray-OFF move crosses a line the rover has ALREADY painted.
+
+        The inter-run connector is a straight shot from one run's run-out to the next
+        run's run-up, and nothing stops it crossing finished geometry. The rover then
+        drives its wheels through wet paint.
+
+        This is a *report*, not a fix: making the router paint-aware means costing
+        crossings in the segment ordering, which is a separate change. Surfacing it here
+        at least means the operator is not the one who discovers it, on the ground.
+        """
+        wp, fl = plan.merged_waypoints, plan.spray_flags
+        if len(wp) < 4 or len(fl) != len(wp):
+            return
+
+        crossings: list[tuple[float, float]] = []
+        for i in range(len(wp) - 1):
+            if fl[i]:
+                continue                      # only spray-OFF moves
+            for j in range(i):
+                if not fl[j]:
+                    continue                  # only against paint already laid
+                if self._seg_cross(wp[i], wp[i + 1], wp[j], wp[j + 1]):
+                    crossings.append(wp[i])
+                    break
+
+        if crossings:
+            where = ", ".join(f"({p[0]:.2f}, {p[1]:.2f})" for p in crossings[:3])
+            more = f" (+{len(crossings) - 3} more)" if len(crossings) > 3 else ""
+            warnings.append(
+                f"Rover drives over already-painted lines at {len(crossings)} point(s): "
+                f"{where}{more}. Transit routing is not paint-aware — the wheels will "
+                f"cross wet paint."
+            )
+
+    def _check_extension_overshoot(self, plan: PlannedPath, warnings: list[str]) -> None:
+        """Warn how far the run-ups/run-outs reach beyond the drawing itself.
+
+        With 0.5 m extensions a 3x3 m square becomes a 4x4 m swept area. On a bounded
+        site — wall, kerb, pad edge, parked vehicle — that is an out-of-bounds excursion,
+        and nothing else in the pipeline mentions it.
+        """
+        ext = (plan.planning_metadata or {}).get("extensions")
+        if not ext:
+            return
+        over = ext.get("max_overshoot_m", 0.0)
+        if over <= 0.01:
+            return
+        swept = ext.get("swept_bbox") or {}
+        marked = ext.get("marked_bbox") or {}
+        warnings.append(
+            f"Extensions reach {over:.2f} m beyond the marked geometry: swept area is "
+            f"{swept.get('width_m', 0):.2f} x {swept.get('height_m', 0):.2f} m vs marked "
+            f"{marked.get('width_m', 0):.2f} x {marked.get('height_m', 0):.2f} m. "
+            f"Confirm the site has this clearance."
+        )
 
     def validate_or_raise(self, plan: PlannedPath) -> list[str]:
         """Return warnings or raise PathValidationError for hard safety failures."""

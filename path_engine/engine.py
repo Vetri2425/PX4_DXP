@@ -178,6 +178,17 @@ class PathEngine:
         # big between segments that are meant to connect. This is a *connectivity*
         # tolerance; it is NOT a point-culling tolerance (see _merge_chain).
         group_join_tol_m: float = 0.05,
+        # ── Extension safety limits (see docs/upgrade_path/03_EXTENSION_GEOMETRY_DEFECTS.md)
+        # E2: pre/aft_extension_m is only a CEILING. A 10 cm line was being given 97 cm
+        # of run-up + run-out (7.4x the line it serves), so cap by line length and skip
+        # lines too short to benefit at all.
+        extension_max_line_fraction: float = 0.5,
+        extension_min_line_length_m: float = 0.30,
+        # E1: an extension continues its own line's direction and is laid down wherever
+        # that lands — including on top of another line the rover paints. Ray-cast
+        # against the rest of the drawing and stop short.
+        extension_obstacle_clearance_m: float = 0.10,
+        extension_min_useful_m: float = 0.10,
     ):
         if mark_spacing <= 0:
             raise ValueError(f"mark_spacing must be > 0, got {mark_spacing}")
@@ -217,6 +228,10 @@ class PathEngine:
         self.max_two_opt_segments = max_two_opt_segments
         self.group_shapes = group_shapes
         self.group_join_tol_m = group_join_tol_m
+        self.extension_max_line_fraction = extension_max_line_fraction
+        self.extension_min_line_length_m = extension_min_line_length_m
+        self.extension_obstacle_clearance_m = extension_obstacle_clearance_m
+        self.extension_min_useful_m = extension_min_useful_m
 
     def plan_file(
         self,
@@ -698,49 +713,62 @@ class PathEngine:
             }
 
         # Step 4: Apply drive extensions to line-like MARK segments.
-        # Vertex-anchored policy: a composite line-chain (square/triangle/
-        # rectangle perimeter) is extended only at its two TRUE open ends — the
-        # chain start and chain end. Internal corners are NOT split and get no
-        # run-up/run-out, so consecutive edges meet exactly at the shared vertex
-        # and the rover pivots cleanly there. A *closed* chain (square) has no
-        # free end, so split_mark_segment_with_extensions() suppresses extensions
-        # entirely via its _is_closed_run() guard. This avoids the diagonal
-        # "transit stitch" spurs (135° out-and-back) that an earlier per-corner
-        # extension scheme produced between each edge's AFT and the next edge's
-        # PRE, which the differential rover could not track.
+        #
+        # per_line=True explodes a composite line-chain (square / rect / polygon / L
+        # perimeter) into its individual edges, and every edge becomes an INDEPENDENT
+        # PRE -> MARK -> AFT pass. Each CAD line is then approached already settled
+        # on-line and up to speed, marked dead straight, and exited — instead of the
+        # rover pivoting through the corner mid-spray. That is the point of the mode.
+        #
+        # It necessarily costs travel: consecutive edges no longer touch, so the rover
+        # drives out along edge N's AFT, turns, and comes back to edge N+1's PRE. Those
+        # connectors are emitted below — AFTER extension, so they run AFT-tip ->
+        # next-PRE-start directly. (Routing them BEFORE extension is what produced the
+        # 180 deg double-back over the rover's own AFT — the d82317d field failure.
+        # See the Step 3 note.)
+        #
+        # per_line=False keeps the chain whole: one continuous sprayed run, extended at
+        # its true open ends only, corners sprayed straight through.
         if self.enable_path_extensions:
-            extended: list[PathSegment] = []
+            # Decompose FIRST, so the obstacle set is built from the same geometry the
+            # extensions spring from. (Building it from the un-decomposed chains would
+            # make every edge's own parent chain an obstacle to itself.)
+            decomposed: list[PathSegment] = []
             for seg in ordered:
-                # per-line mode explodes a composite line-chain (square / rect / polygon
-                # / L perimeter) into its individual edges, and every edge becomes an
-                # INDEPENDENT PRE -> MARK -> AFT pass. Each CAD line is then approached
-                # already settled on-line and up to speed, marked dead straight, and
-                # exited — instead of the rover pivoting through the corner mid-spray.
-                # That is the whole point of the mode, and it is what keeps each side
-                # inside the per-line accuracy target.
-                #
-                # It necessarily costs travel: consecutive edges no longer touch, so the
-                # rover drives out along edge N's AFT, turns, and comes back to edge N+1's
-                # PRE. Those connectors are emitted below — AFTER extension, so they run
-                # AFT-tip -> next-PRE-start directly. (Routing them BEFORE extension is
-                # what produced the 180 deg double-back over the rover's own AFT — the
-                # d82317d field failure. See the Step 3 note.)
-                #
-                # per_line=False keeps the chain whole: one continuous sprayed run,
-                # extended at its true open ends only, corners sprayed straight through.
-                edges = (
+                decomposed.extend(
                     decompose_line_chain_to_edges(seg)
-                    if self.per_line_extensions else [seg]
+                    if self.per_line_extensions and seg.segment_type == SegmentType.MARK
+                    else [seg]
                 )
-                for edge in edges:
-                    parts = split_mark_segment_with_extensions(
-                        edge,
-                        pre_extension_m=self.pre_extension_m,
-                        aft_extension_m=self.aft_extension_m,
-                        transit_speed=self.transit_speed,
-                        suppress_closed_loops=not self.per_line_extensions,
-                    )
-                    extended.extend(parts)
+
+            # E1: ray-cast every extension against ALL OTHER marked geometry so it can
+            # never be laid down across a line the rover paints. Sibling edges of the
+            # same shape ARE obstacles — an extension that dives back into its own
+            # polygon is exactly the star_3x3m failure. An extension touching its
+            # neighbour at the shared vertex hits at t~0 and is ignored by the ray test.
+            mark_idx = [
+                i for i, s in enumerate(decomposed)
+                if s.segment_type == SegmentType.MARK and len(s.points) >= 2
+            ]
+            mark_polys = {i: list(decomposed[i].points) for i in mark_idx}
+
+            extended: list[PathSegment] = []
+            for i, seg in enumerate(decomposed):
+                obstacles = [poly for j, poly in mark_polys.items() if j != i]
+                parts = split_mark_segment_with_extensions(
+                    seg,
+                    pre_extension_m=self.pre_extension_m,
+                    aft_extension_m=self.aft_extension_m,
+                    transit_speed=self.transit_speed,
+                    suppress_closed_loops=not self.per_line_extensions,
+                    obstacles=obstacles,
+                    max_line_fraction=self.extension_max_line_fraction,
+                    min_line_length_m=self.extension_min_line_length_m,
+                    obstacle_clearance_m=self.extension_obstacle_clearance_m,
+                    min_useful_extension_m=self.extension_min_useful_m,
+                )
+                extended.extend(parts)
+
             # Travel between runs is inserted HERE, after extension, so each connector
             # spans AFT-tip -> next PRE-start. Step 3 withheld its own transit links
             # precisely so this is the only routing pass. Step 5b densifies them.
@@ -807,7 +835,15 @@ class PathEngine:
                 # sample them at MARK spacing (not the coarser transit spacing) —
                 # the rover then tracks the run-up as tightly as the marked line
                 # and is fully settled on-line before/after the spray boundary.
-                is_extension = seg.metadata.get("extension_role") in ("pre", "aft")
+                #
+                # E5: inter-run CONNECTORS get the same treatment. They were left at
+                # transit_spacing (0.15 m), which put ~15 cm gaps on the short diagonal
+                # the rover crosses BETWEEN TWO 135 deg PIVOTS — the sparsest sampling
+                # at the hardest point on the whole path.
+                is_extension = (
+                    seg.metadata.get("extension_role") in ("pre", "aft")
+                    or seg.metadata.get("extension_connector") is True
+                )
                 transit_spacing = (
                     self.mark_spacing if is_extension else self.transit_spacing
                 )
@@ -898,6 +934,52 @@ class PathEngine:
                 "height_m": max(norths) - min(norths),
             }
 
+        # E4: `bbox` above is the SWEPT area — it includes the run-ups/run-outs, which
+        # reach beyond the drawing. An operator who draws a 3x3 m square and turns on
+        # 0.5 m extensions gets a 4x4 m swept area, and until now nothing said so. On a
+        # bounded site (wall, kerb, pad edge, parked vehicle) that is an out-of-bounds
+        # excursion. Report the marked bbox alongside the swept one and the overshoot
+        # between them, so the app and the operator can see it.
+        extension_report = None
+        if self.enable_path_extensions and merged_waypoints:
+            mark_pts = [p for p, f in zip(merged_waypoints, spray_flags) if f]
+            if mark_pts:
+                mn = [p[0] for p in mark_pts]
+                me = [p[1] for p in mark_pts]
+                marked_bbox = {
+                    "min_n": min(mn), "max_n": max(mn),
+                    "min_e": min(me), "max_e": max(me),
+                    "width_m": max(me) - min(me),
+                    "height_m": max(mn) - min(mn),
+                }
+                overshoot_m = max(
+                    marked_bbox["min_n"] - bbox["min_n"],
+                    bbox["max_n"] - marked_bbox["max_n"],
+                    marked_bbox["min_e"] - bbox["min_e"],
+                    bbox["max_e"] - marked_bbox["max_e"],
+                )
+                clamped = sum(
+                    1 for s in ordered if s.metadata.get("extension_clamped")
+                )
+                extension_report = {
+                    "marked_bbox": marked_bbox,
+                    "swept_bbox": bbox,
+                    "max_overshoot_m": overshoot_m,
+                    "clamped_extensions": clamped,
+                    "limits": {
+                        "max_line_fraction": self.extension_max_line_fraction,
+                        "min_line_length_m": self.extension_min_line_length_m,
+                        "obstacle_clearance_m": self.extension_obstacle_clearance_m,
+                    },
+                }
+                log.info(
+                    "extensions: swept area %.2f x %.2f m vs marked %.2f x %.2f m "
+                    "(rover reaches %.2f m beyond the drawing); %d extension(s) clamped",
+                    bbox["width_m"], bbox["height_m"],
+                    marked_bbox["width_m"], marked_bbox["height_m"],
+                    overshoot_m, clamped,
+                )
+
         planning_time_s = time.perf_counter() - t0
         planning_meta = {
             "input_segments": input_segment_count,
@@ -906,6 +988,7 @@ class PathEngine:
             "final_segments": len(ordered),
             "final_waypoints": len(merged_waypoints),
             "bbox": bbox,
+            "extensions": extension_report,
             "spacing": {
                 "mark_m": self.mark_spacing,
                 "transit_m": self.transit_spacing,

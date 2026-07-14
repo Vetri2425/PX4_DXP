@@ -1674,3 +1674,161 @@ class TestSprayCompensationAtContiguousMarkJunctions:
             assert abs(length - (2.0 + lead_in - lead_out)) < 1e-3, (
                 f"edge is {length:.4f} m — compensation not applied at this boundary"
             )
+
+
+class TestExtensionSafetyLimits:
+    """E1/E2/E5: an extension must not be longer than the line it serves, must not be
+    laid down across geometry the rover paints, and must be sampled as tightly as a
+    mark line.
+
+    All three were found by planning the 14 sample DXFs and measuring the result:
+    docs/upgrade_path/03_EXTENSION_GEOMETRY_DEFECTS.md
+    """
+
+    @staticmethod
+    def _line(a, b, src="LINE_X") -> PathSegment:
+        return PathSegment(
+            segment_type=SegmentType.MARK,
+            points=[a, b],
+            speed=0.35,
+            source_entity=src,
+            metadata={"geometry_type": "LINE", "line_like": True},
+        )
+
+    # ── E2: proportion ──────────────────────────────────────────────────────
+
+    def test_short_line_gets_no_extension(self):
+        """A 10 cm mark cannot benefit from a 50 cm run-up.
+
+        star_3x3m's two 10 cm crosshair lines were each given 0.465 m of PRE + 0.503 m
+        of AFT — 7.4x the line they serve. The rover drove nearly a metre to paint a
+        hand's width, twice.
+        """
+        eng = PathEngine(enable_path_extensions=True, pre_extension_m=0.5,
+                         aft_extension_m=0.5, per_line_extensions=True,
+                         compensate_spray=False, optimize_order=False,
+                         extension_min_line_length_m=0.30)
+        plan = eng.plan_segments([self._line((0.0, 0.0), (0.10, 0.0))])
+        assert not any(s.metadata.get("extension_role") for s in plan.segments)
+
+    def test_extension_capped_at_a_fraction_of_the_line(self):
+        """A 0.6 m line with max_line_fraction=0.5 gets at most 0.3 m of run-up."""
+        eng = PathEngine(enable_path_extensions=True, pre_extension_m=0.5,
+                         aft_extension_m=0.5, per_line_extensions=True,
+                         compensate_spray=False, optimize_order=False,
+                         mark_spacing=0.05,
+                         extension_max_line_fraction=0.5,
+                         extension_min_line_length_m=0.30)
+        plan = eng.plan_segments([self._line((0.0, 0.0), (0.6, 0.0))])
+        for s in plan.segments:
+            if s.metadata.get("extension_role") in ("pre", "aft"):
+                length = sum(math.dist(s.points[i], s.points[i + 1])
+                             for i in range(len(s.points) - 1))
+                assert length <= 0.3 + 1e-6, f"extension {length:.3f} m exceeds 0.5x line"
+                assert s.metadata.get("extension_clamped") is True
+
+    def test_long_line_keeps_the_full_requested_extension(self):
+        """The cap must not shorten extensions that were already reasonable."""
+        eng = PathEngine(enable_path_extensions=True, pre_extension_m=0.5,
+                         aft_extension_m=0.5, per_line_extensions=True,
+                         compensate_spray=False, optimize_order=False,
+                         mark_spacing=0.05)
+        plan = eng.plan_segments([self._line((0.0, 0.0), (3.0, 0.0))])
+        roles = [s for s in plan.segments
+                 if s.metadata.get("extension_role") in ("pre", "aft")]
+        assert len(roles) == 2
+        for s in roles:
+            length = sum(math.dist(s.points[i], s.points[i + 1])
+                         for i in range(len(s.points) - 1))
+            assert abs(length - 0.5) < 1e-6
+            assert not s.metadata.get("extension_clamped")
+
+    # ── E1: collision ───────────────────────────────────────────────────────
+
+    def test_extension_stops_short_of_marked_geometry(self):
+        """The run-out must not be driven across a line the rover paints.
+
+        star_3x3m's tips touch the enclosing square, so six of its run-ups/run-outs were
+        laid straight across the square's edges. The extension is now ray-cast against
+        the rest of the drawing and shortened (or dropped) before it reaches one.
+        """
+        # A 2 m line pointing east, with a wall of paint 0.30 m past its end.
+        line = self._line((0.0, 0.0), (0.0, 2.0), "LINE_A")
+        wall = self._line((-1.0, 2.30), (1.0, 2.30), "LINE_WALL")
+
+        eng = PathEngine(enable_path_extensions=True, pre_extension_m=0.5,
+                         aft_extension_m=0.5, per_line_extensions=True,
+                         compensate_spray=False, optimize_order=False,
+                         mark_spacing=0.05, group_shapes=False,
+                         extension_obstacle_clearance_m=0.10)
+        plan = eng.plan_segments([line, wall])
+
+        aft = next((s for s in plan.segments
+                    if s.metadata.get("extension_role") == "aft"
+                    and s.metadata.get("parent_source_entity") == "LINE_A"), None)
+        if aft is not None:
+            # Reaches at most (0.30 - 0.10 clearance) = 0.20 m, so it never touches 2.30.
+            assert max(p[1] for p in aft.points) <= 2.30 - 0.10 + 1e-6, (
+                "run-out crosses the wall of paint it was supposed to stop short of"
+            )
+
+    def test_extension_unobstructed_is_left_alone(self):
+        """Nothing in the way → full requested length. No false clamping."""
+        line = self._line((0.0, 0.0), (0.0, 2.0), "LINE_A")
+        far = self._line((10.0, 0.0), (10.0, 2.0), "LINE_FAR")
+        eng = PathEngine(enable_path_extensions=True, pre_extension_m=0.5,
+                         aft_extension_m=0.5, per_line_extensions=True,
+                         compensate_spray=False, optimize_order=False,
+                         mark_spacing=0.05, group_shapes=False)
+        plan = eng.plan_segments([line, far])
+        aft = next(s for s in plan.segments
+                   if s.metadata.get("extension_role") == "aft"
+                   and s.metadata.get("parent_source_entity") == "LINE_A")
+        length = sum(math.dist(aft.points[i], aft.points[i + 1])
+                     for i in range(len(aft.points) - 1))
+        assert abs(length - 0.5) < 1e-6
+
+    # ── E5: connector sampling ──────────────────────────────────────────────
+
+    def test_connectors_are_sampled_at_mark_spacing(self):
+        """Inter-run connectors sit between two ~135 deg pivots — the hardest point on
+        the path to track. They were left at transit_spacing (0.15 m), i.e. the sparsest
+        sampling exactly where the rover most needs waypoints.
+        """
+        eng = PathEngine(enable_path_extensions=True, pre_extension_m=0.5,
+                         aft_extension_m=0.5, per_line_extensions=True,
+                         compensate_spray=False, optimize_order=True,
+                         mark_spacing=0.05, transit_spacing=0.15)
+        c = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0)]
+        square = [self._line(c[i], c[i + 1], f"LINE_{i}") for i in range(4)]
+        plan = eng.plan_segments(square)
+
+        conns = [s for s in plan.segments if s.metadata.get("extension_connector")]
+        assert conns, "expected inter-run connectors on a per-line square"
+        for s in conns:
+            gaps = [math.dist(s.points[i], s.points[i + 1])
+                    for i in range(len(s.points) - 1)]
+            assert max(gaps) <= 0.05 + 1e-9, (
+                f"connector sampled at {max(gaps) * 100:.1f} cm — should be mark_spacing"
+            )
+
+    # ── E4: reporting ───────────────────────────────────────────────────────
+
+    def test_swept_footprint_is_reported(self):
+        """A 2 m square with 0.5 m extensions sweeps a bigger area than it marks, and
+        the operator must be told — on a bounded site that is an out-of-bounds excursion.
+        """
+        eng = PathEngine(enable_path_extensions=True, pre_extension_m=0.5,
+                         aft_extension_m=0.5, per_line_extensions=True,
+                         compensate_spray=False, optimize_order=True, mark_spacing=0.05)
+        c = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0)]
+        plan = eng.plan_segments([self._line(c[i], c[i + 1], f"LINE_{i}")
+                                  for i in range(4)])
+        rep = plan.planning_metadata.get("extensions")
+        assert rep is not None
+        assert rep["max_overshoot_m"] > 0.2
+        assert rep["swept_bbox"]["width_m"] > rep["marked_bbox"]["width_m"]
+
+        from path_engine.validator import PathValidator
+        warnings = PathValidator().validate(plan)
+        assert any("beyond the marked geometry" in w for w in warnings)
