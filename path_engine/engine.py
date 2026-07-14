@@ -748,14 +748,42 @@ class PathEngine:
                 transit_speed=self.transit_speed,
             )
 
-        # Step 5: Apply spray latency compensation to MARK segments
+        # Step 5: Apply spray latency compensation — at REAL spray boundaries only.
+        #
+        # A grouped perimeter is decomposed into one MARK per edge, and those edges now
+        # meet directly at the corners (see Step 4). The rover sprays straight through
+        # such a corner — the spray never toggles there — so it is NOT a boundary.
+        # Compensating it anyway pulls spray OFF 3.5 mm before the corner and back ON
+        # 3.5 cm after it, which leaves an unpainted notch at every corner and makes the
+        # planner stitch a small spray-off diagonal outside it. A 2 m square ended up
+        # with 8 spray transitions instead of 2.
+        #
+        # A junction is interior iff both sides are MARK and they touch.
         if self.compensate_spray:
+            def _is_interior_mark_junction(a: PathSegment, b: PathSegment) -> bool:
+                return (
+                    a.segment_type == SegmentType.MARK
+                    and b.segment_type == SegmentType.MARK
+                    and bool(a.points) and bool(b.points)
+                    and _point_distance(a.points[-1], b.points[0]) <= _SEGMENT_JOIN_TOL_M
+                )
+
             compensated: list[PathSegment] = []
-            for seg in ordered:
+            for i, seg in enumerate(ordered):
+                prev_seg = ordered[i - 1] if i > 0 else None
+                next_seg = ordered[i + 1] if i + 1 < len(ordered) else None
                 compensated.append(apply_spray_latency_compensation(
                     seg,
                     spray_on_latency_s=self.spray_on_latency,
                     spray_off_latency_s=self.spray_off_latency,
+                    compensate_start=not (
+                        prev_seg is not None
+                        and _is_interior_mark_junction(prev_seg, seg)
+                    ),
+                    compensate_end=not (
+                        next_seg is not None
+                        and _is_interior_mark_junction(seg, next_seg)
+                    ),
                 ))
             ordered = compensated
             if self.enable_path_extensions:

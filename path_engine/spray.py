@@ -44,6 +44,8 @@ def apply_spray_latency_compensation(
     segment: PathSegment,
     spray_on_latency_s: float = 0.10,
     spray_off_latency_s: float = 0.01,
+    compensate_start: bool = True,
+    compensate_end: bool = True,
 ) -> PathSegment:
     """Shift spray start/end points to compensate for solenoid latency.
 
@@ -57,6 +59,16 @@ def apply_spray_latency_compensation(
         segment: Input PathSegment.
         spray_on_latency_s: Seconds for solenoid to fully open (default 0.10).
         spray_off_latency_s: Seconds for solenoid to close (default 0.01).
+        compensate_start: This MARK's start is a real OFF->ON spray boundary.
+        compensate_end: This MARK's end is a real ON->OFF spray boundary.
+
+            Both must be False at an INTERIOR junction of a contiguous sprayed run.
+            A grouped perimeter (square / polygon) is decomposed into one MARK per
+            edge, but those edges meet at corners the rover sprays straight through —
+            the spray never toggles there. Compensating such a junction pulls the
+            spray OFF 3.5 mm before the corner and back ON 3.5 cm after it, leaving an
+            unpainted notch at every corner and a small diagonal detour outside it.
+            Compensation belongs only at the two ends of the whole sprayed run.
 
     Returns:
         New PathSegment with compensated endpoints.
@@ -79,12 +91,12 @@ def apply_spray_latency_compensation(
 
     # Pre-start: add a point before the first waypoint, shifted along
     # the direction from first to second point
-    if lead_in > 0.001 and len(pts) >= 2:
+    if compensate_start and lead_in > 0.001 and len(pts) >= 2:
         pre_start = _shift_point(pts[0], pts[1], -lead_in)
         pts.insert(0, pre_start)
 
     # Early end: trim the last point towards the second-to-last
-    if lead_out > 0.001 and len(pts) >= 2:
+    if compensate_end and lead_out > 0.001 and len(pts) >= 2:
         pts[-1] = _shift_point(pts[-1], pts[-2], lead_out)
 
     return PathSegment(

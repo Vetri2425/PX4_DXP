@@ -1572,3 +1572,94 @@ class TestDensifyIdempotence:
             gaps = [math.dist(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
             assert max(gaps) <= 0.05 + 1e-9, f"length={length}: max gap {max(gaps)}"
             assert abs(pts[-1][0] - length) < 1e-12, "endpoint must be exact"
+
+
+class TestSprayCompensationAtInteriorCorners:
+    """Spray latency compensation belongs at REAL spray boundaries only.
+
+    A grouped perimeter is decomposed into one MARK per edge, and (since extensions
+    are applied at the chain ends only) those edges meet directly at the corners. The
+    rover sprays straight through such a corner — the spray never toggles there.
+
+    Compensating it anyway pulled spray OFF 3.5 mm *before* each corner and back ON
+    3.5 cm *after* it, so the planner stitched a spray-off diagonal outside the corner.
+    Every corner of a square got an unpainted notch, and a 2 m square reported EIGHT
+    spray transitions instead of two.
+    """
+
+    @staticmethod
+    def _square_segs() -> list[PathSegment]:
+        c = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0)]
+        return [
+            PathSegment(
+                segment_type=SegmentType.MARK,
+                points=[c[i], c[i + 1]],
+                speed=0.35,
+                source_entity=f"LINE_{i}",
+                metadata={"geometry_type": "LINE", "line_like": True},
+            )
+            for i in range(4)
+        ]
+
+    def _plan(self):
+        eng = PathEngine(
+            enable_path_extensions=True,
+            pre_extension_m=0.5,
+            aft_extension_m=0.5,
+            per_line_extensions=True,
+            compensate_spray=True,      # the case that regressed
+            optimize_order=True,
+            mark_spacing=0.05,
+            transit_spacing=0.15,
+        )
+        return eng.plan_segments(self._square_segs())
+
+    def test_square_has_exactly_two_spray_transitions(self):
+        """OFF->ON once at the start of the run, ON->OFF once at the end. That's all."""
+        flags = self._plan().spray_flags
+        toggles = sum(1 for a, b in zip(flags, flags[1:]) if a != b)
+        assert toggles == 2, (
+            f"{toggles} spray transitions on a closed square — the interior corners are "
+            "toggling spray, which leaves an unpainted notch at each one"
+        )
+        assert flags[0] is False and flags[-1] is False
+
+    def test_no_spray_off_gap_at_any_corner(self):
+        """Spray must stay ON continuously across every corner of the perimeter."""
+        plan = self._plan()
+        wps, flags = plan.merged_waypoints, plan.spray_flags
+        corners = [(2.0, 0.0), (2.0, 2.0), (0.0, 2.0)]  # the three interior corners
+        for cn, ce in corners:
+            near = [i for i, p in enumerate(wps)
+                    if math.hypot(p[0] - cn, p[1] - ce) < 0.10]
+            assert near, f"corner {(cn, ce)} missing from the path"
+            assert all(flags[i] for i in near), (
+                f"spray drops OFF within 10 cm of corner {(cn, ce)} — unpainted notch"
+            )
+
+    def test_interior_corners_have_no_connector(self):
+        """No stitched detour around a corner the rover should drive straight through."""
+        segs = self._plan().segments
+        assert not any(s.metadata.get("extension_connector") for s in segs)
+
+    def test_compensation_still_applied_at_the_true_run_boundaries(self):
+        """The fix must not disable compensation where it is genuinely needed.
+
+        Asserted by magnitude rather than by a fixed coordinate: the optimizer is free
+        to enter the square from any edge, so which axis the lead-in lies on is not
+        part of the contract. What IS the contract is the offset distance from the
+        geometric corner where the sprayed run begins/ends.
+        """
+        plan = self._plan()
+        wps, flags = plan.merged_waypoints, plan.spray_flags
+        on_idx = next(i for i in range(len(flags) - 1) if not flags[i] and flags[i + 1])
+        off_idx = next(i for i in range(len(flags) - 1) if flags[i] and not flags[i + 1])
+
+        corner = (0.0, 0.0)  # the run starts and ends at the chain's open end
+        lead_in = 0.10 * 0.35    # 3.5 cm — solenoid open time
+        lead_out = 0.01 * 0.35   # 3.5 mm — solenoid close time
+
+        # Spray fires early, i.e. BEFORE the geometry starts...
+        assert abs(math.dist(wps[on_idx], corner) - lead_in) < 1e-6
+        # ...and cuts early, i.e. just BEFORE the geometry ends.
+        assert abs(math.dist(wps[off_idx], corner) - lead_out) < 1e-6
