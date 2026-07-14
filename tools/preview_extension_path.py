@@ -43,6 +43,7 @@ import json
 import math
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -107,7 +108,10 @@ def plan_with_extensions(host, port, token, name, *, enabled, pre, aft, per_line
                          spacing, transit_spacing, mark_speed, transit_speed,
                          compensate_spray):
     """Set the per-file extension config, then plan. Returns the plan response."""
-    _api(host, port, "POST", f"/api/path/{name}/extensions", token, {
+    # Several sample DXFs have spaces in the name ("sct 1.5m.DXF"), which are illegal
+    # in a request line. The body still carries the raw name.
+    quoted = urllib.parse.quote(name, safe="")
+    _api(host, port, "POST", f"/api/path/{quoted}/extensions", token, {
         "enabled": enabled,
         "pre_extension_m": pre,
         "aft_extension_m": aft,
@@ -384,8 +388,9 @@ def main() -> int:
             ext = plan_with_extensions(args.host, args.port, args.token, name,
                                        enabled=True, pre=args.pre, aft=args.aft,
                                        per_line=args.per_line, **common)
-        except ApiError as e:
-            print(f"    FAILED: {e}\n")
+        except Exception as e:
+            # One bad DXF must not abort the sweep — report and carry on.
+            print(f"    FAILED: {type(e).__name__}: {e}\n")
             rc = 1
             continue
 
