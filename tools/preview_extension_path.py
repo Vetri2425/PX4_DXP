@@ -150,6 +150,22 @@ def analyse(plan: dict) -> dict:
 
     marked = sum(gaps[i] for i in range(len(gaps)) if fl[i])
     driven = sum(gaps)
+
+    # Short gaps are only suspicious AWAY from a spray boundary. Latency compensation
+    # legitimately inserts a lead-in point 3.5 cm before the mark starts and trims the
+    # end 3.5 mm early, and both land inside a naive "2-4 cm" window. Counting those as
+    # double-densify artefacts made every single plan — RAW included — look broken.
+    half = 0
+    for i, g in enumerate(gaps):
+        if not (0.02 < g < 0.04):
+            continue
+        at_boundary = (
+            (i > 0 and fl[i - 1] != fl[i])
+            or (i + 1 < len(fl) and fl[i] != fl[i + 1])
+        )
+        if not at_boundary:
+            half += 1
+
     return {
         "waypoints": len(wp),
         "marked_m": marked,
@@ -157,7 +173,7 @@ def analyse(plan: dict) -> dict:
         "overhead_pct": (driven / marked - 1) * 100 if marked > 1e-9 else float("nan"),
         "max_gap_cm": max(nz) * 100 if nz else 0.0,
         "over_spacing": sum(1 for g in nz if g > 0.0501),
-        "half_gaps": sum(1 for g in nz if 0.02 < g < 0.04),  # double-densify artefact
+        "half_gaps": half,  # double-densify artefact, spray-boundary points excluded
         "turns": turns,
         "hard_turns": [t for t in turns if t[1] > 100],
         "spurs": sum(1 for s in plan.get("segments", [])
