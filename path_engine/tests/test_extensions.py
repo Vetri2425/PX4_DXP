@@ -1331,38 +1331,41 @@ class TestPerLineExtensions:
             for i, (a, b) in enumerate(edges)
         ]
 
-    def test_engine_per_line_square_extends_chain_ends_only(self):
-        """A closed square gets ONE run-up and ONE run-out — not one per edge.
+    def test_engine_per_line_square_gives_four_passes(self):
+        """per_line means what it says: every CAD line is an INDEPENDENT PRE/MARK/AFT.
 
-        This previously asserted (pre, mark, aft) == (4, 4, 4): every edge got its own
-        PRE *and* AFT. That is the defect. At each SHARED vertex it put a run-out and a
-        run-in back to back, so the rover drove 0.5 m past the corner, reversed through
-        135°, and came back to a point 0.5 m before the next edge — an out-and-back spur
-        at every corner, and the geometry the differential rover could not track (the
-        d82317d field failure). On square_2m it cost 77% extra driving.
-
-        Correct policy: the chain's two true open ends are extended; interior vertices
-        are left alone so consecutive edges meet and the rover simply pivots. The closed
-        square still gains the tangential run-up/run-out it never had under the legacy
-        closed-loop suppression (where it started marking from a dead stop, spray on).
+        Each side is approached already settled on-line and up to speed, marked dead
+        straight, and exited — rather than the rover pivoting through the corner
+        mid-spray. That is the whole point of the mode.
         """
         eng = PathEngine(enable_path_extensions=True, pre_extension_m=0.5,
                          aft_extension_m=0.5, per_line_extensions=True,
                          compensate_spray=False, optimize_order=False)
         plan = eng.plan_segments(self._square_segs())
-
         pre = sum(1 for s in plan.segments if s.metadata.get("extension_role") == "pre")
         aft = sum(1 for s in plan.segments if s.metadata.get("extension_role") == "aft")
         mark = sum(1 for s in plan.segments
                    if s.segment_type == SegmentType.MARK
                    and not s.metadata.get("extension_role"))
-        assert (pre, mark, aft) == (1, 4, 1)
+        assert (pre, mark, aft) == (4, 4, 4)
 
-        # The spur signature: an out-and-back stitch between an AFT and the next PRE.
-        assert not any(s.metadata.get("extension_connector") for s in plan.segments)
+    def test_engine_per_line_never_doubles_back_on_its_own_aft(self):
+        """The cost of per-line is travel between lines — never a RETRACE.
 
-        # ...and therefore no >100° reversal anywhere (a square's own corners are 90°).
-        wps = plan.merged_waypoints
+        Consecutive edges no longer touch, so the rover drives out along edge N's AFT,
+        turns, and comes back to edge N+1's PRE. Those connectors must be routed AFTER
+        extension so they span AFT-tip -> next-PRE-start directly. Routing them BEFORE
+        (the old Step 3 behaviour) left them wired to the ORIGINAL mark endpoints, so
+        the rover had to drive 180 deg back over its own AFT to reach the stale link —
+        cancelling the run-out entirely. That is the d82317d field failure.
+
+        A pivot at a corner is fine (it is spray-off, and stop-pivot handles it). Driving
+        back over ground it just covered is not.
+        """
+        eng = PathEngine(enable_path_extensions=True, pre_extension_m=0.5,
+                         aft_extension_m=0.5, per_line_extensions=True,
+                         compensate_spray=False, optimize_order=True)
+        wps = eng.plan_segments(self._square_segs()).merged_waypoints
         for i in range(1, len(wps) - 1):
             ax, ay = wps[i][0] - wps[i - 1][0], wps[i][1] - wps[i - 1][1]
             bx, by = wps[i + 1][0] - wps[i][0], wps[i + 1][1] - wps[i][1]
@@ -1370,22 +1373,18 @@ class TestPerLineExtensions:
             if la < 1e-9 or lb < 1e-9:
                 continue
             dot = max(-1.0, min(1.0, (ax * bx + ay * by) / (la * lb)))
-            assert math.degrees(math.acos(dot)) <= 100.0
+            ang = math.degrees(math.acos(dot))
+            assert ang < 170.0, f"near-reversal of {ang:.0f} deg at {wps[i]} — retracing"
 
     def test_engine_per_line_spray_flags_off_on_off(self):
-        """Spray toggles once ON at the mark start and once OFF at the mark end.
-
-        Previously asserted 8 toggles (off→on→off per edge), which only held because
-        every edge carried its own PRE/AFT. With the chain extended at its ends only,
-        the four edges are one contiguous sprayed run: OFF (run-up) → ON → OFF (run-out).
-        """
+        """4 lines → exactly 8 spray toggles (off→on then on→off per line)."""
         eng = PathEngine(enable_path_extensions=True, per_line_extensions=True,
                          compensate_spray=False, optimize_order=False)
         plan = eng.plan_segments(self._square_segs())
         toggles = sum(1 for a, b in zip(plan.spray_flags, plan.spray_flags[1:]) if a != b)
-        assert toggles == 2
+        assert toggles == 8
         assert any(plan.spray_flags) and not all(plan.spray_flags)
-        # Spray must be OFF on the run-up and OFF on the run-out.
+        # Spray OFF on the leading run-up and the trailing run-out.
         assert plan.spray_flags[0] is False
         assert plan.spray_flags[-1] is False
 
@@ -1574,23 +1573,83 @@ class TestDensifyIdempotence:
             assert abs(pts[-1][0] - length) < 1e-12, "endpoint must be exact"
 
 
-class TestSprayCompensationAtInteriorCorners:
+class TestSprayCompensationAtContiguousMarkJunctions:
     """Spray latency compensation belongs at REAL spray boundaries only.
 
-    A grouped perimeter is decomposed into one MARK per edge, and (since extensions
-    are applied at the chain ends only) those edges meet directly at the corners. The
-    rover sprays straight through such a corner — the spray never toggles there.
+    Where two MARK segments actually touch, the rover sprays straight through the
+    junction — the spray never toggles there, so it is not a boundary. Compensating it
+    anyway pulls spray OFF 3.5 mm *before* the junction and back ON 3.5 cm *after* it,
+    and the planner then stitches a spray-off detour around the gap it just created:
+    an unpainted notch in the middle of continuous marked geometry.
 
-    Compensating it anyway pulled spray OFF 3.5 mm *before* each corner and back ON
-    3.5 cm *after* it, so the planner stitched a spray-off diagonal outside the corner.
-    Every corner of a square got an unpainted notch, and a 2 m square reported EIGHT
-    spray transitions instead of two.
+    (This is separate from per-line mode, where consecutive edges are deliberately
+    separated by PRE/AFT and every edge end IS a real boundary — compensation must
+    still fire there. See test_compensation_still_fires_at_real_boundaries.)
     """
 
     @staticmethod
-    def _square_segs() -> list[PathSegment]:
-        c = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0)]
+    def _touching_lines() -> list[PathSegment]:
+        # An L: two MARK segments sharing the vertex (2,0). Grouping is disabled below,
+        # so they stay as two segments that touch — the case under test.
         return [
+            PathSegment(
+                segment_type=SegmentType.MARK,
+                points=[(0.0, 0.0), (2.0, 0.0)],
+                speed=0.35,
+                source_entity="LINE_0",
+                metadata={"geometry_type": "LINE", "line_like": True},
+            ),
+            PathSegment(
+                segment_type=SegmentType.MARK,
+                points=[(2.0, 0.0), (2.0, 2.0)],
+                speed=0.35,
+                source_entity="LINE_1",
+                metadata={"geometry_type": "LINE", "line_like": True},
+            ),
+        ]
+
+    def _plan(self):
+        eng = PathEngine(
+            enable_path_extensions=False,
+            compensate_spray=True,
+            optimize_order=False,
+            group_shapes=False,      # keep them as two touching MARK segments
+            mark_spacing=0.05,
+            transit_spacing=0.15,
+        )
+        return eng.plan_segments(self._touching_lines())
+
+    def test_spray_stays_on_across_a_touching_mark_junction(self):
+        plan = self._plan()
+        wps, flags = plan.merged_waypoints, plan.spray_flags
+        near = [i for i, p in enumerate(wps) if math.hypot(p[0] - 2.0, p[1]) < 0.10]
+        assert near, "shared vertex missing from the path"
+        assert all(flags[i] for i in near), (
+            "spray drops OFF within 10 cm of the shared vertex — unpainted notch in "
+            "the middle of continuous marked geometry"
+        )
+
+    def test_no_detour_stitched_around_the_junction(self):
+        assert not any(s.metadata.get("extension_connector")
+                       for s in self._plan().segments)
+
+    def test_compensation_still_fires_at_real_boundaries(self):
+        """The fix must not disable compensation where it is genuinely needed.
+
+        Per-line mode separates every edge with PRE/AFT, so all four of a square's edge
+        ends are real OFF->ON / ON->OFF boundaries and must each be compensated.
+        """
+        eng = PathEngine(
+            enable_path_extensions=True,
+            pre_extension_m=0.5,
+            aft_extension_m=0.5,
+            per_line_extensions=True,
+            compensate_spray=True,
+            optimize_order=False,
+            mark_spacing=0.05,
+        )
+        c = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0)]
+        square = [
             PathSegment(
                 segment_type=SegmentType.MARK,
                 points=[c[i], c[i + 1]],
@@ -1600,66 +1659,18 @@ class TestSprayCompensationAtInteriorCorners:
             )
             for i in range(4)
         ]
+        plan = eng.plan_segments(square)
 
-    def _plan(self):
-        eng = PathEngine(
-            enable_path_extensions=True,
-            pre_extension_m=0.5,
-            aft_extension_m=0.5,
-            per_line_extensions=True,
-            compensate_spray=True,      # the case that regressed
-            optimize_order=True,
-            mark_spacing=0.05,
-            transit_spacing=0.15,
-        )
-        return eng.plan_segments(self._square_segs())
-
-    def test_square_has_exactly_two_spray_transitions(self):
-        """OFF->ON once at the start of the run, ON->OFF once at the end. That's all."""
-        flags = self._plan().spray_flags
-        toggles = sum(1 for a, b in zip(flags, flags[1:]) if a != b)
-        assert toggles == 2, (
-            f"{toggles} spray transitions on a closed square — the interior corners are "
-            "toggling spray, which leaves an unpainted notch at each one"
-        )
-        assert flags[0] is False and flags[-1] is False
-
-    def test_no_spray_off_gap_at_any_corner(self):
-        """Spray must stay ON continuously across every corner of the perimeter."""
-        plan = self._plan()
-        wps, flags = plan.merged_waypoints, plan.spray_flags
-        corners = [(2.0, 0.0), (2.0, 2.0), (0.0, 2.0)]  # the three interior corners
-        for cn, ce in corners:
-            near = [i for i, p in enumerate(wps)
-                    if math.hypot(p[0] - cn, p[1] - ce) < 0.10]
-            assert near, f"corner {(cn, ce)} missing from the path"
-            assert all(flags[i] for i in near), (
-                f"spray drops OFF within 10 cm of corner {(cn, ce)} — unpainted notch"
-            )
-
-    def test_interior_corners_have_no_connector(self):
-        """No stitched detour around a corner the rover should drive straight through."""
-        segs = self._plan().segments
-        assert not any(s.metadata.get("extension_connector") for s in segs)
-
-    def test_compensation_still_applied_at_the_true_run_boundaries(self):
-        """The fix must not disable compensation where it is genuinely needed.
-
-        Asserted by magnitude rather than by a fixed coordinate: the optimizer is free
-        to enter the square from any edge, so which axis the lead-in lies on is not
-        part of the contract. What IS the contract is the offset distance from the
-        geometric corner where the sprayed run begins/ends.
-        """
-        plan = self._plan()
-        wps, flags = plan.merged_waypoints, plan.spray_flags
-        on_idx = next(i for i in range(len(flags) - 1) if not flags[i] and flags[i + 1])
-        off_idx = next(i for i in range(len(flags) - 1) if flags[i] and not flags[i + 1])
-
-        corner = (0.0, 0.0)  # the run starts and ends at the chain's open end
         lead_in = 0.10 * 0.35    # 3.5 cm — solenoid open time
         lead_out = 0.01 * 0.35   # 3.5 mm — solenoid close time
-
-        # Spray fires early, i.e. BEFORE the geometry starts...
-        assert abs(math.dist(wps[on_idx], corner) - lead_in) < 1e-6
-        # ...and cuts early, i.e. just BEFORE the geometry ends.
-        assert abs(math.dist(wps[off_idx], corner) - lead_out) < 1e-6
+        marks = [s for s in plan.segments
+                 if s.segment_type == SegmentType.MARK
+                 and not s.metadata.get("extension_role")]
+        assert len(marks) == 4
+        for m in marks:
+            # Each 2.0 m edge is lengthened by the lead-in and shortened by the lead-out.
+            length = sum(math.dist(m.points[i], m.points[i + 1])
+                         for i in range(len(m.points) - 1))
+            assert abs(length - (2.0 + lead_in - lead_out)) < 1e-3, (
+                f"edge is {length:.4f} m — compensation not applied at this boundary"
+            )

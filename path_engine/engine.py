@@ -712,30 +712,31 @@ class PathEngine:
             extended: list[PathSegment] = []
             for seg in ordered:
                 # per-line mode explodes a composite line-chain (square / rect / polygon
-                # / L perimeter) into its individual edges. That is what lets a *closed*
-                # shape be extended at all: the closed-loop guard suppresses extensions
-                # on an intact loop because it has no free end, which leaves the rover
-                # starting to mark from a dead stop with spray already on.
+                # / L perimeter) into its individual edges, and every edge becomes an
+                # INDEPENDENT PRE -> MARK -> AFT pass. Each CAD line is then approached
+                # already settled on-line and up to speed, marked dead straight, and
+                # exited — instead of the rover pivoting through the corner mid-spray.
+                # That is the whole point of the mode, and it is what keeps each side
+                # inside the per-line accuracy target.
                 #
-                # But only the chain's TWO TRUE OPEN ENDS get extended. Giving every edge
-                # its own PRE *and* AFT puts a run-out and a run-in back-to-back at each
-                # SHARED vertex, forcing the rover 0.5 m past the corner, through a 135
-                # deg reversal, and back to a point 0.5 m before the next edge — an
-                # out-and-back spur at every corner. That is the geometry the differential
-                # rover could not track (the d82317d field failure), and on square_2m it
-                # cost 77% extra driving. Consecutive edges must simply meet and pivot.
+                # It necessarily costs travel: consecutive edges no longer touch, so the
+                # rover drives out along edge N's AFT, turns, and comes back to edge N+1's
+                # PRE. Those connectors are emitted below — AFTER extension, so they run
+                # AFT-tip -> next-PRE-start directly. (Routing them BEFORE extension is
+                # what produced the 180 deg double-back over the rover's own AFT — the
+                # d82317d field failure. See the Step 3 note.)
+                #
+                # per_line=False keeps the chain whole: one continuous sprayed run,
+                # extended at its true open ends only, corners sprayed straight through.
                 edges = (
                     decompose_line_chain_to_edges(seg)
                     if self.per_line_extensions else [seg]
                 )
-                last = len(edges) - 1
-                for i, edge in enumerate(edges):
+                for edge in edges:
                     parts = split_mark_segment_with_extensions(
                         edge,
-                        # Chain start gets the run-up, chain end gets the run-out,
-                        # interior vertices get neither.
-                        pre_extension_m=self.pre_extension_m if i == 0 else 0.0,
-                        aft_extension_m=self.aft_extension_m if i == last else 0.0,
+                        pre_extension_m=self.pre_extension_m,
+                        aft_extension_m=self.aft_extension_m,
                         transit_speed=self.transit_speed,
                         suppress_closed_loops=not self.per_line_extensions,
                     )
