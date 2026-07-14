@@ -19,7 +19,8 @@
 > |---|---|---|
 > | **E1** | Extensions blind to other geometry | ✅ **FIXED** — 6 crossings → **0** |
 > | **E2** | Extension length not proportional | ✅ **FIXED** — worst 7.4× → **0.92×** |
-> | **E3** | Connectors not paint-aware | ⚠️ **NOT FIXED — now WARNED** (5 remain) |
+> | **E3** | Connectors not paint-aware | ✅ **FIXED** — 5 crossings → **1** (`99f1c40`) |
+> | **S1** | **Spray was DOUBLE-compensated** — paint started ~9 cm early | ✅ **FIXED** (`99f1c40`) |
 > | **E4** | Swept footprint never reported | ✅ **REPORTED** — metadata + operator warning |
 > | **E5** | Connectors sampled at `transit_spacing` | ✅ **FIXED** — 14.9 cm → **5.0 cm** |
 > | **E6** | Overhead | ✅ **IMPROVED** — star +117% → **+92%** |
@@ -223,17 +224,70 @@ same as PRE/AFT.
 New knobs on `PathEngine`: `extension_max_line_fraction`, `extension_min_line_length_m`,
 `extension_obstacle_clearance_m`, `extension_min_useful_m`.
 
+## E3 + S1 (`99f1c40`)
+
+### S1 — spray was double-compensated: paint started ~9 cm early
+
+The planner shifted the MARK boundary **3.5 cm** early to cover solenoid open time
+(`spray.py` — a *static* shift that assumes `marking_speed`). But the spray controller
+**already does this at runtime, from the rover's ACTUAL speed**:
+
+```python
+# spray_controller_node.py:276
+on_lead = speed_mps * solenoid_open_delay_s + on_overspray_margin_m
+        = 0.35 * 0.10 + 0.02   =  5.5 cm at marking speed
+```
+
+Both fired. Paint began **~9 cm before the CAD line**, on every line.
+
+The controller is the right place for it — its lead stays correct when the profile slows into a
+corner, or when `marking_speed` changes. The planner's does not. **`compensate_spray` now
+defaults OFF** (`PathEngine`, `PathPlanRequest`, `PathManager`), so the plan carries the *true*
+geometry. Live backend, `square_2m` at API default:
+
+```
+MARK lengths : 2.0000  2.0000  2.0000  2.0000   (CAD = 2.000 m)
+spray toggles: 0.00 cm from each CAD corner
+```
+
+### E3 — paint-aware routing
+
+The fix is **ordering, not rerouting**, and it turns on one observation: **crossing a line that
+has not been painted yet is free.** `star_3x3m`'s crosshairs sit inside both the star and the
+square, so *some* connector must cross that geometry — but if the crosshairs are marked **first**,
+there is no paint there to cross. `_PaintAwareness` penalises only **already-laid** paint (5 m of
+equivalent deadhead per crossing) and the optimizer finds that ordering by itself.
+
+Live proof — the star now marks the two centre crosshairs first, unprompted:
+
+```
+first 3 marked: ['LINE_14', 'LINE_15', 'LWPOLYLINE_3:edge9']
+wet-paint warnings: NONE
+```
+
+**Also required:** in per-line mode the chains are now unfused into edges **before** the TSP
+(Step 2c), not after. With the square still fused into one composite chain the optimizer only saw
+*two* marks on `square_circle`, and every ordering forced a crossing. With the edges visible it
+picks the one square edge reachable from the circle's run-out without crossing anything.
+Chain-ends mode is untouched — shape-level traversal is the whole point there.
+
+**Bonus: edge-level ordering also finds shorter routes.**
+
+| Shape | before | after |
+|---|---|---|
+| square_circle | 23.96 m | **22.69 m** |
+| square + triangle | 27.70 m | **25.95 m** |
+| square_line | 20.28 m | **18.12 m** |
+| sct 1.5m | 40.55 m | **38.71 m** |
+
+The penalty **saturates at 5 m** (15 / 30 / 60 m give identical results), so 5 m is the value.
+
 ## Still open
 
-**E3 — connectors still cross already-laid paint (5 across 4 shapes).** The validator now warns
-with exact coordinates, e.g. on the star:
-
-> *"Rover drives over already-painted lines at 2 point(s): (0.35, -0.02), (1.01, 0.90).
-> Transit routing is not paint-aware — the wheels will cross wet paint."*
-
-The real fix is to **cost crossings in the segment ordering** so the TSP prefers a route that
-avoids finished geometry. That is a change to `optimizers/segment_order.py` and carries a
-routing-regression risk, so it was kept out of this patch rather than rushed into it.
+**1 crossing remains, on `sct 1.5m`.** It is a 2-opt local minimum, not a weighting problem —
+raising the penalty does not shift it. The validator warns with its coordinates. Fixing it needs a
+stronger move set than slice-reversal 2-opt (or-opt / segment insertion), which is a separate
+change.
 
 ---
 
