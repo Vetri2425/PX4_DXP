@@ -217,13 +217,59 @@ def _deadhead_cost(
     return cost
 
 
+_OR_OPT_MAX_RUN = 3
+
+
+def _or_opt_pass(
+    best: list[PathSegment],
+    best_cost: float,
+    start_position: tuple[float, float] | None,
+    paint: "_PaintAwareness | None",
+) -> tuple[list[PathSegment], float, int]:
+    """Relocate a short run of 1-3 segments elsewhere in the route (either orientation).
+
+    2-opt only ever REVERSES a contiguous slice in place. It cannot lift a segment out
+    and put it somewhere else, so a route where one edge got stranded at the end is a
+    local minimum it can never escape — no reversal helps.
+
+    That is exactly what happened on sct_1.5m: the optimizer marked four edges of a
+    shape, left for the other shapes, and came back for the fifth edge last, driving
+    over finished paint to reach it. Relocating that single edge back next to its
+    siblings costs nothing and removes the crossing; 2-opt could not express the move.
+    """
+    n = len(best)
+    improvements = 0
+
+    for run in range(1, _OR_OPT_MAX_RUN + 1):
+        for i in range(0, n - run + 1):
+            chunk = best[i:i + run]
+            rest = best[:i] + best[i + run:]
+            for j in range(len(rest) + 1):
+                if j == i:
+                    continue  # putting it back where it came from
+                for flip in (False, True):
+                    piece = (
+                        [_reverse_segment(s) for s in reversed(chunk)]
+                        if flip else list(chunk)
+                    )
+                    cand = rest[:j] + piece + rest[j:]
+                    cand_cost = _deadhead_cost(cand, start_position, paint)
+                    if cand_cost + 1e-9 < best_cost:
+                        return cand, cand_cost, improvements + 1
+    return best, best_cost, improvements
+
+
 def _apply_two_opt(
     route: list[PathSegment],
     start_position: tuple[float, float] | None,
     max_passes: int = 20,
     paint: "_PaintAwareness | None" = None,
 ) -> tuple[list[PathSegment], float, float, int]:
-    """Improve an oriented route with 2-opt slice reversals."""
+    """Improve an oriented route with 2-opt slice reversals AND or-opt relocations.
+
+    The two move sets are complementary: 2-opt fixes crossed/backtracking legs, or-opt
+    fixes stranded segments. Alternate until neither can improve.
+    """
     n = len(route)
     if n < 4:
         cost = _deadhead_cost(route, start_position, paint)
@@ -236,6 +282,8 @@ def _apply_two_opt(
 
     for _ in range(max_passes):
         changed = False
+
+        # 2-opt: reverse a contiguous slice.
         for i in range(0, n - 2):
             for k in range(i + 1, n):
                 candidate = (
@@ -249,6 +297,14 @@ def _apply_two_opt(
                     best_cost = cand_cost
                     improvements += 1
                     changed = True
+
+        # or-opt: lift a short run out and re-insert it elsewhere.
+        best, or_cost, or_imp = _or_opt_pass(best, best_cost, start_position, paint)
+        if or_imp:
+            best_cost = or_cost
+            improvements += or_imp
+            changed = True
+
         if not changed:
             break
 

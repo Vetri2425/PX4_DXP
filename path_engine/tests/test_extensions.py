@@ -1996,3 +1996,141 @@ class TestPaintAwareRouting:
         """Without the penalty the same geometry DOES cross wet paint — proving the test
         is measuring the fix and not a coincidence of this shape."""
         assert self._crossings(self._plan(avoid=False)) > 0
+
+
+class TestDuplicateGeometry:
+    """CAD files contain lines drawn on top of each other.
+
+    sct_1.5m.DXF has the same (0,0)->(1.5,0) LINE twice (handles 64 and 67) — drawn once,
+    copied, never noticed. Left in, the planner faithfully paints it TWICE: mark it, run
+    out past the end, reverse 180 deg, and mark it again backwards. Double-thick line,
+    wasted time, and the reverse-flip the differential rover handles worst.
+    """
+
+    def test_coincident_line_is_dropped(self):
+        line = PathSegment(
+            segment_type=SegmentType.MARK, points=[(0.0, 0.0), (0.0, 2.0)], speed=0.35,
+            source_entity="LINE_A", metadata={"geometry_type": "LINE", "line_like": True},
+        )
+        clone = PathSegment(
+            segment_type=SegmentType.MARK, points=[(0.0, 0.0), (0.0, 2.0)], speed=0.35,
+            source_entity="LINE_B", metadata={"geometry_type": "LINE", "line_like": True},
+        )
+        eng = PathEngine(optimize_order=False, mark_spacing=0.05, group_shapes=False)
+        plan = eng.plan_segments([line, clone])
+        marks = [s for s in plan.segments if s.segment_type == SegmentType.MARK]
+        assert len(marks) == 1
+        assert plan.planning_metadata["duplicate_geometry"]["removed"] == 1
+
+    def test_reversed_duplicate_is_also_dropped(self):
+        """The same line drawn backwards is still the same line."""
+        line = PathSegment(
+            segment_type=SegmentType.MARK, points=[(0.0, 0.0), (0.0, 2.0)], speed=0.35,
+            source_entity="LINE_A", metadata={"geometry_type": "LINE", "line_like": True},
+        )
+        flipped = PathSegment(
+            segment_type=SegmentType.MARK, points=[(0.0, 2.0), (0.0, 0.0)], speed=0.35,
+            source_entity="LINE_B", metadata={"geometry_type": "LINE", "line_like": True},
+        )
+        eng = PathEngine(optimize_order=False, mark_spacing=0.05, group_shapes=False)
+        plan = eng.plan_segments([line, flipped])
+        assert sum(1 for s in plan.segments
+                   if s.segment_type == SegmentType.MARK) == 1
+
+    def test_distinct_lines_are_kept(self):
+        a = PathSegment(
+            segment_type=SegmentType.MARK, points=[(0.0, 0.0), (0.0, 2.0)], speed=0.35,
+            source_entity="LINE_A", metadata={"geometry_type": "LINE", "line_like": True},
+        )
+        b = PathSegment(
+            segment_type=SegmentType.MARK, points=[(5.0, 0.0), (5.0, 2.0)], speed=0.35,
+            source_entity="LINE_B", metadata={"geometry_type": "LINE", "line_like": True},
+        )
+        eng = PathEngine(optimize_order=False, mark_spacing=0.05, group_shapes=False)
+        plan = eng.plan_segments([a, b])
+        assert sum(1 for s in plan.segments
+                   if s.segment_type == SegmentType.MARK) == 2
+        assert plan.planning_metadata["duplicate_geometry"]["removed"] == 0
+
+    def test_operator_is_warned(self):
+        line = PathSegment(
+            segment_type=SegmentType.MARK, points=[(0.0, 0.0), (0.0, 2.0)], speed=0.35,
+            source_entity="LINE_A", metadata={"geometry_type": "LINE", "line_like": True},
+        )
+        clone = PathSegment(
+            segment_type=SegmentType.MARK, points=[(0.0, 0.0), (0.0, 2.0)], speed=0.35,
+            source_entity="LINE_B", metadata={"geometry_type": "LINE", "line_like": True},
+        )
+        from path_engine.validator import PathValidator
+        eng = PathEngine(optimize_order=False, mark_spacing=0.05, group_shapes=False)
+        warnings = PathValidator().validate(eng.plan_segments([line, clone]))
+        assert any("duplicate line" in w for w in warnings)
+
+
+class TestRetraceSuppression:
+    """A run-out must never be followed by a connector that drives straight back over it.
+
+    Two runs meeting end-to-start is normally fine — a square's corners meet that way and
+    the extensions leave PERPENDICULAR to each other, giving a wide turn. But when the two
+    runs are COLLINEAR at the junction, the run-out leaves along the very line the run-in
+    approaches on, and the connector can only double back:
+
+        sct_1.5m: edge1 ends at (1.5, 3.0); CIRCLE_63 starts there, tangentially
+          AFT  (1.5,3.0) -> (1.0,3.0)
+          CONN (1.0,3.0) -> (2.0,3.0)    retraces it
+          PRE  (2.0,3.0) -> (1.5,3.0)    retraces again
+
+    The test is on DIRECTION, not on a shared point: perpendicular -> keep, collinear -> drop.
+    """
+
+    def test_collinear_junction_drops_the_extensions(self):
+        """Two collinear segments end-to-end: no run-out/run-in between them."""
+        a = PathSegment(
+            segment_type=SegmentType.MARK, points=[(0.0, 0.0), (0.0, 2.0)], speed=0.35,
+            source_entity="LINE_A", metadata={"geometry_type": "LINE", "line_like": True},
+        )
+        b = PathSegment(
+            segment_type=SegmentType.MARK, points=[(0.0, 2.0), (0.0, 4.0)], speed=0.35,
+            source_entity="LINE_B", metadata={"geometry_type": "LINE", "line_like": True},
+        )
+        eng = PathEngine(enable_path_extensions=True, per_line_extensions=True,
+                         pre_extension_m=0.5, aft_extension_m=0.5,
+                         optimize_order=False, mark_spacing=0.05, group_shapes=False)
+        plan = eng.plan_segments([a, b])
+        roles = [s.metadata.get("extension_role") for s in plan.segments]
+        assert roles.count("pre") == 1     # only the very start of the run
+        assert roles.count("aft") == 1     # only the very end
+        wps = plan.merged_waypoints
+        for i in range(1, len(wps) - 1):
+            ax, ay = wps[i][0] - wps[i - 1][0], wps[i][1] - wps[i - 1][1]
+            bx, by = wps[i + 1][0] - wps[i][0], wps[i + 1][1] - wps[i][1]
+            la, lb = math.hypot(ax, ay), math.hypot(bx, by)
+            if la < 1e-9 or lb < 1e-9:
+                continue
+            dot = max(-1.0, min(1.0, (ax * bx + ay * by) / (la * lb)))
+            assert math.degrees(math.acos(dot)) < 170.0, "the rover retraces itself"
+
+    def test_perpendicular_corner_keeps_per_line(self):
+        """A square's corner is NOT a retrace — every edge must keep its own pass.
+
+        This is the guard against 'fixing' retraces by quietly deleting per-line, which
+        is what a naive shared-endpoint test does.
+        """
+        c = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0)]
+        square = [
+            PathSegment(
+                segment_type=SegmentType.MARK, points=[c[i], c[i + 1]], speed=0.35,
+                source_entity=f"LINE_{i}",
+                metadata={"geometry_type": "LINE", "line_like": True},
+            )
+            for i in range(4)
+        ]
+        eng = PathEngine(enable_path_extensions=True, per_line_extensions=True,
+                         pre_extension_m=0.5, aft_extension_m=0.5,
+                         optimize_order=True, mark_spacing=0.05)
+        plan = eng.plan_segments(square)
+        roles = [s.metadata.get("extension_role") for s in plan.segments]
+        marks = [s for s in plan.segments if s.segment_type == SegmentType.MARK]
+        assert (roles.count("pre"), len(marks), roles.count("aft")) == (4, 4, 4), (
+            "per-line was silently disabled at the square's corners"
+        )

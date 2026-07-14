@@ -64,7 +64,28 @@ class PathValidator:
         # 7. How far outside the drawing do the extensions reach? (E4)
         self._check_extension_overshoot(plan, warnings)
 
+        # 8. Duplicate geometry dropped from the source drawing.
+        self._check_duplicate_geometry(plan, warnings)
+
         return warnings, errors
+
+    def _check_duplicate_geometry(self, plan: PlannedPath, warnings: list[str]) -> None:
+        """Tell the operator when the DRAWING contained lines on top of each other.
+
+        The planner drops them (marking a line twice paints it double-thick and forces a
+        180 deg reverse between the two passes), but the operator should know their CAD
+        file has them — the next export will have them too.
+        """
+        dup = (plan.planning_metadata or {}).get("duplicate_geometry") or {}
+        n = dup.get("removed", 0)
+        if not n:
+            return
+        srcs = ", ".join(dup.get("sources", [])[:3])
+        more = f" (+{n - 3} more)" if n > 3 else ""
+        warnings.append(
+            f"Dropped {n} duplicate line(s) from the drawing: {srcs}{more}. They sit on "
+            f"top of geometry already being marked — check the source DXF."
+        )
 
     @staticmethod
     def _seg_cross(p1, p2, p3, p4) -> bool:

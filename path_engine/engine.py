@@ -62,6 +62,12 @@ def _point_distance(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.hypot(b[0] - a[0], b[1] - a[1])
 
 
+def _unit_dir(a: tuple[float, float], b: tuple[float, float]) -> tuple[float, float] | None:
+    dn, de = b[0] - a[0], b[1] - a[1]
+    length = math.hypot(dn, de)
+    return (dn / length, de / length) if length > 1e-9 else None
+
+
 def _insert_transit_connectors_between_segments(
     segments: list[PathSegment],
     transit_speed: float,
@@ -669,6 +675,45 @@ class PathEngine:
             segments = smoothed
             smoothing_stats["waypoints_after"] = after
 
+        # Step 1c: Drop MARK entities that are coincident with one already kept.
+        #
+        # CAD files contain duplicate lines. sct_1.5m.DXF has the same (0,0)->(1.5,0)
+        # LINE twice (handles 64 and 67) — drawn once, copied, never noticed. Left in,
+        # the planner faithfully paints it TWICE: mark it, run out past the end, reverse
+        # 180 deg, and mark it again backwards. That is a double-thick line, wasted time,
+        # and the exact reverse-flip the differential rover handles worst.
+        #
+        # Coincident means same endpoints (either direction) within one mark_spacing.
+        duplicate_stats = {"removed": 0, "sources": []}
+        if segments:
+            seen: dict[tuple, str] = {}
+            deduped: list[PathSegment] = []
+            tol = max(self.mark_spacing, 1e-3)
+            for seg in segments:
+                if seg.segment_type != SegmentType.MARK or len(seg.points) < 2:
+                    deduped.append(seg)
+                    continue
+                a = (round(seg.points[0][0] / tol), round(seg.points[0][1] / tol))
+                b = (round(seg.points[-1][0] / tol), round(seg.points[-1][1] / tol))
+                length = round(
+                    sum(math.dist(seg.points[i], seg.points[i + 1])
+                        for i in range(len(seg.points) - 1)) / tol
+                )
+                key = (min(a, b), max(a, b), length)
+                if key in seen:
+                    duplicate_stats["removed"] += 1
+                    duplicate_stats["sources"].append(str(seg.source_entity))
+                    log.warning(
+                        "duplicate geometry: %s is coincident with %s — dropping it. "
+                        "Left in, the rover would mark this line twice (and reverse 180 "
+                        "deg between the two passes).",
+                        seg.source_entity, seen[key],
+                    )
+                    continue
+                seen[key] = str(seg.source_entity)
+                deduped.append(seg)
+            segments = deduped
+
         # Step 2: Densify segments  (E1 fix: renumbered — was duplicate "Step 2")
         densified: list[PathSegment] = []
         for seg in segments:
@@ -806,13 +851,55 @@ class PathEngine:
             ]
             mark_polys = {i: list(decomposed[i].points) for i in mark_idx}
 
+            # Suppress the run-out/run-in at a junction where they would RETRACE.
+            #
+            # Two runs meeting end-to-start is normally fine — a square's corners meet
+            # that way, and the run-out/run-in leave perpendicular to each other, giving
+            # a wide (135 deg) turn the rover drives around. That is the intended cost of
+            # per-line and must be kept.
+            #
+            # But when the two runs are COLLINEAR at the junction, the run-out leaves
+            # along the very line the run-in approaches on, and the connector between
+            # them can only double straight back:
+            #
+            #   sct_1.5m: edge1 ends at (1.5, 3.0); CIRCLE_63 starts there, tangentially
+            #     AFT  (1.5,3.0) -> (1.0,3.0)     run-out
+            #     CONN (1.0,3.0) -> (2.0,3.0)     retraces it, and overshoots
+            #     PRE  (2.0,3.0) -> (1.5,3.0)     retraces again
+            #   Two 180 deg reversals to end up exactly where it started.
+            #
+            # The test is on DIRECTION, not merely on a shared point: perpendicular ->
+            # keep (a corner), collinear -> drop (a retrace).
+            _COLLINEAR_DOT = 0.94  # ~20 deg
+
+            def _retraces(a: PathSegment, b: PathSegment) -> bool:
+                if (a.segment_type != SegmentType.MARK
+                        or b.segment_type != SegmentType.MARK
+                        or len(a.points) < 2 or len(b.points) < 2):
+                    return False
+                if _point_distance(a.points[-1], b.points[0]) > _SEGMENT_JOIN_TOL_M:
+                    return False
+                a_out = _unit_dir(a.points[-2], a.points[-1])   # a leaves this way
+                b_in = _unit_dir(b.points[0], b.points[1])      # b is entered this way
+                if a_out is None or b_in is None:
+                    return False
+                return (a_out[0] * b_in[0] + a_out[1] * b_in[1]) > _COLLINEAR_DOT
+
+            def _touches(a: PathSegment, b: PathSegment) -> bool:
+                return _retraces(a, b)
+
             extended: list[PathSegment] = []
             for i, seg in enumerate(decomposed):
                 obstacles = [poly for j, poly in mark_polys.items() if j != i]
+                prev_seg = decomposed[i - 1] if i > 0 else None
+                next_seg = decomposed[i + 1] if i + 1 < len(decomposed) else None
+                joins_prev = prev_seg is not None and _touches(prev_seg, seg)
+                joins_next = next_seg is not None and _touches(seg, next_seg)
+
                 parts = split_mark_segment_with_extensions(
                     seg,
-                    pre_extension_m=self.pre_extension_m,
-                    aft_extension_m=self.aft_extension_m,
+                    pre_extension_m=0.0 if joins_prev else self.pre_extension_m,
+                    aft_extension_m=0.0 if joins_next else self.aft_extension_m,
                     transit_speed=self.transit_speed,
                     suppress_closed_loops=not self.per_line_extensions,
                     obstacles=obstacles,
@@ -1043,6 +1130,7 @@ class PathEngine:
             "final_waypoints": len(merged_waypoints),
             "bbox": bbox,
             "extensions": extension_report,
+            "duplicate_geometry": duplicate_stats,
             "spacing": {
                 "mark_m": self.mark_spacing,
                 "transit_m": self.transit_spacing,

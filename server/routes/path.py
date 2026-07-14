@@ -849,6 +849,22 @@ async def plan_path(req: PathPlanRequest):
         )
         log.warning("/api/path/plan: %s", deprecation_warning)
 
+    # Planner-side spray latency compensation is GONE, not merely defaulted off. The
+    # spray controller node already leads the solenoid at runtime from the rover's ACTUAL
+    # speed (spray_controller_node.py:276); doing it here too shifted the boundary a
+    # further 3.5 cm, so paint began ~9 cm before the CAD line. A client that still asks
+    # for it would silently get that double compensation back, so the field is refused
+    # rather than honoured — the plan always carries the true CAD geometry.
+    spray_compensation_warning = None
+    if req.compensate_spray:
+        spray_compensation_warning = (
+            "Ignored compensate_spray=true: solenoid latency is compensated by the "
+            "spray controller at runtime, from actual speed. Applying it in the planner "
+            "as well double-compensates and starts paint ~9 cm early. The plan marks "
+            "exactly the CAD geometry."
+        )
+        log.warning("/api/path/plan: %s", spray_compensation_warning)
+
     origin = tuple(req.origin) if req.origin else (0.0, 0.0)
     start_position = tuple(req.start_position) if req.start_position else None
     summary_only = not (req.include_waypoints)
@@ -868,7 +884,7 @@ async def plan_path(req: PathPlanRequest):
                 transit_speed=req.transit_speed,
                 layer_mapping=req.layer_mapping,
                 optimize=req.optimize,
-                compensate_spray=req.compensate_spray,
+                compensate_spray=False,   # never: see spray_compensation_warning above
                 # Extension settings are configured per DXF via
                 # GET/POST /api/path/{name}/extensions, then loaded by
                 # PathManager during planning.
@@ -897,8 +913,9 @@ async def plan_path(req: PathPlanRequest):
     except Exception as exc:
         raise HTTPException(422, f"Planning error: {exc}")
 
-    if deprecation_warning:
-        result["warnings"] = list(result.get("warnings") or []) + [deprecation_warning]
+    extra_warnings = [w for w in (deprecation_warning, spray_compensation_warning) if w]
+    if extra_warnings:
+        result["warnings"] = list(result.get("warnings") or []) + extra_warnings
 
     alignment_meta = result.get("alignment_metadata") or {}
 
@@ -1341,7 +1358,7 @@ async def plan_and_stage(name: str, req: PathPlanRequest):
                 transit_speed=req.transit_speed,
                 layer_mapping=req.layer_mapping,
                 optimize=req.optimize,
-                compensate_spray=req.compensate_spray,
+                compensate_spray=False,   # never: see spray_compensation_warning above
                 corner_smooth_radius_m=req.corner_smooth_radius_m,
                 corner_smooth_arc_pts=req.corner_smooth_arc_pts,
                 use_two_opt=req.use_two_opt,
