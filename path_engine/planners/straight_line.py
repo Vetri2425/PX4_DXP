@@ -35,7 +35,18 @@ def densify_line(
     if length < 1e-9:
         return [start]
 
-    n_steps = max(2, int(math.ceil(length / spacing)) + 1)
+    # The epsilon makes densification IDEMPOTENT, which the pipeline relies on:
+    # extension run-ups get densified once when they are built and again in the
+    # re-densify pass, and TRANSIT connectors can be densified more than once.
+    #
+    # Without it, re-densifying an already-5cm-spaced line halves every interval.
+    # An interval that is *exactly* `spacing` accumulates float error into
+    # length = 0.050000000000000003, so ceil(length/spacing) = ceil(1.0000000000000007)
+    # = 2 instead of 1, and each 5cm step is split into two 2.5cm steps. Subtracting
+    # a relative epsilon before the ceil absorbs that noise without affecting any
+    # interval that genuinely exceeds the spacing.
+    n_intervals = max(1, int(math.ceil(length / spacing - 1e-9)))
+    n_steps = n_intervals + 1
     pts: list[tuple[float, float]] = []
     for i in range(n_steps):
         t = i / (n_steps - 1)

@@ -136,6 +136,7 @@ def optimize_segment_order(
     use_two_opt: bool = True,
     max_two_opt_segments: int = 80,
     stats: dict | None = None,
+    insert_transits: bool = True,
 ) -> list[PathSegment]:
     """Reorder MARK segments using nearest-neighbor heuristic with endpoint reversal.
 
@@ -143,18 +144,28 @@ def optimize_segment_order(
     If the nearest approach is via the segment's end point, the segment's
     point order is reversed so the rover enters from that end.
 
-    Inserts TRANSIT segments between consecutive MARK segments with
-    spray_on=False and speed=transit_speed.
-
     Args:
         segments: Input segments (MARK and TRANSIT).
         start_position: Rover starting (north, east) position. If None,
                         starts from the first segment's start point.
         transit_speed: Speed for inserted TRANSIT segments (m/s).
+        insert_transits: Emit TRANSIT links between consecutive MARK segments.
+
+            Set False when the caller is going to wrap each MARK in PRE/AFT
+            extensions afterwards. A transit link generated *here* connects the
+            ORIGINAL mark endpoints, and once extensions are added it no longer
+            reaches them — the rover then has to drive out along the AFT, reverse
+            180 deg back over it to the original endpoint to pick up the stale
+            transit, cross to the next mark, overshoot it along its PRE, and
+            reverse 180 deg again. Two pointless reversals per transition, with
+            the run-up/run-out exactly cancelled.
+
+            With this False the caller inserts the connectors *after* extension,
+            so travel runs AFT-tip -> next PRE-start directly.
 
     Returns:
-        Reordered segments with TRANSIT segments inserted between MARK segments.
-        MARK segments may have their point order reversed for optimal traversal.
+        Reordered MARK segments (point order possibly reversed), with TRANSIT
+        links inserted between them iff `insert_transits`.
     """
     mark_segments = [s for s in segments if s.segment_type == SegmentType.MARK]
     if not mark_segments:
@@ -174,7 +185,11 @@ def optimize_segment_order(
         if should_reverse:
             seg = _reverse_segment(seg)
 
-        result = _insert_transits([seg], start_position, transit_speed, include_start_transit=True)
+        result = (
+            _insert_transits([seg], start_position, transit_speed,
+                             include_start_transit=True)
+            if insert_transits else [seg]
+        )
         if stats is not None:
             cost = _deadhead_cost([seg], start_position)
             stats.update({
@@ -253,4 +268,6 @@ def optimize_segment_order(
             "max_two_opt_segments": max_two_opt_segments,
         })
 
+    if not insert_transits:
+        return route
     return _insert_transits(route, start_position, transit_speed, include_start_transit=False)

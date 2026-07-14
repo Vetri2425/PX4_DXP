@@ -1331,26 +1331,63 @@ class TestPerLineExtensions:
             for i, (a, b) in enumerate(edges)
         ]
 
-    def test_engine_per_line_square_gives_four_passes(self):
+    def test_engine_per_line_square_extends_chain_ends_only(self):
+        """A closed square gets ONE run-up and ONE run-out — not one per edge.
+
+        This previously asserted (pre, mark, aft) == (4, 4, 4): every edge got its own
+        PRE *and* AFT. That is the defect. At each SHARED vertex it put a run-out and a
+        run-in back to back, so the rover drove 0.5 m past the corner, reversed through
+        135°, and came back to a point 0.5 m before the next edge — an out-and-back spur
+        at every corner, and the geometry the differential rover could not track (the
+        d82317d field failure). On square_2m it cost 77% extra driving.
+
+        Correct policy: the chain's two true open ends are extended; interior vertices
+        are left alone so consecutive edges meet and the rover simply pivots. The closed
+        square still gains the tangential run-up/run-out it never had under the legacy
+        closed-loop suppression (where it started marking from a dead stop, spray on).
+        """
         eng = PathEngine(enable_path_extensions=True, pre_extension_m=0.5,
                          aft_extension_m=0.5, per_line_extensions=True,
                          compensate_spray=False, optimize_order=False)
         plan = eng.plan_segments(self._square_segs())
+
         pre = sum(1 for s in plan.segments if s.metadata.get("extension_role") == "pre")
         aft = sum(1 for s in plan.segments if s.metadata.get("extension_role") == "aft")
         mark = sum(1 for s in plan.segments
                    if s.segment_type == SegmentType.MARK
                    and not s.metadata.get("extension_role"))
-        assert (pre, mark, aft) == (4, 4, 4)
+        assert (pre, mark, aft) == (1, 4, 1)
+
+        # The spur signature: an out-and-back stitch between an AFT and the next PRE.
+        assert not any(s.metadata.get("extension_connector") for s in plan.segments)
+
+        # ...and therefore no >100° reversal anywhere (a square's own corners are 90°).
+        wps = plan.merged_waypoints
+        for i in range(1, len(wps) - 1):
+            ax, ay = wps[i][0] - wps[i - 1][0], wps[i][1] - wps[i - 1][1]
+            bx, by = wps[i + 1][0] - wps[i][0], wps[i + 1][1] - wps[i][1]
+            la, lb = math.hypot(ax, ay), math.hypot(bx, by)
+            if la < 1e-9 or lb < 1e-9:
+                continue
+            dot = max(-1.0, min(1.0, (ax * bx + ay * by) / (la * lb)))
+            assert math.degrees(math.acos(dot)) <= 100.0
 
     def test_engine_per_line_spray_flags_off_on_off(self):
+        """Spray toggles once ON at the mark start and once OFF at the mark end.
+
+        Previously asserted 8 toggles (off→on→off per edge), which only held because
+        every edge carried its own PRE/AFT. With the chain extended at its ends only,
+        the four edges are one contiguous sprayed run: OFF (run-up) → ON → OFF (run-out).
+        """
         eng = PathEngine(enable_path_extensions=True, per_line_extensions=True,
                          compensate_spray=False, optimize_order=False)
         plan = eng.plan_segments(self._square_segs())
-        # 4 lines → exactly 8 spray toggles (off→on then on→off per line).
         toggles = sum(1 for a, b in zip(plan.spray_flags, plan.spray_flags[1:]) if a != b)
-        assert toggles == 8
+        assert toggles == 2
         assert any(plan.spray_flags) and not all(plan.spray_flags)
+        # Spray must be OFF on the run-up and OFF on the run-out.
+        assert plan.spray_flags[0] is False
+        assert plan.spray_flags[-1] is False
 
     def test_engine_per_line_densifies_runups_at_mark_spacing(self):
         eng = PathEngine(enable_path_extensions=True, pre_extension_m=0.5,
@@ -1369,3 +1406,169 @@ class TestPerLineExtensions:
                          compensate_spray=False, optimize_order=False)
         plan = eng.plan_segments(self._square_segs())
         assert not any(s.metadata.get("extension_role") for s in plan.segments)
+
+
+class TestInterEntityTransitRouting:
+    """The transit between two entities must leave from the AFT tip and arrive at
+    the next PRE start — never from the original mark endpoints.
+
+    The bug: `optimize_segment_order` generated its TRANSIT links in Step 3, wiring
+    the ORIGINAL mark endpoints together. Step 4 then wrapped each mark in PRE/AFT,
+    which left those links connected to nothing, and the connector pass could only
+    reconcile them by driving the rover BACKWARDS over its own AFT:
+
+        circle MARK ends (1.00, 1.95)
+        AFT out to       (1.50, 1.95)
+        <<< 180 deg
+        back to          (1.00, 1.95)   <- retraces the AFT, cancelling it
+        transit to       (0.00, 0.00)   <- the stale link, from the ORIGINAL endpoint
+        overshoot to     (0.00,-0.50)
+        <<< 180 deg
+        back to          (0.00, 0.00)   <- that was the "PRE"
+        square MARK begins
+
+    Two pointless 180 deg reversals per transition, and the run-up/run-out exactly
+    cancelled — the rover still entered every spray boundary from a standstill, which
+    is the one thing extensions exist to prevent.
+
+    Fix: Step 3 withholds its transit links when extensions are on, so the connector
+    pass runs AFT-tip -> next-PRE-start directly.
+    """
+
+    @staticmethod
+    def _two_separate_lines() -> list[PathSegment]:
+        # Two parallel lines, far apart: the rover must deadhead between them.
+        return [
+            PathSegment(
+                segment_type=SegmentType.MARK,
+                points=[(0.0, 0.0), (2.0, 0.0)],
+                speed=0.35,
+                source_entity="LINE_A",
+                metadata={"geometry_type": "LINE", "line_like": True},
+            ),
+            PathSegment(
+                segment_type=SegmentType.MARK,
+                points=[(0.0, 5.0), (2.0, 5.0)],
+                speed=0.35,
+                source_entity="LINE_B",
+                metadata={"geometry_type": "LINE", "line_like": True},
+            ),
+        ]
+
+    def _plan(self):
+        eng = PathEngine(
+            enable_path_extensions=True,
+            pre_extension_m=0.5,
+            aft_extension_m=0.5,
+            per_line_extensions=False,
+            compensate_spray=False,
+            optimize_order=True,
+            mark_spacing=0.05,
+            transit_spacing=0.15,
+        )
+        return eng.plan_segments(self._two_separate_lines())
+
+    def test_no_reversal_between_entities(self):
+        """No near-180 deg turn anywhere: the rover must not double back on itself."""
+        wps = self._plan().merged_waypoints
+        for i in range(1, len(wps) - 1):
+            ax, ay = wps[i][0] - wps[i - 1][0], wps[i][1] - wps[i - 1][1]
+            bx, by = wps[i + 1][0] - wps[i][0], wps[i + 1][1] - wps[i][1]
+            la, lb = math.hypot(ax, ay), math.hypot(bx, by)
+            if la < 1e-9 or lb < 1e-9:
+                continue  # zero-length step = deliberate spray-boundary duplicate
+            dot = max(-1.0, min(1.0, (ax * bx + ay * by) / (la * lb)))
+            ang = math.degrees(math.acos(dot))
+            assert ang < 170.0, (
+                f"near-reversal of {ang:.1f} deg at {wps[i]} — the rover is doubling "
+                "back on itself (stale transit link routed before extensions)"
+            )
+
+    def test_transit_leaves_from_aft_tip_not_the_mark_endpoint(self):
+        """The connector must start where the AFT ends, not where the MARK ended."""
+        plan = self._plan()
+        segs = plan.segments
+        aft_idx = next(i for i, s in enumerate(segs)
+                       if s.metadata.get("extension_role") == "aft")
+        aft = segs[aft_idx]
+        # The AFT is not the last segment: travel to the next run follows it.
+        assert aft_idx < len(segs) - 1
+        nxt = segs[aft_idx + 1]
+        assert nxt.segment_type == SegmentType.TRANSIT
+        # Contiguous: the connector begins exactly at the AFT tip.
+        assert math.dist(nxt.points[0], aft.points[-1]) < 1e-6, (
+            f"transit starts at {nxt.points[0]} but the AFT ends at {aft.points[-1]} — "
+            "the rover would have to drive back over its own run-out to reach it"
+        )
+
+    def test_transit_arrives_at_the_pre_start(self):
+        """...and it must hand off to the next run's PRE, not overshoot past it."""
+        plan = self._plan()
+        segs = plan.segments
+        pre_idxs = [i for i, s in enumerate(segs)
+                    if s.metadata.get("extension_role") == "pre"]
+        # The second run's PRE is preceded by the inter-run transit.
+        second_pre = pre_idxs[-1]
+        assert second_pre > 0
+        prev = segs[second_pre - 1]
+        assert prev.segment_type == SegmentType.TRANSIT
+        assert math.dist(prev.points[-1], segs[second_pre].points[0]) < 1e-6
+
+    def test_path_is_continuous(self):
+        """Every segment starts where the previous one ended — no teleports."""
+        segs = self._plan().segments
+        for a, b in zip(segs, segs[1:]):
+            assert math.dist(a.points[-1], b.points[0]) < 1e-6, (
+                f"discontinuity: {a.source_entity} ends {a.points[-1]}, "
+                f"{b.source_entity} starts {b.points[0]}"
+            )
+
+
+class TestDensifyIdempotence:
+    """densify must be idempotent: extensions get densified when built AND again in
+    the re-densify pass, and TRANSIT connectors can pass through more than once.
+
+    Without a float guard, an interval that is *exactly* `spacing` accumulates float
+    error to 0.050000000000000003, so ceil(length/spacing) == 2 and every 5 cm step is
+    split into two 2.5 cm steps. On a per-line star this produced 328 spurious gaps.
+    """
+
+    def test_densify_line_is_idempotent(self):
+        from path_engine.planners.straight_line import densify_line
+
+        pts = densify_line((0.0, 0.0), (0.5, 0.0), 0.05)
+        again = []
+        for i in range(len(pts) - 1):
+            chunk = densify_line(pts[i], pts[i + 1], 0.05)
+            again.extend(chunk[1:] if again else chunk)
+        assert len(again) == len(pts), (
+            f"re-densifying split {len(pts)} points into {len(again)} — "
+            "every interval was halved"
+        )
+
+    def test_densify_segment_is_idempotent(self):
+        from path_engine.planners.straight_line import densify_segment
+
+        seg = PathSegment(
+            segment_type=SegmentType.TRANSIT,
+            points=[(0.0, -0.5), (0.0, 0.0)],
+            speed=0.5,
+            source_entity="x:pre",
+            metadata={"extension_role": "pre"},
+        )
+        once = densify_segment(seg, 0.05, 0.05)
+        twice = densify_segment(once, 0.05, 0.05)
+        assert len(twice.points) == len(once.points)
+        gaps = [math.dist(twice.points[i], twice.points[i + 1])
+                for i in range(len(twice.points) - 1)]
+        assert all(abs(g - 0.05) < 1e-9 for g in gaps), f"non-uniform spacing: {set(gaps)}"
+
+    def test_densify_still_honours_spacing(self):
+        """The guard must not under-densify: every interval stays <= spacing."""
+        from path_engine.planners.straight_line import densify_line
+
+        for length in (0.05, 0.10, 0.12, 0.5, 2.0, 1.0 / 3):
+            pts = densify_line((0.0, 0.0), (length, 0.0), 0.05)
+            gaps = [math.dist(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
+            assert max(gaps) <= 0.05 + 1e-9, f"length={length}: max gap {max(gaps)}"
+            assert abs(pts[-1][0] - length) < 1e-12, "endpoint must be exact"

@@ -69,12 +69,18 @@ def _insert_transit_connectors_between_segments(
 ) -> list[PathSegment]:
     """Make all inter-segment travel explicit.
 
-    The final /path topic is a flat polyline, so adjacent segment endpoints that
-    do not touch become real rover motion even if no PathSegment represents the
-    connector.  After extension expansion, those gaps can occur between
-    aft-extension and pre-extension chunks.  Insert explicit TRANSIT segments so
-    the geometry, spray flags, segment metadata, and transit length all describe
-    the same trajectory.
+    The final /path topic is a flat polyline, so adjacent segment endpoints that do
+    not touch become real rover motion even if no PathSegment represents the
+    connector. Insert explicit TRANSIT segments so the geometry, spray flags, segment
+    metadata, and transit length all describe the same trajectory.
+
+    With extensions enabled this is the ONLY routing pass: Step 3 withholds the
+    optimizer's transit links (see its `insert_transits` arg) so that by the time we
+    get here every run is already [PRE, MARK, AFT], and the connector we emit
+    therefore spans AFT-tip -> next PRE-start. Previously the optimizer's links were
+    generated first, against the ORIGINAL mark endpoints, and this pass could only
+    reconcile them by driving the rover back over its own AFT — two 180 deg reversals
+    per transition, with the run-up/run-out exactly cancelled.
     """
     if len(segments) < 2:
         return list(segments)
@@ -660,6 +666,14 @@ class PathEngine:
             resolved_start = self._resolve_start_position(densified, origin, start_position)
 
         # Step 3: Optimize segment order (nearest-neighbor TSP with endpoint reversal)
+        #
+        # When extensions are enabled we deliberately DO NOT let the optimizer emit its
+        # transit links here. Those links connect the ORIGINAL mark endpoints, but Step 4
+        # is about to wrap each mark in PRE/AFT — after which the links no longer reach
+        # anything, and the connector pass can only patch the gap by driving the rover
+        # backwards over its own AFT (two 180 deg reversals per transition, run-up and
+        # run-out exactly cancelled). Deferring transit generation until after extension
+        # lets travel run AFT-tip -> next PRE-start directly.
         optimization_stats = {}
         if self.optimize_order and any(s.segment_type == SegmentType.MARK for s in densified):
             ordered = optimize_segment_order(
@@ -669,6 +683,7 @@ class PathEngine:
                 use_two_opt=self.use_two_opt,
                 max_two_opt_segments=self.max_two_opt_segments,
                 stats=optimization_stats,
+                insert_transits=not self.enable_path_extensions,
             )
         else:
             ordered = densified
@@ -696,34 +711,38 @@ class PathEngine:
         if self.enable_path_extensions:
             extended: list[PathSegment] = []
             for seg in ordered:
-                # per-line mode: explode a composite line-chain (square / rect /
-                # polygon / L-shape perimeter) into its individual edges so each
-                # CAD line gets its OWN PRE/MARK/AFT, even on a closed shape.
-                # Legacy (vertex-anchored) mode leaves the chain whole and the
-                # closed-loop guard suppresses extensions — byte-identical to before.
+                # per-line mode explodes a composite line-chain (square / rect / polygon
+                # / L perimeter) into its individual edges. That is what lets a *closed*
+                # shape be extended at all: the closed-loop guard suppresses extensions
+                # on an intact loop because it has no free end, which leaves the rover
+                # starting to mark from a dead stop with spray already on.
+                #
+                # But only the chain's TWO TRUE OPEN ENDS get extended. Giving every edge
+                # its own PRE *and* AFT puts a run-out and a run-in back-to-back at each
+                # SHARED vertex, forcing the rover 0.5 m past the corner, through a 135
+                # deg reversal, and back to a point 0.5 m before the next edge — an
+                # out-and-back spur at every corner. That is the geometry the differential
+                # rover could not track (the d82317d field failure), and on square_2m it
+                # cost 77% extra driving. Consecutive edges must simply meet and pivot.
                 edges = (
                     decompose_line_chain_to_edges(seg)
                     if self.per_line_extensions else [seg]
                 )
-                for edge in edges:
+                last = len(edges) - 1
+                for i, edge in enumerate(edges):
                     parts = split_mark_segment_with_extensions(
                         edge,
-                        pre_extension_m=self.pre_extension_m,
-                        aft_extension_m=self.aft_extension_m,
+                        # Chain start gets the run-up, chain end gets the run-out,
+                        # interior vertices get neither.
+                        pre_extension_m=self.pre_extension_m if i == 0 else 0.0,
+                        aft_extension_m=self.aft_extension_m if i == last else 0.0,
                         transit_speed=self.transit_speed,
                         suppress_closed_loops=not self.per_line_extensions,
                     )
-                    if self.per_line_extensions:
-                        # Densify the spray-OFF PRE/AFT run-ups at MARK spacing
-                        # (0.05 m) so the rover gets a smooth approach/exit, not a
-                        # 2-point jump. MARK edges are already dense.
-                        parts = [
-                            densify_segment(p, self.mark_spacing, self.mark_spacing)
-                            if p.metadata.get("extension_role") in ("pre", "aft")
-                            else p
-                            for p in parts
-                        ]
                     extended.extend(parts)
+            # Travel between runs is inserted HERE, after extension, so each connector
+            # spans AFT-tip -> next PRE-start. Step 3 withheld its own transit links
+            # precisely so this is the only routing pass. Step 5b densifies them.
             ordered = _insert_transit_connectors_between_segments(
                 extended,
                 transit_speed=self.transit_speed,
