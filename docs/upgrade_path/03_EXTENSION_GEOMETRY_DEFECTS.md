@@ -13,6 +13,23 @@
 
 ## Summary
 
+> ### STATUS — patched in `3e41ba5`, deployed to the Jetson, 485 tests pass
+>
+> | # | Defect | Status |
+> |---|---|---|
+> | **E1** | Extensions blind to other geometry | ✅ **FIXED** — 6 crossings → **0** |
+> | **E2** | Extension length not proportional | ✅ **FIXED** — worst 7.4× → **0.92×** |
+> | **E3** | Connectors not paint-aware | ⚠️ **NOT FIXED — now WARNED** (5 remain) |
+> | **E4** | Swept footprint never reported | ✅ **REPORTED** — metadata + operator warning |
+> | **E5** | Connectors sampled at `transit_spacing` | ✅ **FIXED** — 14.9 cm → **5.0 cm** |
+> | **E6** | Overhead | ✅ **IMPROVED** — star +117% → **+92%** |
+>
+> **Live backend, `star_3x3m.dxf`:** the two 10 cm crosshair lines now carry **no extension at
+> all**; swept area 4.00 × 4.00 m vs marked 3.07 × 3.07 m is **reported** (0.47 m overshoot,
+> 4 extensions clamped); marked share of travel 46% → **52%**; near-reversals still **0**.
+>
+> Original findings retained below for the record.
+
 | # | Defect | Severity | Shapes affected |
 |---|---|---|---|
 | **E1** | Extensions are **blind to other geometry** — they cross lines the rover paints | 🔴 **Paint damage** | star (6), sct, square_circle, square_line |
@@ -184,15 +201,39 @@ actually requires. **Fixing E2 and E3 reduces E6 as a side-effect; E6 is not a s
 
 ---
 
-## Suggested order
+## What shipped (`3e41ba5`)
 
-1. **E2** — clamp extension to line length. Cheapest, biggest single win, kills the 7.4× case.
-2. **E1** — make extensions geometry-aware (shorten/drop on collision). Highest severity: it is
-   the one that actually damages paint.
-3. **E3** — make connectors paint-aware.
-4. **E5** — densify connectors at `mark_spacing`. One-line change.
-5. **E4** — report the swept bbox; add a site-boundary check.
-6. **E6** — falls out of 1–3.
+**E1** — every extension is ray-cast against all other MARK polylines
+(`extensions.py::_ray_first_hit`) and shortened to stop `extension_obstacle_clearance_m`
+(10 cm) short of a hit, or dropped if nothing useful survives. Hits within **3 cm of the
+extension's own origin are ignored** — where two entities genuinely *touch* in the drawing the
+rover must cross the junction anyway, and a tangential departure from a discretised curve nicks
+its chord polyline at millimetre scale. The star's real obstructions were 7 cm out and are caught.
+
+**E2** — `pre/aft_extension_m` is now a **ceiling**, not a promise
+(`extensions.py::_clamp_extension`): capped at `extension_max_line_fraction` (0.5) of the line,
+and lines below `extension_min_line_length_m` (0.30 m) get **no extension at all**.
+
+**E5** — `engine.py` Step 5b now densifies `extension_connector` segments at `mark_spacing`,
+same as PRE/AFT.
+
+**E4** — `planning_metadata.extensions` carries `marked_bbox` / `swept_bbox` /
+`max_overshoot_m` / `clamped_extensions`, and `PathValidator` warns.
+
+New knobs on `PathEngine`: `extension_max_line_fraction`, `extension_min_line_length_m`,
+`extension_obstacle_clearance_m`, `extension_min_useful_m`.
+
+## Still open
+
+**E3 — connectors still cross already-laid paint (5 across 4 shapes).** The validator now warns
+with exact coordinates, e.g. on the star:
+
+> *"Rover drives over already-painted lines at 2 point(s): (0.35, -0.02), (1.01, 0.90).
+> Transit routing is not paint-aware — the wheels will cross wet paint."*
+
+The real fix is to **cost crossings in the segment ordering** so the TSP prefers a route that
+avoids finished geometry. That is a change to `optimizers/segment_order.py` and carries a
+routing-regression risk, so it was kept out of this patch rather than rushed into it.
 
 ---
 
