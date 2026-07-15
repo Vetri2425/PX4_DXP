@@ -628,11 +628,13 @@ def test_path_manager_saves_extension_config(tmp_path):
     mgr = PathManager(str(tmp_path))
     saved = mgr.save_extension_config("field.dxf", True, 0.4, 0.6)
 
+    # per_line omitted (None) on a fresh file resolves to the default, now True
+    # (per-entity extensions on every edge/corner).
     assert saved == {
         "enabled": True,
         "pre_extension_m": 0.4,
         "aft_extension_m": 0.6,
-        "per_line": False,
+        "per_line": True,
     }
     assert mgr.load_extension_config("field.dxf") == saved
 
@@ -647,6 +649,26 @@ def test_path_manager_saves_extension_config(tmp_path):
     # explicit False still turns it off
     saved_off = mgr.save_extension_config("field.dxf", True, 0.3, 0.3, per_line=False)
     assert saved_off["per_line"] is False
+
+
+def test_plan_preflight_rejects_oversized_mission(tmp_path):
+    """A drawing that densifies past the waypoint cap fails fast with the
+    actionable message (before the slow full plan), and honours coarser spacing
+    so the operator can follow the message's own advice."""
+    ezdxf = pytest.importorskip("ezdxf")
+    doc = ezdxf.new()
+    doc.header["$INSUNITS"] = 6  # metres
+    doc.modelspace().add_line((0, 0), (600, 0))  # 600 m marking line
+    (tmp_path / "long.dxf").write_bytes(b"")  # placeholder so saveas path exists
+    doc.saveas(str(tmp_path / "long.dxf"))
+
+    mgr = PathManager(str(tmp_path))
+    # Default 5 cm spacing → ~12000 waypoints > 10000 cap → reject fast.
+    with pytest.raises(ValueError, match="Too many waypoints"):
+        mgr.plan_path("long.dxf", summary_only=True)
+    # Coarser 20 cm spacing → ~3000 waypoints → the guard does not fire.
+    result = mgr.plan_path("long.dxf", summary_only=True, line_spacing=0.20)
+    assert result["num_waypoints"] > 0
 
 
 @pytest.mark.anyio

@@ -74,6 +74,20 @@ def test_dxf_entity_is_mark_custom_mapping():
     assert ent.is_mark(layer_mapping={"OUTLINE": "ignore"}) is True  # "ignore" treated as non-transit
 
 
+def test_dxf_entity_annotation_layers_ignored():
+    # Annotation / non-printing layers must never be sprayed by default, so a
+    # design that keeps its dimensions on a DIM layer isn't painted onto the field.
+    for layer in ("DIM", "DIMENSIONS", "DEFPOINTS", "ANNOTATION", "HATCH_FILL"):
+        ent = DXFEntity(entity_type="LINE", layer=layer)
+        assert ent.classify() == "ignore", layer
+    # An explicit layer_mapping still wins (escape hatch to force-spray).
+    forced = DXFEntity(entity_type="LINE", layer="DIM")
+    assert forced.classify(layer_mapping={"DIM": "mark"}) == "mark"
+    # Ordinary marking layers are unaffected.
+    assert DXFEntity(entity_type="LINE", layer="MARKINGS").classify() == "mark"
+    assert DXFEntity(entity_type="LINE", layer="STAR").classify() == "mark"
+
+
 def test_planned_path_defaults():
     plan = PlannedPath()
     assert plan.num_waypoints == 0

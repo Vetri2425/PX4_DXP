@@ -169,6 +169,16 @@ class DXFEntity:
 
         # Default rules
         upper = self.layer.upper()
+        # Non-printing / annotation layers by CAD convention → never sprayed.
+        # Dimension callouts (DIM*), AutoCAD definition points (DEFPOINTS),
+        # annotations (ANNOT*) and hatch fills are design aids, not field
+        # geometry. Without this, a design that keeps its dimensions on a DIM
+        # layer would have the rover paint the dimension lines. An explicit
+        # layer_mapping above still overrides this (e.g. {"DIM": "mark"}).
+        annotation_keywords = ("DIM", "DEFPOINTS", "ANNOT", "HATCH")
+        for kw in annotation_keywords:
+            if kw in upper:
+                return "ignore"
         transit_keywords = ("TRANSIT", "TRAVEL", "MOVE", "RAPID")
         for kw in transit_keywords:
             if kw in upper:
@@ -178,6 +188,45 @@ class DXFEntity:
     def is_mark(self, layer_mapping: dict[str, str] | None = None) -> bool:
         """Classify this entity as MARK (spray on) or TRANSIT (spray off)."""
         return self.classify(layer_mapping) != "transit"
+
+    def approx_length_m(self) -> float:
+        """Cheap arc-length estimate in metres (geometry is already scaled).
+
+        Used for a pre-plan waypoint-count estimate — no densification. Chord
+        sums for polyline/spline undercount curvature slightly, which is safe
+        for a guard (never over-rejects). Unsupported types return 0.0.
+        """
+        g = self.geometry
+        t = self.entity_type
+
+        def _d(a, b) -> float:
+            return math.hypot(a[0] - b[0], a[1] - b[1])
+
+        if t == "LINE":
+            return _d(g.get("start", (0, 0)), g.get("end", (0, 0)))
+        if t == "CIRCLE":
+            return 2 * math.pi * g.get("radius", 0.0)
+        if t == "ARC":
+            sweep = (g.get("end_angle", 360.0) - g.get("start_angle", 0.0)) % 360.0
+            if sweep == 0.0:
+                sweep = 360.0
+            return g.get("radius", 0.0) * math.radians(sweep)
+        if t in ("LWPOLYLINE", "POLYLINE"):
+            vs = g.get("vertices", [])
+            length = sum(_d(vs[i], vs[i + 1]) for i in range(len(vs) - 1))
+            if g.get("closed") and len(vs) > 2:
+                length += _d(vs[-1], vs[0])
+            return length
+        if t == "SPLINE":
+            cps = g.get("control_points", [])
+            return sum(_d(cps[i], cps[i + 1]) for i in range(len(cps) - 1))
+        if t == "ELLIPSE":
+            maj = g.get("major_axis", (0.0, 0.0))
+            a = math.hypot(maj[0], maj[1])
+            b = a * g.get("ratio", 1.0)
+            # Ramanujan full-ellipse perimeter (sweep ignored — safe overshoot).
+            return math.pi * (3 * (a + b) - math.sqrt((3 * a + b) * (a + 3 * b)))
+        return 0.0
 
 
 

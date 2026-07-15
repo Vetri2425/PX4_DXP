@@ -338,13 +338,52 @@ class PathManager:
             pass
         self._preview_cache.pop(fpath, None)
 
+    def _estimate_waypoint_count(
+        self,
+        fpath: str,
+        layer_mapping: dict[str, str] | None,
+        mark_spacing: float,
+        transit_spacing: float,
+    ) -> int:
+        """Cheap pre-plan estimate of the densified waypoint count.
+
+        Parses the DXF (fast) and sums sprayed/transit arc-length ÷ spacing.
+        Ignored (annotation) entities are excluded, matching the planner. This
+        is a lower bound (chord sums undercount curves, extensions add a little)
+        so it never over-rejects a valid mission — the post-plan validator stays
+        authoritative. Returns 0 on any parse issue so a real failure surfaces
+        later with a precise message rather than being masked here.
+        """
+        try:
+            entities = self.parse_dxf(fpath)
+        except Exception:
+            return 0
+        mark_len = 0.0
+        transit_len = 0.0
+        for ent in entities:
+            cls = ent.classify(layer_mapping)
+            if cls == "ignore":
+                continue
+            length = ent.approx_length_m()
+            if cls == "transit":
+                transit_len += length
+            else:
+                mark_len += length
+        ms = max(float(mark_spacing), 1e-3)
+        ts = max(float(transit_spacing), 1e-3)
+        return int(mark_len / ms + transit_len / ts)
+
     def load_extension_config(self, filename: str) -> dict[str, float | bool]:
         """Load saved path extension config for a mission file."""
         default = {
             "enabled": False,
             "pre_extension_m": 0.5,
             "aft_extension_m": 0.5,
-            "per_line": False,
+            # Default per-entity: when extensions are enabled without an explicit
+            # per_line choice, every CAD edge gets its own PRE→MARK→AFT run-up
+            # (each side of a square/polygon and every corner), rather than only a
+            # chain's open ends. Explicitly-saved per_line values still win.
+            "per_line": True,
         }
         fpath = os.path.join(self._dir, os.path.basename(filename))
         sidecar = self._extension_config_path(fpath)
@@ -982,6 +1021,25 @@ class PathManager:
         # optimizer flag, entity overrides, and saved order all come from a
         # single consistent read of the filesystem.
         is_dxf = os.path.splitext(fpath)[1].lower() == ".dxf"
+
+        # Pre-flight guard: reject an obviously-oversized mission from a cheap
+        # length estimate BEFORE the full plan. The planner itself is fast, but
+        # on a CPU-contended companion it runs behind the telemetry/MAVROS event
+        # loop, so planning a 17k-waypoint pitch can exceed the request budget
+        # and surface as an opaque 504 timeout instead of this actionable error.
+        # The estimate uses the caller's spacing, so coarser spacing (the real
+        # fix for a too-dense drawing) is honoured. Authoritative validation
+        # still runs post-plan; this only short-circuits the clear over-limit case.
+        if is_dxf:
+            est_waypoints = self._estimate_waypoint_count(
+                fpath, layer_mapping, line_spacing, transit_spacing
+            )
+            if est_waypoints > int(max_waypoints * 1.1):
+                raise ValueError(
+                    f"Too many waypoints: ~{est_waypoints} exceeds limit {max_waypoints}. "
+                    "Increase spacing, fix units, or simplify the drawing before publishing."
+                )
+
         overrides = self.load_entity_overrides(name) if is_dxf else {}
         saved_order: list[str] = self.load_entity_order(name) if is_dxf else []
         # When the user has committed a manual entity order, the optimizer would
