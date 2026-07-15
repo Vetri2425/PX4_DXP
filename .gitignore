@@ -127,3 +127,6 @@ bags_jet/
 **/analysis.json
 **/analyze.log
 Simple Demo/sample_dxf/videos/
+
+# DXF verification harness generated artifacts (PNGs, MP4s, summaries)
+verification_output/
