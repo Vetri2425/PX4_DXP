@@ -79,8 +79,13 @@ def _install_ros_stubs() -> None:
         def __init__(self):
             self.data = []
 
+    class _String:
+        def __init__(self):
+            self.data = ""
+
     std_msg.Bool = _Bool
     std_msg.Float32MultiArray = _Float32MultiArray
+    std_msg.String = _String
     sys.modules["std_msgs"] = std_msgs
     sys.modules["std_msgs.msg"] = std_msg
 
@@ -114,6 +119,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from spray_controller_node import SprayControllerNode  # noqa: E402
 from std_msgs.msg import Bool  # noqa: E402  (stubbed)
+from spray_fsm import SpraySafetyStateMachine, SprayState  # noqa: E402  (pure, no ROS)
+from spray_session_config import cleared_config  # noqa: E402  (pure, no ROS)
 
 
 # ── Test harness ──────────────────────────────────────────────────────────────
@@ -164,6 +171,18 @@ class _Pub:
 
     def publish(self, msg):
         self.msgs.append(bool(msg.data))
+
+
+class _StringPub:
+    """Publisher stub for /spray/status (std_msgs/String, JSON payload) —
+    kept distinct from _Pub since the recorded value must be the raw string,
+    not a bool-cast of it."""
+
+    def __init__(self):
+        self.msgs = []
+
+    def publish(self, msg):
+        self.msgs.append(msg.data)
 
 
 class _Future:
@@ -224,6 +243,21 @@ class _Cli:
         return fut
 
 
+def _fresh_confirmed_off_fsm() -> SpraySafetyStateMachine:
+    """Build a SpraySafetyStateMachine already past the startup handshake
+    (OFF_UNCONFIRMED -> OFF_PENDING -> OFF_CONFIRMED), entirely through the
+    FSM's own public API — mirrors the real node's startup drive without
+    reaching into FSM internals. Used as the make_node() baseline so
+    existing tests don't need to simulate the boot sequence themselves
+    (matches the old fixture's `_off_confirmed = True` shortcut)."""
+    fsm = SpraySafetyStateMachine()
+    cmd = fsm.tick(desired=False, safety_ok=True, enabled=True, now=0.0)
+    assert cmd is not None and cmd.on is False
+    fsm.on_ack(cmd.seq, True, now=0.0)
+    assert fsm.state == SprayState.OFF_CONFIRMED
+    return fsm
+
+
 def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node = SprayControllerNode.__new__(SprayControllerNode)
     node._params = {
@@ -265,11 +299,11 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._commanded_pub = _Pub()
     node._debug_pub = _Pub()
     node._manual_state_pub = _Pub()
+    node._status_pub = _StringPub()
     node._desired_raw = False
     node._candidate = None
     node._candidate_count = 0
     node._desired_debounced = False
-    node._commanded = False
     node._last_active_time = None
     node._legacy_active_raw = False
     node._manual_active = False
@@ -277,10 +311,14 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._armed = armed
     node._mode = mode
     node._service_ready = True
-    node._off_confirmed = True
-    node._last_off_send_time_ns = None
-    node._cmd_seq = 0
+    # Actuator FSM (Spray Controller V2 §4), pre-advanced past the startup
+    # OFF handshake so tests start from a known-confirmed-off baseline —
+    # replaces the old _commanded/_off_confirmed/_cmd_seq bookkeeping.
+    node._fsm = _fresh_confirmed_off_fsm()
     node._path_model = None
+    node._session_config = cleared_config()
+    node._config_fingerprint = node._session_config.path_fingerprint()
+    node._last_decision = None
     node._pose_ned = None
     node._pose_recv_time = None
     node._vel_ned = (0.0, 0.0)
@@ -310,7 +348,7 @@ def test_manual_on_commands_actuator_and_sets_deadline():
     node._manual_cb(_bool_msg(True))
     assert node._manual_active is True
     assert node._manual_deadline_ns == node._clock.ns + 10_000_000_000
-    assert node._commanded is True
+    assert node._fsm.commanded is True
     assert _last_param1(node) == 1.0
     assert node._manual_state_pub.msgs[-1] is True
 
@@ -319,7 +357,7 @@ def test_manual_on_rejected_when_disarmed():
     node = make_node(armed=False)
     node._manual_cb(_bool_msg(True))
     assert node._manual_active is False
-    assert node._commanded is False
+    assert node._fsm.commanded is False
     assert all(p.param1 != 1.0 for p in node._command_cli.requests)
 
 
@@ -329,7 +367,7 @@ def test_spray_disabled_blocks_manual_on():
     node._params["spray_enabled"] = _Param(False)
     node._manual_cb(_bool_msg(True))
     assert node._manual_active is False
-    assert node._commanded is False
+    assert node._fsm.commanded is False
     assert all(p.param1 != 1.0 for p in node._command_cli.requests)
 
 
@@ -346,7 +384,7 @@ def test_spray_enabled_allows_manual_on():
     node._params["spray_enabled"] = _Param(True)
     node._manual_cb(_bool_msg(True))
     assert node._manual_active is True
-    assert node._commanded is True
+    assert node._fsm.commanded is True
 
 
 def test_manual_on_allowed_when_not_offboard():
@@ -354,7 +392,7 @@ def test_manual_on_allowed_when_not_offboard():
     node = make_node(mode="MANUAL", require_offboard=True)
     node._manual_cb(_bool_msg(True))
     assert node._manual_active is True
-    assert node._commanded is True
+    assert node._fsm.commanded is True
     assert _last_param1(node) == 1.0
 
 
@@ -363,7 +401,7 @@ def test_manual_off_cancels_and_reverts_to_auto_off():
     node._manual_cb(_bool_msg(True))
     node._manual_cb(_bool_msg(False))
     assert node._manual_active is False
-    assert node._commanded is False
+    assert node._fsm.commanded is False
     assert _last_param1(node) == -1.0
 
 
@@ -373,7 +411,7 @@ def test_manual_expires_via_watchdog():
     node._clock.ns += 10_500_000_000  # past the 10 s deadline
     node._watchdog_tick()
     assert node._manual_active is False
-    assert node._commanded is False
+    assert node._fsm.commanded is False
     assert _last_param1(node) == -1.0
 
 
@@ -381,22 +419,22 @@ def test_manual_survives_spray_active_staleness():
     node = make_node()
     node._active_cb(_bool_msg(False))  # auto stream alive, desires OFF
     node._manual_cb(_bool_msg(True))
-    assert node._commanded is True
+    assert node._fsm.commanded is True
     node._clock.ns += 1_000_000_000  # /spray/active now stale (>0.5 s)
     node._watchdog_tick()
     # Staleness clears the auto desire but not the (self-timed) manual hold.
     assert node._manual_active is True
-    assert node._commanded is True
+    assert node._fsm.commanded is True
 
 
 def test_disarm_failsafe_outranks_manual():
     node = make_node()
     node._manual_cb(_bool_msg(True))
-    assert node._commanded is True
+    assert node._fsm.commanded is True
     state = types.SimpleNamespace(armed=False, mode="OFFBOARD")
     node._state_cb(state)
     assert node._manual_active is False
-    assert node._commanded is False
+    assert node._fsm.commanded is False
     assert _last_param1(node) == -1.0
 
 
@@ -405,9 +443,9 @@ def test_auto_stream_off_does_not_override_manual_on():
     node._manual_cb(_bool_msg(True))
     for _ in range(5):
         node._active_cb(_bool_msg(False))  # RPP keeps saying TRANSIT
-    assert node._commanded is True  # manual still wins
+    assert node._fsm.commanded is True  # manual still wins
     node._manual_cb(_bool_msg(False))
-    assert node._commanded is False
+    assert node._fsm.commanded is False
 
 
 def test_shutdown_clears_manual_and_sends_off():

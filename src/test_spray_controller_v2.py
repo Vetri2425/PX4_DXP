@@ -11,6 +11,7 @@ import types
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from test_spray_manual_override import _Cli, _Param, _bool_msg, make_node  # noqa: E402
+import spray_controller_node as scn  # noqa: E402  (for monkeypatching time.monotonic)
 from spray_controller_node import (  # noqa: E402
     MARK_TO_TRANSIT,
     TRANSIT_TO_MARK,
@@ -19,6 +20,7 @@ from spray_controller_node import (  # noqa: E402
     _nozzle_position_ned,
     _project_onto_path,
 )
+from spray_fsm import SpraySafetyStateMachine, SprayState  # noqa: E402  (pure, no ROS)
 
 
 def _straight_mark_path():
@@ -196,31 +198,91 @@ def test_fallback_to_spray_active_when_distance_aware_disabled():
     node._active_cb(_bool_msg(True))
 
     assert node._desired_debounced is True
-    assert node._commanded is True
+    assert node._fsm.commanded is True
     assert node._command_cli.requests[-1].param1 == 1.0
 
 
-def test_off_retry_does_not_mark_off_until_confirmed():
+def test_off_retry_after_failure_reaches_off_confirmed_via_recovery():
+    """Supersedes the old _commanded/_off_confirmed boolean version of this
+    test (which poked _force_off/_send_command directly — both deleted).
+    A failed OFF ack must not be silently treated as confirmed-off: the FSM
+    enters RECOVERY and retries once its backoff deadline elapses (plan
+    §4). Intent preserved: /spray/state must never report True during the
+    retry window, and the actuator is only reported off-confirmed once a
+    retry actually succeeds. Drives the OFF via a normal desired-off
+    transition (manual cancel) so safety_ok stays True throughout and the
+    RECOVERY backoff path (not the safety-loss bypass — see
+    test_disarm_safety_loss_forces_off_every_tick_bypassing_backoff below)
+    is what's actually exercised."""
     node = make_node()
-    node._commanded = True
-    node._off_confirmed = True
-    node._publish_state(True)
-    node._command_cli = _Cli(responses=[(False, 99), True])
+    node._manual_cb(_bool_msg(True))  # reach ON_CONFIRMED
+    assert node._fsm.state == SprayState.ON_CONFIRMED
 
-    node._force_off("test failure")
+    fake_time = [1000.0]
+    original_monotonic = scn.time.monotonic
+    scn.time.monotonic = lambda: fake_time[0]
+    try:
+        node._command_cli = _Cli(responses=[(False, 99), True])
+        node._manual_cb(_bool_msg(False))  # OFF dispatch; first ack fails
 
-    assert len(node._command_cli.requests) == 1
-    assert node._commanded is True
-    assert node._off_confirmed is False
-    assert node._state_pub.msgs[-1] is True
+        assert len(node._command_cli.requests) == 1
+        assert node._fsm.state == SprayState.RECOVERY
+        assert node._fsm.spraying is False
+        assert node._state_pub.msgs[-1] is False
 
-    node._clock.ns += 600_000_000
-    node._reassert_tick()
+        fake_time[0] += 0.6  # past the 0.5s first-attempt RECOVERY backoff
+        node._reassert_tick()
 
-    assert len(node._command_cli.requests) == 2
-    assert node._commanded is False
-    assert node._off_confirmed is True
-    assert node._state_pub.msgs[-1] is False
+        assert len(node._command_cli.requests) == 2
+        assert node._fsm.state == SprayState.OFF_CONFIRMED
+        assert node._state_pub.msgs[-1] is False
+    finally:
+        scn.time.monotonic = original_monotonic
+
+
+def test_disarm_safety_loss_forces_off_then_stays_quiet_and_honors_backoff():
+    """Safety loss (disarm) forces OFF immediately on the edge, but a
+    SUSTAINED unsafe condition must NOT re-dispatch a forced OFF every tick.
+    Regression guard for the ~50 Hz /mavros/cmd/command flood a disarmed
+    rover would otherwise generate: once OFF is confirmed the FSM is quiet,
+    and a failed OFF honors the RECOVERY backoff instead of hammering."""
+    node = make_node()
+    node._manual_cb(_bool_msg(True))
+    assert node._fsm.state == SprayState.ON_CONFIRMED
+
+    fake_time = [1000.0]
+    original_monotonic = scn.time.monotonic
+    scn.time.monotonic = lambda: fake_time[0]
+    try:
+        node._command_cli = _Cli(deferred=True)
+        # Disarm: safety-loss edge forces OFF once (dispatch #1).
+        node._state_cb(types.SimpleNamespace(armed=False, mode="OFFBOARD"))
+        assert len(node._command_cli.requests) == 1
+        off_future_1 = node._command_cli.futures[-1]
+        off_future_1.fire(success=False, result=4)  # ack fails -> RECOVERY
+        assert node._fsm.state == SprayState.RECOVERY
+
+        # Still disarmed, NO time advance: backoff not elapsed -> no retry.
+        for _ in range(10):
+            node._reassert_tick()
+        assert len(node._command_cli.requests) == 1, "must not hammer OFF within backoff"
+
+        # Past the 0.5 s first-attempt backoff -> exactly one retry.
+        fake_time[0] += 0.6
+        node._reassert_tick()
+        assert len(node._command_cli.requests) == 2
+        node._command_cli.futures[-1].fire(success=True)
+        assert node._fsm.state == SprayState.OFF_CONFIRMED
+
+        # Confirmed OFF while still disarmed: sustained-unsafe ticks stay
+        # silent (the anti-flood guarantee) even as time keeps advancing.
+        for _ in range(20):
+            fake_time[0] += 0.1
+            node._reassert_tick()
+        assert len(node._command_cli.requests) == 2, "must stay quiet once OFF confirmed"
+        assert node._fsm.spraying is False
+    finally:
+        scn.time.monotonic = original_monotonic
 
 
 def test_cross_track_gate_forces_off_on_mark_geometry():
@@ -244,7 +306,7 @@ def test_velocity_stale_forces_off():
     node._distance_aware_tick()
 
     assert node._desired_debounced is False
-    assert node._commanded is False
+    assert node._fsm.commanded is False
     assert "velocity stale" in node._last_safety_block_reason
 
 
@@ -254,7 +316,7 @@ def test_min_speed_end_to_end_forces_off():
     node._distance_aware_tick()
 
     assert node._desired_debounced is False
-    assert node._commanded is False
+    assert node._fsm.commanded is False
     assert "below min spray speed" in node._last_safety_block_reason
 
 
@@ -273,11 +335,11 @@ def test_disarm_retains_path_across_sustained_disarm():
     sometimes before arm — clearing it left no model for the armed drive)."""
     node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=1.0)
     node._distance_aware_tick()
-    assert node._commanded is True
+    assert node._fsm.commanded is True
 
     # Disarm edge: spray OFF immediately, but path retained.
     node._state_cb(types.SimpleNamespace(armed=False, mode="OFFBOARD"))
-    assert node._commanded is False
+    assert node._fsm.commanded is False
     assert node._path_model is not None
 
     # Even a long sustained disarm must NOT clear the path now.
@@ -289,7 +351,7 @@ def test_disarm_retains_path_across_sustained_disarm():
 def test_brief_disarm_flap_keeps_path_and_resumes_spray():
     node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=1.0)
     node._distance_aware_tick()
-    assert node._commanded is True
+    assert node._fsm.commanded is True
 
     # Transient single-message disarm then immediate re-arm (State flap).
     node._state_cb(types.SimpleNamespace(armed=False, mode="OFFBOARD"))
@@ -300,7 +362,7 @@ def test_brief_disarm_flap_keeps_path_and_resumes_spray():
     node._pose_recv_time = node.get_clock().now()
     node._vel_recv_time = node.get_clock().now()
     node._distance_aware_tick()
-    assert node._commanded is True
+    assert node._fsm.commanded is True
 
 
 def test_path_published_before_arm_survives_to_drive():
@@ -320,7 +382,7 @@ def test_path_published_before_arm_survives_to_drive():
     node._pose_recv_time = node.get_clock().now()
     node._vel_recv_time = node.get_clock().now()
     node._distance_aware_tick()
-    assert node._commanded is True
+    assert node._fsm.commanded is True
 
 
 def test_xtrack_gate_forces_off_through_tick():
@@ -329,7 +391,7 @@ def test_xtrack_gate_forces_off_through_tick():
     node._pose_recv_time = node.get_clock().now()
     node._distance_aware_tick()
     assert node._desired_debounced is False
-    assert node._commanded is False
+    assert node._fsm.commanded is False
     assert "xtrack error" in node._last_safety_block_reason
 
 
@@ -337,14 +399,13 @@ def test_startup_unconfirmed_off_is_commanded_while_disarmed():
     # Mirrors the __init__ startup state: actuator OFF not yet confirmed.
     node = make_node(armed=False)
     node._params["use_distance_aware_spray"] = _Param(True)
-    node._off_confirmed = False
-    node._commanded = False
+    node._fsm = SpraySafetyStateMachine()  # fresh: OFF_UNCONFIRMED
 
     node._watchdog_tick()
 
     assert node._command_cli.requests
     assert node._command_cli.requests[-1].param1 == -1.0
-    assert node._off_confirmed is True
+    assert node._fsm.state == SprayState.OFF_CONFIRMED
 
 
 def test_boundary_projection_at_transit_mark_vertex_uses_later_segment():
@@ -385,7 +446,7 @@ def test_full_distance_aware_tick_anticipatory_on_and_off():
 
     assert node._desired_pub.msgs[-1] is True
     assert node._commanded_pub.msgs[-1] is True
-    assert node._commanded is True
+    assert node._fsm.commanded is True
 
     node._pose_ned = (2.96, 0.0, 0.0)
     node._pose_recv_time = node.get_clock().now()
@@ -393,79 +454,88 @@ def test_full_distance_aware_tick_anticipatory_on_and_off():
 
     assert node._desired_pub.msgs[-1] is False
     assert node._commanded_pub.msgs[-1] is False
-    assert node._commanded is False
+    assert node._fsm.commanded is False
 
 
 def test_late_on_success_does_not_resurrect_commanded_on():
     # ON dispatched, then OFF supersedes and confirms; the late ON reply must
-    # not flip state back to ON.
+    # not flip state back to ON. Rewritten against the FSM-backed node API
+    # (_send_command no longer exists — the FSM owns dispatch); driven via
+    # manual_cb so an ON_PENDING -> desired(OFF) supersede is reachable
+    # (per the FSM's own transition table, this direction IS supersedable,
+    # unlike OFF_PENDING — see the tests below).
     node = make_node()
     node._command_cli = _Cli(deferred=True)
 
-    node._send_command(True, reason="edge")    # seq=1, commanded optimistic ON
+    node._manual_cb(_bool_msg(True))             # seq=1, ON_PENDING (deferred)
     on_future = node._command_cli.futures[-1]
-    assert node._commanded is True
+    assert node._fsm.state == SprayState.ON_PENDING
 
-    node._send_command(False, reason="edge")   # seq=2 supersedes
+    node._manual_cb(_bool_msg(False))             # seq=2 supersedes: ON_PENDING + desired(OFF) -> OFF_PENDING
     off_future = node._command_cli.futures[-1]
-    off_future.fire(success=True)              # latest OFF confirms
-    assert node._commanded is False
-    assert node._off_confirmed is True
+    off_future.fire(success=True)                 # latest OFF confirms
+    assert node._fsm.state == SprayState.OFF_CONFIRMED
 
-    on_future.fire(success=True)               # stale ON reply — ignored
-    assert node._commanded is False
-    assert node._off_confirmed is True
+    on_future.fire(success=True)                  # stale ON reply — ignored
+    assert node._fsm.state == SprayState.OFF_CONFIRMED
 
 
-def test_late_off_success_does_not_clear_newer_on():
-    # OFF dispatched, then ON supersedes; the late OFF success must not clear
-    # the newer ON state. This is the dangerous direction the guard fixes.
+def test_stale_off_ack_after_newer_on_does_not_clobber_state():
+    # Supersedes test_late_off_success_does_not_clear_newer_on. Note: unlike
+    # ON_PENDING (which the FSM allows a desired-flip to supersede with a
+    # fresh OFF before its ack lands), OFF_PENDING is NOT supersedable — the
+    # FSM's transition table has no "OFF_PENDING + desired(ON)" row, so an
+    # ON is queued behind an in-flight OFF's ack rather than racing ahead of
+    # it (spray_fsm.py). This test therefore drives the OFF to completion
+    # first, then manufactures a stale/duplicate reply for that same
+    # (now-superseded) seq after a newer ON has since been dispatched — the
+    # original hazard this test protects against: a late/duplicate reply
+    # carrying a superseded cmd_seq must never override newer state.
     node = make_node()
     node._command_cli = _Cli(deferred=True)
 
-    node._send_command(False, reason="edge")   # seq=1
+    node._manual_cb(_bool_msg(True))    # seq=1, ON_PENDING (deferred)
+    node._manual_cb(_bool_msg(False))   # seq=2 supersedes -> OFF_PENDING (deferred)
     off_future = node._command_cli.futures[-1]
+    off_future.fire(success=True)
+    assert node._fsm.state == SprayState.OFF_CONFIRMED
 
-    node._send_command(True, reason="edge")    # seq=2, commanded ON
-    assert node._commanded is True
+    node._manual_cb(_bool_msg(True))    # seq=3, newer ON dispatch (deferred)
+    assert node._fsm.state == SprayState.ON_PENDING
 
-    off_future.fire(success=True)              # stale OFF success — ignored
-    assert node._commanded is True
-    assert node._off_confirmed is False
+    off_future.fire(success=True)       # duplicate/late reply for the stale seq=2 — must be ignored
+    assert node._fsm.state == SprayState.ON_PENDING
+    assert node._fsm.commanded is True
+
+    on_future = node._command_cli.futures[-1]
+    on_future.fire(success=True)
+    assert node._fsm.state == SprayState.ON_CONFIRMED
 
 
-def test_failed_off_for_latest_command_triggers_retry():
+def test_stale_exception_reply_ignored_does_not_corrupt_newer_state():
+    # Supersedes test_stale_failed_result_ignored_does_not_corrupt_state. A
+    # stale reply that raises (rather than returning success=False) must
+    # also be ignored via the seq guard — exercises the same INVARIANT 2
+    # guard as the test above, but through the future.result() exception
+    # path in _command_done.
     node = make_node()
-    node._commanded = True
-    node._off_confirmed = True
     node._command_cli = _Cli(deferred=True)
 
-    node._send_command(False, reason="edge")   # latest OFF
+    node._manual_cb(_bool_msg(True))
+    node._manual_cb(_bool_msg(False))   # OFF dispatch (seq=2), deferred
     off_future = node._command_cli.futures[-1]
-    off_future.fire(success=False, result=4)   # rejected
-    assert node._off_confirmed is False         # stays unconfirmed (fail-closed)
-    assert node._commanded is True              # not cleared until confirmed
+    off_future.fire(success=True)
+    assert node._fsm.state == SprayState.OFF_CONFIRMED
 
-    node._clock.ns += 600_000_000               # past 0.5s retry throttle
-    node._reassert_tick()
-    assert len(node._command_cli.requests) == 2  # OFF retried
+    node._manual_cb(_bool_msg(True))    # newer ON dispatch (seq=3), deferred
+    assert node._fsm.state == SprayState.ON_PENDING
+
+    off_future.fire(exc=RuntimeError("late failure"))  # stale exception reply — ignored
+    assert node._fsm.state == SprayState.ON_PENDING
+    assert node._fsm.commanded is True
+
     node._command_cli.futures[-1].fire(success=True)
-    assert node._off_confirmed is True
-    assert node._commanded is False
-
-
-def test_stale_failed_result_ignored_does_not_corrupt_state():
-    node = make_node()
-    node._command_cli = _Cli(deferred=True)
-
-    node._send_command(False, reason="edge")   # seq=1
-    off_future = node._command_cli.futures[-1]
-    node._send_command(True, reason="edge")    # seq=2, commanded ON
-    assert node._commanded is True
-
-    off_future.fire(exc=RuntimeError("late failure"))  # stale failed OFF — ignored
-    assert node._commanded is True
-    assert node._off_confirmed is False
+    assert node._fsm.state == SprayState.ON_CONFIRMED
 
 
 def main():

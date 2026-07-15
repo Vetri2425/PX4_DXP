@@ -14,6 +14,18 @@ shutdown all clear it. While the override is active the /spray/active
 staleness watchdog only clears the *auto* desire (manual has its own timeout
 and does not depend on the RPP stream). Actual override state is reported on
 /spray/manual_state for the server.
+
+Spray Controller V2, Phase A (docs/Architecture/SPRAY_CONTROLLER_V2_PLAN.md,
+Mode 1 / continuous only, behavior-preserving): actuator command state is now
+owned by `spray_fsm.SpraySafetyStateMachine` instead of scattered booleans
+(`_commanded`, `_off_confirmed`, `_cmd_seq`, ad-hoc retry timers), and the
+node maintains an internal `spray_session_config.SpraySessionConfig`
+representation of the mission geometry alongside the existing `_path_model`.
+A new `/spray/status` (std_msgs/String, JSON) publishes a typed
+`spray_status.SpraySessionStatus` snapshot every control tick. All existing
+Mode-1 distance-aware behavior, topics, and ROS params are unchanged, with
+one intended exception: `/spray/state` now reflects a *confirmed* ON only
+(see `_publish_actuator_state`).
 """
 
 from __future__ import annotations
@@ -33,7 +45,15 @@ from geometry_msgs.msg import PoseStamped, TwistStamped
 from mavros_msgs.msg import State
 from mavros_msgs.srv import CommandLong
 from nav_msgs.msg import Path
-from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, String
+
+from spray_fsm import SpraySafetyStateMachine, SprayCommand, SprayState
+from spray_session_config import (
+    SpraySessionConfig,
+    cleared_config,
+    continuous_config_from_path,
+)
+from spray_status import make_status, status_to_json_safe
 
 
 MAV_CMD_DO_SET_ACTUATOR = 187
@@ -376,7 +396,6 @@ class SprayControllerNode(Node):
         self._candidate: Optional[bool] = None
         self._candidate_count = 0
         self._desired_debounced = False
-        self._commanded = False
         self._last_active_time = None
         self._legacy_active_raw = False
         self._manual_active = False
@@ -384,16 +403,25 @@ class SprayControllerNode(Node):
         self._armed = False
         self._mode = "UNKNOWN"
         self._service_ready = False
-        # Actuator state is UNKNOWN at startup — a previous instance may have
-        # left the output ON. Start unconfirmed so the node drives a confirmed
-        # OFF before trusting the believed state (see end of __init__).
-        self._off_confirmed = False
-        self._last_off_send_time_ns: Optional[int] = None
-        # Monotonic command id. Each dispatched command carries the id current
-        # at send time; _command_done ignores any result that is not the latest
-        # so a late/out-of-order MAVROS reply cannot overwrite newer state.
-        self._cmd_seq = 0
+        # Actuator command state machine (Spray Controller V2 §4). Replaces
+        # the scattered _commanded/_off_confirmed/_cmd_seq booleans and the
+        # old flat-500ms retry throttle in _maybe_retry_off/_force_off — the
+        # FSM now owns cmd_seq, RECOVERY backoff, and retry. State starts
+        # OFF_UNCONFIRMED (actuator's real state unknown at boot — a
+        # previous instance may have left the output ON); the FSM will not
+        # accept an ON until a confirmed OFF ack lands (see the startup
+        # drive at the end of __init__).
+        self._fsm = SpraySafetyStateMachine()
         self._path_model: Optional[SprayPathModel] = None
+        # Internal SpraySessionConfig representation (plan §3), kept
+        # alongside _path_model. /path (unchanged) is still the Phase A
+        # ingestion source — there is no /spray/session_config subscription
+        # yet (that lands with dash/point modes); this is purely how the
+        # node represents /path geometry internally now, and gives it a
+        # local fingerprint for future change-detection.
+        self._session_config: SpraySessionConfig = cleared_config()
+        self._config_fingerprint: str = self._session_config.path_fingerprint()
+        self._last_decision: Optional[SprayDecision] = None
         self._pose_ned: Optional[tuple[float, float, float]] = None
         self._pose_recv_time = None
         self._vel_ned = (0.0, 0.0)
@@ -423,6 +451,12 @@ class SprayControllerNode(Node):
         )
         self._manual_state_pub = self.create_publisher(
             Bool, "/spray/manual_state", _best_effort_qos()
+        )
+        # NEW (Phase A telemetry foundation, plan §6): typed JSON status
+        # snapshot. Additive only — none of the five publishers above are
+        # removed or renamed.
+        self._status_pub = self.create_publisher(
+            String, "/spray/status", _best_effort_qos()
         )
         self.create_subscription(
             Bool,
@@ -499,12 +533,15 @@ class SprayControllerNode(Node):
         else:
             self.get_logger().info("Spray backend=mavlink_actuator (normalized -1/+1)")
 
-        self._publish_state(False)
+        self._publish_actuator_state()
         self.get_logger().info("spray_controller started")
-        # Proactively drive the actuator OFF on startup. If the service is not
-        # yet ready, _send_command leaves _off_confirmed False and the watchdog
-        # / service-probe retry path issues the OFF as soon as it appears.
-        self._send_command(False, reason="startup")
+        # Proactively drive the actuator OFF on startup through the FSM
+        # (OFF_UNCONFIRMED -> dispatch OFF -> OFF_CONFIRMED once acked). If
+        # the service is not yet ready, _dispatch_command treats that as an
+        # immediate ack-failure, which the FSM routes into RECOVERY;
+        # _service_probe_tick calls _drive_fsm_tick again once the service
+        # appears, which retries the still-pending OFF.
+        self._drive_fsm_tick("startup")
 
     def _service_probe_tick(self) -> None:
         if self._service_ready:
@@ -512,19 +549,19 @@ class SprayControllerNode(Node):
         if self._command_cli.service_is_ready():
             self._service_ready = True
             self.get_logger().info("spray command service is ready")
-            if not self._off_confirmed:
-                self._maybe_retry_off("service ready startup OFF", force=True)
+            self._drive_fsm_tick("service ready startup OFF")
 
     def _state_cb(self, msg: State) -> None:
-        prev_safe = self._safety_allows_on()
+        was_safe = self._safety_allows_on()
         self._armed = bool(msg.armed)
         self._mode = str(msg.mode)
         now_safe = self._safety_allows_on()
-        if prev_safe and not now_safe:
-            # Safety-loss edge: command OFF immediately (bypass retry throttle).
-            self._force_off("FCU left armed/OFFBOARD safe state", force=True)
-        elif not prev_safe and now_safe and self._desired_debounced:
-            self._commit_desired_state()
+        if was_safe and not now_safe:
+            # Fail-safes outrank the manual override — clear it so spray
+            # cannot resume ON without a fresh, safety-gated manual command.
+            self._manual_active = False
+            self._manual_deadline_ns = None
+        self._drive_fsm_tick("state changed")
 
     def _active_cb(self, msg: Bool) -> None:
         self._last_active_time = self.get_clock().now()
@@ -540,6 +577,9 @@ class SprayControllerNode(Node):
         flags = [p.pose.position.z > 0.5 for p in msg.poses]
         if not points:
             self._path_model = None
+            self._session_config = cleared_config()
+            self._config_fingerprint = self._session_config.path_fingerprint()
+            self._fsm.note_event_reset(time.monotonic())
             self._set_auto_desired(False, source="distance")
             self.get_logger().warn("spray path cleared: received empty /path")
             return
@@ -547,9 +587,19 @@ class SprayControllerNode(Node):
             self._path_model = _build_path_model(points, flags)
         except ValueError as exc:
             self._path_model = None
+            self._session_config = cleared_config()
+            self._config_fingerprint = self._session_config.path_fingerprint()
             self._set_auto_desired(False, source="distance")
             self.get_logger().warn(f"spray path rejected: {exc}")
             return
+        # Internal SpraySessionConfig mirror of the same geometry (plan §3).
+        self._session_config = continuous_config_from_path(points, flags)
+        self._config_fingerprint = self._session_config.path_fingerprint()
+        # A new mission/config load resets the FSM's RECOVERY backoff so a
+        # fresh mission gets a fast first retry rather than inheriting a
+        # stale backoff window left over from whatever happened on the
+        # previous one (plan §4's backoff-reset rule).
+        self._fsm.note_event_reset(time.monotonic())
         self.get_logger().info(
             f"spray path loaded: {len(points)} points, "
             f"{len(self._path_model.boundaries)} boundaries"
@@ -605,7 +655,7 @@ class SprayControllerNode(Node):
                 self.get_logger().info("manual spray override cancelled")
             self._manual_active = False
             self._manual_deadline_ns = None
-        self._commit_desired_state()
+        self._drive_fsm_tick("manual override changed")
         self._publish_manual_state()
 
     def _effective_desired(self) -> bool:
@@ -628,15 +678,16 @@ class SprayControllerNode(Node):
             self._candidate_count += 1
 
         debounce_samples = max(0, int(self.get_parameter("debounce_samples").value))
-        if self._candidate_count < max(1, debounce_samples):
-            return
-        if self._desired_debounced == self._candidate:
-            if self._effective_desired() != self._commanded:
-                self._commit_desired_state()
-            return
+        if self._candidate_count >= max(1, debounce_samples):
+            self._desired_debounced = bool(self._candidate)
 
-        self._desired_debounced = bool(self._candidate)
-        self._commit_desired_state()
+        # Centralized FSM drive point for the auto/legacy desire pipeline —
+        # this runs every distance-aware tick (the node's control-loop
+        # cadence), so the FSM always sees a fresh (desired, safety_ok,
+        # enabled) tuple. Manual overrides and FCU state changes drive the
+        # FSM separately (see _manual_cb / _state_cb) since they bypass this
+        # debounce pipeline entirely.
+        self._drive_fsm_tick("debounce")
 
     def _watchdog_tick(self) -> None:
         # Manual override hard expiry — never latches, independent of /spray/active.
@@ -645,8 +696,16 @@ class SprayControllerNode(Node):
                 self._manual_active = False
                 self._manual_deadline_ns = None
                 self.get_logger().info("manual spray override expired — reverting")
-                self._commit_desired_state()
+                self._drive_fsm_tick("manual expired")
 
+        # Each mode branch drives the FSM exactly once per tick (~50 Hz), so
+        # safety/enable state is enforced every tick in EVERY mode:
+        #   - distance-aware: via _distance_aware_tick -> _apply_debounce
+        #   - disabled:       via _set_auto_desired    -> _apply_debounce
+        #   - legacy:         drives unconditionally at the end of its tick
+        # (this replaced an earlier unconditional drive here that
+        # double-drove — and double-published /spray/status — in the default
+        # distance-aware mode).
         if bool(self.get_parameter("use_distance_aware_spray").value):
             self._distance_aware_tick()
         elif bool(self.get_parameter("allow_legacy_spray_active_fallback").value):
@@ -654,27 +713,25 @@ class SprayControllerNode(Node):
         else:
             self._set_auto_desired(False, source="disabled")
 
-        if not self._safety_allows_on():
-            # Periodic enforcement — throttled so a stuck/failing OFF retries at
-            # the retry cadence rather than flooding MAVROS at the tick rate.
-            self._force_off("safety gate")
         self._publish_manual_state()
 
     def _legacy_active_watchdog_tick(self) -> None:
         timeout_s = max(0.0, float(self.get_parameter("active_timeout_s").value))
+        reason = "legacy watchdog"
         if self._last_active_time is not None:
             age_s = (self.get_clock().now() - self._last_active_time).nanoseconds * 1e-9
-            if age_s > timeout_s:
+            if age_s > timeout_s and not self._manual_active:
+                # Staleness kills the *auto* desire only; an active manual
+                # override has its own timeout and does not depend on RPP.
                 self._desired_raw = False
                 self._desired_debounced = False
                 self._candidate = False
                 self._candidate_count = 0
-                # Staleness kills the *auto* desire only; an active manual
-                # override has its own timeout and does not depend on RPP.
-                if not self._manual_active:
-                    self._force_off(f"/spray/active stale ({age_s:.2f}s)")
-                    self._publish_manual_state()
-                    return
+                reason = f"/spray/active stale ({age_s:.2f}s)"
+        # Drive the FSM every tick (not only when stale): this is the
+        # legacy mode's single per-tick FSM drive, so a spray_enabled=False
+        # disable or any safety loss is enforced within one watchdog tick.
+        self._drive_fsm_tick(reason)
 
     def _distance_aware_tick(self) -> None:
         model = self._path_model
@@ -738,6 +795,10 @@ class SprayControllerNode(Node):
                 float(self.get_parameter("max_xtrack_error_m").value),
             ),
         )
+        # Feeds _fsm_safety_ok() so the FSM's safety_ok input reflects the
+        # full distance-aware gate stack (armed/offboard/path/pose/vel/speed
+        # from _auto_safety_status, plus the xtrack gate folded in above).
+        self._last_decision = decision
         self._publish_debug(decision.debug)
 
         if decision.event and decision.event != self._last_distance_event:
@@ -794,26 +855,17 @@ class SprayControllerNode(Node):
             return False, "below min spray speed"
         return True, ""
 
-    def _reassert_tick(self) -> None:
-        if self._effective_desired() and self._commanded and self._safety_allows_on():
-            self._send_command(True, reason="reassert")
-        elif not self._effective_desired() and not self._off_confirmed:
-            self._maybe_retry_off("OFF reassert")
-
-    def _commit_desired_state(self) -> None:
-        desired = self._effective_desired()
-        self._publish_desired_state(desired)
-        if desired and not self._safety_allows_on():
-            self._force_off("desired ON blocked by safety gate")
-            return
-        if not desired:
-            if self._commanded or not self._off_confirmed:
-                self._maybe_retry_off("desired OFF")
-            return
-        if desired != self._commanded:
-            self._send_command(desired, reason="edge")
-
     def _safety_allows_on(self) -> bool:
+        """Coarse gate: is a *manual* ON request currently honorable at all.
+
+        Kept as its own helper (unchanged from pre-V2) — used by _manual_cb
+        to decide whether to accept a manual ON, and by _reassert_on_command
+        to gate the periodic ON heartbeat. This is deliberately not the same
+        thing as the FSM's `safety_ok` input (see _fsm_safety_ok): this gate
+        includes `spray_enabled`, which the FSM instead receives as its own
+        separate `enabled` input so a disable event is modeled distinctly
+        (-> DISABLED) from a safety-loss event (-> forced OFF + RECOVERY).
+        """
         if not bool(self.get_parameter("spray_enabled").value):
             return False
         if not self._armed:
@@ -827,66 +879,74 @@ class SprayControllerNode(Node):
             return False
         return True
 
-    def _force_off(self, reason: str, force: bool = False) -> None:
-        # Fail-safes outrank the manual override — clear it so spray cannot
-        # come back ON without a fresh, safety-gated manual command.
-        self._manual_active = False
-        self._manual_deadline_ns = None
-        self._publish_desired_state(False)
-        if self._commanded or not self._off_confirmed:
-            self.get_logger().warn(f"forcing spray OFF: {reason}", throttle_duration_sec=1.0)
-            # force=True only on a genuine edge (safety-loss transition,
-            # shutdown). The periodic watchdog call leaves force=False so the
-            # retry honors the 0.5 s throttle instead of firing every tick.
-            self._maybe_retry_off(f"failsafe: {reason}", force=force)
-        else:
-            self._publish_state(False)
+    def _fsm_safety_ok(self) -> tuple[bool, str]:
+        """Safety input fed to SpraySafetyStateMachine.tick().
 
-    def _maybe_retry_off(self, reason: str, force: bool = False) -> None:
-        now_ns = self.get_clock().now().nanoseconds
-        retry_interval_ns = 500_000_000
-        if (
-            not force
-            and self._last_off_send_time_ns is not None
-            and now_ns - self._last_off_send_time_ns < retry_interval_ns
-        ):
-            return
-        self.get_logger().warn(
-            f"retrying spray OFF command: {reason}",
-            throttle_duration_sec=1.0,
+        Deliberately excludes spray_enabled — that is the FSM's separate
+        `enabled` input (see _drive_fsm_tick), so a disable event is modeled
+        distinctly from a safety-loss event per plan §4. For a manual
+        override this is the manual gate (armed only, no OFFBOARD
+        requirement); for auto/distance-aware mode this is the full gate
+        stack computed by the latest _distance_aware_tick() (armed,
+        offboard, path loaded, pose/velocity freshness, min speed, xtrack);
+        for the legacy /spray/active fallback it is armed + offboard.
+        """
+        if not self._armed:
+            return False, "disarmed"
+        if self._manual_active:
+            return True, ""
+        if bool(self.get_parameter("use_distance_aware_spray").value):
+            if self._last_decision is not None:
+                return self._last_decision.safety_ok, self._last_decision.safety_reason
+            return False, "distance-aware safety not yet evaluated"
+        require_offboard = bool(self.get_parameter("require_offboard").value)
+        if require_offboard and self._mode != "OFFBOARD":
+            return False, "not OFFBOARD"
+        return True, ""
+
+    def _drive_fsm_tick(self, reason: str) -> None:
+        """Single entry point that advances the actuator FSM by one tick and
+        dispatches whatever command it returns (plan §4/§10 — the node's
+        control-tick loop). Also publishes the current actuator/desired/
+        status telemetry so every drive point stays consistent.
+        """
+        desired = self._effective_desired()
+        safety_ok, safety_reason = self._fsm_safety_ok()
+        enabled = bool(self.get_parameter("spray_enabled").value)
+        cmd = self._fsm.tick(
+            desired=desired, safety_ok=safety_ok, enabled=enabled, now=time.monotonic()
         )
-        self._send_command(False, reason=reason)
+        if cmd is not None:
+            self._dispatch_command(cmd, reason)
+        self._publish_actuator_state()
+        self._publish_desired_state(desired)
+        self._publish_status(desired, safety_ok, safety_reason)
 
-    def _send_command(self, on: bool, reason: str) -> None:
-        if on and not self._safety_allows_on():
-            on = False
-        # A new command intent supersedes any in-flight request; bump the id
-        # before the service-ready check so a stale reply is invalidated even
-        # when the new intent cannot be dispatched.
-        self._cmd_seq += 1
-        seq = self._cmd_seq
-        if not self._service_ready:
-            self.get_logger().warn(
-                "spray command service not ready; command suppressed",
-                throttle_duration_sec=1.0,
+    def _dispatch_command(self, cmd: Optional[SprayCommand], reason: str) -> None:
+        """Send an FSM-issued SprayCommand to MAVROS.
+
+        Loops through any immediate follow-up the FSM emits: if the command
+        service is not ready, that is treated as an instant ack-failure
+        (fed back into the FSM via on_ack), which for an ON dispatch
+        produces a follow-up OFF per the FSM's own transition table, and
+        for an OFF dispatch enters RECOVERY (returns None, ending the loop).
+        """
+        while cmd is not None:
+            if not self._service_ready:
+                self.get_logger().warn(
+                    "spray command service not ready; command suppressed",
+                    throttle_duration_sec=1.0,
+                )
+                cmd = self._fsm.on_ack(cmd.seq, False, now=time.monotonic())
+                continue
+            seq = cmd.seq
+            on = cmd.on
+            req = self._build_command_request(on)
+            future = self._command_cli.call_async(req)
+            future.add_done_callback(
+                lambda fut, s=seq, o=on, why=reason: self._command_done(fut, s, o, why)
             )
-            if not on:
-                self._off_confirmed = False
-            return
-
-        if on:
-            self._off_confirmed = False
-        else:
-            self._off_confirmed = False
-            self._last_off_send_time_ns = self.get_clock().now().nanoseconds
-        req = self._build_command_request(on)
-        future = self._command_cli.call_async(req)
-        future.add_done_callback(
-            lambda fut, requested=on, why=reason, s=seq: self._command_done(fut, requested, why, s)
-        )
-        if on:
-            self._commanded = True
-            self._publish_state(True)
+            cmd = None
 
     def _build_command_request(self, on: bool) -> CommandLong.Request:
         req = CommandLong.Request()
@@ -942,49 +1002,95 @@ class SprayControllerNode(Node):
         req.param3 = req.param4 = req.param5 = req.param6 = req.param7 = 0.0
         return req
 
-    def _command_done(self, future, requested: bool, reason: str, seq: int) -> None:
-        if seq != self._cmd_seq:
+    def _command_done(self, future, seq: int, on: bool, reason: str) -> None:
+        if seq != self._fsm.cmd_seq:
             # A newer command was issued before this result arrived; ignoring
             # it prevents a stale reply from corrupting current spray state.
+            # (INVARIANT 2, spray_fsm.py — enforced again here purely to
+            # avoid an unnecessary on_ack()/publish round-trip; on_ack()
+            # would no-op on a seq mismatch regardless.)
             self.get_logger().debug(
                 f"ignoring stale spray command result "
-                f"(seq={seq}, latest={self._cmd_seq}, requested={requested}, reason={reason})"
+                f"(seq={seq}, latest={self._fsm.cmd_seq}, on={on}, reason={reason})"
             )
             return
         try:
             resp = future.result()
         except Exception as exc:
-            if not requested:
-                self._off_confirmed = False
-                self.get_logger().warn(
-                    f"spray OFF command {reason} failed; will retry: {exc}"
-                )
-            else:
-                self.get_logger().warn(f"spray command {reason} failed: {exc}")
+            self.get_logger().warn(
+                f"spray command ({'ON' if on else 'OFF'}) {reason} raised: {exc}"
+            )
+            followup = self._fsm.on_ack(seq, False, now=time.monotonic())
+            self._publish_actuator_state()
+            self._dispatch_command(followup, f"{reason} ack-exception-followup")
             return
         success = bool(getattr(resp, "success", False))
-        result = getattr(resp, "result", None)
         if not success:
-            if not requested:
-                self._off_confirmed = False
-                self.get_logger().warn(
-                    f"spray OFF command {reason} rejected; will retry: result={result}"
-                )
-            else:
-                self.get_logger().warn(
-                    f"spray command {reason} rejected: requested={requested} result={result}"
-                )
-            return
-        if not requested:
-            self._off_confirmed = True
-            self._commanded = False
-            self._publish_state(False)
+            self.get_logger().warn(
+                f"spray command ({'ON' if on else 'OFF'}) {reason} rejected: "
+                f"result={getattr(resp, 'result', None)}"
+            )
+        followup = self._fsm.on_ack(seq, success, now=time.monotonic())
+        self._publish_actuator_state()
+        self._dispatch_command(followup, f"{reason} ack-followup")
 
-    def _publish_state(self, active: bool) -> None:
-        msg = Bool()
-        msg.data = bool(active)
-        self._state_pub.publish(msg)
-        self._commanded_pub.publish(msg)
+    def _reassert_tick(self) -> None:
+        self._drive_fsm_tick("reassert")
+        if self._effective_desired() and self._fsm.commanded and self._safety_allows_on():
+            self._reassert_on_command()
+
+    def _reassert_on_command(self) -> None:
+        """Periodic re-affirmation of an already-(pending-or-)confirmed ON
+        command — unchanged from today's reassert_hz behavior. This is a
+        wire-level heartbeat re-send of the current ON value; it does NOT
+        go through the FSM state machine (no state transition, no cmd_seq
+        bump) — a failure here is logged only, matching prior behavior
+        where reassert failures had no side effect on commanded/off_confirmed
+        state.
+        """
+        if not self._service_ready:
+            return
+        seq = self._fsm.cmd_seq
+        req = self._build_command_request(True)
+        future = self._command_cli.call_async(req)
+        future.add_done_callback(lambda fut, s=seq: self._reassert_command_done(fut, s))
+
+    def _reassert_command_done(self, future, seq: int) -> None:
+        if seq != self._fsm.cmd_seq:
+            return
+        try:
+            resp = future.result()
+        except Exception as exc:
+            self.get_logger().warn(f"spray ON reassert failed: {exc}")
+            return
+        if not bool(getattr(resp, "success", False)):
+            self.get_logger().warn(
+                f"spray ON reassert rejected: result={getattr(resp, 'result', None)}"
+            )
+
+    def _fsm_off_confirmed(self) -> bool:
+        """True once the FSM has a confirmed-OFF actuator state (OFF_CONFIRMED
+        or the terminal DISABLED, which per spray_fsm.py is only entered once
+        OFF is confirmed). Equivalent to the old `_off_confirmed` bool for
+        shutdown-flush purposes.
+        """
+        return self._fsm.state in (SprayState.OFF_CONFIRMED, SprayState.DISABLED)
+
+    def _publish_actuator_state(self) -> None:
+        commanded_msg = Bool()
+        commanded_msg.data = bool(self._fsm.commanded)
+        self._commanded_pub.publish(commanded_msg)
+        # INTENDED BEHAVIOR CHANGE (Spray Controller V2 plan §4, defect #6 —
+        # "no optimistic-ON"): /spray/state now reflects state == ON_CONFIRMED
+        # only. Previously this published True the instant an ON command was
+        # dispatched (see the old _send_command, before any MAVROS ack) — the
+        # exact "commanded == spraying" conflation the V2 FSM makes
+        # structurally impossible (spray_fsm.py INVARIANT 1). This is the
+        # ONE intended Mode-1 behavior change in Phase A; everything else in
+        # this file is behavior-preserving.
+        state_msg = Bool()
+        state_msg.data = bool(self._fsm.spraying)
+        self._state_pub.publish(state_msg)
 
     def _publish_desired_state(self, active: bool) -> None:
         msg = Bool()
@@ -1001,12 +1107,52 @@ class SprayControllerNode(Node):
         msg.data = bool(self._manual_active)
         self._manual_state_pub.publish(msg)
 
+    def _publish_status(self, desired: bool, safety_ok: bool, safety_reason: str) -> None:
+        decision = self._last_decision
+        distance_to_boundary_m: Optional[float] = None
+        xtrack_error_m: Optional[float] = None
+        if decision is not None:
+            if decision.next_boundary is not None:
+                distance_to_boundary_m = decision.distance_to_boundary_m
+            if decision.projection is not None:
+                xtrack_error_m = decision.projection.xtrack_error_m
+        status = make_status(
+            mode="continuous",
+            fsm_state=self._fsm.state.value,
+            spraying=self._fsm.spraying,
+            desired=desired,
+            manual_active=self._manual_active,
+            safety_ok=safety_ok,
+            safety_reason=safety_reason,
+            distance_to_boundary_m=distance_to_boundary_m,
+            # The RTK/GPS fix-quality gate is Phase B — it is NOT evaluated
+            # in Phase A. Report gps_fix_ok=True (this gate does not yet
+            # block spray) but label it "not_evaluated" so no consumer
+            # mistakes this for a real, checked RTK-healthy signal.
+            gps_fix_ok=True,
+            gps_fix_name="not_evaluated",
+            xtrack_error_m=xtrack_error_m,
+            mode_state={},
+        )
+        msg = String()
+        msg.data = status_to_json_safe(status)
+        self._status_pub.publish(msg)
+
     def shutdown_off(self) -> None:
         self._desired_raw = False
         self._desired_debounced = False
+        self._candidate = None
+        self._candidate_count = 0
         self._manual_active = False
         self._manual_deadline_ns = None
-        self._maybe_retry_off("shutdown", force=True)
+        # Reset any RECOVERY backoff so the shutdown OFF is retried
+        # immediately: without this, if the FSM is mid-RECOVERY (a prior OFF
+        # ack failed) its backoff deadline (up to backoff_max_s = 5 s) can
+        # outlast the 1 s flush window below, and the node would tear down
+        # with the actuator possibly still energized. note_event_reset makes
+        # the next tick's RECOVERY retry fire now.
+        self._fsm.note_event_reset(time.monotonic())
+        self._drive_fsm_tick("shutdown")
         # Flush: spin briefly so the OFF actually reaches MAVROS and is
         # confirmed before the executor stops. Best-effort and bounded so
         # shutdown can never hang.
@@ -1014,13 +1160,13 @@ class SprayControllerNode(Node):
         if spin_once is None:
             return
         deadline = time.monotonic() + 1.0
-        while not self._off_confirmed and time.monotonic() < deadline:
+        while not self._fsm_off_confirmed() and time.monotonic() < deadline:
             try:
                 spin_once(self, timeout_sec=0.1)
             except Exception:
                 break
-            if not self._off_confirmed:
-                self._maybe_retry_off("shutdown flush", force=True)
+            if not self._fsm_off_confirmed():
+                self._drive_fsm_tick("shutdown flush")
 
 
 def main() -> None:
