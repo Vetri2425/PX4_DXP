@@ -131,11 +131,12 @@ async def lifespan(app: FastAPI):
     path_mgr = PathManager(MISSION_DIR)
     offboard_ctrl = OffboardController(ros_node, activity_log)
 
-    # Joystick / manual control (docs/Architecture/JOYSTICK_CONTROLLER_PLAN.md,
-    # phase J1: server skeleton only — JOYSTICK_MANUAL_ENABLED defaults to
-    # "0", so acquire() always rejects until the firmware gates in the plan
-    # §7.1/§7.2 are bench-verified and this is flipped on deliberately).
+    # Joystick / manual control (docs/Architecture/JOYSTICK_CONTROLLER_PLAN.md).
+    # Enablement is deployment-controlled via ROVER_JOYSTICK_MANUAL_ENABLED
+    # (config.JOYSTICK_MANUAL_ENABLED); when False, acquire() rejects with
+    # manual_control_disabled and the subsystem only streams neutral frames.
     try:
+        from config import JOYSTICK_MANUAL_ENABLED
         from joystick_controller import JoystickController
         from manual_control_gateway import ManualControlGateway, build_manual_transport
 
@@ -143,7 +144,12 @@ async def lifespan(app: FastAPI):
         _manual_gateway = ManualControlGateway(_manual_transport)
         _manual_gateway.start()
         joystick_ctrl = JoystickController(ros_node, offboard_ctrl, _manual_gateway)
-        _record("info", "Joystick subsystem initialised (manual control disabled)")
+        _record(
+            "info",
+            "Joystick subsystem initialised (manual control "
+            + ("ENABLED" if JOYSTICK_MANUAL_ENABLED else "disabled")
+            + f", transport={_manual_transport.name})",
+        )
     except Exception as exc:
         log.exception("joystick subsystem failed to initialise")
         _record("warning", f"joystick subsystem unavailable: {exc}")
