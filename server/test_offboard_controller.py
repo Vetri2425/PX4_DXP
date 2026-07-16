@@ -256,3 +256,73 @@ def test_loaded_path_summary_exposes_staged_identity():
     s2 = ctrl2.loaded_path_summary()
     assert s2["mission_id"] is None
     assert s2["protected"] is False
+
+
+# ── Mission↔joystick arbiter wiring (plan §7.4) ────────────────────────────────
+
+from control_arbiter import ControlArbiter, ControlOwner
+
+
+class _FakeStateHolder:
+    def __init__(self, state=MissionState.IDLE):
+        self.state = state
+
+
+def _joystick_owned_arbiter():
+    arb = ControlArbiter()
+    run(arb.begin_joystick_acquire(_FakeStateHolder(MissionState.IDLE)))
+    arb.mark_joystick_active("sess-1", "lease-1")
+    assert arb.joystick_owned
+    return arb
+
+
+def test_start_rejected_while_joystick_owns_arbiter():
+    """A mission must not begin while the joystick owns manual control, and it
+    must be refused BEFORE any FCU I/O (no arm, no mode switch)."""
+    arb = _joystick_owned_arbiter()
+    node = FakeNode([{"connected": True, "rpp_state": RPP_TRACKING}])
+    ctrl = OffboardController(node, deque(), arbiter=arb)
+    ctrl.load_path([(1.0, 2.0), (3.0, 4.0)], name="test")
+
+    ok, msg = run(ctrl.start_async())
+
+    assert ok is False
+    assert "joystick" in msg.lower()
+    assert ctrl.state != MissionState.RUNNING
+    assert ("arm", True) not in node.calls  # refused before touching the FCU
+
+
+def test_start_relinquishes_arbiter_on_success():
+    """owner==MISSION is in-flight-only: a successful start leaves the arbiter
+    back at IDLE (the running mission is guarded by state, not a sticky owner)."""
+    old_grace = offboard_module.SETPOINT_STREAM_GRACE_S
+    offboard_module.SETPOINT_STREAM_GRACE_S = 0.0
+    try:
+        arb = ControlArbiter()
+        node = FakeNode([
+            {"connected": True, "rpp_state": RPP_TRACKING},
+            {"connected": True, "rpp_state": RPP_TRACKING},
+        ])
+        ctrl = OffboardController(node, deque(), arbiter=arb)
+        ctrl.load_path([(1.0, 2.0), (3.0, 4.0)], name="test")
+
+        ok, _ = run(ctrl.start_async())
+
+        assert ok is True
+        assert ctrl.state == MissionState.RUNNING
+        assert arb.owner == ControlOwner.IDLE  # bracket relinquished on exit
+    finally:
+        offboard_module.SETPOINT_STREAM_GRACE_S = old_grace
+
+
+def test_start_relinquishes_arbiter_on_failure():
+    """An early-guard failure (no path loaded) must also relinquish the bracket
+    so a stranded owner can never block a later joystick acquire."""
+    arb = ControlArbiter()
+    node = FakeNode([{"connected": True, "rpp_state": RPP_IDLE}])
+    ctrl = OffboardController(node, deque(), arbiter=arb)
+
+    ok, _ = run(ctrl.start_async())  # no load_path → early return
+
+    assert ok is False
+    assert arb.owner == ControlOwner.IDLE

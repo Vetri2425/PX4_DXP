@@ -14,6 +14,7 @@ TOPIC_MAVROS_SETPOINT = "/mavros/setpoint_raw/local"
 TOPIC_MAVROS_BATTERY = "/mavros/battery"
 TOPIC_MAVROS_GLOBAL_POS = "/mavros/global_position/global"
 TOPIC_MAVROS_GPS_RAW = "/mavros/gpsstatus/gps1/raw"
+TOPIC_MAVROS_MANUAL_CONTROL = "/mavros/manual_control/send"
 
 # ── ROS2 Service Names ────────────────────────────────────────────────────────
 SRV_ARMING = "/mavros/cmd/arming"
@@ -150,6 +151,71 @@ TOKEN_FILE_DEFAULT = os.environ.get(
 # ── File upload limits ────────────────────────────────────────────────────────
 ALLOWED_UPLOAD_EXTENSIONS = {".waypoints", ".csv", ".dxf"}
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MiB (DXF files can be large)
+
+# ── Joystick / manual control (docs/Architecture/JOYSTICK_CONTROLLER_PLAN.md) ──
+# Master switch. MUST stay "0" until the firmware gates in the plan (§7.1 axis
+# mapping, §7.2 COM_RC_IN_MODE) are bench-verified — see plan §8 phase J3.
+JOYSTICK_MANUAL_ENABLED = os.environ.get("ROVER_JOYSTICK_MANUAL_ENABLED", "0") == "1"
+JOYSTICK_MANUAL_TRANSPORT = os.environ.get("ROVER_JOYSTICK_TRANSPORT", "mavros")
+JOYSTICK_COMMAND_RATE_HZ = float(os.environ.get("ROVER_JOYSTICK_COMMAND_RATE_HZ", "20.0"))
+JOYSTICK_GATEWAY_RATE_HZ = float(os.environ.get("ROVER_JOYSTICK_GATEWAY_RATE_HZ", "50.0"))
+# Timeout-ordering safety chain (plan §4.5) — validated below at import time.
+JOYSTICK_SERVER_STOP_TIMEOUT_S = float(
+    os.environ.get("ROVER_JOYSTICK_SERVER_STOP_TIMEOUT_S", "0.30")
+)
+JOYSTICK_GATEWAY_STALE_TIMEOUT_S = float(
+    os.environ.get("ROVER_JOYSTICK_GATEWAY_STALE_TIMEOUT_S", "0.40")
+)
+JOYSTICK_PX4_RC_LOSS_S = float(os.environ.get("ROVER_JOYSTICK_PX4_RC_LOSS_S", "0.50"))
+JOYSTICK_LEASE_REVOKE_TIMEOUT_S = float(
+    os.environ.get("ROVER_JOYSTICK_LEASE_REVOKE_TIMEOUT_S", "2.0")
+)
+JOYSTICK_LEASE_EXPIRY_S = float(os.environ.get("ROVER_JOYSTICK_LEASE_EXPIRY_S", "30.0"))
+JOYSTICK_NEUTRAL_PRESTREAM_S = float(
+    os.environ.get("ROVER_JOYSTICK_NEUTRAL_PRESTREAM_S", "0.20")
+)
+JOYSTICK_MODE_CONFIRM_TIMEOUT_S = float(
+    os.environ.get("ROVER_JOYSTICK_MODE_CONFIRM_TIMEOUT_S", "3.0")
+)
+# Pinned conservative first-field-run defaults (plan §4.5/§7.8/§7.9) — do not
+# inherit whichever default happens to drift between reference sources.
+JOYSTICK_MAX_ABS_THROTTLE = float(os.environ.get("ROVER_JOYSTICK_MAX_ABS_THROTTLE", "0.10"))
+JOYSTICK_MAX_ABS_STEERING = float(os.environ.get("ROVER_JOYSTICK_MAX_ABS_STEERING", "0.20"))
+JOYSTICK_MAVROS_REQUIRE_SUBSCRIBER = (
+    os.environ.get("ROVER_JOYSTICK_MAVROS_REQUIRE_SUBSCRIBER", "1") == "1"
+)
+JOYSTICK_MAVROS_PUBLISH_ERROR_LIMIT = int(
+    os.environ.get("ROVER_JOYSTICK_MAVROS_PUBLISH_ERROR_LIMIT", "10")
+)
+JOYSTICK_PYMAVLINK_ENDPOINT = os.environ.get(
+    "ROVER_JOYSTICK_PYMAVLINK_ENDPOINT", "udpout:127.0.0.1:14540"
+)
+
+
+def _validate_joystick_timeout_ordering() -> None:
+    """Refuse to start if the joystick timeout safety chain is out of order.
+
+    Meaning (plan §4.5): server zeros the command first, the gateway
+    independently goes neutral next, PX4's own RC-loss failsafe is the
+    backstop, and only after that is the lease revoked. Any other ordering
+    lets a later, coarser layer misfire before an earlier, finer one has had
+    a chance to act.
+    """
+    chain = [
+        ("JOYSTICK_SERVER_STOP_TIMEOUT_S", JOYSTICK_SERVER_STOP_TIMEOUT_S),
+        ("JOYSTICK_GATEWAY_STALE_TIMEOUT_S", JOYSTICK_GATEWAY_STALE_TIMEOUT_S),
+        ("JOYSTICK_PX4_RC_LOSS_S", JOYSTICK_PX4_RC_LOSS_S),
+        ("JOYSTICK_LEASE_REVOKE_TIMEOUT_S", JOYSTICK_LEASE_REVOKE_TIMEOUT_S),
+    ]
+    for (name_a, val_a), (name_b, val_b) in zip(chain, chain[1:]):
+        if not val_a < val_b:
+            raise RuntimeError(
+                f"joystick timeout-ordering invariant violated: "
+                f"{name_a}={val_a} must be < {name_b}={val_b}"
+            )
+
+
+_validate_joystick_timeout_ordering()
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 if AUTH_DISABLED:

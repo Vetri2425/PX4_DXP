@@ -24,6 +24,7 @@ from config import (
     RPP_UNHEALTHY_CODES,
     SETPOINT_STREAM_GRACE_S,
 )
+from control_arbiter import ControlArbiter, ControlArbiterError, get_control_arbiter
 from logging_setup import get_logger
 from mission_loading import pose_origin_or_error
 from mission_placement import (
@@ -67,9 +68,21 @@ class MissionClearConflict(Exception):
 
 
 class OffboardController:
-    def __init__(self, ros_node, activity_log: deque) -> None:
+    def __init__(
+        self,
+        ros_node,
+        activity_log: deque,
+        *,
+        arbiter: ControlArbiter | None = None,
+    ) -> None:
         self._node       = ros_node
         self._log        = activity_log
+        # Mission↔joystick mutual-exclusion. Wired into start_async so a mission
+        # cannot begin while the joystick owns manual control; the reverse guard
+        # (joystick cannot acquire mid-mission) lives in the joystick controller
+        # and reads self.state. See docs/Architecture/JOYSTICK_CONTROLLER_PLAN.md
+        # §7.4 and control_arbiter.mission_start().
+        self._arbiter    = arbiter or get_control_arbiter()
         self._state      = MissionState.IDLE
         self._loaded_pts: list[tuple[float, float]] | None = None
         self._loaded_spray_flags: list[bool] | None = None
@@ -266,6 +279,23 @@ class OffboardController:
         return f"start: RPP unhealthy (code={rpp_code})"
 
     async def start_async(self, auto_origin: bool = False) -> tuple[bool, str]:
+        """Begin a mission, bracketed by the mission↔joystick arbiter.
+
+        The arbiter claim happens before any FCU I/O: if the joystick owns
+        manual control, the mission is refused here (typed 409-style reject)
+        rather than racing the vehicle. On any exit — success, early guard
+        return, PlacementError, or unexpected failure — the bracket relinquishes
+        MISSION ownership (see control_arbiter.mission_start()); the running
+        mission is thereafter guarded by self.state, not by a sticky owner.
+        """
+        try:
+            async with self._arbiter.mission_start(self):
+                return await self._start_locked(auto_origin)
+        except ControlArbiterError as exc:
+            self._log_entry("warning", f"start rejected: {exc.message}")
+            return False, exc.message
+
+    async def _start_locked(self, auto_origin: bool = False) -> tuple[bool, str]:
         async with self._lifecycle_lock():
             if self._node is None:
                 return False, "ROS node not available"
