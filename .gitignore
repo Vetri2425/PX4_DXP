@@ -68,8 +68,11 @@ nul
 front-end.zip
 
 # Uploaded mission files (runtime user data). Committed templates are negated below.
-server/missions/*.dxf
-server/missions/*.csv
+# Case classes, not *.dxf: CAD tools emit .DXF as often as .dxf, and gitignore
+# matching is case-sensitive — a plain *.dxf leaves every uppercase upload
+# untracked-but-not-ignored, which is what buried real changes in git status.
+server/missions/*.[dD][xX][fF]
+server/missions/*.[cC][sS][vV]
 !server/missions/soccer_field_penalty_area.dxf
 
 # Staged aligned-DXF missions (runtime handoff artifacts)
@@ -116,7 +119,7 @@ image_ref/
 tools/rosbag.txt
 
 # Generated DXF sidecars (entities/extensions cache, regenerated on parse)
-server/missions/.*.dxf.*.json
+server/missions/.*.[dD][xX][fF].*.json
 
 # Local bag/trajectory analysis output (data + plots, not for tracking)
 analysis/
