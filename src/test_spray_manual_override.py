@@ -278,6 +278,8 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "on_overspray_margin_m": _Param(0.02),
         "off_overspray_margin_m": _Param(0.0),
         "min_spray_speed_mps": _Param(0.05),
+        "spray_off_during_pivot": _Param(True),
+        "segment_state_timeout_s": _Param(1.0),
         "max_xtrack_error_m": _Param(0.10),
         "pose_timeout_s": _Param(0.5),
         "velocity_timeout_s": _Param(0.5),
@@ -323,6 +325,8 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._pose_recv_time = None
     node._vel_ned = (0.0, 0.0)
     node._vel_recv_time = None
+    node._segment_state = None
+    node._segment_state_recv_time = None
     node._last_auto_source = ""
     node._last_distance_event = ""
     node._last_safety_block_reason = ""

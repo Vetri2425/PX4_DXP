@@ -310,14 +310,22 @@ def test_velocity_stale_forces_off():
     assert "velocity stale" in node._last_safety_block_reason
 
 
-def test_min_speed_end_to_end_forces_off():
+def test_crawl_speed_end_to_end_keeps_spraying():
+    """INVERTED 2026-07-17. This test used to assert that speed<min forced spray
+    OFF ("below min spray speed"). That gate is gone: it collided with the frozen
+    RPP corner speeds and dithered (157 valve fires for 25 real boundaries), and
+    it made endpoint approach (0.03 m/s) structurally unsprayable.
+
+    Speed now governs HOW MUCH (flow), never WHETHER. A rover crawling mid-MARK
+    must keep painting -- only an explicit RPP pivot suppresses it.
+    """
     node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=0.01)
 
     node._distance_aware_tick()
 
-    assert node._desired_debounced is False
-    assert node._fsm.commanded is False
-    assert "below min spray speed" in node._last_safety_block_reason
+    assert node._desired_debounced is True
+    assert node._fsm.commanded is True
+    assert node._last_safety_block_reason == ""
 
 
 def test_anticipation_lead_scales_with_fresh_speed():

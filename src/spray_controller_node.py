@@ -62,6 +62,13 @@ _SERVO_PWM_MAX_US = 2200
 TRANSIT_TO_MARK = "TRANSIT_TO_MARK"
 MARK_TO_TRANSIT = "MARK_TO_TRANSIT"
 
+# Mirrors rpp_controller_node.SegmentStateCode.CORNER_ALIGN, read off
+# /rpp/segment_debug data[1]. Duplicated rather than imported: the spray node
+# must not take a build/runtime dependency on the controller module, and this
+# node already runs standalone in tests. If the RPP's enum ever renumbers, this
+# breaks silently -- test_spray_pivot_gate.py pins the contract.
+_SEGMENT_STATE_CORNER_ALIGN = 3
+
 
 def _best_effort_qos(depth: int = 1) -> QoSProfile:
     return QoSProfile(
@@ -371,7 +378,26 @@ class SprayControllerNode(Node):
         self.declare_parameter("anticipatory_margin_m", 0.02)
         self.declare_parameter("on_overspray_margin_m", 0.02)
         self.declare_parameter("off_overspray_margin_m", 0.0)
+        # DEPRECATED as an on/off gate (2026-07-17). Still declared because the
+        # server's param serializer sends it and an undeclared param is a hard
+        # load rejection. It no longer decides whether to spray: speed governs
+        # HOW MUCH (flow, upcoming phase), never WHETHER.
+        #
+        # Why it was removed: a bare `speed < 0.05` test collided with the
+        # frozen RPP corner speeds (brake cap 0.08, min corner 0.08, endpoint
+        # approach 0.03). The rover deliberately crawls across that threshold,
+        # so the gate dithered. In the 2026-07-17 bags this produced 157 valve
+        # transitions where the path geometry asked for 25 -- 132 spurious
+        # fires, all of them explained by this one comparison. It also made
+        # endpoint approach (0.03) structurally unsprayable.
         self.declare_parameter("min_spray_speed_mps", 0.05)
+        # Replacement for the speed gate: suppress spray only while the rover
+        # is pivoting in place, which is the actual thing we needed to avoid
+        # (a stationary nozzle sweeping an arc puddles paint). Sourced from the
+        # RPP's own state machine rather than inferred from a speed threshold --
+        # a discrete state cannot dither the way a threshold does.
+        self.declare_parameter("spray_off_during_pivot", True)
+        self.declare_parameter("segment_state_timeout_s", 1.0)
         self.declare_parameter("max_xtrack_error_m", 0.10)
         self.declare_parameter("pose_timeout_s", 0.5)
         self.declare_parameter("velocity_timeout_s", 0.5)
@@ -426,6 +452,8 @@ class SprayControllerNode(Node):
         self._pose_recv_time = None
         self._vel_ned = (0.0, 0.0)
         self._vel_recv_time = None
+        self._segment_state: Optional[int] = None
+        self._segment_state_recv_time = None
         self._last_auto_source = ""
         self._last_distance_event = ""
         self._last_safety_block_reason = ""
@@ -483,6 +511,16 @@ class SprayControllerNode(Node):
             TwistStamped,
             "/mavros/local_position/velocity_local",
             self._vel_cb,
+            _best_effort_qos(),
+            callback_group=self._group,
+        )
+        # Read-only: the RPP's segment state, used solely to know when the rover
+        # is pivoting in place. We never command the controller and never read
+        # its tuning -- the frozen RPP baseline is untouched by this.
+        self.create_subscription(
+            Float32MultiArray,
+            "/rpp/segment_debug",
+            self._segment_debug_cb,
             _best_effort_qos(),
             callback_group=self._group,
         )
@@ -833,6 +871,42 @@ class SprayControllerNode(Node):
         timeout_s = max(0.0, float(self.get_parameter("velocity_timeout_s").value))
         return age_s <= timeout_s, age_s
 
+    def _segment_debug_cb(self, msg: Float32MultiArray) -> None:
+        """Track the RPP segment state. data[1] is SegmentStateCode."""
+        if len(msg.data) < 2:
+            return
+        self._segment_state = int(msg.data[1])
+        self._segment_state_recv_time = self.get_clock().now()
+
+    def _pivot_is_active(self) -> bool:
+        """True only while the RPP is pivoting the rover in place.
+
+        Gated on CORNER_ALIGN alone, deliberately NOT on CORNER_STOP. Read the
+        SegmentStateCode comment in rpp_controller_node: CORNER_STOP means
+        "commanding zero, waiting for the rover to physically stop" -- the rover
+        is still coasting through it and still laying the last ~2 cm of the leg
+        (measured across the 2026-07-17 bags: 11.8 cm over 6 corners). Cutting
+        spray there would trade the chatter bug for a 2 cm gap at every corner.
+        CORNER_ALIGN is entered only once the RPP has CONFIRMED zero motion, so
+        it is both the correct moment and an already-debounced one.
+
+        Absent/stale state is treated as "not pivoting" (permissive): geometry
+        keeps its authority, which preserves behaviour against an RPP that does
+        not publish this topic. A missed pivot costs a small puddle; wrongly
+        asserting a pivot would silently kill spray for a whole run.
+        """
+        if not bool(self.get_parameter("spray_off_during_pivot").value):
+            return False
+        if self._segment_state is None or self._segment_state_recv_time is None:
+            return False
+        timeout_s = max(0.0, float(self.get_parameter("segment_state_timeout_s").value))
+        age_s = (
+            self.get_clock().now() - self._segment_state_recv_time
+        ).nanoseconds * 1e-9
+        if age_s > timeout_s:
+            return False
+        return self._segment_state == _SEGMENT_STATE_CORNER_ALIGN
+
     def _auto_safety_status(
         self,
         pose_fresh: bool,
@@ -850,9 +924,12 @@ class SprayControllerNode(Node):
             return False, "pose stale"
         if not velocity_fresh:
             return False, "velocity stale"
-        min_speed = max(0.0, float(self.get_parameter("min_spray_speed_mps").value))
-        if speed < min_speed:
-            return False, "below min spray speed"
+        # NOTE: `speed` is intentionally NOT compared against a minimum here.
+        # See min_spray_speed_mps's declaration for why the old gate was removed.
+        # Spraying is a question of WHERE the nozzle is, not how fast it is
+        # moving; slow means thin (flow control), never off.
+        if self._pivot_is_active():
+            return False, "pivoting in place"
         return True, ""
 
     def _safety_allows_on(self) -> bool:
