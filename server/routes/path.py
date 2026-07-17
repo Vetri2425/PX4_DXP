@@ -26,6 +26,7 @@ import os
 import tempfile
 import time
 import uuid
+from typing import Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
@@ -51,6 +52,7 @@ from models import (
     DXFEntityInfo,
     DXFParseResponse,
     EntityExtensionPreview,
+    EntityExtensionRun,
     EntityOrderUpdateRequest,
     EntityOrderUpdateResponse,
     EntityTransitPreview,
@@ -166,39 +168,89 @@ def _subsample_points(
 # Matches PathEngine.group_join_tol_m: two mark endpoints this close are the
 # same chain junction, so neither is a free end eligible for an extension.
 _EXTENSION_JUNCTION_TOL_M = 0.05
+# Same value as engine.py's _COLLINEAR_DOT (~20 deg): at a junction this steep
+# the two runs continue straight through each other, so a run-out there can only
+# be retraced by the connector.
+#
+# Equal VALUE, deliberately weaker TEST. The planner (engine.py _retraces) knows
+# its traversal order, so it takes a signed dot of exit->entry between segments
+# it already knows are adjacent. The preview keeps DXF order while /plan reorders
+# via TSP, so it knows neither: it compares |dot| against every other mark end.
+# That is the conservative direction — the preview may suppress a run-up the
+# planner would keep at an anti-collinear or non-adjacent junction. Both agree
+# wherever it matters today (square corners are perpendicular, |dot|~0). Keeping
+# the value in sync is necessary but NOT sufficient for preview==plan; changing
+# either predicate needs a paired check, not just a matching constant.
+_EXTENSION_COLLINEAR_DOT = 0.94
+
+
+def _unit_dir(
+    a: tuple[float, float], b: tuple[float, float]
+) -> Optional[tuple[float, float]]:
+    """Unit vector a->b, or None when the two points are coincident."""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    h = math.hypot(dx, dy)
+    if h < 1e-9:
+        return None
+    return (dx / h, dy / h)
 
 
 def _extension_endpoint_freeness(
-    endpoints: list[tuple[tuple[float, float], tuple[float, float]]],
+    runs: list[tuple[
+        tuple[float, float], tuple[float, float],
+        Optional[tuple[float, float]], Optional[tuple[float, float]],
+    ]],
     tol: float = _EXTENSION_JUNCTION_TOL_M,
+    per_line: bool = False,
 ) -> list[tuple[bool, bool]]:
-    """Per mark entity (start, end), decide whether each end is a FREE end.
+    """Per mark entity (start, end, start_dir, end_dir), is each end FREE?
 
-    An end is *free* when it does not coincide with any OTHER mark entity's
-    endpoint — i.e. it is the outer end of a chain, not an internal junction.
-    A self-closed entity (start ≈ end) has no free end.
+    Two policies, matching the two the planner actually runs:
 
-    This mirrors the vertex-anchored planner policy: extensions live only at a
-    chain's true open ends, never at internal corners or on closed loops. Doing
-    it by endpoint connectivity (not entity order) means preview and plan agree
-    even though the preview keeps DXF order while the planner reorders via TSP.
+    * per_line=False (chain ends) — an end is free only when it coincides with
+      no OTHER mark entity's endpoint: extensions live at a chain's true open
+      ends, never at internal corners or on closed loops. Mirrors
+      split_mark_segment_with_extensions(suppress_closed_loops=True).
+
+    * per_line=True — every CAD edge is an independent PRE→MARK→AFT pass, so a
+      shared corner does NOT block a run-up; each side of a closed square gets
+      its own. Only a *collinear* junction blocks, because there the run-out and
+      the next run-in lie along the same line and the connector can only double
+      straight back over them (the d82317d retrace field failure). Mirrors the
+      planner's decompose_line_chain_to_edges() + suppress_closed_loops=False,
+      whose _touches() is a DIRECTION test (_COLLINEAR_DOT), not a shared point.
+
+    Collinearity is compared as |dot| so it holds regardless of which way each
+    entity happens to be drawn or traversed. Doing this by endpoint geometry
+    (not entity order) keeps preview and plan agreeing even though the preview
+    keeps DXF order while the planner reorders via TSP.
     """
-    def _shared(pt, skip_idx) -> bool:
-        for j, (s, e) in enumerate(endpoints):
+    def _collinear(d1, d2) -> bool:
+        if d1 is None or d2 is None:
+            return False
+        return abs(d1[0] * d2[0] + d1[1] * d2[1]) > _EXTENSION_COLLINEAR_DOT
+
+    def _blocked(pt, my_dir, skip_idx) -> bool:
+        for j, (s, e, s_dir, e_dir) in enumerate(runs):
             if j == skip_idx:
                 continue
-            if math.hypot(pt[0] - s[0], pt[1] - s[1]) <= tol:
-                return True
-            if math.hypot(pt[0] - e[0], pt[1] - e[1]) <= tol:
-                return True
+            for other_pt, other_dir in ((s, s_dir), (e, e_dir)):
+                if math.hypot(pt[0] - other_pt[0], pt[1] - other_pt[1]) > tol:
+                    continue
+                if not per_line:
+                    return True  # chain ends: any junction blocks
+                if _collinear(my_dir, other_dir):
+                    return True  # per-line: only a retrace blocks
         return False
 
     freeness = []
-    for i, (start, end) in enumerate(endpoints):
+    for i, (start, end, s_dir, e_dir) in enumerate(runs):
         if math.hypot(start[0] - end[0], start[1] - end[1]) <= tol:
-            freeness.append((False, False))  # self-closed loop — no free end
+            # Self-closed entity (circle / closed polyline): no linear free end
+            # to run off, in either mode.
+            freeness.append((False, False))
             continue
-        freeness.append((not _shared(start, i), not _shared(end, i)))
+        freeness.append((not _blocked(start, s_dir, i), not _blocked(end, e_dir, i)))
     return freeness
 
 
@@ -260,10 +312,20 @@ def _entity_transit_previews(
 ) -> list[EntityTransitPreview]:
     """Straight no-spray connectors between consecutive MARK entities.
 
-    *mark_endpoints* is (entity_id, first_pt, last_pt) per drawable MARK
-    entity, in DXF/entity order. Callers must already have dropped entities
-    with no preview points, so a degenerate entity cannot break the chain —
-    its drawable neighbours still get connected, like the planner would.
+    *mark_endpoints* is (entity_id, entry_pt, exit_pt) per drawable MARK entity,
+    in DXF/entity order. Callers must already have dropped entities with no
+    preview points, so a degenerate entity cannot break the chain — its drawable
+    neighbours still get connected, like the planner would.
+
+    entry/exit are the extension TIPS when that end has a run-up, so a connector
+    spans AFT-tip -> next PRE-start — matching the planner, which routes travel
+    only AFTER extension (_insert_transit_connectors_between_segments). In
+    per-line mode this is what makes a square's corners grow real connectors:
+    the edges no longer touch once each has run off its own end.
+
+    NOTE (known, pre-existing): the order here is DXF order, while /plan reorders
+    via TSP. These connectors are therefore honest about GEOMETRY per junction,
+    but not about which junctions the mission will actually drive.
     """
     transits = []
     for (from_id, _, start), (to_id, end, _) in zip(mark_endpoints, mark_endpoints[1:]):
@@ -500,7 +562,7 @@ async def path_entities(name: str):
     # applies. Computed here (before the build loop) because freeness of one
     # entity's end depends on every other mark entity's endpoints.
     resolved: list[tuple] = []  # (ent, preview_pts, tangent_pts, default_is_mark, is_mark)
-    mark_endpoints_for_freeness: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    mark_endpoints_for_freeness: list[tuple] = []  # (start, end, start_dir, end_dir)
     mark_slot_of_entity: dict[int, int] = {}
     for idx, ent in enumerate(entities):
         preview_pts = _entity_preview_tuples(ent)
@@ -517,17 +579,29 @@ async def path_entities(name: str):
         resolved.append((ent, preview_pts, tangent_pts, default_is_mark, is_mark))
         if is_mark and tangent_pts:
             mark_slot_of_entity[idx] = len(mark_endpoints_for_freeness)
-            mark_endpoints_for_freeness.append((tangent_pts[0], tangent_pts[-1]))
+            # Tangents at each end, taken the way the planner takes them: into
+            # the run at the start, out of it at the end.
+            mark_endpoints_for_freeness.append((
+                tangent_pts[0],
+                tangent_pts[-1],
+                _unit_dir(tangent_pts[0], tangent_pts[1]) if len(tangent_pts) > 1 else None,
+                _unit_dir(tangent_pts[-2], tangent_pts[-1]) if len(tangent_pts) > 1 else None,
+            ))
 
-    freeness = _extension_endpoint_freeness(mark_endpoints_for_freeness)
+    freeness = _extension_endpoint_freeness(
+        mark_endpoints_for_freeness,
+        per_line=bool(extension_config.per_line),
+    )
 
-    # (entity_id, first_pt, last_pt) per drawable MARK entity — endpoints
-    # only, so large per-entity point lists aren't retained past the loop.
+    # (entity_id, entry_pt, exit_pt) per drawable MARK entity — endpoints only,
+    # so large per-entity point lists aren't retained past the loop. Entry/exit
+    # are the extension TIPS where a run-up exists, so connectors span
+    # AFT-tip -> next PRE-start like the planner routes them; they fall back to
+    # the mark endpoints when that end has no extension.
     mark_endpoints: list[tuple[str, tuple[float, float], tuple[float, float]]] = []
+    extension_runs: list[EntityExtensionRun] = []
     for order_index, (ent, preview_pts, tangent_pts, default_is_mark, is_mark) in enumerate(resolved):
         all_pts.extend(preview_pts)
-        if is_mark and tangent_pts:
-            mark_endpoints.append((ent.entity_id, tangent_pts[0], tangent_pts[-1]))
         slot = mark_slot_of_entity.get(order_index)
         start_is_free, end_is_free = freeness[slot] if slot is not None else (True, True)
         extension_preview = _entity_extension_preview(
@@ -540,8 +614,30 @@ async def path_entities(name: str):
             start_is_free=start_is_free,
             end_is_free=end_is_free,
         )
+        if is_mark and tangent_pts:
+            # Travel starts/ends at the run-up tips when they exist — the rover
+            # drives out along AFT, turns, and comes back to the next PRE, so a
+            # connector pinned to the mark vertex would both overlap the
+            # extension and under-report the real distance.
+            pre_pts, aft_pts = extension_preview.pre_points, extension_preview.aft_points
+            entry_pt = (pre_pts[0].north, pre_pts[0].east) if pre_pts else tangent_pts[0]
+            exit_pt = (aft_pts[-1].north, aft_pts[-1].east) if aft_pts else tangent_pts[-1]
+            mark_endpoints.append((ent.entity_id, entry_pt, exit_pt))
         for ext_pt in extension_preview.pre_points + extension_preview.aft_points:
             all_pts.append((ext_pt.north, ext_pt.east))
+        # Same geometry as extension_preview, flattened into the named
+        # "Extensions" layer so a client can draw them without walking entities.
+        for role, pts, length in (
+            ("pre", extension_preview.pre_points, extension_preview.pre_length_m),
+            ("aft", extension_preview.aft_points, extension_preview.aft_length_m),
+        ):
+            if pts:
+                extension_runs.append(EntityExtensionRun(
+                    entity_id=ent.entity_id,
+                    role=role,
+                    length_m=round(length, 3),
+                    points=pts,
+                ))
         geometry = ent.geometry
         if ent.entity_type in ("SPLINE", "ELLIPSE"):
             # Flattened spline/ellipse vertices duplicate preview_points
@@ -583,6 +679,7 @@ async def path_entities(name: str):
         bounds=bounds,
         extension_config=extension_config,
         transit_preview=transit_preview,
+        extensions=extension_runs,
         entities=previews,
     )
 

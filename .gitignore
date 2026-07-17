@@ -130,3 +130,9 @@ Simple Demo/sample_dxf/videos/
 
 # DXF verification harness generated artifacts (PNGs, MP4s, summaries)
 verification_output/
+
+# Local dev server log (uvicorn run from server/ on the Mac) — never tracked.
+server/_local_server.log
+
+# Operator checklist PDFs kept alongside the tree, not source.
+Checklists /

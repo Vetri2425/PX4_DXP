@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 
@@ -379,10 +380,13 @@ async def test_entities_api_uses_dense_spline_points_for_extension_preview(tmp_p
 
 @pytest.mark.anyio
 async def test_entities_api_suppresses_extension_preview_on_closed_chain(tmp_path, monkeypatch):
-    """Connectivity-aware preview: a closed square (4 edges meeting corner-to-
-    corner) has no free end, so NO entity may show a run-up — matching the
-    vertex-anchored planner, which suppresses extensions on closed chains.
-    Internal corners are junctions, not open ends."""
+    """per_line=False only. A closed square (4 edges meeting corner-to-corner)
+    has no free end, so NO entity may show a run-up — matching the planner's
+    vertex-anchored chain-ends policy (suppress_closed_loops=True). Internal
+    corners are junctions, not open ends.
+
+    per_line=True is the opposite contract and is covered by
+    test_entities_api_per_line_extends_every_side_of_closed_square."""
     mission_file = tmp_path / "square.dxf"
     mission_file.write_text("0\nEOF\n", encoding="utf-8")
 
@@ -406,7 +410,9 @@ async def test_entities_api_suppresses_extension_preview_on_closed_chain(tmp_pat
             return {}
 
         def load_extension_config(self, filename):
-            return {"enabled": True, "pre_extension_m": 0.5, "aft_extension_m": 0.5}
+            # Explicit: this test pins the per_line=False chain-ends policy.
+            return {"enabled": True, "pre_extension_m": 0.5, "aft_extension_m": 0.5,
+                    "per_line": False}
 
         def load_entity_order(self, filename):
             return []
@@ -451,7 +457,9 @@ async def test_entities_api_extension_preview_only_at_open_ends_of_chain(tmp_pat
             return {}
 
         def load_extension_config(self, filename):
-            return {"enabled": True, "pre_extension_m": 0.5, "aft_extension_m": 0.5}
+            # Explicit: this test pins the per_line=False chain-ends policy.
+            return {"enabled": True, "pre_extension_m": 0.5, "aft_extension_m": 0.5,
+                    "per_line": False}
 
         def load_entity_order(self, filename):
             return []
@@ -468,6 +476,278 @@ async def test_entities_api_extension_preview_only_at_open_ends_of_chain(tmp_pat
     assert by_id["L0"].pre_points != [] and by_id["L0"].aft_points == []
     # L1: shared start at corner -> no PRE; free end at (2,2) -> AFT only.
     assert by_id["L1"].pre_points == [] and by_id["L1"].aft_points != []
+
+
+def _fake_square_mgr(per_line: bool, corners=None):
+    """4 LINE entities drawn corner-to-corner as a closed square."""
+    corners = corners or [(0.0, 0.0), (0.0, 2.0), (2.0, 2.0), (2.0, 0.0), (0.0, 0.0)]
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            return [
+                SimpleNamespace(
+                    entity_id=f"E{i}", entity_type="LINE", layer="M", color=7,
+                    geometry={"start": corners[i], "end": corners[i + 1]},
+                    is_mark=lambda: True,
+                )
+                for i in range(4)
+            ]
+
+        def load_entity_overrides(self, filename):
+            return {}
+
+        def load_extension_config(self, filename):
+            return {"enabled": True, "pre_extension_m": 0.5, "aft_extension_m": 0.5,
+                    "per_line": per_line}
+
+        def load_entity_order(self, filename):
+            return []
+
+    return FakePathManager()
+
+
+@pytest.mark.anyio
+async def test_entities_api_per_line_extends_every_side_of_closed_square(tmp_path, monkeypatch):
+    """per_line=True: every side of a CLOSED square gets its own PRE and AFT.
+
+    Regression for the preview<->plan divergence: the preview applied the
+    chain-ends freeness gate unconditionally and reported enabled=False on all
+    four sides, while the planner (decompose_line_chain_to_edges +
+    suppress_closed_loops=False) really does emit 4 PRE + 4 AFT here — see
+    path_engine test_engine_per_line_square_gives_four_passes. A square's
+    corners are perpendicular, so none of them is a collinear retrace.
+    """
+    (tmp_path / "square.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_square_mgr(per_line=True))
+
+    data = await path_entities("square.dxf")
+
+    assert data.extension_config.per_line is True
+    for ent in data.entities:
+        assert ent.extension_preview.enabled is True, ent.entity_id
+        assert ent.extension_preview.pre_points != [], ent.entity_id
+        assert ent.extension_preview.aft_points != [], ent.entity_id
+        assert ent.extension_preview.pre_length_m == 0.5
+        assert ent.extension_preview.aft_length_m == 0.5
+
+    # Matches the planner's (pre, aft) == (4, 4) on this same shape.
+    assert sum(1 for x in data.extensions if x.role == "pre") == 4
+    assert sum(1 for x in data.extensions if x.role == "aft") == 4
+
+
+@pytest.mark.anyio
+async def test_entities_api_per_line_run_up_geometry_is_outward_and_collinear(tmp_path, monkeypatch):
+    """A PRE run-up must approach ALONG the line from outside it, not sideways.
+
+    E0 runs (0,0)->(0,2) (north const, east +). Its PRE therefore starts 0.5 m
+    BEFORE (0,0) on the same line — i.e. at east=-0.5 — and ends at the vertex.
+    """
+    (tmp_path / "square.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_square_mgr(per_line=True))
+
+    data = await path_entities("square.dxf")
+    pre = next(x for x in data.extensions if x.entity_id == "E0" and x.role == "pre")
+
+    assert (pre.points[0].north, round(pre.points[0].east, 6)) == (0.0, -0.5)
+    assert (pre.points[-1].north, pre.points[-1].east) == (0.0, 0.0)
+    assert pre.length_m == 0.5
+
+
+@pytest.mark.anyio
+async def test_entities_api_per_line_suppresses_collinear_retrace_junction(tmp_path, monkeypatch):
+    """per_line=True still drops a run-up at a COLLINEAR junction.
+
+    Two edges continuing straight through a shared point are a retrace: the AFT
+    would run out along the very line the next PRE runs back in on, so the
+    connector doubles back over both (the d82317d field failure). The planner's
+    _touches() is a direction test, so the preview must be one too — a shared
+    point alone is not enough to block, but a straight-through one is.
+    """
+    (tmp_path / "split.dxf").write_text("0\nEOF\n", encoding="utf-8")
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            return [  # one 4 m line drawn as two collinear 2 m halves
+                SimpleNamespace(
+                    entity_id="C0", entity_type="LINE", layer="M", color=7,
+                    geometry={"start": (0.0, 0.0), "end": (0.0, 2.0)},
+                    is_mark=lambda: True,
+                ),
+                SimpleNamespace(
+                    entity_id="C1", entity_type="LINE", layer="M", color=7,
+                    geometry={"start": (0.0, 2.0), "end": (0.0, 4.0)},
+                    is_mark=lambda: True,
+                ),
+            ]
+
+        def load_entity_overrides(self, filename):
+            return {}
+
+        def load_extension_config(self, filename):
+            return {"enabled": True, "pre_extension_m": 0.5, "aft_extension_m": 0.5,
+                    "per_line": True}
+
+        def load_entity_order(self, filename):
+            return []
+
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    data = await path_entities("split.dxf")
+    by_id = {e.entity_id: e.extension_preview for e in data.entities}
+
+    # Outer ends stay free; the collinear seam at (0,2) is suppressed both sides.
+    assert by_id["C0"].pre_points != [] and by_id["C0"].aft_points == []
+    assert by_id["C1"].pre_points == [] and by_id["C1"].aft_points != []
+
+
+@pytest.mark.anyio
+async def test_entities_api_extensions_layer_mirrors_per_entity_preview(tmp_path, monkeypatch):
+    """The named `extensions` layer is a flattening, never a second source of truth."""
+    (tmp_path / "square.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_square_mgr(per_line=True))
+
+    data = await path_entities("square.dxf")
+
+    flat = {(x.entity_id, x.role): [(p.north, p.east) for p in x.points]
+            for x in data.extensions}
+    expected = {}
+    for ent in data.entities:
+        ep = ent.extension_preview
+        if ep.pre_points:
+            expected[(ent.entity_id, "pre")] = [(p.north, p.east) for p in ep.pre_points]
+        if ep.aft_points:
+            expected[(ent.entity_id, "aft")] = [(p.north, p.east) for p in ep.aft_points]
+    assert flat == expected
+
+
+@pytest.mark.anyio
+async def test_entities_api_extensions_layer_empty_when_chain_ends_suppress(tmp_path, monkeypatch):
+    """per_line=False on a closed square: no previews, so no `extensions` layer."""
+    (tmp_path / "square.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_square_mgr(per_line=False))
+
+    data = await path_entities("square.dxf")
+    assert data.extensions == []
+
+
+@pytest.mark.anyio
+async def test_entities_api_connectors_span_aft_tip_to_next_pre_start(tmp_path, monkeypatch):
+    """With per-line extensions on, travel runs AFT-tip -> next PRE-start.
+
+    The planner routes connectors only AFTER extension, so a connector pinned to
+    the mark vertex would overlap the run-up it should start from and
+    under-report the distance driven. Square in DXF order 0..3:
+      E0 (0,0)->(0,2) exits its AFT at (0,2.5)
+      E1 (0,2)->(2,2) enters its PRE at (-0.5,2)
+    so the connector is (0,2.5) -> (-0.5,2), NOT the vertex (0,2) -> (0,2).
+    """
+    (tmp_path / "square.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_square_mgr(per_line=True))
+
+    data = await path_entities("square.dxf")
+    t0 = data.transit_preview[0]
+
+    assert (t0.from_entity_id, t0.to_entity_id) == ("E0", "E1")
+    assert (t0.points[0].north, t0.points[0].east) == (0.0, 2.5)   # E0 AFT tip
+    assert (t0.points[-1].north, round(t0.points[-1].east, 6)) == (-0.5, 2.0)  # E1 PRE start
+    assert t0.length_m == round(math.hypot(0.5, 0.5), 3) == 0.707
+
+
+@pytest.mark.anyio
+async def test_entities_api_per_line_corners_are_not_dropped_as_zero_length(tmp_path, monkeypatch):
+    """Every corner of a per-line square has a REAL connector.
+
+    Pre-fix the preview measured vertex->vertex, got 0, and silently skipped it —
+    hiding travel the rover genuinely drives. Once each edge runs off its own
+    end the edges no longer touch, so all 3 in-order junctions are ~0.707 m.
+    """
+    (tmp_path / "square.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_square_mgr(per_line=True))
+
+    data = await path_entities("square.dxf")
+
+    assert len(data.transit_preview) == 3
+    for t in data.transit_preview:
+        assert t.length_m == 0.707, (t.from_entity_id, t.to_entity_id, t.length_m)
+
+
+@pytest.mark.anyio
+async def test_entities_api_connectors_use_mark_endpoints_when_no_extensions(tmp_path, monkeypatch):
+    """No extensions -> connectors are unchanged: vertex to vertex, touching
+    corners still collapse to nothing. Guards the fallback path."""
+    (tmp_path / "square.dxf").write_text("0\nEOF\n", encoding="utf-8")
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            corners = [(0.0, 0.0), (0.0, 2.0), (2.0, 2.0), (2.0, 0.0), (0.0, 0.0)]
+            return [
+                SimpleNamespace(
+                    entity_id=f"E{i}", entity_type="LINE", layer="M", color=7,
+                    geometry={"start": corners[i], "end": corners[i + 1]},
+                    is_mark=lambda: True,
+                )
+                for i in range(4)
+            ]
+
+        def load_entity_overrides(self, filename):
+            return {}
+
+        def load_extension_config(self, filename):
+            return {"enabled": False, "pre_extension_m": 0.5, "aft_extension_m": 0.5,
+                    "per_line": True}
+
+        def load_entity_order(self, filename):
+            return []
+
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    data = await path_entities("square.dxf")
+
+    assert data.extensions == []
+    # Consecutive edges share their vertices, so every connector is zero-length
+    # and correctly dropped.
+    assert data.transit_preview == []
+
+
+@pytest.mark.anyio
+async def test_entities_api_extension_bounds_include_run_ups(tmp_path, monkeypatch):
+    """Bounds must cover the run-ups, or a client clips them off-canvas.
+
+    per_line square 0..2 with 0.5 m extensions -> -0.5..2.5 on both axes.
+    """
+    (tmp_path / "square.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_square_mgr(per_line=True))
+
+    data = await path_entities("square.dxf")
+    assert data.bounds.north_min == -0.5 and data.bounds.north_max == 2.5
+    assert data.bounds.east_min == -0.5 and data.bounds.east_max == 2.5
 
 
 @pytest.mark.anyio

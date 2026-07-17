@@ -285,7 +285,20 @@ class DXFEntitiesResponse(BaseModel):
     bounds: Optional[PathPreviewBounds] = None
     extension_config: Optional["PathExtensionConfig"] = None
     transit_preview: list["EntityTransitPreview"] = Field(default_factory=list)
+    # Flat list of every PRE/AFT run-up in the preview, so a client can render
+    # "Extensions" as one named layer without walking entities[]. Mirrors the
+    # per-entity extension_preview, which stays populated for hit-testing.
+    extensions: list["EntityExtensionRun"] = Field(default_factory=list)
     entities: list[DXFEntityPreview]
+
+
+class EntityExtensionRun(BaseModel):
+    """One PRE or AFT run-up/run-out, flattened for canvas rendering."""
+
+    entity_id: str
+    role: str  # "pre" | "aft"
+    length_m: float = 0.0
+    points: list[EntityPreviewPoint]
 
 
 class EntityTransitPreview(BaseModel):
