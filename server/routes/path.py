@@ -753,12 +753,23 @@ async def update_entity_order(name: str, req: EntityOrderUpdateRequest):
         path_mgr.parse_dxf, fpath,
         what="Parsing DXF for entity order validation",
     )
-    valid_ids = [ent.entity_id for ent in entities]
-    valid_set = set(valid_ids)
+    # The order sequences DRIVABLE shapes only. POINT entities (survey markers)
+    # carry no traversable path and the planner drops them; entities on ignore
+    # layers (DIM/DEFPOINTS/...) are never driven either. The client orders the
+    # drawable line/curve shapes and legitimately omits these, so requiring them
+    # in a "full order" would reject every valid order for a DXF that has any
+    # survey points — which is exactly what happened for a georeferenced square
+    # (one LWPOLYLINE + 5 POINTs). Exclude them from the contract.
+    orderable = [
+        ent for ent in entities
+        if ent.entity_type != "POINT" and ent.classify() != "ignore"
+    ]
+    valid_set = {ent.entity_id for ent in orderable}
     posted = req.entity_order
     posted_set = set(posted)
 
-    # Full-order contract: must contain exactly the current entity ID set.
+    # Full-order contract over the ORDERABLE set: no dup, no unknown, and every
+    # orderable entity present (so the traversal sequence stays deterministic).
     if len(posted) != len(posted_set):
         raise HTTPException(422, "Duplicate entity IDs in entity_order")
 

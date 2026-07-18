@@ -16,6 +16,7 @@ from routes.path import (
     preview_path,
     save_path_entity_overrides,
     save_path_extensions,
+    update_entity_order,
 )
 import main
 from path_manager import PathManager
@@ -564,6 +565,76 @@ def _fake_closed_polyline_mgr(per_line: bool, closed: bool = True):
             return []
 
     return FakePathManager()
+
+
+@pytest.mark.anyio
+async def test_entity_order_excludes_survey_points(tmp_path, monkeypatch):
+    """A DXF that is one LWPOLYLINE + survey POINTs must accept an order of just
+    the polyline — POINTs are not drivable and the client never orders them.
+
+    Regression for the georeferenced-square load failure: the order contract
+    required EVERY parsed entity id (incl. 5 POINTs), so a valid order of the
+    single polyline was rejected as 'Missing entity IDs'.
+    """
+    from path_engine.core import DXFEntity
+    from models import EntityOrderUpdateRequest
+    import routes.path as path_route
+
+    (tmp_path / "geo.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+
+    saved = {}
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            return [
+                DXFEntity(entity_type="LWPOLYLINE", layer="Lines", entity_id="PL0",
+                          geometry={"vertices": [(0.0, 0.0), (2.0, 0.0)]}),
+                DXFEntity(entity_type="POINT", layer="Points", entity_id="P1",
+                          geometry={"position": (0.0, 0.0)}),
+                DXFEntity(entity_type="POINT", layer="Points", entity_id="P2",
+                          geometry={"position": (2.0, 0.0)}),
+            ]
+
+        def save_entity_order(self, filename, order):
+            saved["order"] = list(order)
+
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    # Ordering just the polyline must succeed — the two POINTs are excluded.
+    resp = await update_entity_order("geo.dxf", EntityOrderUpdateRequest(entity_order=["PL0"]))
+    assert resp.entity_order == ["PL0"]
+    assert saved["order"] == ["PL0"]
+
+
+@pytest.mark.anyio
+async def test_entity_order_rejects_point_id(tmp_path, monkeypatch):
+    """A POINT id is not orderable, so posting it is 'unknown', not accepted."""
+    from path_engine.core import DXFEntity
+    from models import EntityOrderUpdateRequest
+    import routes.path as path_route
+
+    (tmp_path / "geo.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            return [
+                DXFEntity(entity_type="LWPOLYLINE", layer="Lines", entity_id="PL0",
+                          geometry={"vertices": [(0.0, 0.0), (2.0, 0.0)]}),
+                DXFEntity(entity_type="POINT", layer="Points", entity_id="P1",
+                          geometry={"position": (0.0, 0.0)}),
+            ]
+
+        def save_entity_order(self, filename, order):
+            pass
+
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    with pytest.raises(HTTPException) as exc:
+        await update_entity_order("geo.dxf", EntityOrderUpdateRequest(entity_order=["PL0", "P1"]))
+    assert exc.value.status_code == 422
+    assert "Unknown" in str(exc.value.detail)
 
 
 def _fake_geographic_mgr():
@@ -1904,6 +1975,7 @@ def _make_line_entity(entity_id: str, is_mark_callable=None):
         color=7,
         geometry={"start": (0.0, 0.0), "end": (1.0, 0.0)},
         is_mark=is_mark_callable,
+        classify=lambda: "mark",
     )
 
 
