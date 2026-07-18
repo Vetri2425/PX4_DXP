@@ -88,6 +88,30 @@ def test_dxf_entity_annotation_layers_ignored():
     assert DXFEntity(entity_type="LINE", layer="STAR").classify() == "mark"
 
 
+def test_dxf_point_is_reference_only_not_planned():
+    # A bare CAD POINT is a reference/survey marker, not a spray target. It must
+    # classify as ignore on ANY layer so survey points sitting on a shape's
+    # vertices don't get planned as their own MARK targets — which drove and
+    # painted a whole square a SECOND time in the field (bag stg_98398053).
+    from path_engine.parsers.dxf_parser import entities_to_segments
+
+    for layer in ("Points", "MARKINGS", "Layer0"):
+        assert DXFEntity(entity_type="POINT", layer=layer).classify() == "ignore", layer
+    # A design can still force points to be driven via layer_mapping.
+    forced = DXFEntity(entity_type="POINT", layer="Points")
+    assert forced.classify(layer_mapping={"Points": "mark"}) == "mark"
+
+    # A polyline + survey points plans as ONE pass — the points drop out.
+    poly = DXFEntity(entity_type="LWPOLYLINE", layer="Lines", entity_id="PL0",
+                     geometry={"vertices": [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)],
+                               "bulges": [0.0] * 4, "closed": True})
+    points = [DXFEntity(entity_type="POINT", layer="Points", entity_id=f"P{i}",
+                        geometry={"position": p})
+              for i, p in enumerate([(0.0, 0.0), (2.0, 0.0), (2.0, 2.0)])]
+    segs = entities_to_segments([poly] + points)
+    assert [s.source_entity for s in segs] == ["LWPOLYLINE_PL0"]
+
+
 def test_planned_path_defaults():
     plan = PlannedPath()
     assert plan.num_waypoints == 0

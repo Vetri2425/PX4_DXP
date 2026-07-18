@@ -173,6 +173,19 @@ class DXFEntity:
 
         # Default rules
         upper = self.layer.upper()
+        # A bare CAD POINT is a reference/survey marker (drawing start/end refs,
+        # georeference anchors), not a drivable spray path — it has no line to
+        # spray along. Default to ignore so points are shown in the preview but
+        # never planned. Without this, survey points that sit on a shape's
+        # vertices were planned as their own MARK targets and the rover drove
+        # AND painted the whole shape a SECOND time (field bag 2026-07-18
+        # stg_98398053: a georeferenced square driven twice — once with
+        # extensions from the polyline, once bare from its 5 corner points).
+        # An explicit layer_mapping above still overrides this if a design ever
+        # means its points as dwell targets (point missions normally come via
+        # the point-CSV flow, not DXF POINT entities).
+        if self.entity_type == "POINT":
+            return "ignore"
         # Non-printing / annotation layers by CAD convention → never sprayed.
         # Dimension callouts (DIM*), AutoCAD definition points (DEFPOINTS),
         # annotations (ANNOT*) and hatch fills are design aids, not field
