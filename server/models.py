@@ -282,6 +282,14 @@ class DXFEntitiesResponse(BaseModel):
     name: str
     frame: str = "local_ned"
     num_entities: int
+    # True when the source DXF held raw WGS84 lat/lon and georef projected it to
+    # local ENU metres. geo_origin is the (lat, lon) the local frame is anchored
+    # at — the client uses this to skip manual ref-point alignment: a
+    # georeferenced DXF already knows where it belongs, so it stages with no
+    # alignment fields and the planner auto-places it at geo_origin. None/False
+    # for an ordinary metric DXF, which still needs alignment.
+    is_geographic: bool = False
+    geo_origin: Optional[list[float]] = None  # [lat, lon] or None
     bounds: Optional[PathPreviewBounds] = None
     extension_config: Optional["PathExtensionConfig"] = None
     transit_preview: list["EntityTransitPreview"] = Field(default_factory=list)
@@ -392,6 +400,11 @@ class DXFParseResponse(BaseModel):
     entities: list[DXFEntityInfo]
     unit_scale: float  # metres per DXF unit
     layer_names: list[str]  # unique layer names found
+    # See DXFEntitiesResponse.is_geographic — set when the DXF carried lat/lon
+    # and was projected to local metres. Lets the client route a georeferenced
+    # file straight to staging (no manual alignment) at geo_origin.
+    is_geographic: bool = False
+    geo_origin: Optional[list[float]] = None  # [lat, lon] or None
 
 
 class RefPoint(BaseModel):

@@ -129,6 +129,19 @@ def _ned_point(pt) -> dict[str, float]:
     return {"north": float(pt[0]), "east": float(pt[1])}
 
 
+def _geo_origin_of(entities) -> Optional[list[float]]:
+    """The DXF's WGS84 origin if georef projected it, else None.
+
+    georef stamps the same (lat, lon) on every entity, so the first non-None
+    wins. Returned as a JSON list [lat, lon] for the response.
+    """
+    for ent in entities:
+        geo = getattr(ent, "geo_origin", None)
+        if geo is not None:
+            return [float(geo[0]), float(geo[1])]
+    return None
+
+
 def _arc_points(
     center: tuple[float, float],
     radius: float,
@@ -709,9 +722,12 @@ async def path_entities(name: str):
             east_max=max(easts),
         )
 
+    geo_origin = _geo_origin_of(entities)
     return DXFEntitiesResponse(
         name=safe,
         num_entities=len(previews),
+        is_geographic=geo_origin is not None,
+        geo_origin=geo_origin,
         bounds=bounds,
         extension_config=extension_config,
         transit_preview=transit_preview,
@@ -931,12 +947,15 @@ async def parse_dxf_file(file: UploadFile = File(...)):
         path_mgr.clear_extension_config(safe)
         path_mgr.clear_entity_order(safe)
 
+        geo_origin = _geo_origin_of(entities)
         return DXFParseResponse(
             filename=safe,
             num_entities=len(entities),
             entities=entity_infos,
             unit_scale=unit_scale,
             layer_names=sorted(layer_names),
+            is_geographic=geo_origin is not None,
+            geo_origin=geo_origin,
         )
     except ImportError:
         os.unlink(fpath)

@@ -566,6 +566,62 @@ def _fake_closed_polyline_mgr(per_line: bool, closed: bool = True):
     return FakePathManager()
 
 
+def _fake_geographic_mgr():
+    """One polyline whose entities carry a geo_origin — i.e. parse_dxf detected
+    lat/lon and georef projected + stamped the WGS84 origin (as it does for a
+    real georeferenced DXF)."""
+    verts = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)]
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            ent = SimpleNamespace(
+                entity_id="PL0", entity_type="LWPOLYLINE", layer="Lines", color=7,
+                geometry={"vertices": verts, "bulges": [0.0] * 4, "closed": True},
+                is_mark=lambda: True, geo_origin=(13.072071, 80.261949))
+            return [ent]
+
+        def load_entity_overrides(self, filename):
+            return {}
+
+        def load_extension_config(self, filename):
+            return {"enabled": False, "pre_extension_m": 0.5, "aft_extension_m": 0.5,
+                    "per_line": True}
+
+        def load_entity_order(self, filename):
+            return []
+
+    return FakePathManager()
+
+
+@pytest.mark.anyio
+async def test_entities_api_exposes_geographic_signal(tmp_path, monkeypatch):
+    """A georeferenced DXF reports is_geographic + geo_origin so the client can
+    skip manual alignment and stage straight to geo_origin."""
+    (tmp_path / "geo.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_geographic_mgr())
+
+    data = await path_entities("geo.dxf")
+    assert data.is_geographic is True
+    assert data.geo_origin == [13.072071, 80.261949]
+
+
+@pytest.mark.anyio
+async def test_entities_api_metric_dxf_not_geographic(tmp_path, monkeypatch):
+    """A plain metric DXF (no geo_origin) reports is_geographic False / None."""
+    (tmp_path / "sq.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_closed_polyline_mgr(per_line=True))
+
+    data = await path_entities("sq.dxf")
+    assert data.is_geographic is False
+    assert data.geo_origin is None
+
+
 @pytest.mark.anyio
 async def test_entities_api_per_line_closed_polyline_matches_plan(tmp_path, monkeypatch):
     """A single CLOSED LWPOLYLINE square must preview the same 4 PRE + 4 AFT the
