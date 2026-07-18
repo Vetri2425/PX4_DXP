@@ -254,57 +254,70 @@ def _extension_endpoint_freeness(
     return freeness
 
 
-def _entity_extension_preview(
+def _entity_extension_edges(
     ent,
-    preview_pts: list[tuple[float, float]],
-    enabled: bool,
-    is_mark: bool,
-    pre_extension_m: float,
-    aft_extension_m: float,
-    start_is_free: bool = True,
-    end_is_free: bool = True,
-) -> EntityExtensionPreview:
-    # Direction math is shared with the planner (analytic arc tangents,
-    # finite differences for line-like geometry) so the preview cannot
-    # drift from what split_mark_segment_with_extensions() actually plans.
-    # start_is_free/end_is_free gate WHERE a run-up may appear: only at a
-    # chain's true open ends, matching the vertex-anchored planner — an
-    # internal corner or a closed loop yields no preview extension.
+    tangent_pts: list[tuple[float, float]],
+    per_line: bool,
+) -> list[tuple[list[tuple[float, float]], Optional[tuple[float, float]], Optional[tuple[float, float]]]]:
+    """The edges a mark entity's extensions attach to, matching the planner.
+
+    In per-line mode a line-like polyline is split at its corners exactly as
+    ``decompose_line_chain_to_edges`` does in the plan (engine.py, gated on
+    ``per_line_extensions``), so each side is an independent PRE/MARK/AFT pass.
+    This is what lets a single *closed* LWPOLYLINE (a square drawn as one
+    polyline) grow the same per-side run-ups the mission actually drives —
+    previously the preview treated it as one self-closed run and produced none,
+    disagreeing with the plan.
+
+    Everything else stays whole (one edge):
+      - chain-ends mode (per_line=False) never decomposes, same as the planner;
+      - ARC / CIRCLE / SPLINE / ELLIPSE are curved — decompose returns them
+        unchanged and they keep their analytic tangents, never finite-difference.
+
+    Returns ``[(points, start_dir, end_dir)]``; dirs are None when a direction
+    cannot be inferred (caller then emits no run for that end).
+    """
+    from path_engine.core import PathSegment, SegmentType
     from path_engine.planners.extensions import (
+        decompose_line_chain_to_edges,
         entity_extension_directions,
-        offset_point,
     )
 
-    if not enabled or not is_mark or len(preview_pts) < 2:
-        return EntityExtensionPreview(enabled=False)
+    whole_dirs = entity_extension_directions(ent, tangent_pts)
 
-    dirs = entity_extension_directions(ent, preview_pts)
-    if dirs is None:
-        return EntityExtensionPreview(enabled=False)
-    start_dir, end_dir = dirs
+    def _whole():
+        s = whole_dirs[0] if whole_dirs else None
+        e = whole_dirs[1] if whole_dirs else None
+        return [(list(tangent_pts), s, e)]
 
-    pre_points = []
-    aft_points = []
-    if pre_extension_m > 0 and start_is_free:
-        start = preview_pts[0]
-        pre_points = [
-            _ned_point(offset_point(start, start_dir, -pre_extension_m)),
-            _ned_point(start),
-        ]
-    if aft_extension_m > 0 and end_is_free:
-        end = preview_pts[-1]
-        aft_points = [
-            _ned_point(end),
-            _ned_point(offset_point(end, end_dir, aft_extension_m)),
-        ]
+    if not per_line or len(tangent_pts) < 3:
+        return _whole()
 
-    return EntityExtensionPreview(
-        enabled=bool(pre_points or aft_points),
-        pre_length_m=pre_extension_m if pre_points else 0.0,
-        aft_length_m=aft_extension_m if aft_points else 0.0,
-        pre_points=pre_points,
-        aft_points=aft_points,
+    # geometry_type drives _is_line_like_segment: line-like polylines split at
+    # corners, curved geometry is returned unchanged (single edge).
+    seg = PathSegment(
+        segment_type=SegmentType.MARK,
+        points=list(tangent_pts),
+        source_entity=str(ent.entity_id),
+        metadata={"geometry_type": str(ent.entity_type).upper()},
     )
+    parts = decompose_line_chain_to_edges(seg)
+    if len(parts) <= 1:
+        # Not split (curved, or already a single straight edge) — keep analytic
+        # tangents rather than a finite-difference approximation.
+        return _whole()
+
+    edges = []
+    for p in parts:
+        pts = p.points
+        if len(pts) < 2:
+            continue
+        edges.append((
+            list(pts),
+            _unit_dir(pts[0], pts[1]),
+            _unit_dir(pts[-2], pts[-1]),
+        ))
+    return edges or _whole()
 
 
 def _entity_transit_previews(
@@ -561,9 +574,16 @@ async def path_entities(name: str):
     # closed loops get none — same rule split_mark_segment_with_extensions()
     # applies. Computed here (before the build loop) because freeness of one
     # entity's end depends on every other mark entity's endpoints.
+    per_line = bool(extension_config.per_line)
     resolved: list[tuple] = []  # (ent, preview_pts, tangent_pts, default_is_mark, is_mark)
-    mark_endpoints_for_freeness: list[tuple] = []  # (start, end, start_dir, end_dir)
-    mark_slot_of_entity: dict[int, int] = {}
+    # Freeness runs over EDGES, not whole entities: in per-line mode a polyline
+    # is split at its corners (see _entity_extension_edges) so each side is its
+    # own run — this is why a single closed square grows the same per-side
+    # run-ups the plan drives. A lone LINE/ARC contributes one edge, so this is
+    # a superset of the old per-entity behaviour, not a change to it.
+    entity_edges: dict[int, list[tuple]] = {}   # order_index -> [(pts, sdir, edir)]
+    edge_freeness_input: list[tuple] = []       # (start, end, sdir, edir) per edge
+    edge_ref: list[tuple[int, int]] = []        # parallel: (order_index, local_edge_i)
     for idx, ent in enumerate(entities):
         preview_pts = _entity_preview_tuples(ent)
         # SPLINE/ELLIPSE previews are subsampled for payload size. Compute
@@ -576,68 +596,86 @@ async def path_entities(name: str):
         )
         default_is_mark = ent.is_mark()
         is_mark = overrides.get(ent.entity_id, default_is_mark)
+        order_index = len(resolved)
         resolved.append((ent, preview_pts, tangent_pts, default_is_mark, is_mark))
-        if is_mark and tangent_pts:
-            mark_slot_of_entity[idx] = len(mark_endpoints_for_freeness)
-            # Tangents at each end, taken the way the planner takes them: into
-            # the run at the start, out of it at the end.
-            mark_endpoints_for_freeness.append((
-                tangent_pts[0],
-                tangent_pts[-1],
-                _unit_dir(tangent_pts[0], tangent_pts[1]) if len(tangent_pts) > 1 else None,
-                _unit_dir(tangent_pts[-2], tangent_pts[-1]) if len(tangent_pts) > 1 else None,
-            ))
+        if is_mark and tangent_pts and len(tangent_pts) >= 2:
+            edges = _entity_extension_edges(ent, tangent_pts, per_line)
+            entity_edges[order_index] = edges
+            for local_i, (pts, sdir, edir) in enumerate(edges):
+                edge_ref.append((order_index, local_i))
+                edge_freeness_input.append((pts[0], pts[-1], sdir, edir))
 
-    freeness = _extension_endpoint_freeness(
-        mark_endpoints_for_freeness,
-        per_line=bool(extension_config.per_line),
-    )
+    freeness_list = _extension_endpoint_freeness(edge_freeness_input, per_line=per_line)
+    edge_freeness: dict[tuple[int, int], tuple[bool, bool]] = {
+        edge_ref[i]: freeness_list[i] for i in range(len(edge_ref))
+    }
 
     # (entity_id, entry_pt, exit_pt) per drawable MARK entity — endpoints only,
     # so large per-entity point lists aren't retained past the loop. Entry/exit
     # are the extension TIPS where a run-up exists, so connectors span
     # AFT-tip -> next PRE-start like the planner routes them; they fall back to
     # the mark endpoints when that end has no extension.
+    from path_engine.planners.extensions import offset_point
+
     mark_endpoints: list[tuple[str, tuple[float, float], tuple[float, float]]] = []
     extension_runs: list[EntityExtensionRun] = []
     for order_index, (ent, preview_pts, tangent_pts, default_is_mark, is_mark) in enumerate(resolved):
         all_pts.extend(preview_pts)
-        slot = mark_slot_of_entity.get(order_index)
-        start_is_free, end_is_free = freeness[slot] if slot is not None else (True, True)
-        extension_preview = _entity_extension_preview(
-            ent,
-            tangent_pts,
-            enabled=extension_config.enabled,
-            is_mark=is_mark,
-            pre_extension_m=extension_config.pre_extension_m,
-            aft_extension_m=extension_config.aft_extension_m,
-            start_is_free=start_is_free,
-            end_is_free=end_is_free,
+        pre_m = extension_config.pre_extension_m
+        aft_m = extension_config.aft_extension_m
+        make_ext = extension_config.enabled and is_mark
+
+        # Per-edge run-ups, matching the plan. For a lone LINE/ARC there is one
+        # edge, so this reduces to the previous single PRE/AFT pair. For a split
+        # polyline every side is handled independently.
+        edges = entity_edges.get(order_index, [])
+        entity_pre_pts: list = []   # first free PRE across this entity's edges
+        entity_aft_pts: list = []   # last  free AFT across this entity's edges
+        entry_pt = tangent_pts[0] if tangent_pts else None
+        exit_pt = tangent_pts[-1] if tangent_pts else None
+        for local_i, (pts, sdir, edir) in enumerate(edges):
+            sfree, efree = edge_freeness.get((order_index, local_i), (True, True))
+            pre_pts: list = []
+            aft_pts: list = []
+            if make_ext and pre_m > 0 and sfree and sdir is not None:
+                pre_pts = [_ned_point(offset_point(pts[0], sdir, -pre_m)), _ned_point(pts[0])]
+            if make_ext and aft_m > 0 and efree and edir is not None:
+                aft_pts = [_ned_point(pts[-1]), _ned_point(offset_point(pts[-1], edir, aft_m))]
+            if pre_pts:
+                extension_runs.append(EntityExtensionRun(
+                    entity_id=ent.entity_id, role="pre", edge_index=local_i,
+                    length_m=round(pre_m, 3), points=pre_pts))
+                if not entity_pre_pts:
+                    entity_pre_pts = pre_pts
+                if local_i == 0:
+                    entry_pt = (pre_pts[0]["north"], pre_pts[0]["east"])
+            if aft_pts:
+                extension_runs.append(EntityExtensionRun(
+                    entity_id=ent.entity_id, role="aft", edge_index=local_i,
+                    length_m=round(aft_m, 3), points=aft_pts))
+                entity_aft_pts = aft_pts
+                if local_i == len(edges) - 1:
+                    exit_pt = (aft_pts[-1]["north"], aft_pts[-1]["east"])
+            for ext_pt in pre_pts + aft_pts:
+                all_pts.append((ext_pt["north"], ext_pt["east"]))
+
+        # Per-entity summary (single PRE/AFT pair). Authoritative, complete
+        # geometry is `extensions[]` above; this stays for per-entity display and
+        # is the entity's outermost run-up pair. Identical to the old field for a
+        # single-edge entity.
+        extension_preview = EntityExtensionPreview(
+            enabled=bool(entity_pre_pts or entity_aft_pts),
+            pre_length_m=pre_m if entity_pre_pts else 0.0,
+            aft_length_m=aft_m if entity_aft_pts else 0.0,
+            pre_points=entity_pre_pts,
+            aft_points=entity_aft_pts,
         )
         if is_mark and tangent_pts:
             # Travel starts/ends at the run-up tips when they exist — the rover
             # drives out along AFT, turns, and comes back to the next PRE, so a
             # connector pinned to the mark vertex would both overlap the
             # extension and under-report the real distance.
-            pre_pts, aft_pts = extension_preview.pre_points, extension_preview.aft_points
-            entry_pt = (pre_pts[0].north, pre_pts[0].east) if pre_pts else tangent_pts[0]
-            exit_pt = (aft_pts[-1].north, aft_pts[-1].east) if aft_pts else tangent_pts[-1]
             mark_endpoints.append((ent.entity_id, entry_pt, exit_pt))
-        for ext_pt in extension_preview.pre_points + extension_preview.aft_points:
-            all_pts.append((ext_pt.north, ext_pt.east))
-        # Same geometry as extension_preview, flattened into the named
-        # "Extensions" layer so a client can draw them without walking entities.
-        for role, pts, length in (
-            ("pre", extension_preview.pre_points, extension_preview.pre_length_m),
-            ("aft", extension_preview.aft_points, extension_preview.aft_length_m),
-        ):
-            if pts:
-                extension_runs.append(EntityExtensionRun(
-                    entity_id=ent.entity_id,
-                    role=role,
-                    length_m=round(length, 3),
-                    points=pts,
-                ))
         geometry = ent.geometry
         if ent.entity_type in ("SPLINE", "ELLIPSE"):
             # Flattened spline/ellipse vertices duplicate preview_points

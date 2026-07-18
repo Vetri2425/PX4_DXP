@@ -538,6 +538,113 @@ async def test_entities_api_per_line_extends_every_side_of_closed_square(tmp_pat
     assert sum(1 for x in data.extensions if x.role == "aft") == 4
 
 
+def _fake_closed_polyline_mgr(per_line: bool, closed: bool = True):
+    """ONE closed LWPOLYLINE square — the test_1.dxf shape (a single polyline,
+    not 4 separate LINEs). Previously the preview treated this as one self-closed
+    run and produced 0 extensions, while the plan splits it into 4 sides."""
+    verts = [(0.0, 0.0), (0.0, 2.0), (2.0, 2.0), (2.0, 0.0)]
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            return [SimpleNamespace(
+                entity_id="PL0", entity_type="LWPOLYLINE", layer="Lines", color=7,
+                geometry={"vertices": verts, "bulges": [0.0] * len(verts),
+                          "closed": closed},
+                is_mark=lambda: True,
+            )]
+
+        def load_entity_overrides(self, filename):
+            return {}
+
+        def load_extension_config(self, filename):
+            return {"enabled": True, "pre_extension_m": 0.5, "aft_extension_m": 0.5,
+                    "per_line": per_line}
+
+        def load_entity_order(self, filename):
+            return []
+
+    return FakePathManager()
+
+
+@pytest.mark.anyio
+async def test_entities_api_per_line_closed_polyline_matches_plan(tmp_path, monkeypatch):
+    """A single CLOSED LWPOLYLINE square must preview the same 4 PRE + 4 AFT the
+    plan drives — not 0.
+
+    This is the preview<->plan divergence the earlier per_line fix did NOT cover:
+    it handled a square drawn as 4 separate LINEs, but a square drawn as ONE
+    closed polyline hit the self-closed 'no free end' branch and got nothing,
+    while engine.py (decompose_line_chain_to_edges, gated on per_line) really
+    splits it into 4 sides and extends each. Cross-checked against the planner
+    functions directly below.
+    """
+    (tmp_path / "poly.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_closed_polyline_mgr(per_line=True))
+
+    data = await path_entities("poly.dxf")
+
+    n_pre = sum(1 for x in data.extensions if x.role == "pre")
+    n_aft = sum(1 for x in data.extensions if x.role == "aft")
+    assert (n_pre, n_aft) == (4, 4), f"preview gave {(n_pre, n_aft)}, plan drives (4, 4)"
+    # All four runs belong to the one polyline, disambiguated by edge_index.
+    assert {x.entity_id for x in data.extensions} == {"PL0"}
+    assert {x.edge_index for x in data.extensions if x.role == "pre"} == {0, 1, 2, 3}
+
+
+@pytest.mark.anyio
+async def test_entities_api_per_line_closed_polyline_equals_planner(tmp_path, monkeypatch):
+    """Definitive: preview extension count == what the real planner emits.
+
+    Runs decompose_line_chain_to_edges + split_mark_segment_with_extensions on
+    the identical geometry and asserts the preview produced the same number of
+    PRE/AFT runs. If the planner's edge-splitting ever changes, this fails.
+    """
+    from path_engine.core import PathSegment, SegmentType
+    from path_engine.planners.extensions import (
+        decompose_line_chain_to_edges, split_mark_segment_with_extensions,
+    )
+    verts = [(0.0, 0.0), (0.0, 2.0), (2.0, 2.0), (2.0, 0.0), (0.0, 0.0)]
+    seg = PathSegment(segment_type=SegmentType.MARK, points=verts, speed=0.35,
+                      source_entity="PL0", metadata={"geometry_type": "LWPOLYLINE"})
+    plan_pre = plan_aft = 0
+    for edge in decompose_line_chain_to_edges(seg):
+        parts = split_mark_segment_with_extensions(
+            edge, pre_extension_m=0.5, aft_extension_m=0.5, transit_speed=0.2,
+            suppress_closed_loops=False)
+        plan_pre += sum(1 for p in parts if p.metadata.get("extension_role") == "pre")
+        plan_aft += sum(1 for p in parts if p.metadata.get("extension_role") == "aft")
+
+    (tmp_path / "poly.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_closed_polyline_mgr(per_line=True))
+    data = await path_entities("poly.dxf")
+
+    prev_pre = sum(1 for x in data.extensions if x.role == "pre")
+    prev_aft = sum(1 for x in data.extensions if x.role == "aft")
+    assert (prev_pre, prev_aft) == (plan_pre, plan_aft), \
+        f"preview {(prev_pre, prev_aft)} != plan {(plan_pre, plan_aft)}"
+
+
+@pytest.mark.anyio
+async def test_entities_api_chain_ends_closed_polyline_gets_no_extension(tmp_path, monkeypatch):
+    """per_line=False (chain-ends): a closed polyline still gets NO extension —
+    a closed loop has no true open end, and the planner does not decompose in
+    this mode. Guards against the fix leaking into chain-ends behaviour."""
+    (tmp_path / "poly.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_closed_polyline_mgr(per_line=False))
+
+    data = await path_entities("poly.dxf")
+    assert data.extensions == []
+    assert all(not e.extension_preview.enabled for e in data.entities)
+
+
 @pytest.mark.anyio
 async def test_entities_api_per_line_run_up_geometry_is_outward_and_collinear(tmp_path, monkeypatch):
     """A PRE run-up must approach ALONG the line from outside it, not sideways.

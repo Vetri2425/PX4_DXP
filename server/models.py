@@ -297,6 +297,11 @@ class EntityExtensionRun(BaseModel):
 
     entity_id: str
     role: str  # "pre" | "aft"
+    # Which decomposed edge of the parent entity this run belongs to. A single
+    # closed polyline (a square) is split into its sides in per-line mode, so one
+    # entity_id yields several runs; edge_index disambiguates them. 0 for an
+    # entity that is a single edge (a lone LINE/ARC), matching the planner.
+    edge_index: int = 0
     length_m: float = 0.0
     points: list[EntityPreviewPoint]
 
