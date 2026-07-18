@@ -630,6 +630,29 @@ async def test_entities_api_per_line_closed_polyline_equals_planner(tmp_path, mo
 
 
 @pytest.mark.anyio
+async def test_entities_api_per_line_closed_polyline_grows_corner_connectors(tmp_path, monkeypatch):
+    """The sides of a split polyline get their between-side connectors.
+
+    Regression for 'the connector is missing': a single polyline was one
+    connector-endpoint and produced none. Per-edge endpoints give one connector
+    per corner traversed (3 for a 4-side square painted in sequence), each
+    spanning AFT-tip -> next PRE-start = sqrt(0.5^2 + 0.5^2) = 0.707 m.
+    """
+    (tmp_path / "poly.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_closed_polyline_mgr(per_line=True))
+
+    data = await path_entities("poly.dxf")
+
+    assert len(data.transit_preview) == 3, [t.length_m for t in data.transit_preview]
+    for t in data.transit_preview:
+        assert t.from_entity_id == "PL0" and t.to_entity_id == "PL0"
+        assert abs(t.length_m - 0.707) < 0.01, t.length_m
+
+
+@pytest.mark.anyio
 async def test_entities_api_chain_ends_closed_polyline_gets_no_extension(tmp_path, monkeypatch):
     """per_line=False (chain-ends): a closed polyline still gets NO extension —
     a closed loop has no true open end, and the planner does not decompose in

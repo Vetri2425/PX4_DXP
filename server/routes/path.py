@@ -610,14 +610,15 @@ async def path_entities(name: str):
         edge_ref[i]: freeness_list[i] for i in range(len(edge_ref))
     }
 
-    # (entity_id, entry_pt, exit_pt) per drawable MARK entity — endpoints only,
-    # so large per-entity point lists aren't retained past the loop. Entry/exit
-    # are the extension TIPS where a run-up exists, so connectors span
-    # AFT-tip -> next PRE-start like the planner routes them; they fall back to
-    # the mark endpoints when that end has no extension.
+    # (entity_id, entry, exit) per drawable MARK EDGE, in order — endpoints only,
+    # so large point lists aren't retained past the loop. entry/exit are the
+    # extension TIPS where a run-up exists, so connectors span AFT-tip -> next
+    # PRE-start like the planner routes them; they fall back to the mark vertex
+    # when that end has no extension. Per-edge (not per-entity) so a split
+    # polyline's sides get their corner connectors.
     from path_engine.planners.extensions import offset_point
 
-    mark_endpoints: list[tuple[str, tuple[float, float], tuple[float, float]]] = []
+    edge_endpoints: list[tuple[str, tuple[float, float], tuple[float, float]]] = []
     extension_runs: list[EntityExtensionRun] = []
     for order_index, (ent, preview_pts, tangent_pts, default_is_mark, is_mark) in enumerate(resolved):
         all_pts.extend(preview_pts)
@@ -631,8 +632,6 @@ async def path_entities(name: str):
         edges = entity_edges.get(order_index, [])
         entity_pre_pts: list = []   # first free PRE across this entity's edges
         entity_aft_pts: list = []   # last  free AFT across this entity's edges
-        entry_pt = tangent_pts[0] if tangent_pts else None
-        exit_pt = tangent_pts[-1] if tangent_pts else None
         for local_i, (pts, sdir, edir) in enumerate(edges):
             sfree, efree = edge_freeness.get((order_index, local_i), (True, True))
             pre_pts: list = []
@@ -647,17 +646,22 @@ async def path_entities(name: str):
                     length_m=round(pre_m, 3), points=pre_pts))
                 if not entity_pre_pts:
                     entity_pre_pts = pre_pts
-                if local_i == 0:
-                    entry_pt = (pre_pts[0]["north"], pre_pts[0]["east"])
             if aft_pts:
                 extension_runs.append(EntityExtensionRun(
                     entity_id=ent.entity_id, role="aft", edge_index=local_i,
                     length_m=round(aft_m, 3), points=aft_pts))
                 entity_aft_pts = aft_pts
-                if local_i == len(edges) - 1:
-                    exit_pt = (aft_pts[-1]["north"], aft_pts[-1]["east"])
             for ext_pt in pre_pts + aft_pts:
                 all_pts.append((ext_pt["north"], ext_pt["east"]))
+            # Per-EDGE connector endpoints. A connector runs from this edge's
+            # exit tip to the NEXT edge's entry tip, so the sides of a split
+            # polyline grow the corner connectors the plan drives — previously a
+            # single polyline was one endpoint and produced none. Travel starts
+            # at the run-up tip when present (rover drives out along AFT, turns,
+            # comes back to the next PRE), else the mark vertex.
+            edge_entry = (pre_pts[0]["north"], pre_pts[0]["east"]) if pre_pts else pts[0]
+            edge_exit = (aft_pts[-1]["north"], aft_pts[-1]["east"]) if aft_pts else pts[-1]
+            edge_endpoints.append((ent.entity_id, edge_entry, edge_exit))
 
         # Per-entity summary (single PRE/AFT pair). Authoritative, complete
         # geometry is `extensions[]` above; this stays for per-entity display and
@@ -670,12 +674,6 @@ async def path_entities(name: str):
             pre_points=entity_pre_pts,
             aft_points=entity_aft_pts,
         )
-        if is_mark and tangent_pts:
-            # Travel starts/ends at the run-up tips when they exist — the rover
-            # drives out along AFT, turns, and comes back to the next PRE, so a
-            # connector pinned to the mark vertex would both overlap the
-            # extension and under-report the real distance.
-            mark_endpoints.append((ent.entity_id, entry_pt, exit_pt))
         geometry = ent.geometry
         if ent.entity_type in ("SPLINE", "ELLIPSE"):
             # Flattened spline/ellipse vertices duplicate preview_points
@@ -698,7 +696,7 @@ async def path_entities(name: str):
 
     # Transit connectors join entity endpoints that are already in all_pts,
     # so bounds cover them without re-adding the points.
-    transit_preview = _entity_transit_previews(mark_endpoints)
+    transit_preview = _entity_transit_previews(edge_endpoints)
 
     bounds = None
     if all_pts:
