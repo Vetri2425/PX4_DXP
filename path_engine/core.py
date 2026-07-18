@@ -131,6 +131,10 @@ class DXFEntity:
     geometry: dict = field(default_factory=dict)
     unit_scale: float = 0.01  # default: DXF units are centimetres
     is_mark_override: Optional[bool] = None
+    # (lat0, lon0) WGS84 origin of the local ENU frame, set only when the DXF
+    # held geographic coordinates and georef projected them to metres. None for
+    # an ordinary metric DXF. Lets GPS_SURVEYED placement recover the geo frame.
+    geo_origin: Optional[tuple[float, float]] = None
 
     def classify(self, layer_mapping: dict[str, str] | None = None) -> str:
         """Classify this entity as 'mark', 'transit', or 'ignore'."""

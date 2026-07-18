@@ -461,6 +461,13 @@ def parse_dxf(
             log.warning("Skipping unsupported DXF entity type: %s (layer=%s, handle=%s)",
                        etype, layer, handle)
 
+    # Georeferenced DXFs (raw WGS84 lat/lon in the coordinate fields) must be
+    # projected to local ENU metres before anything metric touches them, or the
+    # whole drawing collapses under metre-based tolerances. No-op for a metric
+    # DXF, so the ordinary path is unchanged.
+    from .georef import detect_and_project
+    detect_and_project(entities)
+
     return entities
 
 
