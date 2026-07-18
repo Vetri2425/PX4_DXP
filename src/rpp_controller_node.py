@@ -921,7 +921,6 @@ class RPPControllerNode(Node):
     def _heading_delta(cls, h0: float, h1: float) -> float:
         return abs(cls._angle_wrap(h1 - h0))
 
-    @classmethod
     @staticmethod
     def _perp_dist(
         p: tuple[float, float],
@@ -935,6 +934,7 @@ class RPPControllerNode(Node):
             return math.hypot(p[0] - a[0], p[1] - a[1])
         return abs(dx * (a[1] - p[1]) - dy * (a[0] - p[0])) / h
 
+    @classmethod
     def _simplify_path_for_profile(
         cls,
         pts: list[tuple[float, float]],
