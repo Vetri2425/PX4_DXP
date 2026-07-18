@@ -329,6 +329,14 @@ class RPPControllerNode(Node):
         # `sharp` is accepted as a runtime alias for `segment`.
         self.declare_parameter("tracking_profile",                    "auto")
         self.declare_parameter("segment_corner_threshold_deg",         45.0)
+        # Segment-mode simplification keeps a "collinear" vertex anyway if it
+        # sits more than this far off the straight run (metric Douglas-Peucker
+        # test). Stops near-straight must-hit points (a few cm off, only ~3 deg)
+        # from being dropped so the rover actually tracks through them. 1 cm is
+        # below the sub-2 cm tracking floor, so real drawn points survive while
+        # exactly-collinear densification samples (0 cm off) are still removed.
+        # 0 = old angle-only behaviour.
+        self.declare_parameter("segment_simplify_max_offset_m",        0.01)
         # D2 (runtime entry): when true, run 0 pivots in place to its first
         # heading before tracking (spray OFF via _run_alignment_hold) instead of
         # the emergent forward-cone arc at tracking speed. Default OFF — enabling
@@ -691,7 +699,10 @@ class RPPControllerNode(Node):
             )
             if profile == "segment":
                 c_pts, c_flags = self._simplify_path_for_profile(
-                    run_pts, run_flags
+                    run_pts, run_flags,
+                    max_offset_m=float(
+                        self.get_parameter("segment_simplify_max_offset_m").value
+                    ),
                 )
             else:
                 c_pts, c_flags = run_pts, run_flags
@@ -911,11 +922,25 @@ class RPPControllerNode(Node):
         return abs(cls._angle_wrap(h1 - h0))
 
     @classmethod
+    @staticmethod
+    def _perp_dist(
+        p: tuple[float, float],
+        a: tuple[float, float],
+        b: tuple[float, float],
+    ) -> float:
+        """Perpendicular distance of point p from the infinite line a->b."""
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        h = math.hypot(dx, dy)
+        if h < 1e-9:
+            return math.hypot(p[0] - a[0], p[1] - a[1])
+        return abs(dx * (a[1] - p[1]) - dy * (a[0] - p[0])) / h
+
     def _simplify_path_for_profile(
         cls,
         pts: list[tuple[float, float]],
         flags: list[bool] | None = None,
         collinear_tol_deg: float = 5.0,
+        max_offset_m: float = 0.0,
     ) -> tuple[list[tuple[float, float]], list[bool]]:
         """Remove duplicate and same-heading vertices while preserving corners.
 
@@ -923,6 +948,15 @@ class RPPControllerNode(Node):
         squares/rectangles often arrive as many collinear samples per side;
         segment mode needs the side endpoints, not every resampled point.
         Flag changes are preserved so mark/transit boundaries are not erased.
+
+        Angle alone is not enough. A must-hit waypoint that sits only a few
+        centimetres off the straight run — e.g. the middle points of a
+        near-straight point-path bend the line by ~3 deg yet are 3-4 cm off —
+        reads as "collinear" by heading and was silently dropped, so the rover
+        tracked a straight line and MISSED the points by that offset. When
+        max_offset_m > 0 a vertex is also kept if its perpendicular distance
+        from the retained line exceeds it (a Douglas-Peucker distance test), so
+        geometrically real points survive regardless of how gentle the angle is.
         """
         if flags is None or len(flags) != len(pts):
             flags = [False] * len(pts)
@@ -952,7 +986,11 @@ class RPPControllerNode(Node):
             h1 = cls._segment_heading(this_pt, next_pt)
             heading_change = cls._heading_delta(h0, h1)
             flag_boundary = clean_flags[i - 1] != clean_flags[i] or clean_flags[i] != clean_flags[i + 1]
-            if heading_change <= tol and not flag_boundary:
+            far_off = (
+                max_offset_m > 0.0
+                and cls._perp_dist(this_pt, prev_pt, next_pt) > max_offset_m
+            )
+            if heading_change <= tol and not flag_boundary and not far_off:
                 continue
             out_pts.append(this_pt)
             out_flags.append(clean_flags[i])
