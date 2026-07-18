@@ -265,6 +265,29 @@ class PathEngine:
         self.avoid_wet_paint = avoid_wet_paint
         self.wet_paint_penalty_m = wet_paint_penalty_m
 
+    @staticmethod
+    def _geo_origin_gps(entities, origin_gps, ref_points_gps):
+        """Default GPS placement to the DXF's own geo_origin.
+
+        A georeferenced DXF (lat/lon coords, projected to local ENU metres by
+        georef with the WGS84 origin stamped on each entity) already knows where
+        it belongs on the ground. When the caller gives no explicit GPS
+        placement, use that origin so the mission drives at the EXACT lat/lon it
+        was drawn at — GPS_SURVEYED placement with no alignment survey. Because
+        georef centres the local frame on this same origin, local (0,0) maps
+        back to it and every waypoint round-trips to its original lat/lon.
+
+        Explicit origin_gps / ref_points always win. A metric DXF has no
+        geo_origin, so this is a no-op and LOCAL_NED placement stands.
+        """
+        if origin_gps is not None or ref_points_gps is not None:
+            return origin_gps
+        for ent in entities:
+            geo = getattr(ent, "geo_origin", None)
+            if geo is not None:
+                return (float(geo[0]), float(geo[1]))
+        return origin_gps
+
     def plan_file(
         self,
         filepath: str,
@@ -310,6 +333,7 @@ class PathEngine:
         if ext == ".dxf":
             entities = parse_dxf(filepath, unit_scale=unit_scale)
             detected_unit_scale = entities[0].unit_scale if entities else unit_scale
+            origin_gps = self._geo_origin_gps(entities, origin_gps, ref_points_gps)
             segments = entities_to_segments(
                 entities, layer_mapping=layer_mapping,
                 mark_speed=self.marking_speed, transit_speed=self.transit_speed,
@@ -371,6 +395,7 @@ class PathEngine:
         Returns:
             PlannedPath with merged waypoints and spray flags.
         """
+        origin_gps = self._geo_origin_gps(entities, origin_gps, ref_points_gps)
         segments = entities_to_segments(
             entities, layer_mapping=layer_mapping,
             mark_speed=self.marking_speed, transit_speed=self.transit_speed,
