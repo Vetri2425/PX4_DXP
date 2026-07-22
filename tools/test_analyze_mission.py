@@ -242,3 +242,113 @@ class TestStopsCoastRegression(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ── §8 ABSOLUTE ACCURACY ─────────────────────────────────────────────────────
+# The one budget §1 and §7 structurally cannot see: both work in the local
+# frame, so a wrong anchor shifts the whole mission on the ground while every
+# local metric still reports centimetres.
+
+_LAT0, _LON0 = 13.07208106, 80.26195346
+_LAT1, _LON1 = 13.07206010, 80.26195184   # 2.3255 m from the first, real survey
+
+
+def _mps(lat):
+    return am._metres_per_degree(lat)
+
+
+def _series_at(offset_n_m=0.0, offset_e_m=0.0):
+    """A rover that drives the two surveyed points, optionally displaced.
+
+    `offset_*` simulates a PLACEMENT error: the local path and the driven pose
+    agree perfectly (so §1 is clean), but the global fixes are shifted.
+    """
+    s = am.Series()
+    mn, me = _mps(_LAT0)
+    # local frame: point 0 at (0,0), point 1 at its true offset
+    dn = (_LAT1 - _LAT0) * mn
+    de = (_LON1 - _LON0) * me
+    s.path = [(0.0, 0.0), (dn, de)]
+    s.path_z = [3, 3]                      # spray ON + must-hit
+    for k, (n, e) in enumerate(s.path):
+        t = 10.0 + k
+        s.pose.append((t, n, e, 0.0))
+        lat = _LAT0 + (n + offset_n_m) / mn
+        lon = _LON0 + (e + offset_e_m) / me
+        s.global_fix.append((t, lat, lon, 0.0))
+    return s
+
+
+def _manifest(tmp_path):
+    csv = tmp_path / "survey.csv"
+    csv.write_text(
+        "Name,Code,Latitude,Longitude\n"
+        f"1,L_1,{_LAT0},{_LON0}\n"
+        f"2,L_1,{_LAT1},{_LON1}\n"
+    )
+    return {"staged_mission": {"source_file": str(csv)}}
+
+
+def test_absolute_passes_when_the_rover_is_where_the_survey_says(tmp_path):
+    out = am.analyze_absolute(_series_at(), _manifest(tmp_path))
+    assert out["available"], out.get("reason")
+    assert out["verdict"] == "PASS"
+    assert out["max_cm"] < 1.0
+    assert out["bias_cm"] < 1.0
+
+
+def test_absolute_catches_a_placement_shift_local_metrics_cannot(tmp_path):
+    """40 cm north shift: every local metric is perfect, §8 must still fail."""
+    out = am.analyze_absolute(_series_at(offset_n_m=0.40), _manifest(tmp_path))
+    assert out["available"], out.get("reason")
+    assert out["verdict"] == "FAIL"
+    assert 39.0 < out["bias_cm"] < 41.0
+    assert out["bias_n_cm"] > 39.0
+    assert out["scatter_cm"] < 1.0, "a rigid shift must show as bias, not scatter"
+    assert any("PLACEMENT" in n for n in out["notes"])
+
+
+def test_absolute_distinguishes_scatter_from_bias(tmp_path):
+    """Equal-and-opposite errors = noise, not placement: bias small, scatter large."""
+    s = _series_at()
+    mn, me = _mps(_LAT0)
+    s.global_fix = []
+    for k, (n, e) in enumerate(s.path):
+        sign = 1.0 if k == 0 else -1.0
+        s.global_fix.append((10.0 + k, _LAT0 + (n + sign * 0.20) / mn,
+                             _LON0 + e / me, 0.0))
+    out = am.analyze_absolute(s, _manifest(tmp_path))
+    assert out["bias_cm"] < 1.0, "opposite errors must cancel in the bias"
+    assert out["scatter_cm"] > 15.0
+    assert out["verdict"] in ("WARN", "FAIL")   # still flagged by per-point miss
+
+
+def test_absolute_unavailable_without_global_fixes(tmp_path):
+    s = _series_at()
+    s.global_fix = []
+    out = am.analyze_absolute(s, _manifest(tmp_path))
+    assert not out["available"]
+    assert "global_position" in out["reason"]
+
+
+def test_absolute_refuses_to_guess_without_independent_ground_truth():
+    """No source file => no check. It must NOT fall back to the mission's own
+    anchor, which would be circular and detect nothing."""
+    out = am.analyze_absolute(_series_at(), {"staged_mission": {}})
+    assert not out["available"]
+    assert "ground truth" in out["reason"]
+
+
+def test_absolute_reports_mismatched_counts_rather_than_pairing_blindly(tmp_path):
+    m = _manifest(tmp_path)
+    s = _series_at()
+    s.path = s.path + [(9.0, 9.0)]
+    s.path_z = [3, 3, 3]
+    out = am.analyze_absolute(s, m)
+    assert not out["available"]
+    assert "cannot pair" in out["reason"]
+
+
+def test_geodesic_matches_the_field_survey():
+    d = am._geodesic_m(_LAT0, _LON0, _LAT1, _LON1)
+    assert abs(d - 2.3255) < 0.001

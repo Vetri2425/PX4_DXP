@@ -72,7 +72,49 @@ EKF_JUMP_M = 0.5            # pose position jump between consecutive samples
 # legitimate when the deviation is survey noise. The point is that it must be
 # VISIBLE, with the number attached, so the operator can judge.
 SURVEY_TOL_CM = 2.5         # deviations below this read as survey noise, above = intent
+# S8 ABSOLUTE ACCURACY. Separate budget from S1 (tracking) and S9 (geometry):
+# both of those live entirely inside the local frame, so a wrong ANCHOR shifts the
+# whole shape on the ground while every local metric still reads perfect.
+ABS_MISS_WARN_CM = 5.0      # per-vertex absolute miss above this = WARN
+ABS_MISS_FAIL_CM = 15.0     # ...above this = FAIL
+ABS_BIAS_FAIL_CM = 10.0     # a consistent mean offset this large is a placement error
 VERTEX_BEND_DEG = 0.8       # heading change that marks a /path point as a real vertex
+
+
+_WGS84_A = 6378137.0
+_WGS84_F = 1.0 / 298.257223563
+_WGS84_E2 = _WGS84_F * (2.0 - _WGS84_F)
+
+
+def _metres_per_degree(lat_deg: float) -> tuple[float, float]:
+    """(north, east) metres per degree on the WGS84 ellipsoid.
+
+    North uses the MERIDIONAL radius of curvature, east the prime vertical.
+    Using the semi-major axis for north is a +0.62% scale error at 13 deg — the
+    bug that was fixed in path_engine/parsers/georef.py on 2026-07-22. Kept
+    duplicated here on purpose: this tool must stay a stdlib-only, independent
+    check on the pipeline, not import the code it is auditing.
+    """
+    lat = math.radians(lat_deg)
+    sn = math.sin(lat)
+    w2 = 1.0 - _WGS84_E2 * sn * sn
+    w = math.sqrt(w2)
+    m_merid = _WGS84_A * (1.0 - _WGS84_E2) / (w2 * w)
+    n_prime = _WGS84_A / w
+    per = math.radians(1.0)
+    return (m_merid * per, n_prime * per * math.cos(lat))
+
+
+def _geodesic_ne_m(lat1, lon1, lat2, lon2) -> tuple[float, float]:
+    """(north, east) metres from point 1 to point 2. Local-tangent, exact enough
+    over a marking site (sub-mm below a few hundred metres)."""
+    mn, me = _metres_per_degree((lat1 + lat2) * 0.5)
+    return ((lat2 - lat1) * mn, (lon2 - lon1) * me)
+
+
+def _geodesic_m(lat1, lon1, lat2, lon2) -> float:
+    dn, de = _geodesic_ne_m(lat1, lon1, lat2, lon2)
+    return math.hypot(dn, de)
 
 
 def _perp_from_span(p, a, b) -> float:
@@ -234,7 +276,16 @@ def _p_gpsraw(d):
     return {"fix_type": r.u8()}
 
 
+def _p_navsatfix(d):
+    """sensor_msgs/NavSatFix — the rover's own lat/lon, for absolute accuracy (S8)."""
+    r = _CDR(d); r.header()
+    r.i8(); r.u8()                       # NavSatStatus: status, service
+    lat = r.f64(); lon = r.f64(); alt = r.f64()
+    return {"lat": lat, "lon": lon, "alt": alt}
+
+
 PARSERS = {
+    "sensor_msgs/msg/NavSatFix": _p_navsatfix,
     "geometry_msgs/msg/PoseStamped": _p_pose,
     "geometry_msgs/msg/TwistStamped": _p_twist,
     "geometry_msgs/msg/Vector3Stamped": _p_vec3,
@@ -449,6 +500,8 @@ class Series:
         self.spray_state = []     # (t, bool)
         self.statustext = []      # (t, severity, text)
         self.gps = []             # (t, fix_type)
+        self.global_fix = []      # (t, lat, lon, alt) — rover's own WGS84 position
+        self.path_z = None        # z bitfield of the kept /path (bit1 = must-hit)
         self.topics_seen = {}     # name -> count
 
 
@@ -487,6 +540,8 @@ def collect(bag_dir: str) -> Series:
                 s.paths.append((t, pts))
                 if s.path is None or len(pts) > len(s.path):
                     s.path = pts
+                    # position.z is a bitfield: bit0 spray, bit1 must-hit vertex.
+                    s.path_z = [int(round(p[2])) for p in m["poses"]]
         elif topic == "/rpp/conditioned_path":
             if m["poses"]:
                 s.cond_paths.append((t, [(p[0], p[1]) for p in m["poses"]]))
@@ -502,9 +557,12 @@ def collect(bag_dir: str) -> Series:
             s.statustext.append((t, m["severity"], m["text"]))
         elif topic == "/mavros/gpsstatus/gps1/raw":
             s.gps.append((t, m["fix_type"]))
+        elif topic == "/mavros/global_position/global":
+            if m["lat"] == m["lat"] and abs(m["lat"]) <= 90.0:   # skip NaN / unset
+                s.global_fix.append((t, m["lat"], m["lon"], m["alt"]))
     for lst in (s.pose, s.vel_meas, s.vel_cmd, s.setpoint, s.state, s.rpp, s.seg,
                 s.yaw_rate, s.spray_active, s.spray_desired, s.spray_commanded,
-                s.spray_state, s.statustext, s.gps):
+                s.spray_state, s.statustext, s.gps, s.global_fix):
         lst.sort(key=lambda r: r[0])
     return s
 
@@ -942,6 +1000,163 @@ def analyze_geometry_fidelity(s: Series, survey_tol_cm: float = SURVEY_TOL_CM) -
     }
 
 
+def _surveyed_latlon_from_source(manifest) -> tuple[list, str]:
+    """The INDEPENDENT ground truth: surveyed lat/lon straight from the source file.
+
+    This must NOT come from the mission's own anchor. Placement computes
+    local = T(global) once, from a single pose/global correspondence pair; if T
+    is wrong (a skewed pair — what POSE_GLOBAL_MAX_SKEW_MS guards), converting
+    the driven local position back through T reproduces the intended lat/lon
+    exactly and detects nothing. Re-reading the source file sidesteps T entirely.
+
+    Returns (points, provenance) where points is [(lat, lon), ...].
+    """
+    staged = ((manifest or {}).get("staged_mission") or {})
+    src = staged.get("source_file")
+    if not src or not os.path.isfile(src):
+        return [], f"source file unavailable ({src or 'not recorded'})"
+    ext = os.path.splitext(src)[1].lower()
+    try:
+        if ext == ".csv":
+            import csv as _csv
+            with open(src, encoding="utf-8-sig", errors="replace") as f:
+                rows = list(_csv.DictReader(f))
+            hdr = {k.strip().lower(): k for k in (rows[0].keys() if rows else {})}
+            klat = next((hdr[k] for k in ("latitude", "lat") if k in hdr), None)
+            klon = next((hdr[k] for k in ("longitude", "lon", "long") if k in hdr), None)
+            if not (klat and klon):
+                return [], "CSV has no Latitude/Longitude columns"
+            pts = []
+            for r in rows:
+                try:
+                    pts.append((float(r[klat]), float(r[klon])))
+                except (TypeError, ValueError):
+                    continue
+            return pts, f"survey CSV {os.path.basename(src)}"
+        if ext == ".dxf":
+            import ezdxf
+            doc = ezdxf.readfile(src)
+            pts = [(p.dxf.location.y, p.dxf.location.x)
+                   for p in doc.modelspace() if p.dxftype() == "POINT"]
+            # A georeferenced DXF stores lat in y and lon in x (parser maps
+            # DXF y->north, x->east and leaves the values unscaled).
+            pts = [(a, b) for a, b in pts if abs(a) <= 90.0 and abs(b) <= 180.0]
+            return pts, f"DXF POINT layer of {os.path.basename(src)}"
+    except Exception as exc:
+        return [], f"{type(exc).__name__} reading {os.path.basename(src)}: {exc}"
+    return [], f"unsupported source extension {ext!r}"
+
+
+def analyze_absolute(s: Series, manifest) -> dict:
+    """Did the rover reach the real-world coordinates? (S8)
+
+    S1 asks "did the controller follow its own path" and S9 asks "was that path
+    the right shape". Neither can see a PLACEMENT error, because both work in the
+    local frame — if the anchor is off by 40 cm the whole shape moves on the
+    ground and both still report centimetres.
+
+    Method: for each surveyed point, find the rover's closest approach in the
+    LOCAL frame, take the CONCURRENT global fix, and measure the geodesic to the
+    surveyed lat/lon. Local closest-approach is only used to pick the instant;
+    the comparison itself is global-to-global, so the anchor never enters it.
+    """
+    out = {"available": False}
+    if not s.global_fix:
+        out["reason"] = "no /mavros/global_position/global in bag"
+        return out
+    if not s.pose:
+        out["reason"] = "no pose"
+        return out
+
+    truth, provenance = _surveyed_latlon_from_source(manifest)
+    out["provenance"] = provenance
+    if not truth:
+        out["reason"] = f"no independent ground truth ({provenance})"
+        out["fixes"] = len(s.global_fix)
+        return out
+
+    # Local-frame targets to time the closest approach against: prefer the
+    # must-hit vertices the planner declared, else every /path vertex.
+    path = s.path or []
+    if not path:
+        out["reason"] = "no /path"
+        return out
+    if s.path_z and len(s.path_z) == len(path):
+        targets = [p for p, z in zip(path, s.path_z) if z & 2]
+        target_kind = "must-hit vertices"
+    else:
+        targets = []
+        target_kind = ""
+    if not targets:
+        targets = path
+        target_kind = "all /path vertices (no must-hit flags in bag)"
+
+    # Pair each surveyed point with a local target. Counts usually match (both
+    # are the surveyed vertex set); if not, say so rather than guessing.
+    out["n_truth"] = len(truth)
+    out["n_targets"] = len(targets)
+    out["target_kind"] = target_kind
+    if len(truth) != len(targets):
+        out["reason"] = (f"cannot pair {len(truth)} surveyed point(s) with "
+                         f"{len(targets)} local target(s)")
+        return out
+
+    gf = s.global_fix
+    rows = []
+    for i, (tgt_n, tgt_e) in enumerate(targets):
+        best_t, best_d = None, float("inf")
+        for (t, n, e, _yaw) in s.pose:
+            d = math.hypot(n - tgt_n, e - tgt_e)
+            if d < best_d:
+                best_d, best_t = d, t
+        if best_t is None:
+            continue
+        # nearest global fix in time
+        j = min(range(len(gf)), key=lambda k: abs(gf[k][0] - best_t))
+        t_fix, lat_r, lon_r, _alt = gf[j]
+        skew_ms = abs(t_fix - best_t) * 1000.0
+        lat_s, lon_s = truth[i]
+        miss_m = _geodesic_m(lat_s, lon_s, lat_r, lon_r)
+        dn, de = _geodesic_ne_m(lat_s, lon_s, lat_r, lon_r)
+        rows.append({"i": i, "miss_cm": miss_m * 100.0,
+                     "dn_cm": dn * 100.0, "de_cm": de * 100.0,
+                     "local_approach_cm": best_d * 100.0, "skew_ms": skew_ms})
+
+    if not rows:
+        out["reason"] = "no usable closest-approach samples"
+        return out
+
+    misses = [r["miss_cm"] for r in rows]
+    mean_dn = sum(r["dn_cm"] for r in rows) / len(rows)
+    mean_de = sum(r["de_cm"] for r in rows) / len(rows)
+    bias_cm = math.hypot(mean_dn, mean_de)
+    # Scatter about the mean separates a PLACEMENT shift (large bias, small
+    # scatter) from noise/tracking (small bias, large scatter).
+    scatter = math.sqrt(sum((r["dn_cm"] - mean_dn) ** 2 + (r["de_cm"] - mean_de) ** 2
+                            for r in rows) / len(rows))
+    max_skew = max(r["skew_ms"] for r in rows)
+
+    verdict = "PASS"
+    notes = []
+    if max(misses) > ABS_MISS_FAIL_CM:
+        verdict = "FAIL"; notes.append(f"worst miss {max(misses):.1f} cm > {ABS_MISS_FAIL_CM:.0f} cm")
+    elif max(misses) > ABS_MISS_WARN_CM:
+        verdict = "WARN"; notes.append(f"worst miss {max(misses):.1f} cm > {ABS_MISS_WARN_CM:.0f} cm")
+    if bias_cm > ABS_BIAS_FAIL_CM:
+        verdict = "FAIL"
+        notes.append(f"systematic {bias_cm:.1f} cm offset with only {scatter:.1f} cm scatter "
+                     f"— this is PLACEMENT, not tracking")
+    if max_skew > 500.0:
+        notes.append(f"global fix up to {max_skew:.0f} ms from closest approach — "
+                     f"at speed that is itself centimetres; treat as indicative")
+
+    out.update({"available": True, "verdict": verdict, "rows": rows,
+                "max_cm": max(misses), "mean_cm": sum(misses) / len(misses),
+                "bias_cm": bias_cm, "bias_n_cm": mean_dn, "bias_e_cm": mean_de,
+                "scatter_cm": scatter, "max_skew_ms": max_skew, "notes": notes})
+    return out
+
+
 def analyze_config(s: Series, manifest) -> dict:
     """As-run params: manifest (FCU + RPP snapshot) plus a live RPP block from the bag."""
     out = {"from_manifest": None, "rpp_from_bag": None}
@@ -1099,8 +1314,36 @@ def _fmt_report(a: dict) -> str:
         line(f"   verdict : {g['verdict']}")
     line("")
 
+    ab = a.get("absolute") or {}
+    line("8. ABSOLUTE ACCURACY (rover's own lat/lon vs the SURVEYED lat/lon)")
+    line("   asks the one question §1 and §7 structurally cannot: is the shape in the")
+    line("   RIGHT PLACE ON EARTH? Both of those live in the local frame, so a wrong")
+    line("   anchor moves the whole mission and they still report centimetres.")
+    if not ab.get("available"):
+        line(f"   unavailable — {ab.get('reason')}")
+        if ab.get("provenance"):
+            line(f"   ground truth : {ab['provenance']}")
+    else:
+        line(f"   ground truth : {ab['provenance']}  ({ab['n_truth']} surveyed point(s))")
+        line(f"   timed against: {ab['target_kind']}")
+        for r in ab["rows"]:
+            line(f"     - pt {r['i'] + 1}: miss {r['miss_cm']:>6.2f} cm "
+                 f"(N {r['dn_cm']:+6.2f}, E {r['de_cm']:+6.2f})   "
+                 f"local approach {r['local_approach_cm']:>5.2f} cm, "
+                 f"fix skew {r['skew_ms']:.0f} ms")
+        line(f"   mean miss {ab['mean_cm']:.2f} cm   max {ab['max_cm']:.2f} cm")
+        line(f"   systematic bias {ab['bias_cm']:.2f} cm "
+             f"(N {ab['bias_n_cm']:+.2f}, E {ab['bias_e_cm']:+.2f})   "
+             f"scatter about it {ab['scatter_cm']:.2f} cm")
+        line("     ^ large bias + small scatter = PLACEMENT (the whole shape is shifted).")
+        line("       small bias + large scatter = tracking/localisation noise.")
+        for n in ab.get("notes", []):
+            line(f"   NOTE: {n}")
+        line(f"   verdict : {ab['verdict']}")
+    line("")
+
     cfg = a["config"]
-    line("8. AS-RUN CONFIG")
+    line("9. AS-RUN CONFIG")
     fm = cfg.get("from_manifest")
     if fm:
         line(f"   git {fm.get('git_sha')}  services {fm.get('services')}")
@@ -1113,7 +1356,7 @@ def _fmt_report(a: dict) -> str:
         line("   (no manifest and no /rpp/debug params)")
     line("")
 
-    line("9. VERDICT")
+    line("10. VERDICT")
     line(f"   ===> {a['verdict']} <===")
     if a["worst_offenders"]:
         line("   worst offenders:")
@@ -1137,13 +1380,14 @@ def analyze(root: str) -> dict:
     spray = analyze_spray(s)
     health = analyze_health(s)
     geometry = analyze_geometry_fidelity(s)
+    absolute = analyze_absolute(s, manifest)
     config = analyze_config(s, manifest)
 
     # overall verdict + worst offenders
     offenders = []
     fails = []
     for name, sec in (("tracking", tracking), ("stops", stops), ("pivots", pivots),
-                      ("geometry", geometry)):
+                      ("geometry", geometry), ("absolute", absolute)):
         v = sec.get("verdict")
         if v == "FAIL":
             fails.append(name)
@@ -1167,6 +1411,14 @@ def analyze(root: str) -> dict:
         offenders.append(f"pivot settle {pivots['worst_settle_deg']}° > {SETTLE_TOL_DEG}°")
     if health.get("offboard_drops"):
         offenders.append(f"{health['offboard_drops']} OFFBOARD drop(s)")
+    if absolute.get("available") and absolute.get("bias_cm", 0) > ABS_BIAS_FAIL_CM:
+        offenders.append(
+            f"the whole mission sits {absolute['bias_cm']:.1f}cm off its surveyed position "
+            f"(scatter only {absolute['scatter_cm']:.1f}cm) — a PLACEMENT error, which no "
+            f"local-frame metric can see")
+    elif absolute.get("available") and absolute.get("max_cm", 0) > ABS_MISS_FAIL_CM:
+        offenders.append(
+            f"worst absolute miss {absolute['max_cm']:.1f}cm vs the surveyed lat/lon")
     verdict = "FAIL" if fails else ("WARN" if (offenders or health.get("verdict") == "WARN") else "PASS")
 
     return {
@@ -1186,6 +1438,7 @@ def analyze(root: str) -> dict:
         "spray": spray,
         "health": health,
         "geometry": geometry,
+        "absolute": absolute,
         "config": config,
         "worst_offenders": offenders,
         "verdict": verdict,
