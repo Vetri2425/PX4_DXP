@@ -26,7 +26,10 @@ from config import (
     POSE_GLOBAL_MAX_SKEW_MS,
     POSE_STALE_MS,
 )
+from logging_setup import get_logger
 from path_engine.ned import latlon_to_ned
+
+log = get_logger("server.placement")
 
 LOCAL_NED = "LOCAL_NED"
 GPS_SURVEYED = "GPS_SURVEYED"
@@ -118,6 +121,42 @@ def resolve_surveyed_points(
             f"GPS fix_type={fix_type} is below RTK_FIXED ({GPS_FIX_TYPE_RTK_FIXED})"
         )
 
+    # ── Preferred: the EKF's own declared local-frame origin ─────────────────
+    # PX4 sets this once at first GPS fix and then holds it for the EKF session
+    # (ekf_helper.cpp: routine GNSS position resets project THROUGH the existing
+    # origin and move only the vehicle estimate). It is the same datum PX4's own
+    # rover controller projects mission waypoints against, re-initialising its
+    # MapProjection only when ref_timestamp changes.
+    #
+    # Using it makes the translation a pure function of (anchor, origin) — no
+    # rover sample at all — so the same staged mission produces a BIT-IDENTICAL
+    # path on every load. The live pose/global pair below cannot do that:
+    # GLOBAL_POSITION_INT carries lat/lon as int32 degE7, quantising to ~1.1 cm
+    # at this latitude, and the two topics are never sampled simultaneously
+    # (the skew gate permits 100 ms, which is 3.5 cm at 0.35 m/s). Measured
+    # consequence of the live pair: the same file published paths 0.39-1.53 cm
+    # apart, in scattered directions, run to run.
+    if state.get("ekf_origin_received"):
+        origin_lat, origin_lon = _finite_pair(
+            (state.get("ekf_origin_lat"), state.get("ekf_origin_lon")),
+            "EKF local-frame origin",
+        )
+        if -90.0 <= origin_lat <= 90.0 and -180.0 <= origin_lon <= 180.0:
+            translation = latlon_to_ned(
+                anchor_lat, anchor_lon, origin_lat, origin_lon
+            )
+            if all(math.isfinite(v) for v in translation):
+                return _apply_translation(source_points, translation)
+        log.warning(
+            "EKF origin present but invalid (%s, %s) — falling back to the live "
+            "pose/global pair", state.get("ekf_origin_lat"), state.get("ekf_origin_lon"))
+    else:
+        log.warning(
+            "no EKF local-frame origin (/mavros/global_position/gp_origin is empty) "
+            "— falling back to the live pose/global pair; placement will vary "
+            "~1 cm run to run")
+
+    # ── Fallback: single live pose/global pair (non-deterministic) ────────────
     rover_local_n, rover_local_e = _finite_pair(
         (state.get("pos_n"), state.get("pos_e")), "rover local position"
     )
@@ -135,6 +174,13 @@ def resolve_surveyed_points(
     if not all(math.isfinite(v) for v in translation):
         raise PlacementError("survey translation contains non-finite values")
 
+    return _apply_translation(source_points, translation)
+
+
+def _apply_translation(
+    source_points: Iterable[tuple[float, float]],
+    translation: tuple[float, float],
+) -> tuple[list[tuple[float, float]], tuple[float, float]]:
     resolved: list[tuple[float, float]] = []
     for point in source_points:
         n, e = _finite_pair(point, "mission waypoint")
@@ -142,5 +188,4 @@ def resolve_surveyed_points(
         if not all(math.isfinite(v) for v in resolved_point):
             raise PlacementError("resolved mission waypoint contains non-finite values")
         resolved.append(resolved_point)
-
     return resolved, translation

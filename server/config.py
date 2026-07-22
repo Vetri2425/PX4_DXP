@@ -102,6 +102,12 @@ POSE_STALE_MS = 500.0  # consider pose stale above this
 # unless overridden — keep global/GPS slightly looser than local pose.
 GLOBAL_POSITION_STALE_MS = float(os.environ.get("ROVER_GLOBAL_POS_STALE_MS", "500"))
 GPS_FIX_STALE_MS = float(os.environ.get("ROVER_GPS_FIX_STALE_MS", "500"))
+# PX4 only force-sends GPS_GLOBAL_ORIGIN at MAVLink stream start; if MAVROS
+# connects later the latched gp_origin topic stays empty and placement loses its
+# fixed datum. Ask for it, bounded.
+ORIGIN_REQUEST_PERIOD_S = float(os.environ.get("ROVER_ORIGIN_REQ_PERIOD_S", "10.0"))
+ORIGIN_REQUEST_MAX_TRIES = int(os.environ.get("ROVER_ORIGIN_REQ_MAX_TRIES", "30"))
+
 POSE_GLOBAL_MAX_SKEW_MS = float(os.environ.get("ROVER_POSE_GLOBAL_SKEW_MS", "100"))
 # Liveness of the RPP controller itself, measured on receipt of /rpp/debug (which it
 # publishes every control tick). Distinct from the controller's own self-reported

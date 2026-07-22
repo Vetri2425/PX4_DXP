@@ -39,6 +39,8 @@ from nav_msgs.msg import Path
 from std_msgs.msg import Bool, Float32MultiArray
 
 from config import (
+    ORIGIN_REQUEST_MAX_TRIES,
+    ORIGIN_REQUEST_PERIOD_S,
     SRV_RPP_GET_PARAMS,
     SRV_RPP_LIST_PARAMS,
     SRV_RPP_SET_PARAMS,
@@ -54,12 +56,21 @@ log = get_logger("server.ros")
 try:
     from mavros_msgs.msg import State
     from sensor_msgs.msg import BatteryState, NavSatFix
-    from mavros_msgs.srv import CommandBool, SetMode
+    from mavros_msgs.srv import CommandBool, CommandLong, SetMode
 
     _HAS_MAVROS = True
 except ImportError:
     _HAS_MAVROS = False
     State = BatteryState = NavSatFix = CommandBool = SetMode = None  # type: ignore
+    CommandLong = None  # type: ignore
+
+try:
+    from geographic_msgs.msg import GeoPointStamped
+
+    _HAS_GEOPOINT = True
+except ImportError:
+    _HAS_GEOPOINT = False
+    GeoPointStamped = None  # type: ignore
 
 try:
     from mavros_msgs.msg import GPSRAW
@@ -157,6 +168,12 @@ class RosBridgeNode(Node):
         "pos_e": 0.0,
         "pose_received": False,
         "global_position_received": False,
+        # EKF-declared local-frame origin (GPS_GLOBAL_ORIGIN -> gp_origin). Fixed
+        # for the EKF session, so using it makes mission placement deterministic.
+        "ekf_origin_lat": 0.0,
+        "ekf_origin_lon": 0.0,
+        "ekf_origin_received": False,
+        "ekf_origin_stamp": None,
         "gps_fix_received": False,
         "heading_ned_deg": 0.0,
         "battery_v": 0.0,
@@ -244,6 +261,17 @@ class RosBridgeNode(Node):
                 _qos_best_effort(),
                 callback_group=self._sub_group,
             )
+            # EKF local-frame origin. mavros publishes this with LatchedStateQoS
+            # (RELIABLE + TRANSIENT_LOCAL, depth 1), so we MUST match durability
+            # or we silently never receive the one latched message.
+            if _HAS_GEOPOINT:
+                self.create_subscription(
+                    GeoPointStamped,
+                    "/mavros/global_position/gp_origin",
+                    self._cb_gp_origin,
+                    _qos_reliable_tl(),
+                    callback_group=self._sub_group,
+                )
             if _HAS_GPSRAW:
                 self.create_subscription(
                     GPSRAW,
@@ -296,6 +324,24 @@ class RosBridgeNode(Node):
         if _HAS_MAVROS:
             self._arming_cli = self.create_client(
                 CommandBool, "/mavros/cmd/arming", callback_group=self._svc_group
+            )
+            # Used only to ask PX4 to (re)send GPS_GLOBAL_ORIGIN — see
+            # _request_ekf_origin_tick. Read-only telemetry request.
+            self._command_cli = self.create_client(
+                CommandLong, "/mavros/cmd/command", callback_group=self._svc_group
+            )
+            # PX4 force-sends GPS_GLOBAL_ORIGIN once when its MAVLink stream
+            # starts, then only on change. If MAVROS connects after that (a
+            # rover-server restart, a MAVROS restart) the latched topic stays
+            # EMPTY FOREVER and mission placement silently falls back to the
+            # non-deterministic live pose/global pair. Verified on the rig:
+            # echo returned nothing until MAV_CMD_REQUEST_MESSAGE was sent, and
+            # the value latched immediately afterwards. So ask for it.
+            self._origin_req_count = 0
+            self.create_timer(
+                ORIGIN_REQUEST_PERIOD_S,
+                self._request_ekf_origin_tick,
+                callback_group=self._svc_group,
             )
             self._set_mode_cli = self.create_client(
                 SetMode, "/mavros/set_mode", callback_group=self._svc_group
@@ -407,6 +453,71 @@ class RosBridgeNode(Node):
             self._state["vrms"] = vrms
             self._state["global_position_received"] = True
 
+
+    def _cb_gp_origin(self, msg) -> None:
+        """EKF-declared local-frame origin (mavros ~/gp_origin, latched).
+
+        This is the datum PX4 itself projects every global coordinate against
+        (`vehicle_local_position.ref_lat/ref_lon`). It is set once at first GPS
+        fix and then fixed for the EKF session, so using it for mission
+        placement makes the published path identical on every load — which a
+        live pose/global pair cannot be, because GLOBAL_POSITION_INT quantises
+        lat/lon to 1e-7 deg (~1.1 cm here) and the two samples are never
+        simultaneous.
+        """
+        lat = float(msg.position.latitude)
+        lon = float(msg.position.longitude)
+        if not (math.isfinite(lat) and math.isfinite(lon)):
+            return
+        if abs(lat) > 90.0 or abs(lon) > 180.0 or (lat == 0.0 and lon == 0.0):
+            return
+        stamp = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+        with self._lock:
+            prev_lat = self._state.get("ekf_origin_lat")
+            prev_recv = self._state.get("ekf_origin_received")
+            self._state["ekf_origin_lat"] = lat
+            self._state["ekf_origin_lon"] = lon
+            self._state["ekf_origin_stamp"] = stamp
+            self._state["ekf_origin_received"] = True
+        if not prev_recv:
+            log.info("EKF local-frame origin received: %.8f, %.8f", lat, lon)
+        elif prev_lat != lat:
+            # A moved origin invalidates any already-placed mission.
+            log.warning(
+                "EKF local-frame origin CHANGED to %.8f, %.8f — previously placed "
+                "missions are no longer valid, re-place before driving", lat, lon)
+
+    def _request_ekf_origin_tick(self) -> None:
+        """Ask PX4 for GPS_GLOBAL_ORIGIN until we have it (bounded retries).
+
+        MAV_CMD_REQUEST_MESSAGE (512) with param1 = 49. This is a pure telemetry
+        request — it cannot move the vehicle — but it is still a command to the
+        FCU, so it is bounded and stops the moment the origin arrives.
+        """
+        with self._lock:
+            have = bool(self._state.get("ekf_origin_received"))
+            connected = bool(self._state.get("connected"))
+        if have or not connected:
+            return
+        if self._origin_req_count >= ORIGIN_REQUEST_MAX_TRIES:
+            return
+        if self._command_cli is None or not self._command_cli.service_is_ready():
+            return
+        self._origin_req_count += 1
+        req = CommandLong.Request()
+        req.broadcast = False
+        req.command = 512               # MAV_CMD_REQUEST_MESSAGE
+        req.confirmation = 0
+        req.param1 = 49.0               # GPS_GLOBAL_ORIGIN
+        try:
+            fut = self._command_cli.call_async(req)
+            fut.add_done_callback(lambda _f: None)
+            log.info(
+                "requested GPS_GLOBAL_ORIGIN from PX4 (attempt %d/%d) — the latched "
+                "gp_origin topic was empty", self._origin_req_count,
+                ORIGIN_REQUEST_MAX_TRIES)
+        except Exception:
+            log.exception("GPS_GLOBAL_ORIGIN request failed")
     def _cb_gps_raw(self, msg) -> None:
         with self._lock:
             self._gps_fix_recv_time = time.monotonic()
