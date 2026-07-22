@@ -277,9 +277,16 @@ def _p_gpsraw(d):
 
 
 def _p_navsatfix(d):
-    """sensor_msgs/NavSatFix — the rover's own lat/lon, for absolute accuracy (S8)."""
+    """sensor_msgs/NavSatFix — the rover's own lat/lon, for absolute accuracy (S8).
+
+    NavSatStatus is `int8 status` + `uint16 service` — service is SIXTEEN bits.
+    Reading it as uint8 shifts every following float64 by one slot, so latitude
+    lands in the longitude field and the whole fix is garbage. Validated against
+    a real bag: the origin must come out near the site, not near (0, lat).
+    """
     r = _CDR(d); r.header()
-    r.i8(); r.u8()                       # NavSatStatus: status, service
+    r.i8()                               # NavSatStatus.status
+    r.u16()                              # NavSatStatus.service  (uint16, not uint8)
     lat = r.f64(); lon = r.f64(); alt = r.f64()
     return {"lat": lat, "lon": lon, "alt": alt}
 
