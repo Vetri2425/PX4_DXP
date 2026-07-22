@@ -60,10 +60,34 @@ Not your job: PX4 firmware, waypoint gen, log analysis — those live on Mac GCS
 - **Lineage still included:** BUG-T3 `510be9b` / BUG-T2 `1af51ac` / BUG-T1 `036f116` (validated 2026-06-15) + collinear momentum `cd44884` (2026-06-19).
 - **Tracking @0.35 m/s — shapes sub-2cm RMS (06-15 bags):** arc 1.46 / lshape 0.90 / square 0.87 / U-turn 1.06 cm.
 - **Arc (smooth RPP) — structural floor, DEFERRED:** velocity OFFBOARD discards `trajectory_setpoint.yawspeed`; pure-P → following err `≈ ω/RO_YAW_P`. `RO_YAW_P=1.5`. Companion `yaw_rate_feedback_gain` is a NO-OP in velocity mode.
-- **Frozen RPP corner-stop defaults (this tree):** `segment_slowdown_dist=0.50`, `segment_brake_velocity_cap_m_s=0.08`, `segment_min_corner_speed=0.08` (PRE_CORNER floor), `segment_endpoint_approach_speed=0.03` (final-segment only), `segment_heading_tolerance_deg=2.0`, `segment_stop_yaw_rate_threshold=0.05`, `segment_align_settle_s=0.20`, `segment_stop_dwell_s=0.30`. Also: `max_yaw_rate_body=0.45`, `a_lat_max=0.3`, `corner_smooth_radius_m=0.5`. PX4: `RO_YAW_P=1.5`, `RO_YAW_RATE_LIM=30`, `EKF2_WENC_CTRL=1`, `RBCLW_COUNTS_REV=148000`. Full FCU set in `PX4_DXP_Tracker.xlsx` → "PX4 FCU Params".
-- **FUTURE — SPD-T1 (backlog):** 1.0 m/s line / 0.6 m/s arc. Prereq: verify RoboClaw top speed vs `RO_MAX_THR_SPEED=0.9`.
+- **Frozen RPP corner-stop defaults (this tree):** `segment_slowdown_dist=0.50`, `segment_brake_velocity_cap_m_s=0.08`, `segment_min_corner_speed=0.08` (PRE_CORNER floor), `segment_endpoint_approach_speed=0.03` (final-segment only), `segment_heading_tolerance_deg=2.0`, `segment_stop_yaw_rate_threshold=0.05`, `segment_align_settle_s=0.20`, `segment_stop_dwell_s=0.30`. Also: `max_yaw_rate_body=0.45`, `a_lat_max=0.3`, `corner_smooth_radius_m=0.5`. **FCU params — verified from the QGC export `PX4_params/22-07-2026/` (880 params), NOT from memory.** Full set in that file; `PX4_DXP_Tracker.xlsx` → "PX4 FCU Params" is stale.
+
+| Group | Param | Value | Note |
+|---|---|---|---|
+| Yaw | `RO_YAW_P` | 1.5 | pure-P; I=D=0 in firmware — structural following-error floor |
+| | `RO_YAW_RATE_P` | 0.13 | was 0.17 |
+| | `RO_YAW_RATE_LIM` | **22** | was 90; **CLAUDE.md previously said 30 — wrong** |
+| | `RO_YAW_ACCEL_LIM` / `RO_YAW_DECEL_LIM` | 15 / 18 | was 25 / 34 |
+| Speed | `RO_MAX_THR_SPEED` | **0.96** | **previously documented as 0.9 — wrong** |
+| Heading | `EKF2_GPS_YAW_OFF` | **180.0** | dual antenna mounted REVERSED. A round number — assumed, not measured. See open bug B1 |
+| | `GPS_YAW_OFFSET` | **180.0** | driver-level twin of the above |
+| Antenna | `EKF2_GPS_POS_X/Y/Z` | 0 / 0 / −0.4 | **Y=0 asserts the antenna is on the centreline** — verify physically (bug B3) |
+| Wheels | `RBCLW_COUNTS_REV` | 148000 | one value for BOTH wheels (bug B2) |
+| | `RBCLW_QPPS_MAX` | 182655 | |
+| | `RD_WHEEL_TRACK` | 0.470 | |
+| | `EKF2_WENC_RAD` | 0.1524 | 6 in |
+| Encoder fusion | `EKF2_WENC_CTRL` | 1 | enabled |
+| | `EKF2_WENC_NOISE` / `_LAT_N` | 0.1 / 0.1 | was 0.35 — **3.5× more trust in the encoder** |
+| | `EKF2_WENC_GATE` | 3 | PX4 default is 5.0 SD — tighter here |
+| Cornering | `RD_TRANS_DRV_TRN` / `_TRN_DRV` | 0.70 / 0.0349 rad | drive→turn 40°, turn→drive 2° |
+| | `NAV_ACC_RAD` | 0.05 | |
+| Failsafe | `NAV_RCL_ACT` / `NAV_DLL_ACT` | 6 / 6 | **Disarm** on RC / datalink loss |
+| | `COM_RC_IN_MODE` | 2 | |
+
+`PP_LOOKAHD_*` (0.7 / 0.6 / 2.0) exist but are **unused** — they drive PX4's own AUTO-mission pure pursuit, which this rover does not use (companion RPP over OFFBOARD velocity).
+- **FUTURE — SPD-T1 (backlog):** 1.0 m/s line / 0.6 m/s arc. Prereq: verify RoboClaw top speed vs `RO_MAX_THR_SPEED=0.96`.
 - Tracking profiles live: `tracking_profile=auto|segment|smooth`.
-- Phase 3 spray: **live on this tree** — `spray_controller_node.py` → PX4 AUX1 via cmd 187; `on_value=1.0` / `off_value=-1.0` (normalized). QGC: `PWM_AUX_FUNC1=301`, `PWM_AUX_MIN1=0`, `PWM_AUX_MAX1=3000` (as documented in this tree), `PWM_AUX_DIS1=0`. Manual: `POST /api/spray/test`.
+- Phase 3 spray: **live on this tree** — `spray_controller_node.py` → PX4 AUX1 via cmd 187; `on_value=1.0` / `off_value=-1.0` (normalized). QGC: `PWM_AUX_FUNC1=301`, `PWM_AUX_MIN1=0`, `PWM_AUX_MAX1=15000` (verified 2026-07-22; raised from 3000 for flow — see spray PWM strength note), `PWM_AUX_DIS1=0`. Manual: `POST /api/spray/test`.
 - Plan doc on branch: `docs/OFFBOARD_POSITION_MODE_PLAN.md` (future position-mode stop architecture — not implemented in controller yet).
 - robot_localization fusion: not pursued (EKF2 wheel-encoder fusion supersedes).
 
