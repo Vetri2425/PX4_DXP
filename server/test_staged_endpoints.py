@@ -202,6 +202,48 @@ async def test_staged_metadata_carries_source_detail_for_the_recorder(
     assert detail["unit_scale_m_per_unit"] == pytest.approx(1.0)
 
 
+async def test_survey_tolerance_is_staged_when_the_operator_sets_it(
+    tmp_path, monkeypatch
+):
+    """The tolerance that judges a run must be the one set when planning it.
+
+    analyze_mission §7 decides FAIL on this number, so it belongs to the
+    survey. Staged here, read from the manifest there.
+    """
+    _, staging = _setup(tmp_path, monkeypatch)
+
+    plan = await path_route.plan_and_stage(
+        "square.dxf",
+        PathPlanRequest(source="square.dxf", origin_gps=[37.7749, -122.4194],
+                        survey_tolerance_m=0.008),
+    )
+    with open(os.path.join(staging, f"{plan.mission_summary.mission_id}.json")) as f:
+        assert json.load(f)["metadata"]["survey_tolerance_m"] == 0.008
+
+
+async def test_survey_tolerance_absent_means_absent_not_defaulted(
+    tmp_path, monkeypatch
+):
+    """None must NOT become a number here, or every mission would claim an
+    explicit tolerance it never chose and the analyser could not tell the
+    operator's 2.5 cm from its own fallback."""
+    _, staging = _setup(tmp_path, monkeypatch)
+
+    plan = await path_route.plan_and_stage(
+        "square.dxf",
+        PathPlanRequest(source="square.dxf", origin_gps=[37.7749, -122.4194]),
+    )
+    with open(os.path.join(staging, f"{plan.mission_summary.mission_id}.json")) as f:
+        assert json.load(f)["metadata"]["survey_tolerance_m"] is None
+
+
+async def test_survey_tolerance_rejects_nonsense(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    for bad in (0.0, -0.01, 2.0):   # zero, negative, 2 metres
+        with pytest.raises(Exception):
+            PathPlanRequest(source="square.dxf", survey_tolerance_m=bad)
+
+
 async def test_get_staged_missing_404(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     with pytest.raises(Exception) as ei:

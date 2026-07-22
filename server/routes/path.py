@@ -1216,6 +1216,10 @@ def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
             # already builds exactly this dict in plan_file(); see
             # path_engine/engine.py:366.
             "source_detail": _source_detail(result),
+            # Operator-set, per survey. Absent (None) means "use the analyser's
+            # default" — deliberately NOT defaulted to a number here, or every
+            # mission would claim an explicit tolerance it never chose.
+            "survey_tolerance_m": req.survey_tolerance_m,
             "mark_length_m": result["mark_length_m"],
             "transit_length_m": result["transit_length_m"],
             "total_length_m": result["total_length_m"],

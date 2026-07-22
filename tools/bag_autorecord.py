@@ -450,6 +450,8 @@ def _staged_mission(mission_id: str | None) -> dict:
         "source_file": source.get("filepath"),
         "source_extension": source.get("extension"),
         "unit_scale_m_per_unit": source.get("unit_scale_m_per_unit"),
+        # Operator's per-survey vertex tolerance; None = analyser default.
+        "survey_tolerance_m": (d.get("metadata") or {}).get("survey_tolerance_m"),
         "placement_mode": d.get("placement_mode"),
         "anchor": anchor or None,
         "alignment": {

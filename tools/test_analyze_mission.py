@@ -521,3 +521,67 @@ def test_manifest_writeback_adds_only_traversal(tmp_path):
 def test_manifest_writeback_is_silent_when_there_is_no_manifest(tmp_path):
     """A bare rosbag dir is a valid input; it just has nowhere to record this."""
     assert am._write_traversal_to_manifest(str(tmp_path), {"status": "COMPLETE"}) is None
+
+
+# ── survey tolerance is the SURVEY's property, not the analyser's ──────────────
+# It decides whether §7 FAILs a run, so where the number came from is part of
+# the verdict. A threshold nobody chose cannot justify either a PASS or a FAIL.
+
+def test_default_when_nothing_is_set():
+    tol, src = am.resolve_survey_tol_cm({})
+    assert tol == am.SURVEY_TOL_CM
+    assert "not set" in src
+
+
+def test_operator_value_staged_with_the_mission_wins():
+    tol, src = am.resolve_survey_tol_cm(
+        {"staged_mission": {"survey_tolerance_m": 0.008}})
+    assert tol == 0.8
+    assert "operator-set" in src
+
+
+def test_cli_overrides_the_staged_value():
+    tol, src = am.resolve_survey_tol_cm(
+        {"staged_mission": {"survey_tolerance_m": 0.008}}, cli_cm=4.0)
+    assert tol == 4.0
+    assert src == "--survey-tol-cm"
+
+
+def test_unusable_staged_values_fall_back_and_say_so():
+    """Silently judging a run by a number nobody chose is the failure mode."""
+    for bad in ("abc", -1.0, 0.0, 5.0):   # non-numeric, negative, zero, an absurd 5 m
+        tol, src = am.resolve_survey_tol_cm(
+            {"staged_mission": {"survey_tolerance_m": bad}})
+        assert tol == am.SURVEY_TOL_CM, bad
+        assert "default" in src and str(bad) in src, (bad, src)
+
+
+def test_tolerance_actually_changes_the_intent_verdict():
+    """The whole point: the same geometry judged by two surveys' precision.
+
+    A vertex 3.43 cm off the chord is INTENT at the 2.5 cm default, but is
+    within noise for a sloppier survey that declared 5 cm.
+    """
+    V = TestGeometryFidelity.V
+    s = am.Series()
+    s.paths = [(0.0, _densify(V))]
+    s.cond_paths = [(0.0, [V[0], V[-1]])]
+    s.pose = [(i * 0.1, n, e, 0.0) for i, (n, e) in enumerate(_densify([V[0], V[-1]]))]
+
+    strict = am.analyze_geometry_fidelity(s, survey_tol_cm=2.5)
+    loose = am.analyze_geometry_fidelity(s, survey_tol_cm=5.0)
+
+    assert strict["dropped_total"] == loose["dropped_total"] == 2   # same geometry
+    assert strict["dropped_above_tolerance"] == 2 and strict["verdict"] == "FAIL"
+    assert loose["dropped_above_tolerance"] == 0 and loose["verdict"] == "WARN"
+
+
+def test_source_is_reported_in_the_result():
+    s = am.Series()
+    s.paths = [(0.0, _densify(TestGeometryFidelity.V))]
+    s.cond_paths = [(0.0, list(TestGeometryFidelity.V))]
+    s.pose = [(i * 0.1, n, e, 0.0)
+              for i, (n, e) in enumerate(_densify(TestGeometryFidelity.V))]
+    g = am.analyze_geometry_fidelity(s, survey_tol_cm=3.0, survey_tol_source="unit test")
+    assert g["survey_tol_cm"] == 3.0
+    assert g["survey_tol_source"] == "unit test"

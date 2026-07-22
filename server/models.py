@@ -466,6 +466,14 @@ class PathPlanRequest(BaseModel):
     max_waypoints: int = Field(10000, ge=100, le=500000)  # Hard publication guard
     max_segments: int = Field(2000, ge=1, le=100000)  # Hard segment-count guard
     include_waypoints: bool = True  # If False, return summary only (no waypoint arrays)
+    # How far a surveyed vertex may sit off the driven chord before that counts
+    # as INTENT rather than survey noise. Decides whether analyze_mission §7
+    # FAILs a run, so it belongs to the survey, not to the analyser: a 1.7 cm
+    # single-epoch RS3 shot and a 5 mm averaged one do not deserve the same
+    # threshold. None = the analyser's documented default (2.5 cm, from the
+    # 2026-07-22 Emlid export). Staged with the mission so the number that
+    # judges a run is the one the operator set when planning it.
+    survey_tolerance_m: Optional[float] = Field(None, gt=0.0, le=1.0)
 
 
 class PathPlanResponse(BaseModel):

@@ -71,6 +71,12 @@ EKF_JUMP_M = 0.5            # pose position jump between consecutive samples
 # removed. It is diagnostic, not a controller change: dropping a vertex is
 # legitimate when the deviation is survey noise. The point is that it must be
 # VISIBLE, with the number attached, so the operator can judge.
+# DEFAULT only — override per mission (operator, staged with the plan) or per
+# run (--survey-tol-cm). It is a property of the SURVEY, not of the analyser:
+# a 1.7 cm single-epoch RS3 shot and a 5 mm averaged one cannot share a
+# threshold. 2.5 cm is empirical, from the 2026-07-22 Emlid export — lateral
+# RMS 1.7 cm at Samples=1 against vertex intent of 3.4/4.4 cm. Because this
+# number decides a FAIL, every report states which source it came from.
 SURVEY_TOL_CM = 2.5         # deviations below this read as survey noise, above = intent
 # S8 ABSOLUTE ACCURACY. Separate budget from S1 (tracking) and S9 (geometry):
 # both of those live entirely inside the local frame, so a wrong ANCHOR shifts the
@@ -919,6 +925,35 @@ def _path_vertices(poly, bend_deg=VERTEX_BEND_DEG):
     return out
 
 
+def resolve_survey_tol_cm(manifest, cli_cm: float | None = None) -> tuple[float, str]:
+    """Return (tolerance_cm, where_it_came_from).
+
+    Precedence: explicit --survey-tol-cm, then the value the operator staged
+    with the mission, then the documented default. The provenance string is
+    returned rather than logged because this threshold decides whether §7
+    FAILs — a verdict that turns on an unattributed constant is not a verdict.
+
+    An unusable staged value (non-numeric, zero, negative, absurd) falls back
+    to the default and SAYS SO, instead of silently judging the run by a
+    number nobody chose.
+    """
+    if cli_cm is not None:
+        return float(cli_cm), "--survey-tol-cm"
+
+    staged = ((manifest or {}).get("staged_mission") or {})
+    raw = staged.get("survey_tolerance_m")
+    if raw is not None:
+        try:
+            val_m = float(raw)
+        except (TypeError, ValueError):
+            return SURVEY_TOL_CM, f"default (staged value {raw!r} is not a number)"
+        if 0.0 < val_m <= 1.0:
+            return val_m * 100.0, "staged with the mission (operator-set)"
+        return SURVEY_TOL_CM, f"default (staged value {val_m} m out of range)"
+
+    return SURVEY_TOL_CM, "built-in default — not set for this survey"
+
+
 def analyze_traversal(s: Series, radius_m: float = COVERAGE_RADIUS_M) -> dict:
     """Did the rover actually GO everywhere it was told to? (report §9)
 
@@ -1050,7 +1085,8 @@ def _write_traversal_to_manifest(root: str, traversal: dict) -> str | None:
         return f"ERROR: {type(exc).__name__}: {exc}"
 
 
-def analyze_geometry_fidelity(s: Series, survey_tol_cm: float = SURVEY_TOL_CM) -> dict:
+def analyze_geometry_fidelity(s: Series, survey_tol_cm: float = SURVEY_TOL_CM,
+                              survey_tol_source: str = "caller-supplied") -> dict:
     """Did the rover track the geometry it was GIVEN? (§9)
 
     Independent of §1: §1 asks "how well did the controller follow its own
@@ -1137,6 +1173,7 @@ def analyze_geometry_fidelity(s: Series, survey_tol_cm: float = SURVEY_TOL_CM) -
     return {
         "available": True,
         "survey_tol_cm": survey_tol_cm,
+        "survey_tol_source": survey_tol_source,
         "runs": runs,
         "dropped_total": len(all_dropped),
         "dropped_above_tolerance": len(intent),
@@ -1443,11 +1480,14 @@ def _fmt_report(a: dict) -> str:
             line(f"   driven vs PLANNED geometry : RMS {xt['rms_cm']} cm  max {xt['max_cm']} cm  "
                  f"(n={xt['n']})")
             line("     ^ independent of §1, which measures against the CONDITIONED path")
+        # State the threshold and where it came from even when nothing was
+        # dropped: a PASS at a tolerance nobody chose is not evidence.
+        line(f"   survey tolerance {g['survey_tol_cm']:.2f} cm  "
+             f"[{g.get('survey_tol_source', '?')}]")
         if not g["dropped_total"]:
             line("   no surveyed vertex was dropped — the rover tracked the full geometry")
         else:
-            line(f"   {g['dropped_total']} vertex/vertices removed by conditioning "
-                 f"(tolerance {g['survey_tol_cm']} cm):")
+            line(f"   {g['dropped_total']} vertex/vertices removed by conditioning:")
             for r in g["runs"]:
                 for d in r["dropped"]:
                     tag = "INTENT — should have been driven" if d["intent"] == "INTENT" else "within survey noise"
@@ -1540,7 +1580,7 @@ def _fmt_report(a: dict) -> str:
     return "\n".join(L) + "\n"
 
 
-def analyze(root: str) -> dict:
+def analyze(root: str, survey_tol_cm: float | None = None) -> dict:
     bag_dir, manifest = _find_bag_dir(root)
     if bag_dir is None:
         sys.exit(f"ERROR: no rosbag2 (.db3 / metadata.yaml) found under {root}")
@@ -1553,7 +1593,9 @@ def analyze(root: str) -> dict:
     speed = analyze_speed(s)
     spray = analyze_spray(s)
     health = analyze_health(s)
-    geometry = analyze_geometry_fidelity(s)
+    tol_cm, tol_source = resolve_survey_tol_cm(manifest, survey_tol_cm)
+    geometry = analyze_geometry_fidelity(s, survey_tol_cm=tol_cm,
+                                         survey_tol_source=tol_source)
     absolute = analyze_absolute(s, manifest)
     traversal = analyze_traversal(s)
     config = analyze_config(s, manifest)
@@ -1584,7 +1626,8 @@ def analyze(root: str) -> dict:
         offenders.append(
             f"{geometry['dropped_above_tolerance']} surveyed vertex/vertices dropped by path "
             f"conditioning (worst {geometry['worst_deviation_cm']}cm off the driven path, "
-            f"tolerance {geometry['survey_tol_cm']}cm) — the rover did not drive the "
+            f"tolerance {geometry['survey_tol_cm']}cm, {geometry['survey_tol_source']}) — "
+            f"the rover did not drive the "
             f"surveyed shape"
         )
     if tracking.get("overall") and tracking["overall"]["rms_cm"] > XTRACK_PROD_CM:
@@ -1642,11 +1685,18 @@ def main() -> int:
                     help="where to write analysis.json + report.txt (default: the bundle dir)")
     ap.add_argument("--json-only", action="store_true", help="skip report.txt")
     ap.add_argument("--quiet", action="store_true", help="do not print the report to stdout")
+    ap.add_argument("--survey-tol-cm", type=float, default=None,
+                    help="vertex deviation above which a dropped point counts as "
+                         "INTENT rather than survey noise. Overrides the value staged "
+                         f"with the mission; default {SURVEY_TOL_CM} cm. Set this from "
+                         "the survey's own lateral RMS, not by taste.")
     args = ap.parse_args()
+    if args.survey_tol_cm is not None and not (0.0 < args.survey_tol_cm <= 100.0):
+        sys.exit(f"ERROR: --survey-tol-cm must be in (0, 100]; got {args.survey_tol_cm}")
     if not os.path.isdir(args.bundle):
         sys.exit(f"ERROR: not a directory: {args.bundle}")
 
-    result = analyze(args.bundle)
+    result = analyze(args.bundle, survey_tol_cm=args.survey_tol_cm)
 
     # A4: fold the traversal verdict back next to outcome, so a partial run is
     # detectable by reading manifest.json alone — no bag, no analysis.json.
