@@ -730,12 +730,27 @@ class Recorder:
                 self.manifest["timestamps"]["recorder_end"] = _stamp(ended)
                 self.manifest["timestamps"]["mission_end_observed"] = _stamp(ended)
                 self.manifest["outcome"] = {
+                    # RECORDER status only: the bag was closed in an orderly way.
+                    # It is NOT a statement about the mission — a clean abort at
+                    # 40% and a full traversal both land here, which is why runs
+                    # covering 24/64 and 76/86 waypoints both read COMPLETE.
+                    # mission_end_reason distinguishes WHY it ended; the traversal
+                    # block below says how much of the path was actually driven.
                     "status": "COMPLETE",
+                    "means": "recorder finalised cleanly; see traversal for mission coverage",
                     "mission_end_reason": reason,
                     "recorder_end": _stamp(ended),
                     "integrity": _bundle_integrity(
                         bundle, exclude={MANIFEST_NAME, MANIFEST_NAME + ".tmp"}
                     ),
+                }
+                # Coverage needs the closed bag, so the analyser fills this in
+                # (it is spawned just below). PENDING is written now so that a
+                # missing verdict reads as "not analysed yet" rather than as a
+                # silent pass — absence must never look like success.
+                self.manifest["traversal"] = {
+                    "status": "PENDING",
+                    "source": "awaiting analyze_mission",
                 }
                 _write_manifest(bundle, self.manifest)
                 log(f"  saved: {bundle}  (manifest + integrity written)")

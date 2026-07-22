@@ -352,3 +352,172 @@ def test_absolute_reports_mismatched_counts_rather_than_pairing_blindly(tmp_path
 def test_geodesic_matches_the_field_survey():
     d = am._geodesic_m(_LAT0, _LON0, _LAT1, _LON1)
     assert abs(d - 2.3255) < 0.001
+
+
+# ── §9 TRAVERSAL ───────────────────────────────────────────────────────────────
+# A4: manifest.outcome.status is hardcoded COMPLETE by the recorder whenever it
+# shuts down cleanly, so a run that aborted at 40% is indistinguishable from a
+# full one. These pin the coverage measure that tells them apart.
+
+def _straight_path(n=40, step=1.0):
+    """A 40 m straight line, one point per metre.
+
+    Spacing is deliberately wider than COVERAGE_RADIUS_M. At 25 cm spacing the
+    point one past the stop sits exactly on the radius and counts as reached,
+    so an abort at 50% measures 52.5% — a real property of the metric, but it
+    would make these assertions about tie-breaking rather than about coverage.
+    """
+    return [(i * step, 0.0) for i in range(n)]
+
+
+def _series_driving(path, fraction=1.0, skip=None):
+    """Rover follows `path` exactly, for `fraction` of it. `skip` = (lo, hi)
+    index range it never visits (but it does come back afterwards)."""
+    s = am.Series()
+    s.path = list(path)
+    s.paths = [(0.0, list(path))]
+    stop_at = int(len(path) * fraction)
+    driven = []
+    for i, (n, e) in enumerate(path[:stop_at]):
+        if skip and skip[0] <= i < skip[1]:
+            continue
+        driven.append((n, e))
+    s.pose = [(i * 0.1, n, e, 0.0) for i, (n, e) in enumerate(driven)]
+    return s
+
+
+def test_full_run_is_complete():
+    t = am.analyze_traversal(_series_driving(_straight_path()))
+    assert t["available"]
+    assert t["status"] == "COMPLETE"
+    assert t["coverage"] == 1.0
+    assert t["verdict"] == "PASS"
+    assert t["shape"] == "FULL"
+    assert t["missing_leading"] == t["missing_trailing"] == t["missing_interior"] == 0
+
+
+def test_abort_partway_is_detected_and_fails():
+    t = am.analyze_traversal(_series_driving(_straight_path(), fraction=0.375))
+    assert t["status"] == "PARTIAL"
+    assert t["verdict"] == "FAIL"
+    assert t["points_covered"] == 15 and t["points_total"] == 40
+    assert t["shape"] == "STOPPED_EARLY"
+    assert t["last_covered_index"] == 14
+    assert t["missing_trailing"] == 25 and t["missing_leading"] == 0
+
+
+def test_never_drove_the_start_is_not_called_stopping_early():
+    """The real 2026-07-22 bag: 24/64 covered, but they were the LAST 24 — the
+    rover never reached the beginning. A two-way abort/skip split called this
+    'not stopped early' and said nothing more, which is why `shape` exists."""
+    path = _straight_path()
+    s = am.Series()
+    s.path = list(path)
+    s.paths = [(0.0, list(path))]
+    s.pose = [(i * 0.1, n, e, 0.0) for i, (n, e) in enumerate(path[25:])]
+    t = am.analyze_traversal(s)
+    assert t["shape"] == "STARTED_LATE"
+    assert t["stopped_early"] is False
+    assert t["missing_leading"] == 25 and t["missing_trailing"] == 0
+    assert t["first_covered_index"] == 25
+    assert t["last_covered_index"] == 39
+
+
+def test_a_gap_mid_path_is_not_reported_as_stopping_early():
+    """Skipping geometry and coming back is a different failure from an abort."""
+    t = am.analyze_traversal(_series_driving(_straight_path(), skip=(10, 20)))
+    assert t["status"] != "COMPLETE"
+    assert t["shape"] == "INTERIOR_GAP"
+    assert t["stopped_early"] is False
+    assert t["missing_interior"] == 10
+    assert t["last_covered_index"] == 39   # it did come back
+
+
+def test_middle_only_run():
+    path = _straight_path()
+    s = am.Series()
+    s.path = list(path)
+    s.paths = [(0.0, list(path))]
+    s.pose = [(i * 0.1, n, e, 0.0) for i, (n, e) in enumerate(path[10:30])]
+    t = am.analyze_traversal(s)
+    assert t["shape"] == "MIDDLE_ONLY"
+    assert t["missing_leading"] == 10 and t["missing_trailing"] == 10
+
+
+def test_rover_nowhere_near_the_path():
+    path = _straight_path()
+    s = am.Series()
+    s.path = list(path)
+    s.paths = [(0.0, list(path))]
+    s.pose = [(i * 0.1, 500.0, 500.0, 0.0) for i in range(10)]
+    t = am.analyze_traversal(s)
+    assert t["shape"] == "NONE"
+    assert t["points_covered"] == 0 and t["coverage"] == 0.0
+    assert t["verdict"] == "FAIL"
+
+
+def test_coverage_uses_distance_not_crosstrack():
+    """A rover stopped dead ON the line has zero xtrack for the rest of the
+    mission it never drove — that is exactly the run this must catch."""
+    t = am.analyze_traversal(_series_driving(_straight_path(), fraction=0.5))
+    assert t["coverage"] == 0.5
+
+
+def test_radius_is_honoured():
+    path = _straight_path(n=4)
+    s = am.Series()
+    s.path = list(path)
+    s.paths = [(0.0, list(path))]
+    # rover passes 40 cm to the side of every point
+    s.pose = [(i * 0.1, n, e + 0.40, 0.0) for i, (n, e) in enumerate(path)]
+    assert am.analyze_traversal(s, radius_m=0.25)["points_covered"] == 0
+    assert am.analyze_traversal(s, radius_m=0.50)["points_covered"] == 4
+
+
+def test_grid_bucketing_matches_bruteforce_on_a_2d_shape():
+    """The spatial grid is an optimisation; it must not change the answer.
+    Checked against the naive all-pairs scan it replaced."""
+    path = [(math.cos(i / 20.0) * 3.0, math.sin(i / 20.0) * 3.0) for i in range(126)]
+    s = am.Series()
+    s.path = path
+    s.paths = [(0.0, path)]
+    s.pose = [(i * 0.1, n + 0.05, e - 0.03, 0.0)
+              for i, (n, e) in enumerate(path) if i % 3]
+    r = 0.25
+    brute = sum(
+        1 for (pn, pe) in path
+        if any(math.hypot(p[1] - pn, p[2] - pe) <= r for p in s.pose)
+    )
+    assert am.analyze_traversal(s, radius_m=r)["points_covered"] == brute
+
+
+def test_no_path_or_no_pose_is_unavailable_not_zero_coverage():
+    """Unavailable must never be reported as 0% — that would fail every bag
+    recorded before /path was captured."""
+    empty = am.Series()
+    assert am.analyze_traversal(empty)["available"] is False
+    s = am.Series()
+    s.path = _straight_path()
+    s.paths = [(0.0, s.path)]
+    assert am.analyze_traversal(s)["available"] is False
+
+
+def test_manifest_writeback_adds_only_traversal(tmp_path):
+    import json as _json
+    mpath = tmp_path / "manifest.json"
+    original = {"identity": {"mission_id": "m1"},
+                "outcome": {"status": "COMPLETE", "recorder_end": {"utc": "2026"}}}
+    mpath.write_text(_json.dumps(original))
+
+    out = am._write_traversal_to_manifest(str(tmp_path), {"status": "PARTIAL",
+                                                          "coverage": 0.375})
+    assert out == str(mpath)
+    got = _json.loads(mpath.read_text())
+    assert got["traversal"]["status"] == "PARTIAL"
+    assert got["outcome"] == original["outcome"]   # untouched
+    assert got["identity"] == original["identity"]
+
+
+def test_manifest_writeback_is_silent_when_there_is_no_manifest(tmp_path):
+    """A bare rosbag dir is a valid input; it just has nowhere to record this."""
+    assert am._write_traversal_to_manifest(str(tmp_path), {"status": "COMPLETE"}) is None

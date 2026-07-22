@@ -79,6 +79,14 @@ ABS_MISS_WARN_CM = 5.0      # per-vertex absolute miss above this = WARN
 ABS_MISS_FAIL_CM = 15.0     # ...above this = FAIL
 ABS_BIAS_FAIL_CM = 10.0     # a consistent mean offset this large is a placement error
 VERTEX_BEND_DEG = 0.8       # heading change that marks a /path point as a real vertex
+# S9 TRAVERSAL. manifest.outcome.status is hardcoded "COMPLETE" by the recorder
+# whenever it shuts down in an orderly way — a clean abort at 40% and a full run
+# are indistinguishable there. Runs covering 24/64 and 76/86 waypoints both read
+# COMPLETE, so filtering bags on that field silently mixes partial runs into an
+# error budget. Coverage is the fraction of /path the pose actually reached.
+COVERAGE_RADIUS_M = 0.25    # a path point counts as reached within this distance
+COVERAGE_COMPLETE = 0.98    # at/above this the path was traversed end to end
+COVERAGE_PARTIAL = 0.75     # below this it is not a full run at all
 
 
 _WGS84_A = 6378137.0
@@ -911,6 +919,137 @@ def _path_vertices(poly, bend_deg=VERTEX_BEND_DEG):
     return out
 
 
+def analyze_traversal(s: Series, radius_m: float = COVERAGE_RADIUS_M) -> dict:
+    """Did the rover actually GO everywhere it was told to? (report §9)
+
+    Every other section measures how well the rover drove the part of the path
+    it drove. None of them notice that it stopped a third of the way through:
+    an aborted run just yields fewer samples, and its statistics are biased —
+    it never reaches the far corners, so its error budget reads low. That is
+    what makes a partial run dangerous when it is averaged in with full ones.
+
+    Coverage = fraction of /path points that the pose came within radius_m of.
+    Deliberately NOT cross-track: a rover that stops dead on the line has zero
+    xtrack error for the rest of the mission it never drove.
+    """
+    if not s.path:
+        return {"available": False, "reason": "no /path in bag"}
+    if len(s.pose) < 2:
+        return {"available": False, "reason": "no pose samples in bag"}
+
+    # Uniform grid over the poses, cell = radius, so each path point tests only
+    # its own cell and the 8 around it. The naive all-pairs scan is O(path x
+    # pose), which is fine for a 160-point square and minutes of wall-clock for
+    # a 17k-waypoint plan against 10k pose samples.
+    cell = max(radius_m, 1e-6)
+    grid: dict[tuple[int, int], list[tuple[float, float]]] = {}
+    for rec in s.pose:
+        n, e = rec[1], rec[2]
+        grid.setdefault((int(n // cell), int(e // cell)), []).append((n, e))
+
+    r2 = radius_m * radius_m
+    covered: list[bool] = []
+    for (pn, pe) in s.path:
+        gn, ge = int(pn // cell), int(pe // cell)
+        hit = False
+        for dn in (-1, 0, 1):
+            for de in (-1, 0, 1):
+                for (n, e) in grid.get((gn + dn, ge + de), ()):
+                    if (n - pn) ** 2 + (e - pe) ** 2 <= r2:
+                        hit = True
+                        break
+                if hit:
+                    break
+            if hit:
+                break
+        covered.append(hit)
+
+    total = len(covered)
+    num_covered = sum(covered)
+    coverage = num_covered / total if total else 0.0
+
+    # WHERE the misses sit matters more than how many there are, and the 07-22
+    # field bags proved a two-way split (abort vs skip) was too coarse: the
+    # 24/64 run covered the LAST 24 points, not the first — it never drove the
+    # beginning at all. Measure the leading and trailing runs of misses and
+    # classify from those.
+    first_covered = next((i for i, c in enumerate(covered) if c), None)
+    last_covered = max((i for i, c in enumerate(covered) if c), default=-1)
+    lead_missing = first_covered if first_covered is not None else total
+    trail_missing = (total - 1 - last_covered) if last_covered >= 0 else 0
+    interior_missing = (
+        total - num_covered - lead_missing - trail_missing if num_covered else 0
+    )
+
+    if num_covered == 0:
+        shape = "NONE"
+    elif lead_missing == trail_missing == interior_missing == 0:
+        shape = "FULL"
+    elif interior_missing:
+        # Missed geometry with driven path on both sides of it.
+        shape = "INTERIOR_GAP"
+    elif lead_missing and trail_missing:
+        shape = "MIDDLE_ONLY"
+    elif lead_missing:
+        # Drove to the end, but the start was never reached: a late start, a
+        # resumed mission, or a recorder that began after the rover did.
+        shape = "STARTED_LATE"
+    else:
+        shape = "STOPPED_EARLY"
+
+    if coverage >= COVERAGE_COMPLETE:
+        status = "COMPLETE"
+    elif coverage >= COVERAGE_PARTIAL:
+        status = "MOSTLY"
+    else:
+        status = "PARTIAL"
+
+    return {
+        "available": True,
+        "status": status,
+        "shape": shape,
+        "coverage": round(coverage, 4),
+        "points_total": total,
+        "points_covered": num_covered,
+        "radius_cm": round(radius_m * 100, 1),
+        "first_covered_index": first_covered,
+        "last_covered_index": last_covered,
+        "missing_leading": lead_missing,
+        "missing_trailing": trail_missing,
+        "missing_interior": interior_missing,
+        # Kept for the one question most callers ask. NOTE: false on a run that
+        # never started, which is why `shape` exists — do not read this alone.
+        "stopped_early": shape == "STOPPED_EARLY",
+        "verdict": "PASS" if status == "COMPLETE" else "FAIL",
+    }
+
+
+def _write_traversal_to_manifest(root: str, traversal: dict) -> str | None:
+    """Fold the traversal verdict back into the bundle's manifest.
+
+    The whole point is to be machine-detectable WITHOUT opening the bag, so the
+    number has to live next to outcome. Rewrites only this one key, atomically,
+    and never raises — a bundle whose manifest cannot be updated is still a
+    valid bundle with a valid analysis.json.
+    """
+    mpath = os.path.join(root, "manifest.json")
+    if not os.path.isfile(mpath):
+        return None
+    try:
+        with open(mpath) as f:
+            manifest = json.load(f)
+        if not isinstance(manifest, dict):
+            return None
+        manifest["traversal"] = traversal
+        tmp = mpath + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(manifest, f, indent=2)
+        os.replace(tmp, mpath)
+        return mpath
+    except Exception as exc:
+        return f"ERROR: {type(exc).__name__}: {exc}"
+
+
 def analyze_geometry_fidelity(s: Series, survey_tol_cm: float = SURVEY_TOL_CM) -> dict:
     """Did the rover track the geometry it was GIVEN? (§9)
 
@@ -1349,8 +1488,36 @@ def _fmt_report(a: dict) -> str:
         line(f"   verdict : {ab['verdict']}")
     line("")
 
+    tv = a.get("traversal") or {}
+    line("9. TRAVERSAL (did the rover reach the whole path, or stop part way?)")
+    line("   every section above describes only the part that WAS driven — an abort")
+    line("   just yields fewer samples, and biases the error budget low.")
+    if not tv.get("available"):
+        line(f"   unavailable — {tv.get('reason')}")
+    else:
+        line(f"   reached {tv['points_covered']}/{tv['points_total']} path points "
+             f"({tv['coverage']:.1%}) within {tv['radius_cm']} cm")
+        if tv["status"] != "COMPLETE":
+            _shape = {
+                "STOPPED_EARLY": f"STOPPED EARLY — drove indices 0..{tv['last_covered_index']} "
+                                 f"of {tv['points_total'] - 1}, then never resumed",
+                "STARTED_LATE": f"NEVER DROVE THE START — first {tv['missing_leading']} "
+                                f"point(s) unreached; ran from index "
+                                f"{tv['first_covered_index']} to the end",
+                "MIDDLE_ONLY": f"drove only the middle — missed {tv['missing_leading']} "
+                               f"at the start and {tv['missing_trailing']} at the end",
+                "INTERIOR_GAP": f"SKIPPED {tv['missing_interior']} point(s) mid-path and "
+                                f"came back — not a clean abort",
+                "NONE": "the rover never came within range of ANY path point",
+            }.get(tv["shape"], tv["shape"])
+            line(f"   {_shape}")
+            line("   ! manifest.outcome.status does NOT encode this: the recorder writes")
+            line("     COMPLETE whenever it shut down cleanly, abort or not.")
+        line(f"   verdict : {tv['verdict']}  ({tv['status']})")
+    line("")
+
     cfg = a["config"]
-    line("9. AS-RUN CONFIG")
+    line("10. AS-RUN CONFIG")
     fm = cfg.get("from_manifest")
     if fm:
         line(f"   git {fm.get('git_sha')}  services {fm.get('services')}")
@@ -1363,7 +1530,7 @@ def _fmt_report(a: dict) -> str:
         line("   (no manifest and no /rpp/debug params)")
     line("")
 
-    line("10. VERDICT")
+    line("11. VERDICT")
     line(f"   ===> {a['verdict']} <===")
     if a["worst_offenders"]:
         line("   worst offenders:")
@@ -1388,16 +1555,31 @@ def analyze(root: str) -> dict:
     health = analyze_health(s)
     geometry = analyze_geometry_fidelity(s)
     absolute = analyze_absolute(s, manifest)
+    traversal = analyze_traversal(s)
     config = analyze_config(s, manifest)
 
     # overall verdict + worst offenders
     offenders = []
     fails = []
     for name, sec in (("tracking", tracking), ("stops", stops), ("pivots", pivots),
-                      ("geometry", geometry), ("absolute", absolute)):
+                      ("geometry", geometry), ("absolute", absolute),
+                      ("traversal", traversal)):
         v = sec.get("verdict")
         if v == "FAIL":
             fails.append(name)
+    if traversal.get("available") and traversal.get("status") != "COMPLETE":
+        _end = {
+            "STOPPED_EARLY": "stopped early and never resumed",
+            "STARTED_LATE": "never drove the start of the path",
+            "MIDDLE_ONLY": "drove only the middle of the path",
+            "INTERIOR_GAP": "skipped geometry mid-path and came back",
+            "NONE": "never came within range of the path at all",
+        }.get(traversal["shape"], traversal["shape"])
+        offenders.append(
+            f"only {traversal['points_covered']}/{traversal['points_total']} path points "
+            f"reached ({traversal['coverage']:.0%}) — {_end}. Every other metric here "
+            f"describes only the part that was driven"
+        )
     if geometry.get("available") and geometry.get("dropped_above_tolerance"):
         offenders.append(
             f"{geometry['dropped_above_tolerance']} surveyed vertex/vertices dropped by path "
@@ -1446,6 +1628,7 @@ def analyze(root: str) -> dict:
         "health": health,
         "geometry": geometry,
         "absolute": absolute,
+        "traversal": traversal,
         "config": config,
         "worst_offenders": offenders,
         "verdict": verdict,
@@ -1464,6 +1647,26 @@ def main() -> int:
         sys.exit(f"ERROR: not a directory: {args.bundle}")
 
     result = analyze(args.bundle)
+
+    # A4: fold the traversal verdict back next to outcome, so a partial run is
+    # detectable by reading manifest.json alone — no bag, no analysis.json.
+    tv = result.get("traversal") or {}
+    if tv.get("available"):
+        written = _write_traversal_to_manifest(args.bundle, {
+            "status": tv["status"],
+            "shape": tv["shape"],
+            "coverage": tv["coverage"],
+            "points_covered": tv["points_covered"],
+            "points_total": tv["points_total"],
+            "radius_cm": tv["radius_cm"],
+            "first_covered_index": tv["first_covered_index"],
+            "last_covered_index": tv["last_covered_index"],
+            "source": "analyze_mission",
+        })
+        if written and written.startswith("ERROR"):
+            print(f"WARN: could not update manifest traversal: {written}",
+                  file=sys.stderr)
+
     outdir = args.outdir or args.bundle
     try:
         os.makedirs(outdir, exist_ok=True)
