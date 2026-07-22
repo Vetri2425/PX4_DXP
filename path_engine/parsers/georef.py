@@ -10,16 +10,38 @@ polyline collapsed to one waypoint in /preview.
 This module detects that case and projects lat/lon → local ENU metres so the
 rest of the pipeline (which assumes metres) works unchanged.
 
-Method — equirectangular tangent plane about the survey centroid:
+Method — equirectangular tangent plane about the survey centroid, scaled by the
+WGS84 ellipsoid's LOCAL RADII OF CURVATURE at that origin:
 
-    N = radians(lat - lat0) * R
-    E = radians(lon - lon0) * R * cos(radians(lat0))
+    N = (lat - lat0) * m_per_deg_north      m_per_deg_north from M(lat0)
+    E = (lon - lon0) * m_per_deg_east       m_per_deg_east  from N(lat0)*cos(lat0)
 
-This is the standard local-tangent-plane approximation. Over a marking site (up
-to a few hundred metres) its error is on the order of (extent / R)^2 * extent —
-sub-millimetre — so a heavier projection (UTM via pyproj) buys nothing here, and
-pyproj is not installed on the rover. The origin's lat/lon is returned so the
-local frame ties back to GPS for GPS_SURVEYED placement.
+where M is the meridional radius of curvature and N the prime vertical radius:
+
+    M(lat) = a(1 - e^2) / (1 - e^2 sin^2 lat)^(3/2)
+    N(lat) = a / (1 - e^2 sin^2 lat)^(1/2)
+
+Using the semi-major axis `a` for BOTH axes — as this module did until
+2026-07-22 — is wrong on the NORTH axis, because the Earth is flattened: near
+the equator the meridian is more tightly curved than `a` implies. The resulting
+error is a pure scale factor, so it is invisible on small geometry and grows
+linearly with run length:
+
+    lat  0.00 deg   +0.674 %   -> +67 cm per 100 m
+    lat 13.07 deg   +0.622 %   -> +62 cm per 100 m   (Chennai test site)
+    lat 30.00 deg   +0.421 %   -> +42 cm per 100 m
+    lat 45.00 deg   +0.169 %   -> +17 cm per 100 m
+
+Verified against a field survey of the same line (Emlid Reach RS3, RTK FIX,
+2026-07-18): the true WGS84 geodesic is 2.3255 m and the surveyor's own
+projected grid reads 2.3264 m (+0.04 %, a normal grid scale factor). The old
+code produced 2.3399 m (+0.62 %); this code reproduces the geodesic.
+
+Beyond the radius fix this remains a tangent-plane approximation. Its residual
+error is of order (extent / R)^2 * extent — sub-millimetre over a marking site —
+so a full projection (UTM via pyproj) still buys nothing here, and pyproj is not
+installed on the rover. The origin's lat/lon is returned so the local frame ties
+back to GPS for GPS_SURVEYED placement.
 
 Parsed geometry stores tuples as (north, east). For a geographic DXF that means
 (latitude, longitude), because the parser maps DXF y->north and x->east and
@@ -33,7 +55,14 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-R_EARTH = 6378137.0  # WGS84 semi-major axis, metres
+# WGS84 defining parameters.
+WGS84_A = 6378137.0            # semi-major axis, metres
+WGS84_F = 1.0 / 298.257223563  # flattening
+WGS84_E2 = WGS84_F * (2.0 - WGS84_F)   # first eccentricity squared
+
+# Kept as the semi-major axis for any external reader; NOT used as the north
+# scale any more (see the module docstring for why that was wrong).
+R_EARTH = WGS84_A
 
 # Absolute-position coordinate keys (get the full origin shift + scale).
 _POINT_KEYS = ("start", "end", "position", "center")
@@ -99,15 +128,31 @@ def looks_geographic(points: list[tuple[float, float]]) -> tuple[bool, str]:
     return True, f"lat/lon centroid ({cen_lat:.6f}, {cen_lon:.6f}), extent {extent:.6g} deg"
 
 
+def metres_per_degree(lat0_deg: float) -> tuple[float, float]:
+    """(north, east) metres per degree at *lat0_deg* on the WGS84 ellipsoid.
+
+    North uses the meridional radius of curvature M, east the prime vertical N
+    times cos(lat). Using the semi-major axis for north instead of M is a
+    +0.62 % scale error at 13 deg latitude — see the module docstring.
+    """
+    lat0 = math.radians(lat0_deg)
+    s = math.sin(lat0)
+    w2 = 1.0 - WGS84_E2 * s * s
+    w = math.sqrt(w2)
+    m_meridional = WGS84_A * (1.0 - WGS84_E2) / (w2 * w)   # a(1-e^2)/(1-e^2 sin^2)^1.5
+    n_prime_vertical = WGS84_A / w                          # a/(1-e^2 sin^2)^0.5
+    per_rad = math.radians(1.0)
+    return (m_meridional * per_rad, n_prime_vertical * per_rad * math.cos(lat0))
+
+
 def _project_point(lat: float, lon: float, lat0: float, lon0: float,
-                   cos_lat0: float) -> tuple[float, float]:
-    n = math.radians(lat - lat0) * R_EARTH
-    e = math.radians(lon - lon0) * R_EARTH * cos_lat0
-    return (n, e)
+                   mdeg_n: float, mdeg_e: float) -> tuple[float, float]:
+    return ((lat - lat0) * mdeg_n, (lon - lon0) * mdeg_e)
 
 
-def _project_vector(dlat: float, dlon: float, cos_lat0: float) -> tuple[float, float]:
-    return (math.radians(dlat) * R_EARTH, math.radians(dlon) * R_EARTH * cos_lat0)
+def _project_vector(dlat: float, dlon: float,
+                    mdeg_n: float, mdeg_e: float) -> tuple[float, float]:
+    return (dlat * mdeg_n, dlon * mdeg_e)
 
 
 def detect_and_project(entities) -> Optional[tuple[float, float]]:
@@ -130,12 +175,11 @@ def detect_and_project(entities) -> Optional[tuple[float, float]]:
     lons = [p[1] for p in points]
     lat0 = sum(lats) / len(lats)
     lon0 = sum(lons) / len(lons)
-    cos_lat0 = math.cos(math.radians(lat0))
-    # metres per degree of latitude at the origin — the undistorted axis, used
-    # to scale radii. A geographic CIRCLE/ARC is inherently distorted E-W by
-    # cos(lat); radius scaling by the latitude rate is the standard local
-    # approximation and exact N-S.
-    m_per_deg = math.radians(1.0) * R_EARTH
+    mdeg_n, mdeg_e = metres_per_degree(lat0)
+    # Radii scale by the LATITUDE rate. A geographic CIRCLE/ARC is inherently
+    # distorted E-W by cos(lat); scaling by the north rate is the standard local
+    # approximation and is the undistorted axis.
+    m_per_deg = mdeg_n
 
     log.warning(
         "Georeferenced DXF detected (%s) — projecting to local ENU metres "
@@ -146,17 +190,17 @@ def detect_and_project(entities) -> Optional[tuple[float, float]]:
         for key in _POINT_KEYS:
             v = geom.get(key)
             if isinstance(v, (tuple, list)) and len(v) >= 2:
-                geom[key] = _project_point(float(v[0]), float(v[1]), lat0, lon0, cos_lat0)
+                geom[key] = _project_point(float(v[0]), float(v[1]), lat0, lon0, mdeg_n, mdeg_e)
         if "vertices" in geom and geom["vertices"]:
             geom["vertices"] = [
-                _project_point(float(v[0]), float(v[1]), lat0, lon0, cos_lat0)
+                _project_point(float(v[0]), float(v[1]), lat0, lon0, mdeg_n, mdeg_e)
                 if isinstance(v, (tuple, list)) and len(v) >= 2 else v
                 for v in geom["vertices"]
             ]
         for key in _VECTOR_KEYS:
             v = geom.get(key)
             if isinstance(v, (tuple, list)) and len(v) >= 2:
-                geom[key] = _project_vector(float(v[0]), float(v[1]), cos_lat0)
+                geom[key] = _project_vector(float(v[0]), float(v[1]), mdeg_n, mdeg_e)
         if "radius" in geom and isinstance(geom["radius"], (int, float)):
             geom["radius"] = float(geom["radius"]) * m_per_deg
         ent.geo_origin = (lat0, lon0)
