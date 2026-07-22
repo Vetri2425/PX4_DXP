@@ -171,6 +171,37 @@ async def test_plan_and_stage_then_get_staged(tmp_path, monkeypatch):
                for r in staged.segment_runs)
 
 
+async def test_staged_metadata_carries_source_detail_for_the_recorder(
+    tmp_path, monkeypatch
+):
+    """The staged artifact must give the bag recorder a real file path.
+
+    Regression: metadata.source was written as a bare filename string while
+    tools/bag_autorecord.py read source.get("filepath") from it, so
+    manifest.staged_mission.source_file was empty in every bundle and §8
+    absolute accuracy could never run. metadata.source stays a string for the
+    frontend; the provenance dict now rides alongside it.
+    """
+    _, staging = _setup(tmp_path, monkeypatch)
+
+    plan = await path_route.plan_and_stage(
+        "square.dxf",
+        PathPlanRequest(source="square.dxf", origin_gps=[37.7749, -122.4194]),
+    )
+    mid = plan.mission_summary.mission_id
+    with open(os.path.join(staging, f"{mid}.json")) as f:
+        meta = json.load(f)["metadata"]
+
+    assert meta["source"] == "square.dxf"  # unchanged shape for the UI
+
+    detail = meta["source_detail"]
+    assert os.path.isfile(detail["filepath"]), detail
+    assert os.path.basename(detail["filepath"]) == "square.dxf"
+    assert detail["extension"] == ".dxf"
+    # $INSUNITS = 6 (metres) in the fixture, so 1 unit == 1 m.
+    assert detail["unit_scale_m_per_unit"] == pytest.approx(1.0)
+
+
 async def test_get_staged_missing_404(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     with pytest.raises(Exception) as ei:

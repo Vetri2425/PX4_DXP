@@ -1137,6 +1137,38 @@ def _prune_staging() -> None:
         pass
 
 
+def _source_detail(result: dict) -> dict | None:
+    """Provenance of the file this plan was built from, for the staged artifact.
+
+    PathEngine.plan_file() records ``filepath`` / ``extension`` /
+    ``unit_scale_m_per_unit`` under planning_metadata. The entity-list planner
+    records the same block minus ``filepath`` (it never opened a file by name),
+    so resolve the flat source name against MISSION_DIR to fill the gap —
+    ``tools/analyze_mission.py`` needs a real path to re-read the surveyed
+    geometry and report absolute accuracy.
+
+    Returns None when there is nothing useful to record (e.g. a builtin path),
+    so the field is absent rather than a dict of nulls.
+    """
+    planning = result.get("planning_metadata") or {}
+    src = planning.get("source")
+    detail = dict(src) if isinstance(src, dict) else {}
+
+    name = result.get("source")
+    if isinstance(name, str) and name and not name.startswith("builtin:"):
+        detail.setdefault("name", name)
+        if not detail.get("filepath"):
+            candidate = os.path.join(MISSION_DIR, os.path.basename(name))
+            if os.path.isfile(candidate):
+                detail["filepath"] = candidate
+        if not detail.get("extension"):
+            ext = os.path.splitext(name)[1].lower()
+            if ext:
+                detail["extension"] = ext
+
+    return detail or None
+
+
 def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
                    rmse: float) -> MissionSummary:
     """Write the aligned mission to a staging file and return its summary.
@@ -1177,6 +1209,13 @@ def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
         "alignment_metadata": alignment_meta,
         "metadata": {
             "source": result["source"],
+            # metadata.source is the flat filename and stays a string — the
+            # frontend renders it. The bag recorder needs the file's provenance
+            # (absolute path, extension, unit scale) to run §8 absolute accuracy,
+            # so carry the planner's own source block alongside it. PathEngine
+            # already builds exactly this dict in plan_file(); see
+            # path_engine/engine.py:366.
+            "source_detail": _source_detail(result),
             "mark_length_m": result["mark_length_m"],
             "transit_length_m": result["transit_length_m"],
             "total_length_m": result["total_length_m"],

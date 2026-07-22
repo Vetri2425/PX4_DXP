@@ -376,12 +376,50 @@ def _loaded_path_identity() -> dict:
 # nothing about the SOURCE. The 2026-07-18 georef investigation had to guess the
 # DXF from a hand-copied ref_dxf/ folder someone happened to create.
 #
-# The staged mission JSON already holds all of it (routes/path.py _plan): the
-# global anchor (lat/lon/rotation/scale), the alignment fit (method, rmse,
-# fitted_scale, residuals) and metadata.source (filepath, extension,
-# unit_scale_m_per_unit). The bundle name IS the mission_id, so it is a direct
-# lookup — no server change, no new endpoint.
+# The staged mission JSON holds the global anchor (lat/lon/rotation/scale) and
+# the alignment fit (method, rmse, fitted_scale, residuals). The bundle name IS
+# the mission_id, so it is a direct lookup.
+#
+# It did NOT hold the file provenance: this reader was written against an assumed
+# metadata.source dict, but the server wrote a bare filename STRING there, so
+# source_file was empty in every bundle recorded before 2026-07-22 and §8
+# absolute accuracy reported "unavailable". The server now also writes
+# metadata.source_detail (a dict); _source_block below reads either shape and
+# resolves a legacy bare filename against server/missions/.
 STAGING_DIR = os.path.join(_REPO_ROOT, "server", "missions", "staging")
+
+
+MISSIONS_DIR = os.path.join(_REPO_ROOT, "server", "missions")
+
+
+def _source_block(metadata: dict) -> dict:
+    """Normalise the staged artifact's source provenance to a dict.
+
+    Three shapes exist on disk and all three must work, because staged files
+    written by an older server outlive the deploy that fixed them:
+
+      * ``source_detail`` — a dict (current server).
+      * ``source`` — a dict (never shipped, but the schema allows it).
+      * ``source`` — a bare filename string (every file staged before this fix).
+        Resolve it against server/missions/ so §8 still gets a real path.
+
+    Returns {} when nothing resolves. Must not raise: the caller's contract is
+    that provenance is best-effort and never blocks a recording.
+    """
+    detail = metadata.get("source_detail")
+    if isinstance(detail, dict) and detail:
+        return detail
+
+    source = metadata.get("source")
+    if isinstance(source, dict):
+        return source
+    if isinstance(source, str) and source and not source.startswith("builtin:"):
+        out = {"name": source, "extension": os.path.splitext(source)[1].lower() or None}
+        candidate = os.path.join(MISSIONS_DIR, os.path.basename(source))
+        if os.path.isfile(candidate):
+            out["filepath"] = candidate
+        return out
+    return {}
 
 
 def _staged_mission(mission_id: str | None) -> dict:
@@ -402,7 +440,7 @@ def _staged_mission(mission_id: str | None) -> dict:
 
     anchor = d.get("anchor") or {}
     align = d.get("alignment_metadata") or {}
-    source = (d.get("metadata") or {}).get("source") or {}
+    source = _source_block(d.get("metadata") or {})
     # A georeferenced DXF is one the parser projected from lat/lon: georef.py
     # stamps geo_origin, the planner promotes it to origin_gps, and the plan is
     # staged GPS_SURVEYED with alignment method "gps_origin" and no ref points.
