@@ -130,6 +130,12 @@ class PathPreviewPoint(BaseModel):
     north: float
     east: float
     spray: bool = True
+    # True = the point came from the source geometry (CAD/survey vertex), not
+    # from densification. Carried so the non-staged load routes can hand vertex
+    # provenance to the controller — RPP must never simplify a must-hit point
+    # away. Defaults False so a preview built without provenance is treated as
+    # "unknown", never as "every point is a surveyed vertex".
+    must_hit: bool = False
 
 
 class PathPreviewBounds(BaseModel):

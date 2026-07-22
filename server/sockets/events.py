@@ -114,9 +114,12 @@ def register_handlers(sio) -> None:
             return
         try:
             pts = path_mgr.load_path(name)
-            from mission_loading import spray_flags_for_path
+            from mission_loading import must_hit_for_path, spray_flags_for_path
             spray_flags = spray_flags_for_path(path_mgr, name, len(pts))
-            offboard_ctrl.load_path(pts, name=name, spray_flags=spray_flags)
+            must_hit = must_hit_for_path(path_mgr, name, len(pts))
+            offboard_ctrl.load_path(
+                pts, name=name, spray_flags=spray_flags, must_hit=must_hit
+            )
             await sio.emit("mission_loaded",
                            {"name": name, "num_points": len(pts)}, to=sid)
         except Exception as exc:

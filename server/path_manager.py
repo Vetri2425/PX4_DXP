@@ -679,6 +679,9 @@ class PathManager:
         if lookup_name in BUILTIN_PATHS:
             pts = list(_cached_builtin(lookup_name))
             spray_flags = [True] * len(pts)
+            # Builtins are pre-densified, so which points are "vertices" is not
+            # recoverable. Claim none rather than claim all.
+            must_hit = [False] * len(pts)
         else:
             fpath = os.path.join(self._dir, os.path.basename(name))
             if not os.path.isfile(fpath):
@@ -719,16 +722,22 @@ class PathManager:
                     plan = engine.plan_file(fpath)
                 pts = list(plan.merged_waypoints)
                 spray_flags = list(plan.spray_flags)
+                must_hit = list(getattr(plan, "must_hit", []) or [])
             else:
                 pts = self._load_file(fpath)
                 spray_flags = [True] * len(pts)
+                # A CSV/.waypoints file is a list of explicit points — nothing
+                # here was interpolated, so every one of them is a vertex.
+                must_hit = [True] * len(pts)
 
         if len(spray_flags) != len(pts):
             spray_flags = [True] * len(pts)
+        if len(must_hit) != len(pts):
+            must_hit = [False] * len(pts)
 
         waypoints = [
-            {"north": n, "east": e, "spray": spray}
-            for (n, e), spray in zip(pts, spray_flags)
+            {"north": n, "east": e, "spray": spray, "must_hit": vertex}
+            for (n, e), spray, vertex in zip(pts, spray_flags, must_hit)
         ]
         if pts:
             norths = [n for n, _ in pts]

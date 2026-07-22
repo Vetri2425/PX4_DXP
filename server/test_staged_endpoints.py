@@ -355,6 +355,100 @@ async def test_loaded_path_sample_truncation(monkeypatch):
     assert len(resp.sample_coords) == 40   # head 20 + tail 20
 
 
+# ── must_hit reaches EVERY load route, not just the staged one ─────────────────
+#
+# Vertex provenance was plumbed through the staged route only. The other three
+# entry points dropped it, so a georeferenced survey loaded any other way had
+# its near-collinear vertices simplified away again by RPP — the exact bug
+# 64c12ff closed, reopened by omission at the call site.
+
+
+async def test_mission_load_route_passes_must_hit(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(mission_route, "MISSION_DIR", str(tmp_path), raising=False)
+    ctrl = OffboardController(None, deque())
+    monkeypatch.setattr(main, "offboard_ctrl", ctrl)
+
+    from models import MissionLoadRequest
+    await mission_route.load_mission(MissionLoadRequest(path_name="square.dxf"))
+
+    assert ctrl._loaded_must_hit is not None, "provenance dropped by /mission/load"
+    assert len(ctrl._loaded_must_hit) == len(ctrl._loaded_pts)
+    # Mixed, not uniform: densified points must be False or these are not
+    # provenance flags at all. NOTE: this square yields fewer must-hit points
+    # than it has corners — but the staged route yields exactly the same ones,
+    # which is what this test pins. The under-marking is a separate engine
+    # defect, tracked apart from A2; do not "fix" it by relaxing this test.
+    assert any(ctrl._loaded_must_hit)
+    assert not all(ctrl._loaded_must_hit)
+
+
+async def test_non_staged_load_matches_staged_provenance(tmp_path, monkeypatch):
+    """The non-staged route must agree with the staged one point for point.
+
+    A weaker test ("some flag is set") would pass on provenance that is merely
+    plausible. The staged route is the reference implementation, so compare.
+    """
+    mgr, _ = _setup(tmp_path, monkeypatch)
+    ctrl = OffboardController(None, deque())
+    monkeypatch.setattr(main, "offboard_ctrl", ctrl)
+
+    staged = mgr.plan_path("square.dxf", summary_only=False)
+
+    from models import MissionLoadRequest
+    await mission_route.load_mission(MissionLoadRequest(path_name="square.dxf"))
+
+    assert ctrl._loaded_must_hit == [bool(f) for f in staged["must_hit"]]
+
+
+async def test_load_path_for_controller_passes_must_hit(tmp_path, monkeypatch):
+    mgr, _ = _setup(tmp_path, monkeypatch)
+    ctrl = OffboardController(None, deque())
+
+    from mission_loading import load_path_for_controller
+    await load_path_for_controller(ctrl, mgr, "square.dxf")
+
+    assert ctrl._loaded_must_hit is not None, "provenance dropped by the async loader"
+    assert any(ctrl._loaded_must_hit)
+
+
+def test_every_controller_load_path_call_site_passes_must_hit():
+    """Structural guard: the socket handler cannot be called directly here, and
+    a future load route would silently drop provenance again. Assert at the
+    source level instead — this is the test the closure checklist asks for."""
+    import re
+    server_dir = os.path.dirname(os.path.abspath(__file__))
+    call_sites = []
+    for root, _dirs, files in os.walk(server_dir):
+        if "test" in os.path.basename(root):
+            continue
+        for fname in files:
+            if not fname.endswith(".py") or fname.startswith("test_"):
+                continue
+            fpath = os.path.join(root, fname)
+            with open(fpath) as fh:
+                src = fh.read()
+            for m in re.finditer(r"offboard_ctrl\.load_path\(", src):
+                # Slice to the matching close paren (no nested parens in these calls
+                # beyond len(...), which carries no commas that confuse the check).
+                depth, i = 0, m.end() - 1
+                while i < len(src):
+                    if src[i] == "(":
+                        depth += 1
+                    elif src[i] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    i += 1
+                line = src[: m.start()].count("\n") + 1
+                call_sites.append((os.path.relpath(fpath, server_dir), line,
+                                   src[m.end():i]))
+
+    assert len(call_sites) >= 4, f"expected the known load routes, found {call_sites}"
+    missing = [(f, ln) for f, ln, args in call_sites if "must_hit" not in args]
+    assert not missing, f"load_path call sites without must_hit: {missing}"
+
+
 # ── regression: /plan stays light (no per-segment points by default) ────────────
 
 def test_plan_path_default_has_no_segment_points(tmp_path):

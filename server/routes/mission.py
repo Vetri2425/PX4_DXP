@@ -16,6 +16,7 @@ from config import RPP_STALE, RPP_STATE_NAMES
 from mission_loading import (
     MissionLoadConflict,
     load_path_for_controller,
+    must_hit_for_path,
     pose_origin_or_error,
     spray_flags_for_path,
 )
@@ -59,7 +60,10 @@ async def load_mission(req: MissionLoadRequest):
     except Exception as exc:
         raise HTTPException(400, f"Load failed: {exc}")
     spray_flags = spray_flags_for_path(path_mgr, name, len(pts))
-    offboard_ctrl.load_path(pts, name=name, spray_flags=spray_flags)
+    must_hit = must_hit_for_path(path_mgr, name, len(pts))
+    offboard_ctrl.load_path(
+        pts, name=name, spray_flags=spray_flags, must_hit=must_hit
+    )
     return {"loaded": name, "num_points": len(pts)}
 
 
