@@ -476,6 +476,10 @@ class RPPControllerNode(Node):
         self._active_tracking_profile: str = "smooth"
         # Per-entity run queue (see _split_runs_by_flag / _apply_run)
         self._runs: list[dict] = []
+        # Quantised (n,e) keys of points the planner flagged as source geometry.
+        # Empty = no provenance on this path (legacy publisher) → simplification
+        # falls back to the geometric tests alone.
+        self._must_hit_keys: frozenset[tuple[int, int]] = frozenset()
         self._run_idx: int = 0
         self._run_align_pending: bool = False
         # Latched while a completed run is physically stopping before the
@@ -648,7 +652,17 @@ class RPPControllerNode(Node):
         # Operates on (north, east) tuples to keep the geometry code simple,
         # then converts back to PoseStamped at the end.
         raw_pts = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
-        raw_flags = [p.pose.position.z > 0.5 for p in msg.poses]
+        # position.z is a bitfield: bit0 = spray ON, bit1 = must-hit vertex
+        # (source geometry, not densification fill). MUST bit-test, not `> 0.5`
+        # — a spray-OFF must-hit point encodes as 2.0.
+        _z = [int(round(p.pose.position.z)) for p in msg.poses]
+        raw_flags = [bool(z & 1) for z in _z]
+        # Provenance travels by coordinate, not by index: run splitting reorders
+        # and re-groups points but never MOVES them, so a quantised (n,e) key
+        # survives the whole conditioning pipeline intact.
+        self._must_hit_keys = frozenset(
+            self._pt_key(p) for p, z in zip(raw_pts, _z) if z & 2
+        )
         n_raw = len(raw_pts)
 
         resample_dx = float(self.get_parameter("path_resample_spacing_m").value)
@@ -703,6 +717,7 @@ class RPPControllerNode(Node):
                     max_offset_m=float(
                         self.get_parameter("segment_simplify_max_offset_m").value
                     ),
+                    must_hit_keys=self._must_hit_keys,
                 )
             else:
                 c_pts, c_flags = run_pts, run_flags
@@ -715,7 +730,9 @@ class RPPControllerNode(Node):
                         c_pts, resample_dx, c_flags
                     )
             runs.append({
-                "poses": self._build_poses(c_pts, c_flags, stamp, expected),
+                "poses": self._build_poses(
+                    c_pts, c_flags, stamp, expected, self._must_hit_keys
+                ),
                 "flags": list(c_flags),
                 "profile": profile,
                 "length": self._pts_length(c_pts),
@@ -934,6 +951,45 @@ class RPPControllerNode(Node):
             return math.hypot(p[0] - a[0], p[1] - a[1])
         return abs(dx * (a[1] - p[1]) - dy * (a[0] - p[0])) / h
 
+    @staticmethod
+    def _pt_key(p: tuple[float, float]) -> tuple[int, int]:
+        """Quantise a point to a 1 mm grid for identity lookups.
+
+        Conditioning reorders and regroups points but never moves them, so a
+        millimetre-quantised key is a stable identity across the pipeline.
+        """
+        return (int(round(p[0] * 1000.0)), int(round(p[1] * 1000.0)))
+
+    @classmethod
+    def _dp_mark_keep(
+        cls,
+        pts: list[tuple[float, float]],
+        eps: float,
+        lo: int,
+        hi: int,
+        keep: list[bool],
+    ) -> None:
+        """Douglas-Peucker: mark indices in (lo, hi) needed to stay within eps.
+
+        Iterative (explicit stack) rather than recursive — a road alignment can
+        carry thousands of points and Python's recursion limit is 1000.
+        """
+        stack = [(lo, hi)]
+        while stack:
+            a_i, b_i = stack.pop()
+            if b_i <= a_i + 1:
+                continue
+            a, b = pts[a_i], pts[b_i]
+            d_max, i_max = 0.0, -1
+            for i in range(a_i + 1, b_i):
+                d = cls._perp_dist(pts[i], a, b)
+                if d > d_max:
+                    d_max, i_max = d, i
+            if i_max >= 0 and d_max > eps:
+                keep[i_max] = True
+                stack.append((a_i, i_max))
+                stack.append((i_max, b_i))
+
     @classmethod
     def _simplify_path_for_profile(
         cls,
@@ -941,6 +997,7 @@ class RPPControllerNode(Node):
         flags: list[bool] | None = None,
         collinear_tol_deg: float = 5.0,
         max_offset_m: float = 0.0,
+        must_hit_keys: frozenset[tuple[int, int]] | None = None,
     ) -> tuple[list[tuple[float, float]], list[bool]]:
         """Remove duplicate and same-heading vertices while preserving corners.
 
@@ -949,14 +1006,35 @@ class RPPControllerNode(Node):
         segment mode needs the side endpoints, not every resampled point.
         Flag changes are preserved so mark/transit boundaries are not erased.
 
-        Angle alone is not enough. A must-hit waypoint that sits only a few
-        centimetres off the straight run — e.g. the middle points of a
-        near-straight point-path bend the line by ~3 deg yet are 3-4 cm off —
-        reads as "collinear" by heading and was silently dropped, so the rover
-        tracked a straight line and MISSED the points by that offset. When
-        max_offset_m > 0 a vertex is also kept if its perpendicular distance
-        from the retained line exceeds it (a Douglas-Peucker distance test), so
-        geometrically real points survive regardless of how gentle the angle is.
+        A point is retained when ANY of these hold:
+
+        1. it is an endpoint, or a spray-flag boundary;
+        2. `must_hit_keys` marks it as source geometry (a CAD/survey vertex
+           rather than densification fill) — the authoritative test;
+        3. its heading change from the last retained point exceeds
+           `collinear_tol_deg` — the corner test;
+        4. `max_offset_m > 0` and dropping it would push the retained polyline
+           further than that from the original — a true Douglas-Peucker test.
+
+        Rule 4 replaces a guard that measured each candidate against the NEXT
+        RAW SAMPLE instead of the span being collapsed. On a path densified at
+        `mark_spacing` (5 cm) that measured ~2.4 mm at a vertex sitting 3-4 cm
+        off the retained chord, so it never fired and surveyed vertices were
+        silently deleted — the rover then drove a straight chord and missed
+        them by that offset. Measuring against the collapsing span is what
+        `tools/analyze_mission.py:_perp_from_span` already does.
+
+        Rule 2 is what actually settles it. A tolerance alone cannot separate
+        survey noise from intent — a 3.4 cm real bend and 3.4 cm of RTK noise
+        are numerically identical. Provenance can: densification fill carries no
+        intent and may be dropped freely, a source vertex is operator intent and
+        is never dropped. If a survey is noisy the resulting shape is noisy, and
+        that is a survey-quality problem to surface, not one for the controller
+        to silently smooth away.
+
+        When `max_offset_m <= 0` and `must_hit_keys` is empty this reduces
+        exactly to the original angle-only behaviour, which the classification
+        and run-merge call sites depend on.
         """
         if flags is None or len(flags) != len(pts):
             flags = [False] * len(pts)
@@ -972,31 +1050,44 @@ class RPPControllerNode(Node):
             clean_pts.append(pt)
             clean_flags.append(bool(flag))
 
-        if len(clean_pts) < 3:
+        n = len(clean_pts)
+        if n < 3:
             return clean_pts, clean_flags
 
         tol = math.radians(collinear_tol_deg)
-        out_pts: list[tuple[float, float]] = [clean_pts[0]]
-        out_flags: list[bool] = [clean_flags[0]]
-        for i in range(1, len(clean_pts) - 1):
-            prev_pt = out_pts[-1]
-            this_pt = clean_pts[i]
-            next_pt = clean_pts[i + 1]
-            h0 = cls._segment_heading(prev_pt, this_pt)
-            h1 = cls._segment_heading(this_pt, next_pt)
-            heading_change = cls._heading_delta(h0, h1)
-            flag_boundary = clean_flags[i - 1] != clean_flags[i] or clean_flags[i] != clean_flags[i + 1]
-            far_off = (
-                max_offset_m > 0.0
-                and cls._perp_dist(this_pt, prev_pt, next_pt) > max_offset_m
-            )
-            if heading_change <= tol and not flag_boundary and not far_off:
-                continue
-            out_pts.append(this_pt)
-            out_flags.append(clean_flags[i])
+        mh = must_hit_keys or frozenset()
 
-        out_pts.append(clean_pts[-1])
-        out_flags.append(clean_flags[-1])
+        # Pass 1 — angle / flag / must-hit anchors. The heading test measures
+        # from the last RETAINED point (not the previous raw one) so gradual
+        # curvature accumulates; classification relies on that exact behaviour.
+        keep = [False] * n
+        keep[0] = True
+        keep[n - 1] = True
+        last_kept = 0
+        for i in range(1, n - 1):
+            this_pt = clean_pts[i]
+            h0 = cls._segment_heading(clean_pts[last_kept], this_pt)
+            h1 = cls._segment_heading(this_pt, clean_pts[i + 1])
+            heading_change = cls._heading_delta(h0, h1)
+            flag_boundary = (
+                clean_flags[i - 1] != clean_flags[i]
+                or clean_flags[i] != clean_flags[i + 1]
+            )
+            must = cls._pt_key(this_pt) in mh
+            if heading_change <= tol and not flag_boundary and not must:
+                continue
+            keep[i] = True
+            last_kept = i
+
+        # Pass 2 — geometric fidelity between anchors. Only runs when a
+        # tolerance is set, so angle-only callers are bit-for-bit unchanged.
+        if max_offset_m > 0.0:
+            anchors = [i for i, k in enumerate(keep) if k]
+            for a_i, b_i in zip(anchors, anchors[1:]):
+                cls._dp_mark_keep(clean_pts, max_offset_m, a_i, b_i, keep)
+
+        out_pts = [clean_pts[i] for i in range(n) if keep[i]]
+        out_flags = [clean_flags[i] for i in range(n) if keep[i]]
         return out_pts, out_flags
 
     @classmethod
@@ -1370,7 +1461,15 @@ class RPPControllerNode(Node):
         flags: list[bool],
         stamp,
         frame_id: str,
+        must_hit_keys: frozenset[tuple[int, int]] | None = None,
     ) -> list[PoseStamped]:
+        """Build conditioned poses, re-emitting the position.z bitfield.
+
+        bit0 = spray ON, bit1 = must-hit. Carrying provenance through to
+        /rpp/conditioned_path is what lets analyze_mission's geometry-fidelity
+        report tell "this vertex was dropped" from "this was only fill".
+        """
+        mh = must_hit_keys or frozenset()
         poses: list[PoseStamped] = []
         for (n, e), flag in zip(pts, flags):
             ps = PoseStamped()
@@ -1378,7 +1477,8 @@ class RPPControllerNode(Node):
             ps.header.frame_id = frame_id
             ps.pose.position.x = float(n)
             ps.pose.position.y = float(e)
-            ps.pose.position.z = 1.0 if flag else 0.0
+            must = (int(round(n * 1000.0)), int(round(e * 1000.0))) in mh
+            ps.pose.position.z = float((1 if flag else 0) | (2 if must else 0))
             ps.pose.orientation.w = 1.0
             poses.append(ps)
         return poses

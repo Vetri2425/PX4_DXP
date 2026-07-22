@@ -72,6 +72,14 @@ def densify_segment(
 
     Single-point segments (from POINT entities) are passed through unchanged.
 
+    PROVENANCE: the returned segment carries ``metadata["vertex_indices"]`` — the
+    indices, into the *densified* point list, of the points that came from the
+    input geometry rather than from interpolation. Downstream simplification uses
+    this to distinguish surveyed intent from machine-generated fill: an
+    interpolated point may be dropped freely, an original vertex may not. Without
+    it the two are numerically indistinguishable, which is how near-collinear
+    survey vertices were silently deleted (see `_simplify_path_for_profile`).
+
     Args:
         segment: Input segment with potentially sparse points.
         mark_spacing: Waypoint spacing for MARK segments (metres).
@@ -81,32 +89,42 @@ def densify_segment(
         New PathSegment with densified points, preserving all other attributes.
     """
     if len(segment.points) <= 1:
-        # Single point or empty — pass through
+        # Single point or empty — pass through. Every point is original.
+        meta = dict(segment.metadata)
+        meta["vertex_indices"] = list(range(len(segment.points)))
         return PathSegment(
             segment_type=segment.segment_type,
             points=list(segment.points),
             speed=segment.speed,
             segment_id=segment.segment_id,
             source_entity=segment.source_entity,
-            metadata=dict(segment.metadata),
+            metadata=meta,
         )
 
     spacing = mark_spacing if segment.segment_type == SegmentType.MARK else transit_spacing
     dense_pts: list[tuple[float, float]] = []
+    vertex_indices: list[int] = []
 
     for i in range(len(segment.points) - 1):
         line_pts = densify_line(segment.points[i], segment.points[i + 1], spacing)
         # Avoid duplicating the junction point
         if dense_pts and line_pts:
+            # segment.points[i] is already in dense_pts as the previous run's
+            # last element, which was recorded as a vertex on that iteration.
             dense_pts.extend(line_pts[1:])
         else:
+            vertex_indices.append(0)   # segment.points[0] lands at index 0
             dense_pts.extend(line_pts)
+        # segment.points[i + 1] is always the last point just appended.
+        vertex_indices.append(len(dense_pts) - 1)
 
+    meta = dict(segment.metadata)
+    meta["vertex_indices"] = vertex_indices
     return PathSegment(
         segment_type=segment.segment_type,
         points=dense_pts,
         speed=segment.speed,
         segment_id=segment.segment_id,
         source_entity=segment.source_entity,
-        metadata=dict(segment.metadata),
+        metadata=meta,
     )

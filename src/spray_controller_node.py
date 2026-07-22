@@ -612,7 +612,10 @@ class SprayControllerNode(Node):
 
     def _path_cb(self, msg: Path) -> None:
         points = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
-        flags = [p.pose.position.z > 0.5 for p in msg.poses]
+        # position.z is a bitfield: bit0 = spray ON, bit1 = must-hit vertex.
+        # MUST bit-test, not `> 0.5`: a spray-OFF must-hit point encodes as 2.0
+        # and a `> 0.5` test would spray a transit leg.
+        flags = [bool(int(round(p.pose.position.z)) & 1) for p in msg.poses]
         if not points:
             self._path_model = None
             self._session_config = cleared_config()

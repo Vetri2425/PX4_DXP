@@ -255,6 +255,11 @@ class PlannedPath:
         segments: Ordered list of PathSegments (MARK + TRANSIT).
         merged_waypoints: Single polyline for the /path topic.
         spray_flags: Parallel to merged_waypoints; True = spray ON.
+        must_hit: Parallel to merged_waypoints; True = the point came from the
+            source geometry (CAD/survey vertex) rather than densification.
+            Consumers MUST NOT simplify a must-hit point away — it is operator
+            intent, not machine-generated fill. Empty list = provenance unknown
+            (legacy plans); consumers should then fall back to geometric tests.
         total_mark_length: Total metres of spray-on path.
         total_transit_length: Total metres of dead-heading.
         origin: (north_m, east_m) NED origin used for lat/lon conversion.
@@ -264,6 +269,7 @@ class PlannedPath:
     segments: list[PathSegment] = field(default_factory=list)
     merged_waypoints: list[tuple[float, float]] = field(default_factory=list)
     spray_flags: list[bool] = field(default_factory=list)
+    must_hit: list[bool] = field(default_factory=list)
     total_mark_length: float = 0.0
     total_transit_length: float = 0.0
     origin: tuple[float, float] = (0.0, 0.0)

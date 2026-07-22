@@ -1173,6 +1173,8 @@ class PathManager:
         if not summary_only:
             result["merged_waypoints"] = plan.merged_waypoints
             result["spray_flags"] = plan.spray_flags
+            # Provenance: True = source geometry vertex, never simplify away.
+            result["must_hit"] = list(getattr(plan, "must_hit", []) or [])
 
         return result
 

@@ -1112,6 +1112,7 @@ async def plan_path(req: PathPlanRequest):
         segments=result["segments"],
         merged_waypoints=result.get("merged_waypoints", []),
         spray_flags=result.get("spray_flags", []),
+        must_hit=result.get("must_hit", []),
         alignment_metadata=alignment_meta or None,
         planning_metadata=result.get("planning_metadata"),
         warnings=result.get("warnings"),
@@ -1171,6 +1172,8 @@ def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
         "origin_gps": list(origin_gps) if origin_gps else None,
         "waypoints": result.get("merged_waypoints", []),
         "spray_flags": result.get("spray_flags", []),
+        # Vertex provenance: True = source geometry, never simplify away.
+        "must_hit": result.get("must_hit", []),
         "alignment_metadata": alignment_meta,
         "metadata": {
             "source": result["source"],
@@ -1262,6 +1265,7 @@ async def load_mission_to_controller(req: LoadMissionRequest):
 
     try:
         spray_flags = [bool(f) for f in staged.get("spray_flags", [])]
+        must_hit = [bool(f) for f in staged.get("must_hit", [])]
         placement_mode = staged.get("placement_mode") or (
             "GPS_SURVEYED" if staged.get("origin_gps") else "LOCAL_NED"
         )
@@ -1272,6 +1276,7 @@ async def load_mission_to_controller(req: LoadMissionRequest):
             waypoints,
             name=safe_id,
             spray_flags=spray_flags,
+            must_hit=must_hit,
             placement_mode=placement_mode,
             origin_gps=origin_gps,
             is_staged=True,
@@ -1581,6 +1586,7 @@ async def plan_and_stage(name: str, req: PathPlanRequest):
         segments=result["segments"],
         merged_waypoints=result.get("merged_waypoints", []),
         spray_flags=result.get("spray_flags", []),
+        must_hit=result.get("must_hit", []),
         alignment_metadata=alignment_meta or None,
         planning_metadata=result.get("planning_metadata"),
         warnings=warnings or None,
@@ -1627,6 +1633,7 @@ async def get_staged_mission(mission_id: str):
         num_waypoints=len(wp_out),
         waypoints=wp_out,
         spray_flags=[bool(f) for f in spray_flags],
+        must_hit=[bool(f) for f in (staged.get("must_hit", []) or [])],
         segment_runs=_spray_runs(wp_out, spray_flags),
         alignment_metadata=staged.get("alignment_metadata"),
         metadata=staged.get("metadata"),

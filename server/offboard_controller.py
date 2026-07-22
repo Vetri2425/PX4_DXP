@@ -86,6 +86,7 @@ class OffboardController:
         self._state      = MissionState.IDLE
         self._loaded_pts: list[tuple[float, float]] | None = None
         self._loaded_spray_flags: list[bool] | None = None
+        self._loaded_must_hit: list[bool] | None = None
         self._path_name: str | None = None
         self._placement_mode = LOCAL_NED
         self._origin_gps: tuple[float, float] | None = None
@@ -95,6 +96,7 @@ class OffboardController:
         # advance_entry_to_marking() once the entry stop is confirmed (RPP DONE).
         self._entry_marking_pts: list[tuple[float, float]] | None = None
         self._entry_marking_flags: list[bool] | None = None
+        self._entry_marking_must_hit: list[bool] | None = None
         # Serialises lifecycle calls. Created lazily on first use: on
         # Python 3.9 asyncio.Lock() binds an event loop at construction,
         # and the controller is built at server startup outside any loop.
@@ -185,12 +187,14 @@ class OffboardController:
             cleared_name = self._path_name
             self._loaded_pts = None
             self._loaded_spray_flags = None
+            self._loaded_must_hit = None
             self._path_name = None
             self._placement_mode = LOCAL_NED
             self._origin_gps = None
             self._is_staged_mission = False
             self._entry_marking_pts = None
             self._entry_marking_flags = None
+            self._entry_marking_must_hit = None
             self._state = MissionState.IDLE
             # Optional path-topic clear if this branch's node grows the hook;
             # baseline has publish_stop_path only, so this self-skips (clear is
@@ -209,6 +213,7 @@ class OffboardController:
         points: list[tuple[float, float]],
         name: Optional[str] = None,
         spray_flags: Optional[list[bool]] = None,
+        must_hit: Optional[list[bool]] = None,
         *,
         placement_mode: str = LOCAL_NED,
         origin_gps: tuple[float, float] | None = None,
@@ -225,6 +230,19 @@ class OffboardController:
         self._loaded_pts = points
         self._entry_marking_pts = None       # D1: wipe any stale entry stash
         self._entry_marking_flags = None
+        self._entry_marking_must_hit = None
+        # Provenance is advisory: a length mismatch degrades to "no provenance"
+        # (geometry-only simplification), never to a wrong flag alignment.
+        if must_hit is not None and len(must_hit) == len(points):
+            self._loaded_must_hit = [bool(f) for f in must_hit]
+        else:
+            if must_hit:
+                self._log_entry(
+                    "warning",
+                    f"must_hit length mismatch for {name or 'unknown'} — "
+                    "publishing without vertex provenance",
+                )
+            self._loaded_must_hit = None
         if spray_flags is not None and len(spray_flags) == len(points):
             self._loaded_spray_flags = [bool(f) for f in spray_flags]
         elif spray_flags is not None:
@@ -338,6 +356,7 @@ class OffboardController:
 
             pts_to_publish = list(self._loaded_pts)
             spray_flags_to_publish = self._loaded_spray_flags
+            must_hit_to_publish = self._loaded_must_hit
 
             # Surveyed placement first so RTK/pose/skew failures keep a typed
             # PlacementError (HTTP 422) instead of being masked by RPP STALE.
@@ -398,8 +417,10 @@ class OffboardController:
             entry_two_phase = False
             publish_pts = pts_to_publish
             publish_flags = spray_flags_to_publish
+            publish_must_hit = must_hit_to_publish
             self._entry_marking_pts = None
             self._entry_marking_flags = None
+            self._entry_marking_must_hit = None
             if self._placement_mode == GPS_SURVEYED and len(pts_to_publish) >= 2:
                 live_n, live_e = fcu.get("pos_n"), fcu.get("pos_e")
                 tgt_n, tgt_e = pts_to_publish[0]
@@ -413,11 +434,16 @@ class OffboardController:
                     self._entry_marking_flags = (
                         list(spray_flags_to_publish) if spray_flags_to_publish else None
                     )
+                    self._entry_marking_must_hit = (
+                        list(must_hit_to_publish) if must_hit_to_publish else None
+                    )
                     publish_pts = [
                         (float(live_n), float(live_e)),
                         (float(tgt_n), float(tgt_e)),
                     ]
                     publish_flags = [False, False]   # entry leg is spray-OFF
+                    # Both entry-leg points are live geometry, not survey intent.
+                    publish_must_hit = [False, False]
                     self._log_entry(
                         "info",
                         f"entry leg: ({live_n:+.3f}N,{live_e:+.3f}E) → first point "
@@ -433,6 +459,7 @@ class OffboardController:
                 self._node.publish_path(
                     publish_pts,
                     spray_flags=publish_flags,
+                    must_hit_flags=publish_must_hit,
                 )
 
                 # ── Arm ───────────────────────────────────────────────────────
@@ -704,10 +731,12 @@ class OffboardController:
             self._log_entry("warning", "entry complete but no marking path stashed")
             return False
         flags = self._entry_marking_flags
+        must = self._entry_marking_must_hit
         self._entry_marking_pts = None
         self._entry_marking_flags = None
+        self._entry_marking_must_hit = None
         if self._node is not None:
-            self._node.publish_path(pts, spray_flags=flags)
+            self._node.publish_path(pts, spray_flags=flags, must_hit_flags=must)
             # Clear the entry-leg DONE so RUNNING does not instantly auto-complete
             # on the stale settle before RPP re-latches on the marking path.
             try:

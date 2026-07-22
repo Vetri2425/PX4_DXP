@@ -474,6 +474,7 @@ class PathPlanResponse(BaseModel):
     segments: list[dict]  # [{type, points, speed, source}]
     merged_waypoints: list[list[float]]  # [[north, east], ...]
     spray_flags: list[bool]  # True = MARK
+    must_hit: list[bool] = Field(default_factory=list)  # True = source vertex
     alignment_metadata: Optional[dict] = None  # alignment stats/residuals
     planning_metadata: Optional[dict] = None  # counts/timings/bbox/unit metadata
     warnings: Optional[list[str]] = None  # geometry/safety warnings
@@ -586,6 +587,7 @@ class StagedMissionResponse(BaseModel):
     num_waypoints: int = 0
     waypoints: list[list[float]] = Field(default_factory=list)
     spray_flags: list[bool] = Field(default_factory=list)
+    must_hit: list[bool] = Field(default_factory=list)
     segment_runs: list[dict] = Field(default_factory=list)  # derived spray on/off runs
     alignment_metadata: Optional[dict] = None
     metadata: Optional[dict] = None

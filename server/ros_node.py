@@ -954,8 +954,16 @@ class RosBridgeNode(Node):
         points: list[tuple[float, float]],
         frame_id: str = "local_ned",
         spray_flags: list[bool] | None = None,
+        must_hit_flags: list[bool] | None = None,
     ) -> None:
-        """Publish nav_msgs/Path. Empty list → see publish_stop_path()."""
+        """Publish nav_msgs/Path. Empty list → see publish_stop_path().
+
+        `pose.position.z` is a BITFIELD, not a boolean:
+            bit 0 (1) = spray ON
+            bit 1 (2) = must-hit (source geometry vertex, never simplify away)
+        Legacy readers that tested `z > 0.5` will misread a spray-OFF must-hit
+        point (z=2) as spray ON — every reader must bit-test `int(round(z)) & 1`.
+        """
         if spray_flags is None:
             flags = [False] * len(points)
         elif len(spray_flags) != len(points):
@@ -968,23 +976,37 @@ class RosBridgeNode(Node):
         else:
             flags = [bool(f) for f in spray_flags]
 
+        if must_hit_flags is None:
+            mh = [False] * len(points)
+        elif len(must_hit_flags) != len(points):
+            log.warning(
+                "publish_path: must_hit_flags length %d != points length %d — "
+                "dropping provenance (simplification falls back to geometry only)",
+                len(must_hit_flags),
+                len(points),
+            )
+            mh = [False] * len(points)
+        else:
+            mh = [bool(f) for f in must_hit_flags]
+
         path = Path()
         path.header.stamp = self.get_clock().now().to_msg()
         path.header.frame_id = frame_id
-        for (n, e), spray in zip(points, flags):
+        for (n, e), spray, must in zip(points, flags, mh):
             ps = PoseStamped()
             ps.header = path.header
             ps.pose.position.x = float(n)
             ps.pose.position.y = float(e)
-            ps.pose.position.z = 1.0 if spray else 0.0
+            ps.pose.position.z = float((1 if spray else 0) | (2 if must else 0))
             ps.pose.orientation.w = 1.0
             path.poses.append(ps)
         self._path_pub.publish(path)
         log.info(
-            "published path: %d points → %s (spray_on=%d)",
+            "published path: %d points → %s (spray_on=%d, must_hit=%d)",
             len(points),
             frame_id,
             sum(1 for f in flags if f),
+            sum(1 for f in mh if f),
         )
 
     def publish_stop_path(

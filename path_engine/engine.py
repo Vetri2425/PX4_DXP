@@ -1023,6 +1023,11 @@ class PathEngine:
         # Step 6: Merge into single polyline with spray flags (and de-duplicate junctions)
         merged_waypoints: list[tuple[float, float]] = []
         spray_flags: list[bool] = []
+        # Parallel to merged_waypoints: True = this point came from the source
+        # geometry (CAD/survey vertex), not from densification. Consumers must
+        # never simplify a must-hit point away — see densify_segment's
+        # "vertex_indices" and RPP `_simplify_path_for_profile`.
+        must_hit: list[bool] = []
         total_mark = 0.0
         total_transit = 0.0
 
@@ -1048,7 +1053,15 @@ class PathEngine:
 
         for seg in ordered:
             is_mark = seg.segment_type == SegmentType.MARK
+            # A segment that never went through densify_segment carries no
+            # provenance, which means every one of its points IS source
+            # geometry (e.g. a parser-tessellated arc). Treat it as all-vertex
+            # rather than all-fill: over-preserving is safe, under-preserving
+            # silently deletes surveyed intent.
+            raw_vidx = seg.metadata.get("vertex_indices")
+            vertex_set = set(raw_vidx) if raw_vidx is not None else None
             for i, pt in enumerate(seg.points):
+                is_vertex = True if vertex_set is None else (i in vertex_set)
                 # Apply origin offset (only if not already aligned using GPS/affine)
                 if has_alignment:
                     offset_pt = pt
@@ -1059,10 +1072,14 @@ class PathEngine:
                 if merged_waypoints:
                     d = math.hypot(offset_pt[0] - merged_waypoints[-1][0], offset_pt[1] - merged_waypoints[-1][1])
                     if d < 0.01 and spray_flags[-1] == is_mark:
+                        # The retained coincident point inherits must-hit, or a
+                        # junction vertex would lose its provenance to dedup.
+                        must_hit[-1] = must_hit[-1] or is_vertex
                         continue
 
                 merged_waypoints.append(offset_pt)
                 spray_flags.append(is_mark)
+                must_hit.append(is_vertex)
 
                 # Compute segment length
                 if i > 0:
@@ -1084,6 +1101,8 @@ class PathEngine:
                 # which would paint the closing leg. Always close with spray OFF.
                 merged_waypoints.append(merged_waypoints[0])
                 spray_flags.append(False)
+                # Closing leg lands back on the path start — a real vertex.
+                must_hit.append(True)
                 # Account for the closing leg in the totals (transit)
                 total_transit += d_start_end
 
@@ -1184,6 +1203,7 @@ class PathEngine:
             segments=ordered,
             merged_waypoints=merged_waypoints,
             spray_flags=spray_flags,
+            must_hit=must_hit,
             total_mark_length=total_mark,
             total_transit_length=total_transit,
             origin=origin if not has_alignment else (0.0, 0.0),

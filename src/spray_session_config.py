@@ -320,7 +320,8 @@ def continuous_config_from_path(points: Sequence, flags: Sequence) -> SpraySessi
     """Build a continuous-mode SpraySessionConfig from `/path` geometry.
 
     Mirrors how `spray_controller_node.py` derives `points`/`flags` from the
-    `/path` topic today (MARK flag = `position.z > 0.5`); this is how the
+    `/path` topic today (MARK flag = bit0 of `position.z`, which is a bitfield:
+    bit0 = spray ON, bit1 = must-hit vertex); this is how the
     node represents that geometry internally in Phase A. A degraded load
     (spray unavailable) is just this call with every flag False — no
     separate code path.
