@@ -1185,6 +1185,15 @@ class PathManager:
         if ext == ".waypoints":
             return read_qgc_waypoints(fpath)
         if ext == ".csv":
+            # A named-header survey export (Emlid/Trimble point file) is a
+            # different format from the legacy headerless NED metres CSV, and
+            # feeding one to read_ned_csv would read lat/lon or grid metres as
+            # NED. Route it through the full planner so it is densified,
+            # grouped by feature code and projected like any other mission.
+            from path_engine.parsers.survey_csv import looks_like_survey_csv
+            if looks_like_survey_csv(fpath):
+                from path_engine import PathEngine
+                return PathEngine().plan_file(fpath).merged_waypoints
             return read_ned_csv(fpath)
         if ext == ".dxf":
             from path_engine import PathEngine

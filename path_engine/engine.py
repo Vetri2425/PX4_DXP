@@ -342,6 +342,15 @@ class PathEngine:
             # CSV and .waypoints: use the parser dispatcher
             detected_unit_scale = None
             segments = load_mission_segments(filepath)
+            # A survey CSV carries its own WGS84 origin (it was projected from
+            # lat/lon), so surveyed placement can auto-anchor exactly as a
+            # georeferenced DXF does.
+            if origin_gps is None:
+                for seg in segments:
+                    geo = seg.metadata.get("geo_origin")
+                    if geo:
+                        origin_gps = (float(geo[0]), float(geo[1]))
+                        break
 
         plan = self._plan_from_segments(
             segments,
@@ -1058,8 +1067,18 @@ class PathEngine:
             # geometry (e.g. a parser-tessellated arc). Treat it as all-vertex
             # rather than all-fill: over-preserving is safe, under-preserving
             # silently deletes surveyed intent.
+            # Precedence: an explicit POINT-layer declaration NARROWS must-hit
+            # to just those vertices; absent one, every source vertex counts.
+            # That is what keeps a long exported road tangent tractable — 200
+            # vertices, 6 declared, 194 free to simplify.
+            raw_ctrl = seg.metadata.get("control_indices")
             raw_vidx = seg.metadata.get("vertex_indices")
-            vertex_set = set(raw_vidx) if raw_vidx is not None else None
+            if raw_ctrl:
+                vertex_set = set(raw_ctrl)
+            elif raw_vidx is not None:
+                vertex_set = set(raw_vidx)
+            else:
+                vertex_set = None
             for i, pt in enumerate(seg.points):
                 is_vertex = True if vertex_set is None else (i in vertex_set)
                 # Apply origin offset (only if not already aligned using GPS/affine)

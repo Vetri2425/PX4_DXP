@@ -92,6 +92,7 @@ def densify_segment(
         # Single point or empty — pass through. Every point is original.
         meta = dict(segment.metadata)
         meta["vertex_indices"] = list(range(len(segment.points)))
+        # control_indices already index the (unchanged) point list.
         return PathSegment(
             segment_type=segment.segment_type,
             points=list(segment.points),
@@ -120,6 +121,14 @@ def densify_segment(
 
     meta = dict(segment.metadata)
     meta["vertex_indices"] = vertex_indices
+    # Declared control points index the ORIGINAL vertex list; remap them onto the
+    # densified list so the declaration survives densification. Without this the
+    # indices would silently point at interpolated fill.
+    ctrl = segment.metadata.get("control_indices")
+    if ctrl:
+        meta["control_indices"] = [
+            vertex_indices[k] for k in ctrl if 0 <= k < len(vertex_indices)
+        ]
     return PathSegment(
         segment_type=segment.segment_type,
         points=dense_pts,

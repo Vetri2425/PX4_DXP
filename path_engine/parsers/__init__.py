@@ -13,6 +13,7 @@ import os
 from ..core import PathSegment, SegmentType
 from .waypoints_parser import read_qgc_waypoints, read_qgc_waypoints_as_segment
 from .csv_parser import read_ned_csv, read_ned_csv_enhanced
+from .survey_csv import looks_like_survey_csv, read_survey_csv
 from .dxf_parser import parse_dxf, entities_to_segments
 
 
@@ -38,6 +39,11 @@ def load_mission_file(filepath: str) -> list[tuple[float, float]]:
     if ext == ".waypoints":
         return read_qgc_waypoints(filepath)
     elif ext == ".csv":
+        if looks_like_survey_csv(filepath):
+            pts: list[tuple[float, float]] = []
+            for seg in read_survey_csv(filepath).segments:
+                pts.extend(seg.points)
+            return pts
         return read_ned_csv(filepath)
     elif ext == ".dxf":
         entities = parse_dxf(filepath)
@@ -75,6 +81,11 @@ def load_mission_segments(filepath: str) -> list[PathSegment]:
         seg = read_qgc_waypoints_as_segment(filepath)
         return [seg]
     elif ext == ".csv":
+        # A named-header survey export (Emlid/Trimble/Leica point file) is a
+        # different format from the legacy headerless NED metres CSV. Detect
+        # rather than guess: the legacy path stays byte-for-byte unchanged.
+        if looks_like_survey_csv(filepath):
+            return read_survey_csv(filepath).segments
         return read_ned_csv_enhanced(filepath)
     elif ext == ".dxf":
         entities = parse_dxf(filepath)
