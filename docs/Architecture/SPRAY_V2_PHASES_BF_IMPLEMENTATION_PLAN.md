@@ -8,15 +8,28 @@
 
 ## ▶ NEXT SESSION — start here
 
-**State:** `Upgrade_Spray` @ `64c12ff` (pushed). Vertex-dropping fix committed, **NOT deployed** — Jetson was down 07-22. Jetson is 2 commits behind (`de943e4` + `64c12ff`).
+**State:** `Upgrade_Spray` @ `51f0ab4` (pushed). 626 tests pass. **NOTHING IS DEPLOYED** — Jetson has been down since 07-22 and is now **4 commits behind**:
+
+```
+51f0ab4  docs (this plan + 2 research docs)
+211244b  survey CSV ingest + POINT-layer control points
+e483d53  georef north-scale fix           <-- changes every geo mission by 0.62 %
+64c12ff  vertex-drop fix (DP + provenance)
+de943e4  §7 geometry-fidelity report      <-- the tool needed to read the runs
+```
 
 **Do in this order:**
-1. **Deploy + verify** — pull on Jetson, restart `rpp-pipeline` *and* `rover-server` (this commit touches `src/` and `server/`). Run `src/test_corner_absorb_pivot.py` + `test_smoke_rpp_controller.py` **in-env** — they have never executed anywhere (no rclpy on the Mac).
-2. **Bench check before driving** — stage `tes_cross_line`, confirm `/rpp/conditioned_path` keeps all 4 vertices. If it still comes out at 2 points, stop; nothing else matters.
-3. **9 georef runs** — 3× `tes_cross_line` (the real test) + 3× `test_line_2` (straight control) + 3× a new long-tangent drawing (15–30 m, 2–3 deflections <2° = the road case). Measure pose vs **raw `/path`**, never `/rpp/debug[0]` (error vs conditioned path — hides this bug) and never `/spray/debug[5]` (nozzle xtrack).
-4. **Then** this document, starting with **plan Rev 4** (§3 divergence) → **B0** (transport).
+1. **Deploy + verify.** Pull, restart `rpp-pipeline` *and* `rover-server` (these touch `src/`, `server/` and `path_engine/`). Run `src/test_corner_absorb_pivot.py` + `test_smoke_rpp_controller.py` **in-env** — no `src/` test has ever executed anywhere (no rclpy on the Mac).
+2. **Re-stage every georeferenced mission.** `e483d53` changes projected north by 0.62 %; anything staged before it is that much long. Do not reuse old staged plans.
+3. **Bench check before driving.** Stage `tes_cross_line`, confirm `/rpp/conditioned_path` keeps all 4 vertices. If it still comes out at 2 points, stop — nothing else matters.
+4. **9 georef runs.** 3× `tes_cross_line` (the real test) + 3× `test_line_2` (straight control) + 3× a new long-tangent drawing (15–30 m, 2–3 deflections <2° = the road case). Measure pose vs **raw `/path`** — never `/rpp/debug[0]` (error vs the conditioned path, structurally hides this bug) and never `/spray/debug[5]` (nozzle xtrack).
+5. **Then** this document: **plan Rev 4** (§3 divergence) → **B0** (transport).
+
+**Smaller items now open from the ingest work:** CSV quality gating (`require_fix` / `max_lateral_rms_m`) exists in the parser but no API route sets it; a grid-only CSV needs explicit operator CRS confirmation rather than a magnitude guess; the DXF `Codes` MTEXT is still unread (POINTs cover the DXF case for now).
 
 **Two open items not covered here:** the segment→smooth ~5 cm seam (visual-only; may already be fixed as a side effect of `64c12ff` — check `/rpp/debug[0]` vs `[40]` at the profile flip) and the spray start-delay vs nozzle-offset A/B (square @0.35 then @0.15 m/s).
+
+> ⚠ **Session lesson worth carrying:** two bugs shipped because a test's ground truth mirrored the bug — `test_7_musthit_points_preserved` fed bare vertices and bypassed densification, and the georef test used haversine with the same wrong radius as the projection. Be sceptical of any geometry test that claims to validate against "truth."
 
 ---
 
