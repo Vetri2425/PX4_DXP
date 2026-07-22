@@ -126,6 +126,10 @@ TOPICS = [
     "/spray/commanded",                   # what the controller commanded to PX4 AUX
     "/spray/state",                       # actual sprayer state (controller)
     "/spray/debug",                       # spray timing / boundary metrics
+    # ── added 2026-07-22: verified present on Upgrade_Spray (grep create_publisher)
+    "/spray/status",                      # Spray V2 Phase A typed status (std_msgs/String JSON)
+    "/spray/manual_state",                # manual-override state (POST /api/spray/test)
+    "/dyx/mission/progress",              # 0.0→1.0 completion @1Hz (path_publisher)
 ]
 
 # QoS profile overrides so the LATCHED (TRANSIENT_LOCAL) topics above are actually
@@ -366,6 +370,81 @@ def _loaded_path_identity() -> dict:
     return ident
 
 
+# ── staged-mission provenance ────────────────────────────────────────────────
+# Without this the bundle cannot answer "what file produced this drive, and was
+# it georeferenced?". manifest.identity only carries counts and origin_gps —
+# nothing about the SOURCE. The 2026-07-18 georef investigation had to guess the
+# DXF from a hand-copied ref_dxf/ folder someone happened to create.
+#
+# The staged mission JSON already holds all of it (routes/path.py _plan): the
+# global anchor (lat/lon/rotation/scale), the alignment fit (method, rmse,
+# fitted_scale, residuals) and metadata.source (filepath, extension,
+# unit_scale_m_per_unit). The bundle name IS the mission_id, so it is a direct
+# lookup — no server change, no new endpoint.
+STAGING_DIR = os.path.join(_REPO_ROOT, "server", "missions", "staging")
+
+
+def _staged_mission(mission_id: str | None) -> dict:
+    """Read the staged mission artifact for *mission_id*. Never raises.
+
+    Returns the provenance block for the manifest. The full artifact is written
+    to the bundle separately (see BagSession.start) so the exact commanded
+    geometry survives even after STAGING_TTL_S prunes the original.
+    """
+    if not mission_id:
+        return {"available": False, "reason": "no mission_id in identity"}
+    path = os.path.join(STAGING_DIR, f"{mission_id}.json")
+    try:
+        with open(path) as f:
+            d = json.load(f)
+    except Exception as exc:
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+    anchor = d.get("anchor") or {}
+    align = d.get("alignment_metadata") or {}
+    source = (d.get("metadata") or {}).get("source") or {}
+    # A georeferenced DXF is one the parser projected from lat/lon: georef.py
+    # stamps geo_origin, the planner promotes it to origin_gps, and the plan is
+    # staged GPS_SURVEYED with alignment method "gps_origin" and no ref points.
+    return {
+        "available": True,
+        "staged_file": path,
+        "source_file": source.get("filepath"),
+        "source_extension": source.get("extension"),
+        "unit_scale_m_per_unit": source.get("unit_scale_m_per_unit"),
+        "placement_mode": d.get("placement_mode"),
+        "anchor": anchor or None,
+        "alignment": {
+            "method": align.get("method"),
+            "rotation_deg": align.get("rotation_deg"),
+            "scale": align.get("scale"),
+            "fitted_scale": align.get("fitted_scale"),
+            "rmse": align.get("rmse"),
+            "residuals": align.get("residuals"),
+        },
+        "is_georeferenced": bool(d.get("origin_gps")) and align.get("method") == "gps_origin",
+        "num_waypoints": len(d.get("waypoints") or []),
+        "num_mark": sum(1 for f in (d.get("spray_flags") or []) if f),
+        "mark_length_m": (d.get("metadata") or {}).get("mark_length_m"),
+        "transit_length_m": (d.get("metadata") or {}).get("transit_length_m"),
+    }
+
+
+def _snapshot_staged_artifact(bundle_dir: str, mission_id: str | None) -> None:
+    """Copy the full staged mission JSON into the bundle. Best-effort, never raises."""
+    if not mission_id:
+        return
+    src = os.path.join(STAGING_DIR, f"{mission_id}.json")
+    try:
+        with open(src) as f:
+            data = f.read()
+        with open(os.path.join(bundle_dir, "staged_mission.json"), "w") as f:
+            f.write(data)
+        log(f"staged mission artifact snapshotted ({len(data)} bytes)")
+    except Exception as exc:
+        log(f"staged mission snapshot skipped: {type(exc).__name__}: {exc}")
+
+
 # ── manifest read/write (G2) ─────────────────────────────────────────────────
 MANIFEST_NAME = "manifest.json"
 INCOMPLETE_SENTINEL = "INCOMPLETE"
@@ -558,10 +637,14 @@ class Recorder:
 
         # Build the initial manifest AFTER the bag is already recording, so none
         # of this best-effort capture can lose data or block the mission (R1).
+        identity = _loaded_path_identity()
+        mission_id = identity.get("mission_id")
+        _snapshot_staged_artifact(self.bundle_dir, mission_id)
         self.manifest = {
             "schema": "bag_autorecord/manifest@1",
             "bundle": name,
-            "identity": _loaded_path_identity(),
+            "identity": identity,
+            "plan_provenance": _staged_mission(mission_id),
             "timestamps": {
                 "recorder_start": _stamp(started),
                 "mission_start_observed": _stamp(started),

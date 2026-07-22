@@ -52,6 +52,57 @@ POSE_STALE_MS = 300.0       # pose age beyond this is a staleness event
 RTK_MIN_FIX = 6             # GPSRAW fix_type below this during drive = RTK degraded
 EKF_JUMP_M = 0.5            # pose position jump between consecutive samples
 
+# ── geometry fidelity (§9) ───────────────────────────────────────────────────
+# The controller conditions /path before tracking it (rpp_controller_node
+# _simplify_path_for_profile): collinear resample points are dropped so segment
+# mode sees real segments instead of 5 cm crumbs. That is correct for generated
+# geometry — but it also silently deletes surveyed vertices that bend the line
+# only slightly, and nothing in this report could see it, because §1 TRACKING
+# reads /rpp/debug[0], which is the controller's error against its OWN
+# conditioned path. The rover graded its own homework and always passed.
+#
+# 2026-07-18 field case (tes_cross_line.dxf, 4 surveyed points): interior
+# vertices bent the line 1.45° / 2.79° and sat 3.4 / 4.4 cm off the end-to-end
+# chord. Both were dropped, /rpp/conditioned_path came out as TWO points, and
+# the rover drove a straight line past them — while §1 reported RMS 0.73 cm and
+# verdict PASS.
+#
+# This section compares the two recorded paths directly and reports what was
+# removed. It is diagnostic, not a controller change: dropping a vertex is
+# legitimate when the deviation is survey noise. The point is that it must be
+# VISIBLE, with the number attached, so the operator can judge.
+SURVEY_TOL_CM = 2.5         # deviations below this read as survey noise, above = intent
+VERTEX_BEND_DEG = 0.8       # heading change that marks a /path point as a real vertex
+
+
+def _perp_from_span(p, a, b) -> float:
+    """Perpendicular distance of p from the infinite line a->b (metres).
+
+    Measured against the SPAN BEING COLLAPSED, deliberately. The controller's
+    own guard measures against the next raw sample ~5 cm away, which reads ~1 mm
+    at a vertex sitting 4 cm off the retained chord — that is why its
+    max_offset_m test never fires on a densified path.
+    """
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    h = math.hypot(dx, dy)
+    if h < 1e-9:
+        return math.hypot(p[0] - a[0], p[1] - a[1])
+    return abs(dx * (a[1] - p[1]) - dy * (a[0] - p[0])) / h
+
+
+def _xtrack_to_polyline(p, poly) -> float:
+    """Shortest distance from p to a polyline (metres)."""
+    best = float("inf")
+    for j in range(len(poly) - 1):
+        a, b = poly[j], poly[j + 1]
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        s2 = dx * dx + dy * dy
+        t = 0.0 if s2 < 1e-12 else max(0.0, min(1.0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / s2))
+        d = math.hypot(p[0] - (a[0] + t * dx), p[1] - (a[1] + t * dy))
+        if d < best:
+            best = d
+    return best
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CDR reader — classic little-endian XCDR1 with proper member alignment.
@@ -390,6 +441,8 @@ class Series:
         self.seg = []        # (t, state, heading_err)
         self.yaw_rate = []   # (t, val)
         self.path = None     # [(n, e)] NED
+        self.paths = []      # (t, [(n, e)]) EVERY /path message — one per run
+        self.cond_paths = [] # (t, [(n, e)]) EVERY /rpp/conditioned_path message
         self.spray_active = []    # (t, bool) desired MARK
         self.spray_desired = []   # (t, bool)
         self.spray_commanded = [] # (t, bool)
@@ -423,7 +476,20 @@ def collect(bag_dir: str) -> Series:
             s.yaw_rate.append((t, m["data"]))
         elif topic == "/path":
             if m["poses"]:
-                s.path = [(p[0], p[1]) for p in m["poses"]]   # /path is NED direct (x=N, y=E)
+                # /path is NED direct (x=N, y=E). A staged mission publishes SEVERAL
+                # /path messages — a 2-pt transit hop, the mark run, then a 1-pt
+                # endpoint marker. Taking the LAST one (the old behaviour) left
+                # s.path as that single endpoint point, so analyze_stops ran against
+                # a 1-point path: _stop_vertices returned [0], verts[idx-1] wrapped
+                # to the same point, and every stop metric was meaningless. Keep the
+                # longest — that is the mark run, the geometry actually driven.
+                pts = [(p[0], p[1]) for p in m["poses"]]
+                s.paths.append((t, pts))
+                if s.path is None or len(pts) > len(s.path):
+                    s.path = pts
+        elif topic == "/rpp/conditioned_path":
+            if m["poses"]:
+                s.cond_paths.append((t, [(p[0], p[1]) for p in m["poses"]]))
         elif topic == "/spray/active":
             s.spray_active.append((t, m["data"]))
         elif topic == "/spray/desired":
@@ -603,10 +669,22 @@ def analyze_stops(s: Series) -> dict:
     for idx in stop_idx:
         bn, be = verts[idx]
         dists = [math.hypot(n - bn, e - be) for (n, e) in rover]
-        i_arrive = next((i for i, d in enumerate(dists) if d <= STOP_APPROACH_CM / 100.0), None)
+        is_endpoint = (idx == last_idx)
+        # Arrival index. For the ENDPOINT this must be the arrival on the FINAL
+        # approach, not the first time the rover was ever near the point: on a
+        # there-and-back shape the rover starts parked beside its own endpoint, so
+        # a first-ever match lands at t≈0 and every window below then spans the
+        # whole mission. Anchor to the last departure beyond DEPART_M first.
+        search_from = 0
+        if is_endpoint:
+            for i in range(len(dists) - 1, -1, -1):
+                if dists[i] > DEPART_M:
+                    search_from = i + 1
+                    break
+        i_arrive = next((i for i in range(search_from, len(dists))
+                         if dists[i] <= STOP_APPROACH_CM / 100.0), None)
         if i_arrive is None:
             continue  # never got close enough to call it a stop
-        is_endpoint = (idx == last_idx)
         # incoming travel direction (unit) into this stop — "past the corner" is
         # the forward projection along it. At a 90° corner the perpendicular
         # departure contributes ~0, so this isolates the true overshoot (unlike a
@@ -635,17 +713,29 @@ def analyze_stops(s: Series) -> dict:
         }
         worst_coast = max(worst_coast, coast)
         if is_endpoint:
-            # euclidean max-distance-after-arrival too (the D3 completion metric):
-            # the endpoint must be a true final stop, so this counts toward verdict.
+            # Where the rover actually came to rest. This is the D3 completion
+            # metric and the trustworthy one — see FINAL_STOP_MAX_CM below.
             entry["resting_cm"] = round(dists[-1] * 100, 1)
-            endpoint_coast = max(dists[i_arrive:])
-            entry["max_dist_after_arrival_cm"] = round(endpoint_coast * 100, 1)
-            worst_coast = max(worst_coast, endpoint_coast)
+            #
+            # `max_dist_after_arrival_cm` used to live here as a second gate and is
+            # GONE on purpose. It was a euclidean max, which cannot tell "still
+            # 10 cm short of the point" from "10 cm past it" — every window you can
+            # anchor it to has its own floor built in (DEPART_M gives ~30 cm,
+            # STOP_APPROACH_CM gives ~10 cm), so it reported a constant artifact and
+            # failed missions that rested 1.1 cm from their endpoint. Overshoot is
+            # already measured correctly above, as the SIGNED forward projection
+            # along the incoming direction (`coast`), which is what a euclidean
+            # distance can never be.
         stops.append(entry)
     saw_done = any(st == S_DONE for (_t, st, _h) in s.seg)
-    verdict = "PASS" if worst_coast <= COAST_MAX_CM / 100.0 else "FAIL"
+    # Endpoint settling is its own criterion. FINAL_STOP_MAX_CM has been declared
+    # since this analyser was written but was never wired to anything.
+    resting_cm = next((e["resting_cm"] for e in stops if e.get("is_endpoint")), None)
+    resting_bad = resting_cm is not None and resting_cm > FINAL_STOP_MAX_CM
+    verdict = ("FAIL" if (worst_coast > COAST_MAX_CM / 100.0 or resting_bad) else "PASS")
     return {"available": True, "count": len(stops), "stops": stops,
             "worst_coast_cm": round(worst_coast * 100, 1),
+            "endpoint_resting_cm": resting_cm,
             "reached_done": saw_done, "verdict": verdict}
 
 
@@ -740,6 +830,118 @@ def analyze_health(s: Series) -> dict:
             "verdict": verdict}
 
 
+def _path_vertices(poly, bend_deg=VERTEX_BEND_DEG):
+    """Interior points of *poly* where the heading turns by more than bend_deg.
+
+    On a densified /path these are exactly the CAD-authored vertices: every
+    other point is a resample sitting dead on its own leg.
+    """
+    out = []
+    for i in range(1, len(poly) - 1):
+        h0 = math.atan2(poly[i][1] - poly[i - 1][1], poly[i][0] - poly[i - 1][0])
+        h1 = math.atan2(poly[i + 1][1] - poly[i][1], poly[i + 1][0] - poly[i][0])
+        d = abs(_wrap(h1 - h0))
+        if math.degrees(d) > bend_deg:
+            out.append((i, poly[i], math.degrees(d)))
+    return out
+
+
+def analyze_geometry_fidelity(s: Series, survey_tol_cm: float = SURVEY_TOL_CM) -> dict:
+    """Did the rover track the geometry it was GIVEN? (§9)
+
+    Independent of §1: §1 asks "how well did the controller follow its own
+    conditioned path"; this asks "does that conditioned path still contain the
+    surveyed geometry". A mission can pass §1 perfectly while having driven a
+    different shape — that is the failure mode this exists to catch.
+    """
+    if not s.paths:
+        return {"available": False, "reason": "no /path in bag"}
+    if not s.cond_paths:
+        return {"available": False,
+                "reason": "no /rpp/conditioned_path in bag (recorder predates it, or "
+                          "the controller never conditioned a run)"}
+
+    # Pair each /path run with the conditioned path published for it. Both are
+    # latched and emitted per run in the same order, so index pairing holds; the
+    # endpoint guard keeps a mismatched count from silently mis-pairing.
+    runs = []
+    for k, (t_in, pin) in enumerate(s.paths):
+        if k >= len(s.cond_paths):
+            break
+        pout = s.cond_paths[k][1]
+        if len(pin) < 3:
+            continue                      # transit hop / endpoint marker: nothing to drop
+        if math.dist(pin[0], pout[0]) > 0.5 or math.dist(pin[-1], pout[-1]) > 0.5:
+            continue                      # not the same run — refuse to guess
+
+        dropped = []
+        for idx, v, bend in _path_vertices(pin):
+            # nearest retained node: if the vertex survived it is there exactly
+            near = min((math.dist(v, q), q) for q in pout)
+            if near[0] <= 0.01:
+                continue
+            # How far off the path the controller ACTUALLY tracked did this
+            # vertex end up? That is the whole question, and it is just the
+            # vertex's distance to the conditioned polyline.
+            dev = _xtrack_to_polyline(v, pout)
+            rec = {
+                "path_index": idx,
+                "n": round(v[0], 4), "e": round(v[1], 4),
+                "bend_deg": round(bend, 2),
+                "deviation_cm": round(dev * 100, 2),
+                "nearest_tracked_node_cm": round(near[0] * 100, 1),
+                "intent": "INTENT" if dev * 100 >= survey_tol_cm else "noise",
+            }
+            dropped.append(rec)
+        runs.append({
+            "run": k,
+            "planned_points": len(pin),
+            "tracked_points": len(pout),
+            "vertices_in_plan": len(_path_vertices(pin)),
+            "dropped": dropped,
+        })
+
+    if not runs:
+        return {"available": False, "reason": "no comparable mark run"}
+
+    # rover closest approach to each dropped vertex — the number that matters
+    track = [(n, e) for (_t, n, e, _y) in s.pose]
+    for r in runs:
+        for d in r["dropped"]:
+            v = (d["n"], d["e"])
+            d["rover_closest_cm"] = (round(min(math.dist(v, p) for p in track) * 100, 2)
+                                     if track else None)
+
+    # independent cross-track: driven vs the PLANNED geometry, not the conditioned one
+    xt_true = None
+    mark = max((p for _t, p in s.paths), key=len, default=None)
+    if track and mark and len(mark) >= 2:
+        i0 = min(range(len(track)), key=lambda i: math.dist(track[i], mark[0]))
+        i1 = min(range(len(track)), key=lambda i: math.dist(track[i], mark[-1]))
+        seg = track[min(i0, i1):max(i0, i1) + 1]
+        if len(seg) >= 2:
+            errs = [_xtrack_to_polyline(p, mark) for p in seg]
+            xt_true = {
+                "rms_cm": round(math.sqrt(sum(e * e for e in errs) / len(errs)) * 100, 2),
+                "max_cm": round(max(errs) * 100, 2),
+                "n": len(errs),
+            }
+
+    all_dropped = [d for r in runs for d in r["dropped"]]
+    intent = [d for d in all_dropped if d["intent"] == "INTENT"]
+    worst = max((d["deviation_cm"] for d in all_dropped), default=0.0)
+    return {
+        "available": True,
+        "survey_tol_cm": survey_tol_cm,
+        "runs": runs,
+        "dropped_total": len(all_dropped),
+        "dropped_above_tolerance": len(intent),
+        "worst_deviation_cm": worst,
+        "xtrack_vs_planned": xt_true,
+        "verdict": "FAIL" if intent else ("WARN" if all_dropped else "PASS"),
+    }
+
+
 def analyze_config(s: Series, manifest) -> dict:
     """As-run params: manifest (FCU + RPP snapshot) plus a live RPP block from the bag."""
     out = {"from_manifest": None, "rpp_from_bag": None}
@@ -806,12 +1008,12 @@ def _fmt_report(a: dict) -> str:
     if st.get("available"):
         for e in st["stops"]:
             tag = "ENDPOINT" if e["is_endpoint"] else f"corner@{e['vertex']}"
-            extra = (f"  resting {e['resting_cm']}cm  final-coast {e['max_dist_after_arrival_cm']}cm"
-                     if "resting_cm" in e else "")
+            extra = f"  resting {e['resting_cm']}cm" if "resting_cm" in e else ""
             line(f"   {tag:11s} closest {e['closest_cm']}cm  coast-past {e['coast_past_cm']}cm"
                  f"  dwell {e['dwell_s']}s{extra}")
-        line(f"   worst coast-past {st['worst_coast_cm']}cm  DONE={st['reached_done']}  "
-             f"verdict {st['verdict']}  (coast ≤ {COAST_MAX_CM}cm)")
+        line(f"   worst coast-past {st['worst_coast_cm']}cm  "
+             f"endpoint resting {st.get('endpoint_resting_cm')}cm  DONE={st['reached_done']}  "
+             f"verdict {st['verdict']}  (coast ≤ {COAST_MAX_CM}cm, resting ≤ {FINAL_STOP_MAX_CM}cm)")
     else:
         line(f"   WARN — {st.get('reason', 'unavailable')}")
     line("")
@@ -867,8 +1069,38 @@ def _fmt_report(a: dict) -> str:
         line(f"   verdict {h['verdict']}")
     line("")
 
+    g = a.get("geometry") or {}
+    line("7. GEOMETRY FIDELITY (planned /path vs tracked /rpp/conditioned_path)")
+    if not g.get("available"):
+        line(f"   unavailable — {g.get('reason')}")
+    else:
+        for r in g["runs"]:
+            line(f"   run {r['run']}: planned {r['planned_points']} pts "
+                 f"({r['vertices_in_plan']} CAD vertices) -> tracked {r['tracked_points']} pts")
+        xt = g.get("xtrack_vs_planned")
+        if xt:
+            line(f"   driven vs PLANNED geometry : RMS {xt['rms_cm']} cm  max {xt['max_cm']} cm  "
+                 f"(n={xt['n']})")
+            line("     ^ independent of §1, which measures against the CONDITIONED path")
+        if not g["dropped_total"]:
+            line("   no surveyed vertex was dropped — the rover tracked the full geometry")
+        else:
+            line(f"   {g['dropped_total']} vertex/vertices removed by conditioning "
+                 f"(tolerance {g['survey_tol_cm']} cm):")
+            for r in g["runs"]:
+                for d in r["dropped"]:
+                    tag = "INTENT — should have been driven" if d["intent"] == "INTENT" else "within survey noise"
+                    line(f"     - idx {d['path_index']:>3} ({d['n']:+.3f}N,{d['e']:+.3f}E)  "
+                         f"bend {d['bend_deg']:>5.2f}deg  {d['deviation_cm']:>5.2f} cm off the "
+                         f"driven path  [{tag}]")
+                    if d.get("rover_closest_cm") is not None:
+                        line(f"       rover closest approach {d['rover_closest_cm']} cm   "
+                             f"nearest tracked node {d['nearest_tracked_node_cm']} cm away")
+        line(f"   verdict : {g['verdict']}")
+    line("")
+
     cfg = a["config"]
-    line("7. AS-RUN CONFIG")
+    line("8. AS-RUN CONFIG")
     fm = cfg.get("from_manifest")
     if fm:
         line(f"   git {fm.get('git_sha')}  services {fm.get('services')}")
@@ -881,7 +1113,7 @@ def _fmt_report(a: dict) -> str:
         line("   (no manifest and no /rpp/debug params)")
     line("")
 
-    line("8. VERDICT")
+    line("9. VERDICT")
     line(f"   ===> {a['verdict']} <===")
     if a["worst_offenders"]:
         line("   worst offenders:")
@@ -904,19 +1136,31 @@ def analyze(root: str) -> dict:
     speed = analyze_speed(s)
     spray = analyze_spray(s)
     health = analyze_health(s)
+    geometry = analyze_geometry_fidelity(s)
     config = analyze_config(s, manifest)
 
     # overall verdict + worst offenders
     offenders = []
     fails = []
-    for name, sec in (("tracking", tracking), ("stops", stops), ("pivots", pivots)):
+    for name, sec in (("tracking", tracking), ("stops", stops), ("pivots", pivots),
+                      ("geometry", geometry)):
         v = sec.get("verdict")
         if v == "FAIL":
             fails.append(name)
+    if geometry.get("available") and geometry.get("dropped_above_tolerance"):
+        offenders.append(
+            f"{geometry['dropped_above_tolerance']} surveyed vertex/vertices dropped by path "
+            f"conditioning (worst {geometry['worst_deviation_cm']}cm off the driven path, "
+            f"tolerance {geometry['survey_tol_cm']}cm) — the rover did not drive the "
+            f"surveyed shape"
+        )
     if tracking.get("overall") and tracking["overall"]["rms_cm"] > XTRACK_PROD_CM:
         offenders.append(f"tracking RMS {tracking['overall']['rms_cm']}cm > {XTRACK_PROD_CM}cm")
     if stops.get("available") and stops["worst_coast_cm"] > COAST_MAX_CM:
         offenders.append(f"coast-past {stops['worst_coast_cm']}cm > {COAST_MAX_CM}cm")
+    if stops.get("available") and (stops.get("endpoint_resting_cm") or 0) > FINAL_STOP_MAX_CM:
+        offenders.append(
+            f"endpoint resting {stops['endpoint_resting_cm']}cm > {FINAL_STOP_MAX_CM}cm")
     if pivots.get("available") and pivots.get("any_reverse_flip"):
         offenders.append("reverse-flip detected during a pivot")
     if pivots.get("available") and pivots.get("worst_settle_deg", 0) > SETTLE_TOL_DEG:
@@ -941,6 +1185,7 @@ def analyze(root: str) -> dict:
         "speed": speed,
         "spray": spray,
         "health": health,
+        "geometry": geometry,
         "config": config,
         "worst_offenders": offenders,
         "verdict": verdict,
