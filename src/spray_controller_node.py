@@ -158,6 +158,15 @@ def _build_path_model(
         kind = TRANSIT_TO_MARK if clean_flags[i] else MARK_TO_TRANSIT
         boundaries.append(SprayBoundary(cumulative_s[i], kind))
 
+    # Hardening: if the path ends on a MARK point there is no terminal
+    # MARK->TRANSIT boundary, so _next_boundary returns None and off_early can
+    # never fire — the nozzle can latch ON at the endpoint. The engine now
+    # appends a trailing TRANSIT run-out (see engine.py merge step), but a path
+    # from any other source could still end on MARK; synthesize the terminal
+    # boundary at the final station so shutoff is guaranteed regardless.
+    if clean_flags and clean_flags[-1]:
+        boundaries.append(SprayBoundary(cumulative_s[-1], MARK_TO_TRANSIT))
+
     return SprayPathModel(clean_points, clean_flags, cumulative_s, boundaries)
 
 

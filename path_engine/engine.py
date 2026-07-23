@@ -1125,6 +1125,58 @@ class PathEngine:
                 # Account for the closing leg in the totals (transit)
                 total_transit += d_start_end
 
+        # Guarantee a terminal MARK->TRANSIT boundary when the mission ends on a
+        # MARK point. With extensions ON, the AFT run-out already appends a
+        # trailing TRANSIT point; with extensions OFF the mission ends on MARK
+        # (spray_flags[-1] is True), so the spray node never sees a terminal
+        # boundary: _next_boundary returns None, off_early can never fire, and
+        # _project_onto_path's global-closest snap can leave the nozzle latched
+        # ON at the endpoint. Append one short TRANSIT run-out so the extensions
+        # OFF tail is structurally identical to the extensions ON tail.
+        #
+        # Placed AFTER the close_loop block on purpose: a closed loop already
+        # ends on a TRANSIT (spray_flags[-1] is False), so this is a no-op there
+        # and cannot spur off the closing leg. This is purely additive — it only
+        # ever extends the deadhead tail by ~0.1 m and never alters a leg the
+        # rover actually marks.
+        #
+        # ONLY for an OPEN mission: a geometrically closed shape (last point
+        # coincides with the path start, e.g. a square outline marked as one
+        # MARK chain) must NOT get a linear run-out — that would drive a spur
+        # out past the closed corner and change the CAD topology (see
+        # test_extensions.py square-topology contracts). Closed shapes have a
+        # separate, pre-existing endpoint ambiguity: the nozzle projection at
+        # the coincident start/end point cannot distinguish "at the start" from
+        # "at the end" without a monotonic-progress window, which is deliberately
+        # deferred. This fix targets the reported case — OPEN extensions-off
+        # missions (lines, point-lines) that end on a MARK.
+        ends_at_start = (
+            len(merged_waypoints) >= 2
+            and math.hypot(
+                merged_waypoints[-1][0] - merged_waypoints[0][0],
+                merged_waypoints[-1][1] - merged_waypoints[0][1],
+            )
+            < 0.01
+        )
+        if merged_waypoints and spray_flags and spray_flags[-1] and not ends_at_start:
+            tail_n, tail_e = merged_waypoints[-1]
+            if len(merged_waypoints) >= 2:
+                p0n, p0e = merged_waypoints[-2]
+                dn, de = tail_n - p0n, tail_e - p0e
+                norm = math.hypot(dn, de)
+                if norm > 1e-9:
+                    dn, de = dn / norm, de / norm
+                else:
+                    dn, de = 1.0, 0.0
+            else:
+                dn, de = 1.0, 0.0
+            runout = self.aft_extension_m if self.enable_path_extensions else 0.1
+            runout = max(0.1, runout)
+            merged_waypoints.append((tail_n + dn * runout, tail_e + de * runout))
+            spray_flags.append(False)
+            must_hit.append(False)
+            total_transit += runout
+
         bbox = None
         if merged_waypoints:
             norths = [p[0] for p in merged_waypoints]
