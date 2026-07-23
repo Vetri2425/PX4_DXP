@@ -475,6 +475,16 @@ class PathPlanRequest(BaseModel):
     # judges a run is the one the operator set when planning it.
     survey_tolerance_m: Optional[float] = Field(None, gt=0.0, le=1.0)
 
+    # Spray mode selection (Spray V2 B0/Phase C). Staged with the mission so it
+    # rides to the controller at load and reaches the spray node on
+    # /spray/session_config. "continuous" (default) preserves pre-B0 behaviour.
+    # Geometry (MARK/transit) still comes from /path — dash only adds the
+    # on/off metering distances. "point" is reserved for Phase D (not emitted).
+    spray_mode: str = Field("continuous", pattern="^(continuous|dash|point)$")
+    dash_on_distance_m: Optional[float] = Field(None, gt=0.0, le=1000.0)
+    dash_off_distance_m: Optional[float] = Field(None, gt=0.0, le=1000.0)
+    dash_start_state: str = Field("on", pattern="^(on|off)$")
+
 
 class PathPlanResponse(BaseModel):
     """Response from /api/path/plan."""

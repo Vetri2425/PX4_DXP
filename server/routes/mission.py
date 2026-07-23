@@ -155,6 +155,22 @@ async def clear_mission():
         status = await offboard_ctrl.clear_mission_async()
     except MissionClearConflict as exc:
         raise HTTPException(409, str(exc))
+
+    # B0 (plan §3): publish an EXPLICIT cleared spray config, don't just stop
+    # publishing. /spray/session_config is TRANSIENT_LOCAL, so silence would
+    # let a restarted spray node re-latch the last mission's mode (e.g. dash)
+    # over a now-empty path. Best-effort — never fail the clear on this.
+    try:
+        from main import ros_node
+        from spray_session_builder import cleared_config_json
+
+        if ros_node is not None:
+            ros_node.publish_spray_session_config(cleared_config_json())
+    except Exception as exc:  # noqa: BLE001
+        import logging
+        logging.getLogger("server.mission").warning(
+            "cleared spray session_config publish failed: %s", exc
+        )
     return MissionClearResponse(cleared=True, status=LoadedPathResponse(**status))
 
 

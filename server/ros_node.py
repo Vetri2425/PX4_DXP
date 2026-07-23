@@ -36,7 +36,7 @@ from rclpy.qos import (
 
 from geometry_msgs.msg import PoseStamped, Vector3Stamped
 from nav_msgs.msg import Path
-from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, String
 
 from config import (
     ORIGIN_REQUEST_MAX_TRIES,
@@ -312,6 +312,14 @@ class RosBridgeNode(Node):
 
         # ── Publishers ────────────────────────────────────────────────────────
         self._path_pub = self.create_publisher(Path, "/path", _qos_reliable_tl())
+        # B0 (plan §3): spray mode + mode params, published once per mission
+        # load. RELIABLE + TRANSIENT_LOCAL (same class as /path) so a restarted
+        # spray node re-latches the current mission's mode. The spray node is
+        # the sole parser; we send it a JSON String and never validate on its
+        # behalf.
+        self._spray_session_config_pub = self.create_publisher(
+            String, "/spray/session_config", _qos_reliable_tl()
+        )
         # Manual spray override command — reliable VOLATILE (depth 1): must
         # arrive, but a stale override must never replay to a restarted node.
         self._spray_manual_pub = self.create_publisher(Bool, "/spray/manual", 1)
@@ -570,6 +578,21 @@ class RosBridgeNode(Node):
         msg.data = bool(on)
         self._spray_manual_pub.publish(msg)
         log.info("published /spray/manual: %s", "ON" if on else "OFF")
+
+    def publish_spray_session_config(self, config_json: str) -> None:
+        """Publish the spray mode/config JSON string on /spray/session_config (B0).
+
+        `config_json` must already be a valid SpraySessionConfig dict serialized
+        to JSON (built by the caller). The spray node is the only parser and
+        fails static on anything it does not accept, so we do not validate here.
+        Published on every mission load AND on mission clear (a cleared config,
+        not silence) — because the topic is TRANSIENT_LOCAL, simply stopping
+        would let a restarted node re-latch stale mission geometry (plan §3).
+        """
+        msg = String()
+        msg.data = str(config_json)
+        self._spray_session_config_pub.publish(msg)
+        log.info("published /spray/session_config (%d bytes)", len(msg.data))
 
     # ── Public API: state ─────────────────────────────────────────────────────
 

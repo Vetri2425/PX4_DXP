@@ -1206,6 +1206,15 @@ def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
         "spray_flags": result.get("spray_flags", []),
         # Vertex provenance: True = source geometry, never simplify away.
         "must_hit": result.get("must_hit", []),
+        # Spray mode (B0/Phase C). Rides to the controller at load and is
+        # published on /spray/session_config. Geometry stays in spray_flags/
+        # waypoints; this carries only the mode + dash metering distances.
+        "spray_session": {
+            "mode": req.spray_mode,
+            "dash_on_distance_m": req.dash_on_distance_m,
+            "dash_off_distance_m": req.dash_off_distance_m,
+            "dash_start_state": req.dash_start_state,
+        },
         "alignment_metadata": alignment_meta,
         "metadata": {
             "source": result["source"],
@@ -1328,6 +1337,30 @@ async def load_mission_to_controller(req: LoadMissionRequest):
         raise HTTPException(422, str(exc))
     except Exception as exc:
         raise HTTPException(409, f"Controller load failed: {exc}")
+
+    # B0/Phase C: publish the spray mode on /spray/session_config right after
+    # /path so geometry and mode reach the spray node from the same load. The
+    # node is the sole parser and fails static on anything it rejects, so a
+    # publish failure here must never fail the mission load — log and continue.
+    spray_session = staged.get("spray_session") or {}
+    spray_mode = spray_session.get("mode", "continuous")
+    try:
+        from main import ros_node
+        from spray_session_builder import build_session_config_json
+
+        cfg_json = build_session_config_json(
+            spray_mode,
+            dash_on_distance_m=spray_session.get("dash_on_distance_m"),
+            dash_off_distance_m=spray_session.get("dash_off_distance_m"),
+            dash_start_state=spray_session.get("dash_start_state", "on"),
+        )
+        ros_node.publish_spray_session_config(cfg_json)
+    except Exception as exc:  # noqa: BLE001 — mode publish is best-effort
+        import logging
+        logging.getLogger("server.path").warning(
+            "spray session_config publish failed for %s (mode=%s): %s — "
+            "spray node keeps its last mode", safe_id, spray_mode, exc,
+        )
 
     return {
         "status": "success",
