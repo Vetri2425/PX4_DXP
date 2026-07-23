@@ -21,7 +21,7 @@ Purpose: land the shared vocabulary and topic plumbing so every later phase is a
 - [x] **G0.4** All new params declared, default = frozen behavior, unread. RPP (`rpp_controller_node.py` after point-hold group): `progress_publish_enabled=False`, `point_precise_stop_enabled=False`, `point_arrival_tolerance_m=0.02`, `precise_stop_mode=feedforward`, `precise_stop_creep_speed=0.05`, `precise_stop_max_s=8.0`, `point_execution_mode=auto`, `manual_wait_timeout_s=0.0`, `point_hold_max_s=10.0`. Spray (`spray_controller_node.py` after pivot-gate group): `consume_rpp_progress=False`, `progress_timeout_s=0.3`.
 - [x] **G0.5** `src/test_mission_progress.py` — enum values frozen, milestone names, QoS specs, 4 round-trips, NaN/Inf→null, lenient-parse-never-raises, out-of-range→IDLE. **15/15 pass on Mac; full pure suite 210/210.**
 
-**DoD:** enum + schemas + QoS + params exist and import cleanly; all params default to frozen behavior; nothing publishes/consumes yet. ✅ Contract module + tests green on Mac (210/210); both nodes AST-parse; param decls are behavior-neutral (declared-but-unread). ⏳ **Remaining:** in-env frozen regression smoke (`test_smoke_rpp_controller` + `test_segment_stop` + `test_corner_pivot`) on the Jetson — rclpy-only, cannot run on Mac.
+**DoD:** enum + schemas + QoS + params exist and import cleanly; all params default to frozen behavior; nothing publishes/consumes yet. ✅ Contract module + tests green on Mac (210/210); both nodes AST-parse; param decls behavior-neutral. ✅ **Deployed + in-env frozen regression green on Jetson (2026-07-23).** **G0 COMPLETE.**
 
 ---
 
@@ -29,14 +29,14 @@ Purpose: land the shared vocabulary and topic plumbing so every later phase is a
 
 Purpose: RPP announces phase + distance-to-boundary. No consumer. Zero behavior change.
 
-- [ ] **G1.1** In `rpp_controller_node.py`, add a phase classifier: from the current pose projection onto `/path`, compute `MissionPhase`, `segment_index`, `point_index`, and `dist_to_next_boundary_m` + `next_boundary`. Reuse existing `/path` bit0 (MARK) / bit1 (must-hit) + per-line extension segments — projection only, **no new geometry**.
-- [ ] **G1.2** Publish `/rpp/progress` at 50 Hz (tie to existing control tick) behind `progress_publish_enabled`.
-- [ ] **G1.3** Emit `/rpp/milestone` once per phase transition with monotonic `seq` (MARK_START, MARK_STOP, PRE_START, AFT_STOP, AT_POINT, DWELL_DONE_RPP, REACHED_END).
-- [ ] **G1.4** Populate `stopped` (confirmed physically stopped — reuse `_corner_stop_satisfied` / speed threshold) and `xtrack_m` (signed) for observability.
-- [ ] **G1.5** Unit tests: phase-transition table across continuous / extensions / point paths; `dist_to_next_boundary` math against a hand-built `/path`.
-- [ ] **G1.6** Bench in-env (Jetson, disarmed): inject pose along a placed `/path`, assert `/rpp/progress` + `/rpp/milestone` sequencing.
+- [x] **G1.1** Phase classifier landed as a **pure module** `src/progress_classifier.py` (`classify()`, `next_mark_boundary()`, `segment_mark_flags()`, `milestones_for()`). Node gathers primitives (seg_idx, projection `t`, `along_s`, spray flags, must-hit ranks, speed) and calls it — projection only, no new geometry. Both boundary regimes: MARK↔non-MARK transitions (continuous/dash) and next must-hit point (point).
+- [x] **G1.2** `/rpp/progress` published every control tick behind `progress_publish_enabled`, via a thin wrapper: `_control_loop` → `_control_loop_impl` (frozen body, byte-for-byte) → gated, **exception-isolated** `_publish_progress_tick` (an observability bug can never crash control).
+- [x] **G1.3** `/rpp/milestone` emitted once per phase/point edge with monotonic `seq` (`_emit_progress` + `milestones_for`): MARK_START/STOP, PRE_START, AFT_STOP, AT_POINT, DWELL_DONE_RPP, REACHED_END.
+- [x] **G1.4** `stopped` (measured-speed < `segment_stop_speed_threshold`) and signed `xtrack_m` populated from the same projection the tick used (tracking pose = `_last_pos` − `_ekf_reset_offset`).
+- [x] **G1.5** `src/test_progress_classifier.py` — phase table (continuous/extensions/point), `dist_to_next_boundary` math, milestone edges. **18 tests; full pure suite 228/228 on Mac.**
+- [ ] **G1.6** Bench in-env (Jetson): `src/test_progress_publication.py` written (progress ON → emits + MARK_TRACKING + MARK_START milestone + monotonic seq; progress OFF → silent, control still drives). **Needs Jetson run** (rclpy-only).
 
-**DoD:** with flag ON, progress/milestone streams are correct on bench; with flag OFF, controller output is byte-for-byte frozen (regression smoke + segment_stop + corner_pivot green).
+**DoD:** with flag ON, progress/milestone streams correct on bench; with flag OFF, controller output byte-for-byte frozen. ✅ Mac: classifier + contract green (228/228); wrapper keeps impl untouched; new param `progress_approach_dist_m` (0.30) + fields all read only under the flag. ⏳ **Remaining:** Jetson run of `test_progress_publication.py` + frozen regression (smoke + segment_stop + corner_pivot) with the flag OFF.
 
 ---
 

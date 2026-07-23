@@ -183,7 +183,12 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 from geometry_msgs.msg import PoseStamped, Vector3Stamped
 from mavros_msgs.msg import GPSRAW          # P0.3 RTK fix gate
 from nav_msgs.msg import Path
-from std_msgs.msg import Bool, Float32MultiArray, MultiArrayDimension, Float32
+from std_msgs.msg import Bool, Float32MultiArray, MultiArrayDimension, Float32, String
+
+import mission_progress as mp
+import progress_classifier as pc
+from mission_progress import MilestoneMsg, MissionPhase, ProgressMsg
+from mission_progress_ros import qos_profile
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +413,7 @@ class RPPControllerNode(Node):
         # docs/Architecture/RPP_PROGRESS_HANDSHAKE_TASKS.md.
         # G1 — publish /rpp/progress + /rpp/milestone (pure observability):
         self.declare_parameter("progress_publish_enabled",            False)
+        self.declare_parameter("progress_approach_dist_m",            0.30)   # m — APPROACH_/MARK_END band width
         # G3 — precise 2 cm stop at must-hit points (point mode only):
         self.declare_parameter("point_precise_stop_enabled",          False)
         self.declare_parameter("point_arrival_tolerance_m",           0.02)   # m
@@ -532,6 +538,15 @@ class RPPControllerNode(Node):
         self._point_hold_done_keys: set = set()
         self._point_hold_active_key = None
         self._point_hold_start_ns = None
+        # G1 — mission-progress publication (default OFF, observability only).
+        # must-hit vertices of the active run in path order + a key→rank map, so
+        # the progress classifier can name the point currently held. Rebuilt in
+        # _apply_run. All read only under progress_publish_enabled.
+        self._musthit_vertices: list[int] = []
+        self._musthit_rank_by_key: dict = {}
+        self._progress_seq: int = 0
+        self._progress_last_phase: MissionPhase = MissionPhase.IDLE
+        self._progress_last_point: int = -1
         self._run_idx: int = 0
         self._run_align_pending: bool = False
         # Latched while a completed run is physically stopping before the
@@ -645,6 +660,15 @@ class RPPControllerNode(Node):
         )
         self._spray_active_pub = self.create_publisher(
             Bool, "/spray/active", be_qos
+        )
+        # G1 — mission-progress channel (design §4.1/§4.2). Separate topics +
+        # separate enum from /rpp/segment_debug, whose frozen contract is left
+        # untouched. Nothing publishes here unless progress_publish_enabled.
+        self._progress_pub = self.create_publisher(
+            String, mp.TOPIC_PROGRESS, qos_profile(mp.PROGRESS_QOS)
+        )
+        self._milestone_pub = self.create_publisher(
+            String, mp.TOPIC_MILESTONE, qos_profile(mp.MILESTONE_QOS)
         )
 
         # ------------------------------------------------------------------
@@ -1600,6 +1624,18 @@ class RPPControllerNode(Node):
         self._path = run["poses"]
         self._path_s = list(run.get("cum_s", []))
         self._spray_flags = list(run["flags"])
+        # G1 — cache this run's must-hit vertices (path order) + key→rank map for
+        # the progress classifier. Behaviour-neutral: only read when
+        # progress_publish_enabled. No-op cost is a single pass at run switch.
+        self._musthit_vertices = []
+        self._musthit_rank_by_key = {}
+        if self._must_hit_keys:
+            for i, ps in enumerate(self._path):
+                p = ps.pose.position
+                key = self._pt_key((p.x, p.y))
+                if key in self._must_hit_keys:
+                    self._musthit_rank_by_key[key] = len(self._musthit_vertices)
+                    self._musthit_vertices.append(i)
         self._active_tracking_profile = run["profile"]
         self._segment_idx = 0
         self._segment_state = (
@@ -3051,6 +3087,124 @@ class RPPControllerNode(Node):
     # Main control loop (50 Hz)
     # ==================================================================
     def _control_loop(self):
+        """Timer entry: run the frozen control tick, then (gated) publish
+        mission progress.
+
+        The control tick is byte-for-byte `_control_loop_impl`. Progress
+        publication is fully behind `progress_publish_enabled` AND wrapped so a
+        bug in the observability path can never take down the controller — if
+        it raises, the drive command for this tick has already been published
+        by the impl, and we only lose one progress sample.
+        """
+        self._control_loop_impl()
+        if bool(self.get_parameter("progress_publish_enabled").value):
+            try:
+                self._publish_progress_tick()
+            except Exception as exc:  # never let observability crash control
+                self.get_logger().warn(
+                    f"progress publish failed: {exc}", throttle_duration_sec=2.0
+                )
+
+    # ------------------------------------------------------------------
+    # G1 — mission-progress publication (design §3/§4). Gated, additive.
+    # ------------------------------------------------------------------
+    def _measured_speed(self) -> float:
+        """Latest measured ground speed (m/s), 0 if no fresh velocity sample."""
+        if self._latest_vel_time is None:
+            return 0.0
+        age = (self.get_clock().now() - self._latest_vel_time).nanoseconds * 1e-9
+        if age >= 0.5:
+            return 0.0
+        v_n, v_e = self._latest_vel_ned
+        return math.hypot(v_n, v_e)
+
+    def _point_progress_inputs(self) -> dict:
+        """Point-mode phase inputs for the classifier, from the point-hold state.
+
+        Reuses the SAME point-hold state the Phase-D overlay maintains
+        (_point_hold_active_key/_start_ns/_done_keys) — G1 only *reports* it.
+        """
+        point_mode = (
+            bool(self.get_parameter("point_hold_enabled").value)
+            and bool(self._must_hit_keys)
+        )
+        if not point_mode:
+            return {"point_mode": False}
+        active_key = self._point_hold_active_key
+        done = self._point_hold_done_keys
+        all_done = len(done) >= len(self._must_hit_keys)
+        if active_key is not None:
+            rank = self._musthit_rank_by_key.get(active_key, -1)
+        else:
+            # closing on the next un-dwelled must-hit point, in path order
+            rank = -1
+            for r, vtx in enumerate(self._musthit_vertices):
+                p = self._path[vtx].pose.position
+                if self._pt_key((p.x, p.y)) not in done:
+                    rank = r
+                    break
+        vertex = self._musthit_vertices[rank] if 0 <= rank < len(self._musthit_vertices) else -1
+        return {
+            "point_mode": True,
+            "point_active": active_key is not None,
+            "point_dwelling": self._point_hold_start_ns is not None,
+            "point_target_rank": rank,
+            "point_target_vertex": vertex,
+            "all_points_done": all_done,
+        }
+
+    def _publish_progress_tick(self) -> None:
+        """Classify this tick and publish /rpp/progress (+ milestone edges)."""
+        if not self._path or self._last_pos is None:
+            self._emit_progress(ProgressMsg(
+                phase=MissionPhase.REACHED_END if self._path_done else MissionPhase.IDLE
+            ))
+            return
+
+        # Tracking pose = raw last pose minus any absorbed EKF-reset offset —
+        # exactly what the control tick projected with this cycle.
+        pos_n = self._last_pos[0] - self._ekf_reset_offset[0]
+        pos_e = self._last_pos[1] - self._ekf_reset_offset[1]
+        seg_idx = max(0, min(self._segment_idx, max(0, len(self._path) - 2)))
+        t, _fn, _fe, signed_xtrack, _de = self._project_onto_segment(pos_n, pos_e, seg_idx)
+        along_s = self._path_progress_at(seg_idx, t)
+        speed = self._measured_speed()
+        stop_thr = float(self.get_parameter("segment_stop_speed_threshold").value)
+
+        pt = self._point_progress_inputs()
+        msg = pc.classify(
+            has_path=True, path_done=self._path_done,
+            spray_flags=self._spray_flags, cum_s=self._path_s,
+            seg_idx=seg_idx, proj_t=t, along_s=along_s,
+            signed_xtrack=signed_xtrack, speed=speed, stopped=speed < stop_thr,
+            approach_dist_m=float(self.get_parameter("progress_approach_dist_m").value),
+            **pt,
+        )
+        self._emit_progress(msg)
+
+    def _emit_progress(self, msg: ProgressMsg) -> None:
+        """Publish a ProgressMsg + any milestone events on the phase/point edge."""
+        s = String()
+        s.data = msg.to_json()
+        self._progress_pub.publish(s)
+
+        events = pc.milestones_for(
+            self._progress_last_phase, msg.phase,
+            self._progress_last_point, msg.point_index,
+        )
+        for event in events:
+            self._progress_seq += 1
+            idx = msg.point_index if msg.point_index >= 0 else msg.segment_index
+            m = String()
+            m.data = MilestoneMsg(
+                event=event, seq=self._progress_seq, index=idx,
+                stamp_ns=self.get_clock().now().nanoseconds,
+            ).to_json()
+            self._milestone_pub.publish(m)
+        self._progress_last_phase = msg.phase
+        self._progress_last_point = msg.point_index
+
+    def _control_loop_impl(self):
         """Compute and publish NED velocity vector."""
         # ---- Read parameters (allows runtime tuning) ----
         hw_max_v    = self.get_parameter("max_linear_vel").value           # hardware ceiling
