@@ -58,6 +58,26 @@ def test_dash_missing_distances_falls_back_to_continuous():
     assert cfg.mode == "continuous"
 
 
+def test_point_round_trips_through_node_parser():
+    cfg = parse_session_config(build_session_config(
+        "point",
+        point_coordinates=[(0.0, 0.0), (1.5, 2.0)],
+        point_arrival_tolerance_m=0.05,
+        point_arrival_settle_s=0.2,
+        point_dwell_s=1.5,
+    ))
+    assert cfg.mode == "point"
+    assert cfg.points_mode is not None
+    assert len(cfg.points_mode.coordinates) == 2
+    assert cfg.points_mode.dwell_s == 1.5
+    assert cfg.points_mode.heading_tolerance_deg is None  # position-only
+
+
+def test_point_no_coordinates_falls_back_to_continuous():
+    cfg = parse_session_config(build_session_config("point", point_coordinates=[]))
+    assert cfg.mode == "continuous"
+
+
 def test_cleared_config_json_parses_continuous_empty():
     cfg = parse_session_config(json.loads(cleared_config_json()))
     assert cfg.mode == "continuous"

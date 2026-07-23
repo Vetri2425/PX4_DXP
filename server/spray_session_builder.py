@@ -29,12 +29,18 @@ def build_session_config(
     dash_on_distance_m: Optional[float] = None,
     dash_off_distance_m: Optional[float] = None,
     dash_start_state: str = "on",
+    point_coordinates=None,
+    point_arrival_tolerance_m: float = 0.05,
+    point_arrival_settle_s: float = 0.2,
+    point_dwell_s: float = 1.0,
+    point_heading_tolerance_deg: Optional[float] = None,
 ) -> dict:
     """Return a schema-1 SpraySessionConfig dict for the given mode.
 
     Unknown/empty modes fall back to continuous (the safe default). Dash needs
-    both distances; if either is missing it also falls back to continuous so a
-    half-configured request can never silently ship a broken dash.
+    both distances; point needs a non-empty coordinate list; if either is
+    incomplete it falls back to continuous so a half-configured request can
+    never silently ship a broken mode.
     """
     mode = (mode or "continuous").lower()
     cfg = {
@@ -52,8 +58,18 @@ def build_session_config(
             "off_distance_m": float(dash_off_distance_m),
             "start_state": "off" if dash_start_state == "off" else "on",
         }
-    # NOTE: mode == "point" is intentionally NOT emitted yet — Phase D builds
-    # the points_mode payload + the planner-side per-point hold together.
+    elif mode == "point" and point_coordinates:
+        cfg["mode"] = "point"
+        cfg["points_mode"] = {
+            "coordinates": [[float(n), float(e)] for n, e in point_coordinates],
+            "arrival_tolerance_m": float(point_arrival_tolerance_m),
+            "heading_tolerance_deg": (
+                None if point_heading_tolerance_deg is None
+                else float(point_heading_tolerance_deg)
+            ),
+            "arrival_settle_s": float(point_arrival_settle_s),
+            "dwell_s": float(point_dwell_s),
+        }
     return cfg
 
 

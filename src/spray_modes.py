@@ -12,6 +12,7 @@ glue and feeds these engines per tick.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -208,4 +209,212 @@ class DashMeter:
             "s_at_last_toggle_m": round(self.s_at_last_toggle, 4),
             "on_distance_m": self.on_distance_m,
             "off_distance_m": self.off_distance_m,
+        }
+
+
+@dataclass(frozen=True)
+class PointUpdate:
+    """Result of one PointMeter tick."""
+
+    geometry_desired: bool  # spray at the dot (before safety gates)?
+    phase: str              # transit|arriving|holding|dwelling|done
+    target_index: int       # coordinate the rover is heading to / at
+    exempt_pivot: bool      # bypass the pivot gate this tick (dwelling on a dot)
+    done: bool              # whole point mission finished
+    skipped_index: int      # index skipped by the watchdog this tick, else -1
+
+
+class PointMeter:
+    """Point / coordinate dwell-marking FSM (plan §7.3).
+
+    Per point i: TRANSIT (rover navigating, spray off) → ARRIVING (near the
+    dot, near-zero speed, optional heading, held for arrival_settle_s — a blip
+    resets, no partial credit) → HOLDING/DWELLING (spray ON for dwell_s) →
+    wait for a CONFIRMED actuator OFF → ADVANCE to the next dot.
+
+    Two-sidedness (plan §7.3): this class only *watches* pose and decides when
+    to spray. Something else (the planner + the driving controller) must
+    actually stop the rover on each dot; without that the rover drives through,
+    ARRIVING never satisfies, and every point is watchdog-skipped. That
+    planner-side per-point hold is the OTHER half of Phase D.
+
+    Safety-critical rules baked in here:
+      * ADVANCE waits for `off_confirmed`, not merely for dwell_s — so a
+        retrying OFF can never let the mission move off a still-spraying dot.
+      * The unreachable-target watchdog skips a point after
+        point_arrival_timeout_s, logs it (skipped_index), and NEVER counts it
+        as sprayed — one bad coordinate can't wedge the whole mission.
+      * `exempt_pivot` is True ONLY while dwelling within tolerance of the
+        active dot — the narrow, node-side pivot-gate exemption (Rev 4 §7.3),
+        never mode-wide (transits between dots keep the gate).
+    """
+
+    def __init__(
+        self,
+        coordinates,
+        arrival_tolerance_m: float,
+        arrival_settle_s: float,
+        dwell_s: float,
+        heading_tolerance_deg=None,
+        *,
+        point_arrival_max_speed_mps: float = 0.05,
+        point_arrival_timeout_s: float = 60.0,
+    ) -> None:
+        self.coordinates = tuple((float(n), float(e)) for n, e in coordinates)
+        if arrival_tolerance_m <= 0.0:
+            raise ValueError(f"arrival_tolerance_m must be > 0, got {arrival_tolerance_m}")
+        self.arrival_tolerance_m = float(arrival_tolerance_m)
+        self.arrival_settle_s = max(0.0, float(arrival_settle_s))
+        self.dwell_s = max(0.0, float(dwell_s))
+        self.heading_tolerance_deg = (
+            None if heading_tolerance_deg is None else float(heading_tolerance_deg)
+        )
+        self.max_speed_mps = max(0.0, float(point_arrival_max_speed_mps))
+        self.timeout_s = max(0.0, float(point_arrival_timeout_s))
+
+        self.target_index = 0
+        self.phase = "done" if not self.coordinates else "transit"
+        self.done = not self.coordinates
+        self.skipped_indices: list[int] = []
+        self._settle_start = None
+        self._dwell_start = None
+        self._transit_start = None
+
+    def _heading_ok(self, yaw_ned: float, i: int) -> bool:
+        """Optional heading gate: aligned with the approach bearing (prev→i).
+
+        Position-only (heading_tolerance_deg=None) always passes. The first
+        point has no approach bearing, so it is position-only too. CSV point
+        lists carry no per-point heading, so None is the common case.
+        """
+        if self.heading_tolerance_deg is None or i == 0:
+            return True
+        pn, pe = self.coordinates[i - 1]
+        tn, te = self.coordinates[i]
+        bearing_ned = math.atan2(te - pe, tn - pn)  # NED: atan2(dE, dN)
+        err = (yaw_ned - bearing_ned + math.pi) % (2.0 * math.pi) - math.pi
+        return abs(math.degrees(err)) <= self.heading_tolerance_deg
+
+    def _advance(self) -> None:
+        self.target_index += 1
+        self._settle_start = None
+        self._dwell_start = None
+        self._transit_start = None
+        if self.target_index >= len(self.coordinates):
+            self.phase = "done"
+            self.done = True
+        else:
+            self.phase = "transit"
+
+    def update(
+        self,
+        pose_n: float,
+        pose_e: float,
+        yaw_ned: float,
+        speed_mps: float,
+        now_s: float,
+        off_confirmed: bool,
+    ) -> PointUpdate:
+        """Advance the FSM one control tick.
+
+        pose_n/pose_e are the NOZZLE position (same frame continuous/dash
+        project onto) so the dot lands under the nozzle. `off_confirmed` is the
+        actuator FSM's OFF_CONFIRMED state; `now_s` is a monotonic clock.
+        """
+        if self.done:
+            return PointUpdate(False, "done", self.target_index, False, True, -1)
+
+        skipped_index = -1
+        # Process instantaneous transitions in one tick (holding→dwelling,
+        # advance→transit) with a bounded loop; the guard is far above the
+        # number of real transitions possible per tick.
+        for _ in range(8):
+            if self.done:
+                break
+            i = self.target_index
+            tn, te = self.coordinates[i]
+            dist = math.hypot(pose_n - tn, pose_e - te)
+            slow = speed_mps <= self.max_speed_mps
+            arrived = dist <= self.arrival_tolerance_m and slow and self._heading_ok(yaw_ned, i)
+
+            if self._transit_start is None:
+                self._transit_start = now_s
+
+            if self.phase == "transit":
+                if arrived:
+                    self.phase = "arriving"
+                    self._settle_start = now_s
+                    continue
+                if now_s - self._transit_start > self.timeout_s:
+                    skipped_index = i
+                    self.skipped_indices.append(i)
+                    self._advance()
+                    continue
+                break  # still transiting, nothing more this tick
+
+            if self.phase == "arriving":
+                if arrived:
+                    if self._settle_start is None:
+                        self._settle_start = now_s
+                    if now_s - self._settle_start >= self.arrival_settle_s:
+                        self.phase = "holding"
+                        continue
+                    break  # settling
+                # Lost the arrival condition before settle completed — no
+                # partial credit; reset the settle timer.
+                self._settle_start = None
+                if now_s - self._transit_start > self.timeout_s:
+                    skipped_index = i
+                    self.skipped_indices.append(i)
+                    self._advance()
+                    continue
+                break
+
+            if self.phase == "holding":
+                # Entry to the dwell: spray ON, start the dwell clock.
+                self._dwell_start = now_s
+                self.phase = "dwelling"
+                continue
+
+            if self.phase == "dwelling":
+                if now_s - self._dwell_start < self.dwell_s:
+                    break  # keep spraying
+                # Dwell complete: stop desiring spray NOW (→ off_wait), and only
+                # advance once the actuator OFF is confirmed — never leave a
+                # spraying dot even if the OFF command is still retrying.
+                self.phase = "off_wait"
+                continue
+
+            if self.phase == "off_wait":
+                if off_confirmed:
+                    self._advance()
+                    continue
+                break  # dwell done, spray desired-off, waiting for OFF ack
+
+            break  # unknown phase safety
+
+        geometry_desired = self.phase in ("holding", "dwelling")
+        exempt_pivot = geometry_desired and (
+            not self.done
+            and math.hypot(
+                pose_n - self.coordinates[self.target_index][0],
+                pose_e - self.coordinates[self.target_index][1],
+            ) <= self.arrival_tolerance_m
+        )
+        return PointUpdate(
+            geometry_desired=geometry_desired,
+            phase=self.phase,
+            target_index=self.target_index,
+            exempt_pivot=exempt_pivot,
+            done=self.done,
+            skipped_index=skipped_index,
+        )
+
+    def mode_state(self) -> dict:
+        return {
+            "phase": self.phase,
+            "target_index": self.target_index,
+            "num_points": len(self.coordinates),
+            "skipped": list(self.skipped_indices),
+            "done": self.done,
         }

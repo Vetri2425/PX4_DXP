@@ -555,10 +555,11 @@ def test_stale_exception_reply_ignored_does_not_corrupt_newer_state():
 
 import json as _json  # noqa: E402
 
-from spray_modes import DashMeter  # noqa: E402
+from spray_modes import DashMeter, PointMeter, PointUpdate  # noqa: E402
 from spray_session_config import (  # noqa: E402
     SCHEMA_VERSION,
     DashConfig,
+    PointsModeConfig,
     SpraySessionConfig,
     to_dict,
 )
@@ -652,6 +653,60 @@ def test_bad_session_config_keeps_last_mode():
     assert node._session_mode == "dash"                         # unchanged
     node._session_config_cb(_Msg(_json.dumps({"schema_version": 999, "mode": "continuous"})))
     assert node._session_mode == "dash"                         # schema mismatch ignored
+
+
+# --------------------------------------------------------------------------
+# Phase D — point mode wiring through _make_spray_decision + the callback.
+# The point FSM itself is covered in test_spray_point_v2.py; these prove the
+# node routing, config selection, and the pivot-gate exemption.
+# --------------------------------------------------------------------------
+
+def test_session_config_cb_selects_point():
+    node = make_node()
+    cfg = SpraySessionConfig(
+        SCHEMA_VERSION, "point", (), (), None,
+        PointsModeConfig(((0.0, 0.0), (1.0, 0.0)), 0.05, None, 0.2, 1.0),
+    )
+    node._session_config_cb(_Msg(_json.dumps(to_dict(cfg))))
+    assert node._session_mode == "point"
+    assert node._point_meter is not None
+    assert len(node._point_meter.coordinates) == 2
+    assert node._dash_meter is None
+
+
+def test_point_decision_routes_to_meter():
+    """mode=point: geometry comes from the PointMeter, no path projection."""
+    meter = PointMeter([(0.0, 0.0)], 0.10, arrival_settle_s=0.0, dwell_s=0.5)
+    d = _make_spray_decision(
+        model=None, nozzle_n=0.0, nozzle_e=0.0, speed_mps=0.0,
+        safety_ok=True, safety_reason="",
+        solenoid_open_delay_s=0.0, solenoid_close_delay_s=0.0,
+        on_overspray_margin_m=0.0, off_overspray_margin_m=0.0,
+        max_xtrack_error_m=0.10, mode="point", point_meter=meter,
+        yaw=0.0, now_s=1.0, off_confirmed=True,
+    )
+    assert d.geometry_desired is True and d.desired is True   # dwelling on the dot
+    assert d.next_boundary is None and d.point_update is not None
+    assert d.point_update.phase == "dwelling"
+
+
+def test_point_config_gate_and_pivot_exemption():
+    node = make_node(armed=True, mode="OFFBOARD", require_offboard=True)
+    node._session_mode = "point"
+    # No point config yet → its own gate reason (not "path not loaded").
+    ok, reason = node._auto_safety_status(pose_fresh=True, speed=0.0, velocity_fresh=True)
+    assert ok is False and reason == "point config not loaded"
+    # Load a point meter and simulate the RPP pivoting in place.
+    node._point_meter = PointMeter([(0.0, 0.0)], 0.10, 0.0, 0.5)
+    node._segment_state = 3  # CORNER_ALIGN
+    node._segment_state_recv_time = node.get_clock().now()
+    # Not dwelling on a dot → pivot gate blocks.
+    ok, reason = node._auto_safety_status(pose_fresh=True, speed=0.0, velocity_fresh=True)
+    assert ok is False and reason == "pivoting in place"
+    # Dwelling on the active dot → exemption lets spray through the pivot.
+    node._last_point_update = PointUpdate(True, "dwelling", 0, True, False, -1)
+    ok, reason = node._auto_safety_status(pose_fresh=True, speed=0.0, velocity_fresh=True)
+    assert ok is True and reason == ""
 
 
 def main():

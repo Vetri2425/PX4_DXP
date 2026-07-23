@@ -295,6 +295,8 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "spray_min_fix_type": _Param(6),
         "gps_fix_timeout_s": _Param(2.0),
         "gps_recover_hold_s": _Param(1.0),
+        "point_arrival_max_speed_mps": _Param(0.05),
+        "point_arrival_timeout_s": _Param(60.0),
         "allow_legacy_spray_active_fallback": _Param(True),
         "actuator_backend": _Param("mavlink_actuator"),
         "servo_instance": _Param(1),
@@ -335,6 +337,8 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     # B0 / Phase C mode state (default continuous == pre-B0 behaviour).
     node._session_mode = "continuous"
     node._dash_meter = None
+    node._point_meter = None
+    node._last_point_update = None
     node._last_tick_monotonic = None
     # Phase B RTK gate state.
     node._gps_fix_type = 0

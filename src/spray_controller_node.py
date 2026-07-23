@@ -49,7 +49,7 @@ from nav_msgs.msg import Path
 from std_msgs.msg import Bool, Float32MultiArray, String
 
 from spray_fsm import SpraySafetyStateMachine, SprayCommand, SprayState
-from spray_modes import DashMeter
+from spray_modes import DashMeter, PointMeter
 from spray_session_config import (
     ConfigSchemaError,
     SpraySessionConfig,
@@ -144,6 +144,7 @@ class SprayDecision:
     distance_to_boundary_m: float
     event: str
     debug: list[float]
+    point_update: object = None  # Phase D: the PointUpdate for this tick, else None
 
 
 def _build_path_model(
@@ -300,12 +301,54 @@ def _make_spray_decision(
     mode: str = "continuous",
     dash_meter: Optional["DashMeter"] = None,
     dt_s: float = 0.0,
+    point_meter: Optional["PointMeter"] = None,
+    yaw: float = 0.0,
+    now_s: float = 0.0,
+    off_confirmed: bool = False,
 ) -> SprayDecision:
     projection: Optional[SprayProjection] = None
     boundary: Optional[SprayBoundary] = None
     distance_to_boundary = float("inf")
     geometry_desired = False
     event = ""
+
+    # Point mode (plan §7.3): no path projection — arrival is the nozzle vs the
+    # coordinate list. Uses the standard safety_ok from the gate stack (armed/
+    # offboard/pose/gps/pivot-exempt), computed by the caller.
+    if mode == "point" and point_meter is not None:
+        pu = None
+        if nozzle_n is not None and nozzle_e is not None:
+            pu = point_meter.update(
+                nozzle_n, nozzle_e, yaw, speed_mps, now_s, off_confirmed
+            )
+            geometry_desired = pu.geometry_desired
+        desired = bool(geometry_desired and safety_ok)
+        debug = [
+            2.0,  # [0] mode marker: 2 = point (1 would be "model present")
+            float(speed_mps),
+            float(nozzle_n) if nozzle_n is not None else math.nan,
+            float(nozzle_e) if nozzle_e is not None else math.nan,
+            float(pu.target_index) if pu is not None else math.nan,
+            math.nan,
+            1.0 if geometry_desired else 0.0,
+            math.nan,
+            float("inf"),
+            1.0 if geometry_desired else 0.0,
+            1.0 if safety_ok else 0.0,
+            1.0 if desired else 0.0,
+        ]
+        return SprayDecision(
+            desired=desired,
+            geometry_desired=geometry_desired,
+            safety_ok=safety_ok,
+            safety_reason=safety_reason,
+            projection=None,
+            next_boundary=None,
+            distance_to_boundary_m=float("inf"),
+            event="",
+            debug=debug,
+            point_update=pu,
+        )
 
     if model is not None and nozzle_n is not None and nozzle_e is not None:
         projection = _project_onto_path(model, nozzle_n, nozzle_e)
@@ -459,6 +502,14 @@ class SprayControllerNode(Node):
         # Asymmetric hysteresis: drop is instant (unsafe edge, no debounce);
         # re-enable only after fix has been continuously good this long.
         self.declare_parameter("gps_recover_hold_s", 1.0)
+        # ── Phase D: point/dwell mode (plan §7.3) ────────────────────────────
+        # A dot counts as "arrived" only at/below this speed (a dwell sprays at
+        # a standstill). Per-point tolerances/settle/dwell come from the
+        # session config, not params.
+        self.declare_parameter("point_arrival_max_speed_mps", 0.05)
+        # A point unreachable this long is skipped (logged, never sprayed) so a
+        # single bad coordinate can't wedge the whole mission.
+        self.declare_parameter("point_arrival_timeout_s", 60.0)
         self.declare_parameter("allow_legacy_spray_active_fallback", True)
         # Backend selector: "mavlink_actuator" (cmd 187, normalized) or
         # "mavlink_servo_pwm" (cmd 183, absolute PWM µs).
@@ -509,6 +560,11 @@ class SprayControllerNode(Node):
         # receives a session_config behaves exactly as it did before B0.
         self._session_mode: str = "continuous"
         self._dash_meter: Optional[DashMeter] = None
+        # Phase D point mode. _last_point_update lets _auto_safety_status apply
+        # the pivot-gate exemption using the most recent point FSM state (it
+        # runs one step before _make_spray_decision updates the meter).
+        self._point_meter: Optional[PointMeter] = None
+        self._last_point_update = None
         # Measured tick interval for arc-length jump-tolerance (§7.2). Seeded
         # on the first dash tick; monotonic clock, never wall time.
         self._last_tick_monotonic: Optional[float] = None
@@ -767,6 +823,9 @@ class SprayControllerNode(Node):
         self._session_mode = cfg.mode
         self._session_config = cfg
 
+        self._dash_meter = None
+        self._point_meter = None
+        self._last_point_update = None
         if cfg.mode == "dash" and cfg.dash is not None:
             try:
                 self._dash_meter = DashMeter(
@@ -779,11 +838,27 @@ class SprayControllerNode(Node):
                     f"dash config invalid ({exc}); reverting to continuous"
                 )
                 self._session_mode = "continuous"
-                self._dash_meter = None
-        else:
-            # continuous / point / cleared → no dash meter. (Point behaviour
-            # is Phase D; until then point mode simply lays no paint.)
-            self._dash_meter = None
+        elif cfg.mode == "point" and cfg.points_mode is not None:
+            pm = cfg.points_mode
+            try:
+                self._point_meter = PointMeter(
+                    pm.coordinates,
+                    pm.arrival_tolerance_m,
+                    pm.arrival_settle_s,
+                    pm.dwell_s,
+                    pm.heading_tolerance_deg,
+                    point_arrival_max_speed_mps=max(
+                        0.0, float(self.get_parameter("point_arrival_max_speed_mps").value)
+                    ),
+                    point_arrival_timeout_s=max(
+                        0.0, float(self.get_parameter("point_arrival_timeout_s").value)
+                    ),
+                )
+            except ValueError as exc:
+                self.get_logger().warn(
+                    f"point config invalid ({exc}); reverting to continuous"
+                )
+                self._session_mode = "continuous"
 
         self._last_tick_monotonic = None  # reseed dt on the next dash tick
         # A mode/config change resets the FSM RECOVERY backoff (plan §4).
@@ -978,6 +1053,10 @@ class SprayControllerNode(Node):
             mode=self._session_mode,
             dash_meter=self._dash_meter,
             dt_s=dt_s,
+            point_meter=self._point_meter,
+            yaw=pose[2] if pose is not None else 0.0,
+            now_s=now_mono,
+            off_confirmed=(self._fsm.state == SprayState.OFF_CONFIRMED),
             solenoid_open_delay_s=max(
                 0.0,
                 float(self.get_parameter("solenoid_open_delay_s").value),
@@ -1003,6 +1082,20 @@ class SprayControllerNode(Node):
         # full distance-aware gate stack (armed/offboard/path/pose/vel/speed
         # from _auto_safety_status, plus the xtrack gate folded in above).
         self._last_decision = decision
+        # Phase D: keep the latest point update for the pivot-gate exemption
+        # (read next tick by _auto_safety_status) and surface skips/completion.
+        if decision.point_update is not None:
+            pu = decision.point_update
+            if pu.skipped_index >= 0:
+                self.get_logger().warn(
+                    f"point mode: target {pu.skipped_index} unreachable — "
+                    f"skipped (not sprayed)"
+                )
+            if pu.done and (
+                self._last_point_update is None or not self._last_point_update.done
+            ):
+                self.get_logger().info("point mode: all targets complete")
+            self._last_point_update = pu
         self._publish_debug(decision.debug)
 
         if decision.event and decision.event != self._last_distance_event:
@@ -1141,7 +1234,12 @@ class SprayControllerNode(Node):
         require_offboard = bool(self.get_parameter("require_offboard").value)
         if require_offboard and self._mode != "OFFBOARD":
             return False, "not OFFBOARD"
-        if self._path_model is None:
+        # Mode-appropriate config gate (§5): continuous/dash need the path model
+        # (geometry rides /path); point needs the coordinate list (its own).
+        if self._session_mode == "point":
+            if self._point_meter is None:
+                return False, "point config not loaded"
+        elif self._path_model is None:
             return False, "path not loaded"
         if not pose_fresh:
             return False, "pose stale"
@@ -1158,7 +1256,17 @@ class SprayControllerNode(Node):
         # Spraying is a question of WHERE the nozzle is, not how fast it is
         # moving; slow means thin (flow control), never off.
         if self._pivot_is_active():
-            return False, "pivoting in place"
+            # Point-mode pivot-gate exemption (Rev 4 §7.3): a dwell sprays at a
+            # standstill, which the pivot gate would otherwise suppress. Exempt
+            # ONLY when point mode is dwelling within tolerance of the active
+            # target — never mode-wide, so transits between dots keep the gate.
+            # Uses last tick's point state (this runs before the meter updates).
+            if not (
+                self._session_mode == "point"
+                and self._last_point_update is not None
+                and self._last_point_update.exempt_pivot
+            ):
+                return False, "pivoting in place"
         return True, ""
 
     def _safety_allows_on(self) -> bool:
@@ -1425,6 +1533,8 @@ class SprayControllerNode(Node):
         mode_state: dict = {}
         if self._session_mode == "dash" and self._dash_meter is not None:
             mode_state = self._dash_meter.mode_state()
+        elif self._session_mode == "point" and self._point_meter is not None:
+            mode_state = self._point_meter.mode_state()
         # Phase B (§7.6): report real GPS health. gps_fix_ok is the instantaneous
         # (fresh AND fix>=min); the recover-hold nuance shows up in safety_reason
         # ("gps recovering") when the RTK gate is the blocking cause.
