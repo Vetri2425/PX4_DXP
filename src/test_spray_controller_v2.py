@@ -709,6 +709,62 @@ def test_point_config_gate_and_pivot_exemption():
     assert ok is True and reason == ""
 
 
+# --------------------------------------------------------------------------
+# Phase E — speed-proportional flow wiring (the FlowModulator math itself is
+# covered in test_spray_flow_model.py). Drives _fsm._state directly to ON to
+# exercise the commanded path without the full ACK handshake.
+# --------------------------------------------------------------------------
+
+def test_flow_current_on_value_defaults_to_full():
+    node = make_node()
+    node._commanded_flow_value = None
+    assert node._current_on_value() == 1.0          # on_value
+    node._commanded_flow_value = 0.55
+    assert node._current_on_value() == 0.55
+
+
+def test_flow_disabled_is_full_flow():
+    node = make_node()                               # flow_modulation_enabled False
+    node._fsm._state = SprayState.ON_CONFIRMED
+    node._update_flow(0.2, 0.02)
+    assert node._commanded_flow_value is None
+    assert node._flow_source == "n/a"
+    assert node._current_on_value() == 1.0
+
+
+def test_flow_speed_scaled_when_enabled_and_moving():
+    node = make_node()
+    node._params["flow_modulation_enabled"] = _Param(True)
+    node._fsm._state = SprayState.ON_CONFIRMED
+    for _ in range(400):                             # ramp up at rated speed
+        node._update_flow(0.35, 0.02)                # rated = 0.35 → full flow
+    assert node._flow_source == "speed_scaled"
+    assert abs(node._commanded_flow_value - 1.0) < 1e-3
+    for _ in range(400):                             # slow to a crawl
+        node._update_flow(0.0, 0.02)
+    assert abs(node._commanded_flow_value - 0.2) < 1e-3   # floors at min_flow_value
+
+
+def test_flow_point_mode_uses_fixed_dwell_value():
+    node = make_node()
+    node._params["flow_modulation_enabled"] = _Param(True)
+    node._params["point_dwell_flow_value"] = _Param(0.8)
+    node._session_mode = "point"
+    node._fsm._state = SprayState.ON_CONFIRMED
+    node._update_flow(0.0, 0.02)                     # a dot sprays at standstill
+    assert node._flow_source == "point_fixed"
+    assert node._commanded_flow_value == 0.8
+
+
+def test_flow_not_modulated_during_manual():
+    node = make_node()
+    node._params["flow_modulation_enabled"] = _Param(True)
+    node._manual_active = True
+    node._fsm._state = SprayState.ON_CONFIRMED
+    node._update_flow(0.35, 0.02)
+    assert node._commanded_flow_value is None and node._flow_source == "n/a"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

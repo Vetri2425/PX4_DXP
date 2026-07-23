@@ -297,6 +297,11 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "gps_recover_hold_s": _Param(1.0),
         "point_arrival_max_speed_mps": _Param(0.05),
         "point_arrival_timeout_s": _Param(60.0),
+        "flow_modulation_enabled": _Param(False),
+        "min_flow_value": _Param(0.2),
+        "rated_marking_speed_mps": _Param(0.35),
+        "max_flow_slew_per_s": _Param(2.0),
+        "point_dwell_flow_value": _Param(1.0),
         "allow_legacy_spray_active_fallback": _Param(True),
         "actuator_backend": _Param("mavlink_actuator"),
         "servo_instance": _Param(1),
@@ -340,6 +345,11 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._point_meter = None
     node._last_point_update = None
     node._last_tick_monotonic = None
+    # Phase E flow state.
+    node._flow_modulator = None
+    node._prev_fsm_commanded = False
+    node._commanded_flow_value = None
+    node._flow_source = "n/a"
     # Phase B RTK gate state.
     node._gps_fix_type = 0
     node._gps_recv_time = None

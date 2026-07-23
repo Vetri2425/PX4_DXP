@@ -49,6 +49,7 @@ from nav_msgs.msg import Path
 from std_msgs.msg import Bool, Float32MultiArray, String
 
 from spray_fsm import SpraySafetyStateMachine, SprayCommand, SprayState
+from spray_flow_model import FlowModulator
 from spray_modes import DashMeter, PointMeter
 from spray_session_config import (
     ConfigSchemaError,
@@ -448,6 +449,19 @@ class SprayControllerNode(Node):
         # Requires PWM_AUX_MIN1=0, PWM_AUX_DIS1=0, PWM_AUX_MAX1=3000 in QGC.
         self.declare_parameter("on_value", 1.0)
         self.declare_parameter("off_value", -1.0)
+        # ── Phase E: speed-proportional flow (plan §7.5) — default OFF ───────
+        # OFF preserves today's behaviour exactly (every ON commands on_value =
+        # full flow). When enabled (mavlink_actuator backend only), the ON
+        # command value scales with ground speed between min_flow_value and
+        # on_value so paint-per-metre stays constant. Requires the §7.5 bench
+        # calibration first — set rated at the TOP of the mission speed range.
+        self.declare_parameter("flow_modulation_enabled", False)
+        self.declare_parameter("min_flow_value", 0.2)             # normalized floor
+        self.declare_parameter("rated_marking_speed_mps", 0.35)   # full flow at/above this
+        self.declare_parameter("max_flow_slew_per_s", 2.0)        # pump ramp cap (/s)
+        # Point-mode dots spray at a standstill (speed 0), so they are NOT
+        # speed-scaled — they use this fixed, separately-calibrated value.
+        self.declare_parameter("point_dwell_flow_value", 1.0)
         self.declare_parameter("debounce_samples", 3)
         self.declare_parameter("reassert_hz", 2.0)
         self.declare_parameter("require_offboard", True)
@@ -568,6 +582,13 @@ class SprayControllerNode(Node):
         # Measured tick interval for arc-length jump-tolerance (§7.2). Seeded
         # on the first dash tick; monotonic clock, never wall time.
         self._last_tick_monotonic: Optional[float] = None
+        # Phase E speed-proportional flow. Modulator is built lazily on the
+        # disabled→enabled edge (picks up fresh calibration params); the
+        # commanded value + source feed the ON command and telemetry.
+        self._flow_modulator: Optional[FlowModulator] = None
+        self._prev_fsm_commanded: bool = False
+        self._commanded_flow_value: Optional[float] = None
+        self._flow_source: str = "n/a"
         # Phase B RTK gate state (§7.6). fix_type 0 = no fix; recv_time None
         # until the first GPSRAW; recover_since is set the moment fix goes good
         # and reset to None on any bad/stale sample (asymmetric hysteresis).
@@ -1043,6 +1064,9 @@ class SprayControllerNode(Node):
         if self._last_tick_monotonic is not None:
             dt_s = max(0.0, now_mono - self._last_tick_monotonic)
         self._last_tick_monotonic = now_mono
+        # Phase E: recompute the speed-proportional flow value for this tick
+        # (no-op / full-flow when disabled). Feeds the ON command + telemetry.
+        self._update_flow(speed, dt_s)
         decision = _make_spray_decision(
             model=model,
             nozzle_n=nozzle_n,
@@ -1362,6 +1386,63 @@ class SprayControllerNode(Node):
             )
             cmd = None
 
+    def _update_flow(self, speed_mps: float, dt_s: float) -> None:
+        """Phase E (§7.5): recompute the commanded flow value for this tick.
+
+        No-op unless flow_modulation_enabled AND the mavlink_actuator backend
+        (servo backend keeps full on_pwm_us — documented limitation). Manual
+        bench ON is not modulated (full flow expected). The modulator is
+        (re)built on the disabled→enabled edge so a fresh calibration takes
+        effect; it can only ever move the command within [min_flow, on_value].
+        """
+        commanded = self._fsm.commanded
+        rising = commanded and not self._prev_fsm_commanded
+        self._prev_fsm_commanded = commanded
+
+        enabled = (
+            bool(self.get_parameter("flow_modulation_enabled").value)
+            and str(self.get_parameter("actuator_backend").value) == "mavlink_actuator"
+            and not self._manual_active
+        )
+        if not enabled:
+            self._flow_modulator = None
+            self._commanded_flow_value = None
+            self._flow_source = "n/a"
+            return
+        if self._flow_modulator is None:
+            # Build from current (freshly-calibrated) params on the enable edge.
+            self._flow_modulator = FlowModulator(
+                min_flow_value=float(self.get_parameter("min_flow_value").value),
+                on_value=float(self.get_parameter("on_value").value),
+                rated_marking_speed_mps=float(
+                    self.get_parameter("rated_marking_speed_mps").value
+                ),
+                max_slew_per_s=float(self.get_parameter("max_flow_slew_per_s").value),
+            )
+            rising = True  # seed the slew filter to the floor on first build
+        if rising:
+            self._flow_modulator.reset()
+        if not commanded:
+            self._commanded_flow_value = None
+            self._flow_source = "n/a"
+            return
+        if self._session_mode == "point":
+            # A dot sprays at a standstill — fixed, separately-calibrated flow.
+            self._commanded_flow_value = float(
+                self.get_parameter("point_dwell_flow_value").value
+            )
+            self._flow_source = "point_fixed"
+        else:
+            self._commanded_flow_value = self._flow_modulator.update(speed_mps, dt_s)
+            self._flow_source = "speed_scaled"
+
+    def _current_on_value(self) -> float:
+        """The actuator ON value to command now — modulated flow if Phase E is
+        active this tick, else the full on_value (today's behaviour)."""
+        if self._commanded_flow_value is not None:
+            return self._commanded_flow_value
+        return float(self.get_parameter("on_value").value)
+
     def _build_command_request(self, on: bool) -> CommandLong.Request:
         req = CommandLong.Request()
         req.broadcast = False
@@ -1387,7 +1468,7 @@ class SprayControllerNode(Node):
             )
             set_index = 1
         value = (
-            float(self.get_parameter("on_value").value)
+            self._current_on_value()  # Phase E: modulated flow when active, else on_value
             if on else
             float(self.get_parameter("off_value").value)
         )
@@ -1535,6 +1616,11 @@ class SprayControllerNode(Node):
             mode_state = self._dash_meter.mode_state()
         elif self._session_mode == "point" and self._point_meter is not None:
             mode_state = self._point_meter.mode_state()
+        # Phase E flow telemetry (§7.5): was this line thin because of a gate or
+        # because of the flow formula — must be visible, not inferred. None when
+        # not spraying / flow modulation off.
+        mode_state["commanded_flow_value"] = self._commanded_flow_value
+        mode_state["flow_source"] = self._flow_source
         # Phase B (§7.6): report real GPS health. gps_fix_ok is the instantaneous
         # (fresh AND fix>=min); the recover-hold nuance shows up in safety_reason
         # ("gps recovering") when the RTK gate is the blocking cause.
