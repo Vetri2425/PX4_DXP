@@ -4,10 +4,13 @@ Ported from `feat/entry-pivot-recenter:server/manual_control_gateway.py`
 (ref index in docs/Architecture/JOYSTICK_CONTROLLER_PLAN.md §12). Transport
 and fixed-rate sender are unchanged from the reference — the plan does not
 flag them as a robustness gap. The axis mapping in `encode_manual_control`
-was the plan §7.1 gate: the reference put steering in `y` (roll) with `r=0`,
-but PX4 `rover_differential` in MANUAL reads turn on `r` (yaw). That mapping
-is now corrected here (steering → `r`, throttle → `z`) and pinned by the
-golden-frame test — see encode_manual_control() for the confirmed mapping.
+was the plan §7.1 gate: a bench claim held that PX4 `rover_differential` in
+MANUAL reads turn on `r` (yaw), so the mapping was briefly changed to steering
+→ `r`. FIELD testing on PX4 v1.16.2 showed the vehicle only steers on `y`
+(roll); the `r` mapping left the rover unable to turn. The mapping is
+therefore reverted to the field-validated reference (steering → `y`,
+throttle → `z`, `r=0`) and pinned by the golden-frame test — see
+encode_manual_control() for the confirmed mapping.
 """
 from __future__ import annotations
 
@@ -59,11 +62,14 @@ class ManualControlTransport(Protocol):
 def encode_manual_control(throttle: float, steering: float) -> ManualControlFrame:
     """Encode normalized operator demand to MAVLink MANUAL_CONTROL fields.
 
-    §7.1 mapping (bench-confirmed for PX4 `rover_differential` MANUAL):
-      • steering → `r` (yaw), bipolar -1000..1000, 0 = straight
+    Mapping (FIELD-confirmed on PX4 v1.16.2 `rover_differential` MANUAL — the
+    live vehicle steers on `y`, not `r`; the earlier bench claim that turn is
+    read from `r` did not hold in the field, so this reverts to the
+    field-validated `feat/entry-pivot-recenter` mapping):
+      • steering → `y` (roll), bipolar -1000..1000, 0 = straight
       • throttle → `z` (thrust), unipolar 0..1000 with 500 = neutral so the
         rover can drive both directions ((throttle+1)*500)
-      • `x` (pitch) and `y` (roll) are unused for a differential rover → 0
+      • `x` (pitch) and `r` (yaw) are unused for a differential rover → 0
     Neutral is therefore (0, 0, 500, 0), matching NEUTRAL_FRAME.
     """
     if not math.isfinite(throttle) or not math.isfinite(steering):
@@ -72,9 +78,9 @@ def encode_manual_control(throttle: float, steering: float) -> ManualControlFram
     steering = max(-1.0, min(1.0, float(steering)))
     return ManualControlFrame(
         x=0,
-        y=0,
+        y=max(-1000, min(1000, round(steering * 1000.0))),
         z=max(0, min(1000, round((throttle + 1.0) * 500.0))),
-        r=max(-1000, min(1000, round(steering * 1000.0))),
+        r=0,
         buttons=0,
     )
 

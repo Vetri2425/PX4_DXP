@@ -53,14 +53,14 @@ def test_neutral_frame_is_zero_throttle_zero_steering():
 
 
 def test_golden_frame_full_forward_full_right():
-    # §7.1 confirmed mapping: steering → r (yaw), throttle → z, y always 0.
+    # FIELD-confirmed mapping: steering → y (roll), throttle → z, r always 0.
     frame = encode_manual_control(throttle=1.0, steering=1.0)
-    assert frame == ManualControlFrame(x=0, y=0, z=1000, r=1000, buttons=0)
+    assert frame == ManualControlFrame(x=0, y=1000, z=1000, r=0, buttons=0)
 
 
 def test_golden_frame_full_reverse_full_left():
     frame = encode_manual_control(throttle=-1.0, steering=-1.0)
-    assert frame == ManualControlFrame(x=0, y=0, z=0, r=-1000, buttons=0)
+    assert frame == ManualControlFrame(x=0, y=-1000, z=0, r=0, buttons=0)
 
 
 def test_golden_frame_half_forward_no_steering():
@@ -70,7 +70,7 @@ def test_golden_frame_half_forward_no_steering():
 
 def test_encode_clamps_out_of_range_inputs():
     frame = encode_manual_control(throttle=5.0, steering=-5.0)
-    assert frame == ManualControlFrame(x=0, y=0, z=1000, r=-1000, buttons=0)
+    assert frame == ManualControlFrame(x=0, y=-1000, z=1000, r=0, buttons=0)
 
 
 def test_encode_rejects_non_finite_inputs():
