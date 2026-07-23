@@ -392,6 +392,16 @@ class RPPControllerNode(Node):
         self.declare_parameter("segment_stop_speed_threshold",         0.02)   # m/s
         self.declare_parameter("segment_stop_yaw_rate_threshold",      0.05)   # rad/s (~2.9 deg/s)
         self.declare_parameter("segment_stop_dwell_s",                 0.30)   # s
+        # ── Phase D point-hold A/B (FROZEN CONTROLLER — default OFF) ─────────
+        # When enabled, the rover brakes to a confirmed stop at each must-hit
+        # waypoint and HOLDS for point_hold_s (long enough for the spray node's
+        # arrival-settle + dwell + OFF-confirm), then continues — so point-mode
+        # dots are actually painted. Reuses the corner-brake/stop primitives.
+        # OFF = byte-for-byte the frozen baseline (the overlay early-returns).
+        # This is a named A/B: enable only for a point-mission run at the rover.
+        self.declare_parameter("point_hold_enabled",                   False)
+        self.declare_parameter("point_hold_s",                         2.0)    # s
+        self.declare_parameter("point_hold_acceptance_m",              0.10)   # m
         # Active braking at a corner stop. PX4 velocity-OFFBOARD does not brake
         # on a zero setpoint — it coasts — so a rover that reaches the corner
         # still at ~0.1-0.16 m/s drifts 2-3 cm before the dwell confirms, and
@@ -500,6 +510,12 @@ class RPPControllerNode(Node):
         # Empty = no provenance on this path (legacy publisher) → simplification
         # falls back to the geometric tests alone.
         self._must_hit_keys: frozenset[tuple[int, int]] = frozenset()
+        # Phase D point-hold A/B (default OFF). Which must-hit points have had
+        # their dwell, the one currently being dwelled, and its dwell start.
+        # Byte-for-byte inert unless point_hold_enabled is set.
+        self._point_hold_done_keys: set = set()
+        self._point_hold_active_key = None
+        self._point_hold_start_ns = None
         self._run_idx: int = 0
         self._run_align_pending: bool = False
         # Latched while a completed run is physically stopping before the
@@ -690,6 +706,10 @@ class RPPControllerNode(Node):
         self._must_hit_keys = frozenset(
             self._pt_key(p) for p, z in zip(raw_pts, _z) if z & 2
         )
+        # A fresh mission re-arms every point-hold dwell (Phase D A/B).
+        self._point_hold_done_keys = set()
+        self._point_hold_active_key = None
+        self._point_hold_start_ns = None
         n_raw = len(raw_pts)
 
         resample_dx = float(self.get_parameter("path_resample_spacing_m").value)
@@ -1621,6 +1641,106 @@ class RPPControllerNode(Node):
             float(self.get_parameter("segment_corner_threshold_deg").value)
         )
         return self._next_run_turn() >= threshold
+
+    def _point_hold_tick(
+        self,
+        pos_n: float,
+        pos_e: float,
+        yaw_ned: float,
+        pose_age_s: float,
+        dist_to_goal: float,
+    ) -> bool:
+        """Phase D A/B: brake+hold at each must-hit point for its mark dwell.
+
+        Returns True when this control cycle was fully handled (braking or
+        dwelling at a point); False to let normal tracking run. Entirely gated
+        by point_hold_enabled — when off it returns False on the first line, so
+        the control loop is the byte-for-byte frozen baseline.
+
+        Reuses the proven corner-brake / corner-stop-confirm primitives, so a
+        point hold decelerates and confirms a physical stop exactly the way a
+        run-boundary corner stop does, then holds zero for point_hold_s. The
+        hold is sized (by the operator) to cover the spray node's
+        arrival-settle + dwell + OFF-confirm, so the dot is painted while the
+        rover is stopped here. Points already dwelled are remembered per
+        mission (_point_hold_done_keys), so each is held exactly once.
+        """
+        if not bool(self.get_parameter("point_hold_enabled").value):
+            return False
+        if not self._must_hit_keys:
+            return False
+
+        acceptance = float(self.get_parameter("point_hold_acceptance_m").value)
+        target_key = None
+        best = acceptance
+        for ps in self._path:
+            p = ps.pose.position
+            key = self._pt_key((p.x, p.y))
+            if key not in self._must_hit_keys or key in self._point_hold_done_keys:
+                continue
+            d = self._dist(pos_n, pos_e, p.x, p.y)
+            if d <= best:
+                best = d
+                target_key = key
+        if target_key is None:
+            # Not near any un-dwelled must-hit point → normal tracking.
+            self._point_hold_active_key = None
+            self._point_hold_start_ns = None
+            return False
+
+        # Entering a hold at a new point: re-arm the stop-confirm primitive once.
+        if self._point_hold_active_key != target_key:
+            self._point_hold_active_key = target_key
+            self._point_hold_start_ns = None
+            self._reset_corner_pivot_state()
+
+        if not self._corner_stop_satisfied():
+            # Not stopped yet — brake toward zero (same primitive as a corner).
+            self._segment_state = SegmentStateCode.CORNER_STOP
+            self._last_speed_cmd = 0.0
+            brake_n, brake_e = self._corner_brake_velocity(yaw_ned)
+            self._publish_velocity(brake_n, brake_e)
+            self._publish_yaw_rate(0.0)
+            self._publish_debug(
+                cross_track=0.0, heading_err=0.0, lookahead=dist_to_goal,
+                speed=math.hypot(brake_n, brake_e), kappa=0.0,
+                dist_goal=dist_to_goal, pose_age_ms=pose_age_s * 1000.0,
+                state=StateCode.TRACKING, l_d_raw=float("nan"),
+                kappa_speed=0.0, yaw_rate=0.0, spray_active=False,
+            )
+            return True
+
+        # Confirmed stopped — dwell.
+        now_ns = self.get_clock().now().nanoseconds
+        if self._point_hold_start_ns is None:
+            self._point_hold_start_ns = now_ns
+            self.get_logger().info(f"point hold: dwelling at must-hit {target_key}")
+        hold_s = float(self.get_parameter("point_hold_s").value)
+        elapsed_s = (now_ns - self._point_hold_start_ns) * 1e-9
+        if elapsed_s < hold_s:
+            self._segment_state = SegmentStateCode.CORNER_STOP
+            self._last_speed_cmd = 0.0
+            self._publish_velocity(0.0, 0.0)
+            self._publish_yaw_rate(0.0)
+            self._publish_debug(
+                cross_track=0.0, heading_err=0.0, lookahead=dist_to_goal,
+                speed=0.0, kappa=0.0, dist_goal=dist_to_goal,
+                pose_age_ms=pose_age_s * 1000.0, state=StateCode.TRACKING,
+                l_d_raw=float("nan"), kappa_speed=0.0, yaw_rate=0.0,
+                spray_active=False,
+            )
+            return True
+
+        # Dwell complete — mark done and release to normal tracking this cycle.
+        self._point_hold_done_keys.add(target_key)
+        self._point_hold_active_key = None
+        self._point_hold_start_ns = None
+        self._reset_corner_pivot_state()
+        self.get_logger().info(
+            f"point hold: released {target_key} after {elapsed_s:.1f}s "
+            f"({len(self._point_hold_done_keys)}/{len(self._must_hit_keys)} done)"
+        )
+        return False
 
     def _hold_before_run_advance(
         self,
@@ -3132,6 +3252,12 @@ class RPPControllerNode(Node):
         min_travel = self._run_min_travel()
         final = self._path[-1].pose.position
         dist_to_goal = self._dist(pos_n, pos_e, final.x, final.y)
+        # Phase D point-hold overlay (default OFF — frozen until enabled). Dwell
+        # at each undone must-hit waypoint before the run-boundary/goal logic so
+        # every surveyed point (incl. corners and the final point) gets its mark
+        # dwell. Byte-for-byte no-op when point_hold_enabled is False.
+        if self._point_hold_tick(pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal):
+            return
         if self._run_boundary_stop_pending:
             self._hold_before_run_advance(
                 pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
