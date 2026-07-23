@@ -191,9 +191,33 @@ def _merge_chain(chain: list[PathSegment], tol: float) -> PathSegment:
         return chain[0]
     pts: list[tuple[float, float]] = []
     sources: list[str] = []
+    # Rebuild provenance for the CONCATENATED point list. Each constituent edge
+    # carries `vertex_indices` (and optionally `control_indices`) that index ITS
+    # OWN densified points; after concatenation those indices are meaningless.
+    # Copying head.metadata verbatim (the previous behaviour) left the composite
+    # declaring only the FIRST edge's two endpoints as source vertices, so a
+    # square assembled from 4 separate LINE entities kept just 2 of its 4 corners
+    # as must-hit — the other two were demoted to droppable fill and the RPP
+    # simplifier could round them off. Remap every edge's provenance into the
+    # composite index space instead (mirror of densify_segment's own remap).
+    vertex_indices: list[int] = []
+    control_indices: list[int] = []
+    any_control = False
     for seg_idx, seg in enumerate(chain):
         if seg.source_entity:
             sources.append(seg.source_entity)
+        # A constituent with no vertex_indices is treated as all-vertex — the same
+        # over-preserving convention the engine merge uses (under-preserving would
+        # silently delete surveyed intent).
+        raw_vidx = seg.metadata.get("vertex_indices")
+        seg_vset = (
+            set(raw_vidx) if raw_vidx is not None else set(range(len(seg.points)))
+        )
+        raw_ctrl = seg.metadata.get("control_indices")
+        seg_cset: set[int] = set()
+        if raw_ctrl is not None:
+            any_control = True
+            seg_cset = set(raw_ctrl)
         for pt_idx, pt in enumerate(seg.points):
             is_seam = seg_idx > 0 and pt_idx == 0
             if (
@@ -201,17 +225,35 @@ def _merge_chain(chain: list[PathSegment], tol: float) -> PathSegment:
                 and pts
                 and math.hypot(pt[0] - pts[-1][0], pt[1] - pts[-1][1]) <= tol
             ):
+                # The seam vertex is folded into its predecessor (the previous
+                # edge's endpoint, already a source vertex). Transfer provenance
+                # so a junction never loses must-hit to the dedup.
+                if pt_idx in seg_vset and (len(pts) - 1) not in vertex_indices:
+                    vertex_indices.append(len(pts) - 1)
+                if pt_idx in seg_cset and (len(pts) - 1) not in control_indices:
+                    control_indices.append(len(pts) - 1)
                 continue
+            if pt_idx in seg_vset:
+                vertex_indices.append(len(pts))
+            if pt_idx in seg_cset:
+                control_indices.append(len(pts))
             pts.append(pt)
     head = chain[0]
     meta = {
         k: v for k, v in head.metadata.items()
         # Tangents/geometry belonged to the first primitive only — dropping them
         # lets the composite be re-tagged below as a whole line chain.
+        # vertex_indices / control_indices are rebuilt below for the composite.
         if k not in ("start_tangent", "end_tangent", "geometry_type",
-                     "direction", "reversed")
+                     "direction", "reversed", "vertex_indices",
+                     "control_indices")
     }
     meta["grouped_from"] = sources
+    meta["vertex_indices"] = sorted(set(vertex_indices))
+    if any_control:
+        # A declared POINT-layer control set NARROWS must-hit to just those
+        # vertices; preserve that narrowing across the merge.
+        meta["control_indices"] = sorted(set(control_indices))
     # Preserve the oriented constituent edges so per-edge PRE/AFT extensions can be
     # applied downstream (engine Step 4). The composite's flattened `points` are
     # still what drives the rover when extensions are OFF; `chain_members` is only

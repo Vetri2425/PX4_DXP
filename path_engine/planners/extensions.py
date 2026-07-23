@@ -397,6 +397,14 @@ def decompose_line_chain_to_edges(
     if len(splits) <= 2:
         return [segment]  # no interior corner → a single straight edge already
 
+    # Parent provenance indexes the parent's full point list. Each edge is a
+    # slice pts[a:b+1]; remap the source-vertex / control indices into the
+    # edge's own index space so must-hit survives the split. Without this the
+    # edge inherits the parent's indices verbatim and points them at the wrong
+    # (or out-of-range) samples — the same stale-index class as _merge_chain.
+    parent_vidx = segment.metadata.get("vertex_indices")
+    parent_ctrl = segment.metadata.get("control_indices")
+
     edges: list[PathSegment] = []
     for k, (a, b) in enumerate(zip(splits[:-1], splits[1:])):
         if b <= a:
@@ -407,6 +415,20 @@ def decompose_line_chain_to_edges(
         meta = dict(segment.metadata)
         meta["edge_index"] = k
         meta["edge_parent"] = segment.source_entity
+        # The two split points a and b are corner vertices by construction; keep
+        # them plus any interior source vertex that fell inside this edge.
+        if parent_vidx is not None:
+            meta["vertex_indices"] = sorted(
+                {0, b - a} | {v - a for v in parent_vidx if a <= v <= b}
+            )
+        else:
+            # No parent provenance → over-preserve (engine convention: unknown
+            # means all points are source geometry, never droppable fill).
+            meta["vertex_indices"] = list(range(len(edge_pts)))
+        if parent_ctrl is not None:
+            meta["control_indices"] = sorted(
+                {c - a for c in parent_ctrl if a <= c <= b}
+            )
         edges.append(PathSegment(
             segment_type=SegmentType.MARK,
             points=edge_pts,

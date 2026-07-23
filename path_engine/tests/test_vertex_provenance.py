@@ -123,3 +123,148 @@ def test_engine_emits_must_hit_parallel_to_merged_waypoints():
         assert min(
             math.hypot(original[0] - p[0], original[1] - p[1]) for p in flagged
         ) < 1e-6, f"source vertex {original} not flagged must-hit in the plan"
+
+
+# ---------------------------------------------------------------------------
+# Multi-piece shapes: grouping must not clobber provenance (A9 regression)
+#
+# A survey export gives a square/rectangle as SEPARATE line entities, not one
+# continuous polyline. `group_connected_segments` chains them into a composite,
+# and `_merge_chain` used to copy the FIRST edge's `vertex_indices` verbatim —
+# so the composite flagged only 2 of the shape's corners as must-hit and the RPP
+# simplifier was free to round off the other two. 64c12ff fixed the continuous
+# case; these pin the assembled-from-pieces case that it never covered.
+# ---------------------------------------------------------------------------
+
+def _square_edges(side: float = 2.0) -> list[PathSegment]:
+    corners = [(0.0, 0.0), (side, 0.0), (side, side), (0.0, side)]
+    edges = list(zip(corners, corners[1:] + corners[:1]))
+    return [
+        densify_segment(
+            PathSegment(
+                segment_type=SegmentType.MARK,
+                points=[a, b],
+                source_entity=f"LINE_{i}",
+                metadata={"geometry_type": "LINE"},
+            ),
+            mark_spacing=0.05,
+        )
+        for i, (a, b) in enumerate(edges)
+    ]
+
+
+def _flagged_coords(seg: PathSegment) -> list[tuple[float, float]]:
+    vidx = seg.metadata["vertex_indices"]
+    return [seg.points[i] for i in vidx if 0 <= i < len(seg.points)]
+
+
+def test_grouped_square_flags_all_four_corners_not_two():
+    from path_engine.optimizers.shape_grouping import group_connected_segments
+
+    grouped = group_connected_segments(_square_edges(2.0), tol=0.05)
+    assert len(grouped) == 1, "four connected edges should chain into one run"
+    composite = grouped[0]
+
+    flagged = _flagged_coords(composite)
+    for corner in [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)]:
+        assert min(
+            math.hypot(corner[0] - p[0], corner[1] - p[1]) for p in flagged
+        ) < 1e-6, f"corner {corner} lost its must-hit flag through grouping"
+
+    # Provenance must not have been over-applied to the densified fill either.
+    assert len(composite.metadata["vertex_indices"]) < len(composite.points)
+
+
+def test_grouped_rectangle_unequal_sides_keeps_every_corner():
+    """A rectangle's corners land at DIFFERENT composite indices per edge, so a
+    stale [0, N] index set cannot coincidentally cover them (unlike a square)."""
+    from path_engine.optimizers.shape_grouping import group_connected_segments
+
+    corners = [(0.0, 0.0), (3.0, 0.0), (3.0, 1.0), (0.0, 1.0)]
+    edges = list(zip(corners, corners[1:] + corners[:1]))
+    segs = [
+        densify_segment(
+            PathSegment(
+                segment_type=SegmentType.MARK, points=[a, b],
+                source_entity=f"LINE_{i}", metadata={"geometry_type": "LINE"},
+            ),
+            mark_spacing=0.05,
+        )
+        for i, (a, b) in enumerate(edges)
+    ]
+    composite = group_connected_segments(segs, tol=0.05)[0]
+    flagged = _flagged_coords(composite)
+    for corner in corners:
+        assert min(
+            math.hypot(corner[0] - p[0], corner[1] - p[1]) for p in flagged
+        ) < 1e-6, f"rectangle corner {corner} lost its must-hit flag"
+
+
+def test_grouped_near_collinear_pieces_preserve_interior_vertex():
+    """The actually-damaging case: two lines meeting at a shallow (~2°) bend.
+
+    A 90° corner survives simplification on angle alone, but a shallow surveyed
+    bend only survives if it is flagged must-hit. If grouping drops the seam
+    vertex's provenance, the rover smooths the bend to a straight chord.
+    """
+    from path_engine.optimizers.shape_grouping import group_connected_segments
+
+    mid = (2.0, 0.07)  # ~2° kink over a 4 m span
+    segs = [
+        densify_segment(
+            PathSegment(
+                segment_type=SegmentType.MARK, points=[a, b],
+                source_entity=f"LINE_{i}", metadata={"geometry_type": "LINE"},
+            ),
+            mark_spacing=0.05,
+        )
+        for i, (a, b) in enumerate([((0.0, 0.0), mid), (mid, (4.0, 0.0))])
+    ]
+    composite = group_connected_segments(segs, tol=0.05)[0]
+    flagged = _flagged_coords(composite)
+    assert min(
+        math.hypot(mid[0] - p[0], mid[1] - p[1]) for p in flagged
+    ) < 1e-6, "the seam bend vertex must stay must-hit through grouping"
+
+
+def test_decompose_edges_remap_provenance_into_edge_index_space():
+    """Per-line mode splits the composite back into edges; each edge's
+    vertex_indices must index its OWN points, not the parent's."""
+    from path_engine.optimizers.shape_grouping import group_connected_segments
+    from path_engine.planners.extensions import decompose_line_chain_to_edges
+
+    composite = group_connected_segments(_square_edges(2.0), tol=0.05)[0]
+    edges = decompose_line_chain_to_edges(composite)
+    assert len(edges) >= 4, "square composite should split into >=4 edges"
+
+    for edge in edges:
+        vidx = edge.metadata["vertex_indices"]
+        assert vidx, "edge lost all provenance"
+        assert all(0 <= i < len(edge.points) for i in vidx), \
+            "edge vertex_indices point outside the edge's own point list"
+        # An edge's own two endpoints are corner vertices and must be flagged.
+        assert 0 in vidx and (len(edge.points) - 1) in vidx
+
+
+def test_engine_multipiece_square_flags_all_corners_must_hit():
+    """End-to-end: a square built from 4 separate LINE segments must land all
+    four corners in plan.must_hit — the field-visible promise A9 broke."""
+    from path_engine.engine import PathEngine
+
+    corners = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)]
+    edges = list(zip(corners, corners[1:] + corners[:1]))
+    segs = [
+        PathSegment(
+            segment_type=SegmentType.MARK, points=[a, b],
+            source_entity=f"LINE_{i}", metadata={"geometry_type": "LINE"},
+        )
+        for i, (a, b) in enumerate(edges)
+    ]
+    engine = PathEngine(mark_spacing=0.05, optimize_order=False, group_shapes=True)
+    plan = engine.plan_segments(segs)
+
+    flagged = [p for p, m in zip(plan.merged_waypoints, plan.must_hit) if m]
+    for corner in corners:
+        assert min(
+            math.hypot(corner[0] - p[0], corner[1] - p[1]) for p in flagged
+        ) < 1e-6, f"corner {corner} not flagged must-hit end-to-end"

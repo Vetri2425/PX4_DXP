@@ -1,8 +1,16 @@
 # Bug Closure Checklist
 
-**Compiled:** 2026-07-22 · **Updated:** 2026-07-22 (post-deploy)
-**Tree:** `Upgrade_Spray` @ `7d77565` (Jetson matches) · 701 tests pass
+**Compiled:** 2026-07-22 · **Updated:** 2026-07-23 (source-verified)
+**Tree:** `Upgrade_Spray` · 701 tests pass
 **Companion doc:** `docs/OPEN_BUGS.md` → `.pdf` (the register) · **Method:** skill `analyse-missions`
+
+> **Source verification 2026-07-23:** three parallel agents read every claim against the tree.
+> All claimed fixes (A1, A2, A4, survey-tolerance, C1–C6) confirmed landed; all open bugs
+> (A3, A5, A6, A7, A8, A9, B1–B4) confirmed present. Corrections: **A9** lives in
+> `shape_grouping.py::_merge_chain`, not `engine.py`; **B4** offsets are applied (default 0.0),
+> not dead; **C3** POINT matching is layer-agnostic. A worried "§8 key-name bug" was chased down
+> and **dismissed** — the staging writer (`routes/path.py:1210`) and reader
+> (`bag_autorecord.py:443`) agree on the `metadata` key; §8 is genuinely unblocked.
 
 > **Status this cycle:** A1, A2, A4 and the survey-tolerance item are **CODE-COMPLETE,
 > pushed and deployed** (`e3939e3`, `21a8b05`, `5f820be`, `7d77565`). Each was verified
@@ -147,7 +155,9 @@ deployed, so the next run batch records clean provenance.
 ## Priority 2 — Close the paint question
 
 ### ☐ B4 — Nozzle offset measured
-- **Current:** `nozzle_forward_offset_m` / `nozzle_lateral_offset_m` declared, **never measured**.
+- **Current:** `nozzle_forward_offset_m` / `nozzle_lateral_offset_m` declared **and applied**
+  (`spray_controller_node.py:178-196` + `:798-804`, real body-frame transform), but both
+  **default to 0.0** — the transform runs, it just shifts by zero. [src-verified 07-23]
 - **Consequence:** every number produced so far describes where the **antenna** went.
 - **Verify:** measure nozzle position relative to the GNSS antenna (forward + lateral); enter it;
   then re-run the spray boundary test.
@@ -199,7 +209,7 @@ deployed, so the next run batch records clean provenance.
 
 ### ☐ C4 — §8 auto-runs → **A1 unblocked**; gate verified RUNS on the Jetson, but has not yet auto-run on a freshly recorded bundle. Needs one drive.
 ### ☐ C2 — Survey CSV ingest driven in the field (all missions to date were DXF).
-### ☐ C3 — POINT-layer control points on a **dense real** drawing (only a synthetic 41-vertex case so far).
+### ☐ C3 — POINT control points on a **dense real** drawing. [src-verified 07-23] The parser is **layer-agnostic** (`dxf_parser.py:702`, snaps any POINT within 1 cm of a vertex — not keyed to a "Points" layer). The 41-vertex case is a commit-message demo, not a committed test; real coverage is a 4-vertex case in `test_core.py:91-112`.
 ### ☐ C5 — segment→smooth ~5 cm seam
 - May already be fixed as a side effect of `64c12ff`.
 - **Verify:** plot `/rpp/debug[0]` (xtrack) against `/rpp/debug[40]` (profile code). If no step
@@ -241,6 +251,22 @@ identical across the reboot.
 ### ☐ A8 — CPU contention (executor mismatch)
 `MultiThreadedExecutor` + `MutuallyExclusiveCallbackGroup` = zero parallelism, 50–65% of one core.
 Arm/disarm safety blocks a naive swap.
+
+### ☑ A9 — must_hit survives multi-entity joins — **FIXED 2026-07-23**  [src-verified 07-23]
+- **Cause:** `path_engine/optimizers/shape_grouping.py::_merge_chain` (~`:206-213`) copies the merged
+  composite's `vertex_indices` from the **`head`** chain member only; the other joined segments'
+  vertices are discarded. A square from 4 LINE entities keeps only its first segment's 2 endpoints
+  as must-hit → **2 of 4 corners**. `64c12ff` fixed vertex-drop in RPP conditioning but never touched
+  this file, so multi-entity shapes are still under-marked upstream of it.
+- **Verify:** plan a 4-LINE square → assert `sum(must_hit) == 4`. Currently pinned at the buggy value
+  by `server/test_staged_endpoints.py:408-425` (comment: "a separate engine defect").
+- **Closes when:** every source-geometry corner of a multi-entity shape carries `must_hit=True`, and
+  the pinning test is flipped to assert the correct count.
+- **DONE:** `_merge_chain` and `decompose_line_chain_to_edges` now remap `vertex_indices` (and
+  `control_indices`) into the composite/edge index space, over-preserving when provenance is absent.
+  A 4-LINE square and an unequal-sided rectangle both keep 4/4 corners. 3 regression tests added to
+  `test_vertex_provenance.py`, proven to fail on pre-fix source (`corner (2,2) not flagged`).
+  **406 path_engine + 168 server tests pass.** ☐ field-unverified — confirm on a real multi-entity survey.
 
 ---
 
