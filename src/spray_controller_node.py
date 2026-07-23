@@ -49,7 +49,13 @@ from nav_msgs.msg import Path
 from std_msgs.msg import Bool, Float32MultiArray, String
 
 import mission_progress as mp
-from mission_progress import MissionPhase, ProgressMsg
+from mission_progress import (
+    MilestoneEvent,
+    MilestoneMsg,
+    MissionPhase,
+    PointDoneMsg,
+    ProgressMsg,
+)
 from spray_fsm import SpraySafetyStateMachine, SprayCommand, SprayState
 from spray_flow_model import FlowModulator
 from spray_modes import DashMeter, PointMeter
@@ -136,6 +142,20 @@ def _path_qos(depth: int = 1) -> QoSProfile:
         depth=depth,
         reliability=ReliabilityPolicy.RELIABLE,
         durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        history=HistoryPolicy.KEEP_LAST,
+    )
+
+
+def _reliable_volatile_qos(depth: int = 10) -> QoSProfile:
+    """RELIABLE + VOLATILE (G4 handshake channels: /rpp/milestone, /spray/point_done).
+
+    Must arrive, but never TRANSIENT_LOCAL — a restart must not replay a stale
+    milestone/done. Mirrors mp.MILESTONE_QOS / mp.POINT_DONE_QOS.
+    """
+    return QoSProfile(
+        depth=depth,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.VOLATILE,
         history=HistoryPolicy.KEEP_LAST,
     )
 
@@ -345,6 +365,10 @@ def _make_spray_decision(
     rpp_in_mark: Optional[bool] = None,
     rpp_boundary_kind: str = "",
     rpp_dist_to_boundary_m: float = float("inf"),
+    # G4 — point handshake gate. None (default) → the PointMeter self-arrives from
+    # pose exactly as before (frozen). A bool → RPP is the arrival authority for
+    # the meter's current target: True iff /rpp/milestone AT_POINT fired for it.
+    rpp_at_point_gate: Optional[bool] = None,
 ) -> SprayDecision:
     projection: Optional[SprayProjection] = None
     boundary: Optional[SprayBoundary] = None
@@ -362,7 +386,8 @@ def _make_spray_decision(
         pu = None
         if point_meter is not None and nozzle_n is not None and nozzle_e is not None:
             pu = point_meter.update(
-                nozzle_n, nozzle_e, yaw, speed_mps, now_s, off_confirmed
+                nozzle_n, nozzle_e, yaw, speed_mps, now_s, off_confirmed,
+                require_arrival_gate=rpp_at_point_gate,
             )
             geometry_desired = pu.geometry_desired
         desired = bool(geometry_desired and safety_ok)
@@ -694,6 +719,13 @@ class SprayControllerNode(Node):
         self._rpp_progress: Optional[ProgressMsg] = None
         self._rpp_progress_recv_time = None
         self._rpp_source = ""
+        # G4 — point handshake. The latest /rpp/milestone AT_POINT index (the RPP
+        # confirms the rover is precisely stopped on this point); _point_done_seq
+        # is the monotonic counter for our outbound /spray/point_done. Reset when
+        # the point session is (re)built so a stale AT_POINT can't gate a new run.
+        self._at_point_index: int = -1
+        self._at_point_seq: int = -1
+        self._point_done_seq: int = 0
         self._last_auto_source = ""
         self._last_distance_event = ""
         self._last_safety_block_reason = ""
@@ -725,6 +757,12 @@ class SprayControllerNode(Node):
         # removed or renamed.
         self._status_pub = self.create_publisher(
             String, "/spray/status", _best_effort_qos()
+        )
+        # G4 — point-handshake completion (spray → RPP). RELIABLE VOLATILE depth 10
+        # (mp.POINT_DONE_QOS): must arrive so the RPP advances, but never
+        # TRANSIENT_LOCAL — a restart must not replay a stale "done".
+        self._point_done_pub = self.create_publisher(
+            String, mp.TOPIC_POINT_DONE, _reliable_volatile_qos(mp.POINT_DONE_QOS.depth)
         )
         self.create_subscription(
             Bool,
@@ -788,6 +826,17 @@ class SprayControllerNode(Node):
             mp.TOPIC_PROGRESS,
             self._rpp_progress_cb,
             _best_effort_qos(),
+            callback_group=self._group,
+        )
+        # G4 — RPP discrete milestones (RELIABLE VOLATILE depth 10). The point
+        # handshake reacts ONLY to AT_POINT i: the RPP has precisely stopped the
+        # rover on point i, so the dwell FSM may spray with proof. Read-only; used
+        # only when consume_rpp_progress is set AND mode is point.
+        self.create_subscription(
+            String,
+            mp.TOPIC_MILESTONE,
+            self._milestone_cb,
+            _reliable_volatile_qos(mp.MILESTONE_QOS.depth),
             callback_group=self._group,
         )
         # Phase B (§7.6): RTK fix quality. Same topic/source as the RPP node's
@@ -944,6 +993,10 @@ class SprayControllerNode(Node):
         """
         if self._session_mode != "point":
             return
+        # G4: a rebuilt session invalidates any cached AT_POINT — a stale
+        # milestone must not gate the new run's first point.
+        self._at_point_index = -1
+        self._at_point_seq = -1
         coords = self._path_must_hit_points or self._point_config_coords
         if not coords:
             self._point_meter = None
@@ -1219,6 +1272,13 @@ class SprayControllerNode(Node):
         rpp_in_mark, rpp_boundary_kind, rpp_dist_m = self._rpp_boundary_inputs(
             self._session_mode
         )
+        # G4: point-handshake arrival gate for the meter's current target (None
+        # unless consume_rpp_progress + point mode → frozen self-arrival).
+        rpp_at_point_gate = (
+            self._point_handshake_gate(self._point_meter.target_index)
+            if self._point_meter is not None
+            else None
+        )
         decision = _make_spray_decision(
             model=model,
             nozzle_n=nozzle_n,
@@ -1256,6 +1316,7 @@ class SprayControllerNode(Node):
             rpp_in_mark=rpp_in_mark,
             rpp_boundary_kind=rpp_boundary_kind,
             rpp_dist_to_boundary_m=rpp_dist_m,
+            rpp_at_point_gate=rpp_at_point_gate,
         )
         # Feeds _fsm_safety_ok() so the FSM's safety_ok input reflects the
         # full distance-aware gate stack (armed/offboard/path/pose/vel/speed
@@ -1270,6 +1331,11 @@ class SprayControllerNode(Node):
                     f"point mode: target {pu.skipped_index} unreachable — "
                     f"skipped (not sprayed)"
                 )
+            # G4: on a confirmed dwell-complete (OFF-confirmed advance), tell the
+            # RPP so it releases the hold. Only under the handshake — off it, the
+            # RPP uses its own fixed point_hold_s timer and ignores point_done.
+            if pu.completed_index >= 0 and rpp_at_point_gate is not None:
+                self._publish_point_done(pu.completed_index)
             if pu.done and (
                 self._last_point_update is None or not self._last_point_update.done
             ):
@@ -1320,6 +1386,69 @@ class SprayControllerNode(Node):
         """Cache the latest RPP progress (G2). Lenient parse never raises."""
         self._rpp_progress = ProgressMsg.from_json(msg.data)
         self._rpp_progress_recv_time = self.get_clock().now()
+
+    def _milestone_cb(self, msg: String) -> None:
+        """G4: record the RPP AT_POINT milestone (the point-handshake trigger).
+
+        Lenient parse never raises. Only AT_POINT is retained — it is the proof
+        that the rover is precisely stopped on that point, which gates the point
+        dwell FSM (design §5). Other milestones are observability only.
+        """
+        m = MilestoneMsg.from_json(msg.data)
+        if m.event == MilestoneEvent.AT_POINT and m.index >= 0:
+            self._at_point_index = m.index
+            self._at_point_seq = m.seq
+
+    def _point_handshake_gate(self, target_index: int):
+        """G4: arrival authority for the point meter's current target.
+
+        Returns None (frozen — PointMeter self-arrives from pose) unless the
+        handshake is active: consume_rpp_progress set AND mode is point. Then it
+        returns True iff the RPP has emitted AT_POINT for this target index (the
+        rover is confirmed on the point), else False (hold, don't guess).
+
+        Index alignment: RPP's milestone index is the must-hit rank within its
+        active run; the meter's index is the mission-order must-hit index. For a
+        single-run point mission (the common case — must-hit points are transit
+        stops, so /path is one spray-OFF run) these coincide. The RPP's
+        point_hold_max_s backstop makes any divergence safe, never wedged.
+        """
+        if not bool(self.get_parameter("consume_rpp_progress").value):
+            return None
+        if self._session_mode != "point":
+            return None
+        if self._at_point_index == target_index:
+            return True
+        # Re-sync fallback (design §6, G4.4): a dropped AT_POINT milestone is
+        # recovered from the fresh /rpp/progress phase — DWELL_HOLD/AT_POINT at
+        # this point index is the same "rover stopped on the point" proof.
+        pm = self._rpp_progress
+        if pm is not None and self._rpp_progress_recv_time is not None:
+            age_s = (
+                self.get_clock().now() - self._rpp_progress_recv_time
+            ).nanoseconds * 1e-9
+            timeout_s = max(0.0, float(self.get_parameter("progress_timeout_s").value))
+            if age_s <= timeout_s and int(pm.point_index) == target_index:
+                try:
+                    ph = MissionPhase(int(pm.phase))
+                except ValueError:
+                    ph = MissionPhase.IDLE
+                if ph in (MissionPhase.AT_POINT, MissionPhase.DWELL_HOLD):
+                    return True
+        return False
+
+    def _publish_point_done(self, index: int) -> None:
+        """G4: tell the RPP a point's dwell is done (OFF-confirmed) so it advances."""
+        self._point_done_seq += 1
+        msg = String()
+        msg.data = PointDoneMsg(
+            point_index=int(index),
+            seq=self._point_done_seq,
+            done=True,
+            reason="dwell_complete",
+        ).to_json()
+        self._point_done_pub.publish(msg)
+        self.get_logger().info(f"point handshake: /spray/point_done {index} (dwell complete)")
 
     def _rpp_boundary_inputs(self, mode: str):
         """Resolve the boundary source for this tick (G2.1/G2.2).
@@ -1830,6 +1959,20 @@ class SprayControllerNode(Node):
             mode_state = self._dash_meter.mode_state()
         elif self._session_mode == "point" and self._point_meter is not None:
             mode_state = self._point_meter.mode_state()
+            # G5: mirror the RPP mission phase so the app can show the "Next
+            # point" button while the RPP holds in WAIT_OPERATOR (manual gate).
+            # rpp_point_index is the point the RPP is holding — the expect_index
+            # the frontend echoes back on /api/spray/point/advance.
+            pm = self._rpp_progress
+            if pm is not None:
+                try:
+                    ph = MissionPhase(int(pm.phase))
+                except ValueError:
+                    ph = MissionPhase.IDLE
+                mode_state["rpp_phase"] = int(ph)
+                mode_state["rpp_phase_name"] = ph.name
+                mode_state["rpp_point_index"] = int(pm.point_index)
+                mode_state["wait_operator"] = ph == MissionPhase.WAIT_OPERATOR
         # Phase E flow telemetry (§7.5): was this line thin because of a gate or
         # because of the flow formula — must be visible, not inferred. None when
         # not spraying / flow modulation off.

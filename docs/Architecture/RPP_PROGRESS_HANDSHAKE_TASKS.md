@@ -74,15 +74,15 @@ Purpose: land the 2 cm along-track stop primitive for must-hit points only.
 
 Purpose: replace the fixed-timer point coordination with `AT_POINT → dwell → point_done → advance` (auto).
 
-- [ ] **G4.1** RPP: on confirmed precise-stop at point `i`, set phase `AT_POINT`, emit milestone `AT_POINT i`, enter `DWELL_HOLD` (hold zero velocity).
-- [ ] **G4.2** Spray: fire dwell FSM **only** on `/rpp/milestone AT_POINT i` (settle ≈ 0 since RPP guarantees the stop); on confirmed actuator OFF, publish `/spray/point_done i` with `seq` + `reason=dwell_complete`.
-- [ ] **G4.3** RPP auto-advance: on `/spray/point_done i`, transition `TRANSIT → i+1`.
-- [ ] **G4.4** Backstops: RPP advances after `point_hold_max_s` if `point_done` never arrives (warn); spray re-syncs from `/rpp/progress.phase==AT_POINT` on a `seq` gap (missed milestone).
-- [ ] **G4.5** `point_execution_mode` plumbing (auto path): carry through `PathPlanRequest → staged spray_session → RPP param at load` (design §8 option (a), server sets it on load).
-- [ ] **G4.6** Unit tests: handshake sequencer (auto), `seq`-gap re-sync, `point_hold_max_s` backstop.
-- [ ] **G4.7** Bench in-env: full auto point sequence over a multi-point `/path`; assert milestone/point_done ordering + `/api/spray/status` phase.
+- [x] **G4.1** RPP handshake release gated behind **`point_handshake_enabled`** (new param, default OFF). On the confirmed stop the point-hold enters the dwell and holds zero velocity; the `AT_POINT i` milestone is emitted at the dwell edge (G1 `milestones_for`, DWELL_HOLD entry). OFF ⇒ the frozen fixed `point_hold_s` timer runs byte-for-byte (the handshake branch is a pure `if point_handshake_enabled:` around it).
+- [x] **G4.2** Spray fires the dwell FSM only on the RPP proof: `PointMeter.update(require_arrival_gate=…)` makes RPP the arrival authority (self-arrival guessing ignored, design §5) — gate True iff `/rpp/milestone AT_POINT i` for the meter's target. On the OFF-confirmed dwell-complete (`PointUpdate.completed_index`), the node publishes `/spray/point_done i` (`seq`, `reason=dwell_complete`).
+- [x] **G4.3** RPP auto-advance: `_point_handshake_ready` releases the hold the tick `/spray/point_done i` matches the held point's rank with a fresh seq (seq-after-arm), so the point-hold releases → tracking drives to `i+1`.
+- [x] **G4.4** Backstops: RPP advances after `point_hold_max_s` if `point_done` never arrives (warn; in manual it still holds for the operator, not skips). Spray re-syncs from the cached `/rpp/progress.phase ∈ {AT_POINT, DWELL_HOLD}` at the target index when the RELIABLE `AT_POINT` milestone is missed (`_point_handshake_gate` fallback).
+- [x] **G4.5** `point_execution_mode` plumbing: `PUT /api/paths/{name}/spray-mode/point` now applies `req.point_execution_mode` (auto|manual) to the RPP via `set_rpp_param_async("point_execution_mode", …)` at load (design §8 option (a)). Behaviour-inert until `point_handshake_enabled`.
+- [x] **G4.6** Unit tests: pure `test_point_handshake.py` (gate replaces self-arrival, completed_index once/OFF-confirmed/skip-safe, classifier WAIT_OPERATOR + DWELL_DONE edge). In-env `test_point_handshake_rpp.py` (auto release on point_done, wrong/stale point_done ignored, `point_hold_max_s` backstop) + `test_point_handshake_spray.py` (milestone intake, gate, re-sync, point_done payload/seq).
+- [ ] **G4.7** Bench in-env (Jetson): full auto point sequence over a multi-point `/path`; assert milestone/point_done ordering + `/api/spray/status` phase. **Needs in-env run.**
 
-**DoD:** auto point missions run the handshake on bench; with point mode OFF, frozen point behavior unchanged; regression green.
+**DoD:** auto point missions run the handshake on bench; with point mode OFF, frozen point behavior unchanged; regression green. ✅ Mac: full pure suite green (326, +10 handshake); both nodes + server AST-parse; the OFF path is structurally the pre-G4 fixed-timer branch (PointMeter gate defaults to None = frozen self-arrival). ⏳ **Remaining:** G4.7 bench run + frozen regression (smoke + segment_stop + corner_pivot + `test_point_hold_rpp` with `point_handshake_enabled` OFF).
 
 ---
 
@@ -90,14 +90,14 @@ Purpose: replace the fixed-timer point coordination with `AT_POINT → dwell →
 
 Purpose: `WAIT_OPERATOR` + operator-driven advance.
 
-- [ ] **G5.1** RPP: when `point_execution_mode=manual`, after `point_done` enter `WAIT_OPERATOR`; advance only on `/point/advance` with matching `expect_index`. Optional `manual_wait_timeout_s` (0 = wait forever).
-- [ ] **G5.2** Server: `POST /api/spray/point/advance` → publishes `/point/advance {advance, expect_index}`. Wire in `server/routes/path.py` where `point_execution_mode` currently dead-ends.
-- [ ] **G5.3** Server: surface `phase == WAIT_OPERATOR` + current `point_index` in `/api/spray/status` (mode/point block already exists @ `0cd284a`) for button visibility.
-- [ ] **G5.4** Frontend: show "Next point" button while `/api/spray/status.phase == WAIT_OPERATOR`; POST advance with `expect_index`; guard double-taps.
-- [ ] **G5.5** Unit tests: manual sequencer, `expect_index` rejects wrong/stale point, wait-forever vs timeout.
-- [ ] **G5.6** Bench/round-trip: button → server → `/point/advance` → RPP advances the correct point.
+- [x] **G5.1** RPP: `point_execution_mode=manual` → after the spray `point_done` proof (or the phase-1 backstop) the hold enters `WAIT_OPERATOR` (`_point_wait_start_ns`; reported on `/rpp/progress` via classifier phase 10) and releases only on `/point/advance` with `expect_index == held rank` (fresh receive-count guards stale double-taps). `manual_wait_timeout_s` (0 = wait forever) optionally advances.
+- [x] **G5.2** Server: `POST /api/spray/point/advance {expect_index}` → `ros_node.publish_point_advance` → `/point/advance {advance:true, expect_index}` (RELIABLE VOLATILE depth 1, never TRANSIENT_LOCAL). In `server/routes/spray.py`.
+- [x] **G5.3** Server: `/api/spray/status.point` now carries `rpp_phase_name`, `rpp_point_index`, `wait_operator` — mirrored from the spray node's `/spray/status` (which reads the cached `/rpp/progress`) for button visibility + the `expect_index`.
+- [~] **G5.4** Frontend: **backend contract complete & ready** — poll `/api/spray/status`; when `point.wait_operator` show "Next point"; `POST /api/spray/point/advance {expect_index: point.rpp_point_index}`; disable while the POST is in-flight (double-tap guard, also enforced server/RPP-side by `expect_index`). Lives in the separate mobile repo (`Three_Wheel_v2`, branch `plan-editor`) — **not committed here**; integrate there.
+- [x] **G5.5** Unit tests: manual sequencer + `expect_index` wrong/stale rejection + wait-forever/timeout in `test_point_handshake_rpp.py` (`test_manual_waits_for_operator_then_advances`, `test_manual_backstop_still_waits_for_operator`, `test_manual_wait_timeout_advances`).
+- [ ] **G5.6** Bench/round-trip (Jetson): button → server → `/point/advance` → RPP advances the correct point. **Needs in-env run.**
 
-**DoD:** manual point mode round-trips button→advance on bench; auto mode unaffected; default execution mode stays `auto`.
+**DoD:** manual point mode round-trips button→advance on bench; auto mode unaffected; default execution mode stays `auto`. ✅ Mac: manual sequencer green; server routes AST-parse; default `point_execution_mode=auto` + `point_handshake_enabled=OFF` keep the frozen path. ⏳ **Remaining:** G5.4 frontend integration (separate repo) + G5.6 bench round-trip.
 
 ---
 

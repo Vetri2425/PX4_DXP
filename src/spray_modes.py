@@ -222,6 +222,7 @@ class PointUpdate:
     exempt_pivot: bool      # bypass the pivot gate this tick (dwelling on a dot)
     done: bool              # whole point mission finished
     skipped_index: int      # index skipped by the watchdog this tick, else -1
+    completed_index: int = -1  # index whose dwell finished (OFF-confirmed) this tick, else -1
 
 
 class PointMeter:
@@ -314,17 +315,26 @@ class PointMeter:
         speed_mps: float,
         now_s: float,
         off_confirmed: bool,
+        require_arrival_gate=None,
     ) -> PointUpdate:
         """Advance the FSM one control tick.
 
         pose_n/pose_e are the NOZZLE position (same frame continuous/dash
         project onto) so the dot lands under the nozzle. `off_confirmed` is the
         actuator FSM's OFF_CONFIRMED state; `now_s` is a monotonic clock.
+
+        `require_arrival_gate` is the G4 RPP handshake gate: when None (default),
+        arrival is the node's own pose/speed/heading guess exactly as before
+        (byte-for-byte frozen). When a bool, RPP is the authority — arrival is
+        `require_arrival_gate` (the RPP `/rpp/milestone AT_POINT i` for THIS
+        target index), so the drop is sprayed only on confirmed-on-the-point
+        proof, never on the node's self-arrival guess (design §5).
         """
         if self.done:
             return PointUpdate(False, "done", self.target_index, False, True, -1)
 
         skipped_index = -1
+        completed_index = -1
         # Process instantaneous transitions in one tick (holding→dwelling,
         # advance→transit) with a bounded loop; the guard is far above the
         # number of real transitions possible per tick.
@@ -335,7 +345,11 @@ class PointMeter:
             tn, te = self.coordinates[i]
             dist = math.hypot(pose_n - tn, pose_e - te)
             slow = speed_mps <= self.max_speed_mps
-            arrived = dist <= self.arrival_tolerance_m and slow and self._heading_ok(yaw_ned, i)
+            if require_arrival_gate is None:
+                arrived = dist <= self.arrival_tolerance_m and slow and self._heading_ok(yaw_ned, i)
+            else:
+                # RPP handshake: proof gates, self-arrival guessing is ignored.
+                arrived = bool(require_arrival_gate)
 
             if self._transit_start is None:
                 self._transit_start = now_s
@@ -387,6 +401,7 @@ class PointMeter:
 
             if self.phase == "off_wait":
                 if off_confirmed:
+                    completed_index = i   # this dot's dwell finished + OFF-confirmed
                     self._advance()
                     continue
                 break  # dwell done, spray desired-off, waiting for OFF ack
@@ -408,6 +423,7 @@ class PointMeter:
             exempt_pivot=exempt_pivot,
             done=self.done,
             skipped_index=skipped_index,
+            completed_index=completed_index,
         )
 
     def mode_state(self) -> dict:

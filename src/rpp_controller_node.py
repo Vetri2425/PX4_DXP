@@ -188,7 +188,13 @@ from std_msgs.msg import Bool, Float32MultiArray, MultiArrayDimension, Float32, 
 import mission_progress as mp
 import precise_stop as pstop
 import progress_classifier as pc
-from mission_progress import MilestoneMsg, MissionPhase, ProgressMsg
+from mission_progress import (
+    AdvanceMsg,
+    MilestoneMsg,
+    MissionPhase,
+    PointDoneMsg,
+    ProgressMsg,
+)
 from mission_progress_ros import qos_profile
 
 
@@ -423,6 +429,14 @@ class RPPControllerNode(Node):
         self.declare_parameter("precise_stop_creep_speed",            0.05)   # m/s (servo)
         self.declare_parameter("precise_stop_max_s",                  8.0)    # s
         # G4/G5 — point handshake + auto/manual advance:
+        # point_handshake_enabled (default OFF) swaps the Phase-D fixed point_hold_s
+        # timer for the RPP↔spray handshake: RPP holds the dwell until the spray
+        # node confirms /spray/point_done (auto), or — in manual mode — until the
+        # operator's /point/advance. point_hold_max_s is the never-wedge backstop.
+        # OFF ⇒ the frozen fixed-timer point-hold runs byte-for-byte. The handshake
+        # also needs progress_publish_enabled (for the AT_POINT milestone spray
+        # reacts to); the backstop makes any misconfig safe.
+        self.declare_parameter("point_handshake_enabled",           False)
         self.declare_parameter("point_execution_mode",               "auto")  # auto|manual
         self.declare_parameter("manual_wait_timeout_s",              0.0)     # s (0 = wait forever)
         self.declare_parameter("point_hold_max_s",                   10.0)    # s backstop cap
@@ -547,6 +561,21 @@ class RPPControllerNode(Node):
         # feed-forward decel profile.
         self._point_servo_start_ns = None
         self._point_approach_speed = 0.0
+        # G4/G5 — point handshake (default OFF; only under point_handshake_enabled).
+        # Latest /spray/point_done seen (index + monotonic seq); the seq snapshot
+        # taken when the current hold armed, so only a point_done that arrived
+        # AFTER arming can release it. _point_spray_done_this_hold latches the
+        # dwell-complete proof so a later point_done for another point cannot
+        # un-latch it mid-wait. _point_wait_start_ns marks the manual WAIT_OPERATOR
+        # phase; the /point/advance index + monotonic count gate the release.
+        self._point_done_index: int = -1
+        self._point_done_seq: int = -1
+        self._point_done_seq_at_arm: int = -1
+        self._point_spray_done_this_hold: bool = False
+        self._point_wait_start_ns = None
+        self._advance_index: int = -1
+        self._advance_count: int = 0
+        self._advance_count_at_wait: int = 0
         # G1 — mission-progress publication (default OFF, observability only).
         # must-hit vertices of the active run in path order + a key→rank map, so
         # the progress classifier can name the point currently held. Rebuilt in
@@ -702,6 +731,19 @@ class RPPControllerNode(Node):
             TwistStamped, "/mavros/local_position/velocity_local",
             self._vel_cb, be_qos,
         )
+        # G4/G5 — point handshake command channels (design §4.3/§4.4). RELIABLE
+        # VOLATILE (never TRANSIENT_LOCAL, so a restart cannot replay a stale
+        # "done"/"advance"). Read-only unless point_handshake_enabled; the
+        # callbacks only cache the latest message, so the frozen controller is
+        # untouched when the flag is OFF.
+        self.create_subscription(
+            String, mp.TOPIC_POINT_DONE, self._point_done_cb,
+            qos_profile(mp.POINT_DONE_QOS),
+        )
+        self.create_subscription(
+            String, mp.TOPIC_ADVANCE, self._advance_cb,
+            qos_profile(mp.ADVANCE_QOS),
+        )
 
         # ------------------------------------------------------------------
         # 50 Hz control timer
@@ -761,6 +803,11 @@ class RPPControllerNode(Node):
         self._point_hold_start_ns = None
         self._point_servo_start_ns = None
         self._point_approach_speed = 0.0
+        # G4/G5 — re-arm the point handshake for the new mission.
+        self._point_spray_done_this_hold = False
+        self._point_wait_start_ns = None
+        self._point_done_seq_at_arm = self._point_done_seq
+        self._advance_count_at_wait = self._advance_count
         n_raw = len(raw_pts)
 
         resample_dx = float(self.get_parameter("path_resample_spacing_m").value)
@@ -1705,6 +1752,84 @@ class RPPControllerNode(Node):
         )
         return self._next_run_turn() >= threshold
 
+    def _point_done_cb(self, msg: String) -> None:
+        """G4: cache the spray node's /spray/point_done (lenient parse)."""
+        pd = PointDoneMsg.from_json(msg.data)
+        if pd.done and pd.point_index >= 0:
+            self._point_done_index = pd.point_index
+            self._point_done_seq = pd.seq
+
+    def _advance_cb(self, msg: String) -> None:
+        """G5: cache the operator's /point/advance (lenient parse).
+
+        A monotonic receive-count (not a wire seq — AdvanceMsg carries none) lets
+        the WAIT_OPERATOR gate accept only a command that arrived AFTER the wait
+        began, so a stale double-tap for an already-advanced point is ignored.
+        """
+        adv = AdvanceMsg.from_json(msg.data)
+        if adv.advance:
+            self._advance_index = adv.expect_index
+            self._advance_count += 1
+
+    def _point_handshake_ready(self, target_key, dwell_start_ns: int) -> bool:
+        """G4/G5: decide when a handshake point-dwell may release. Default OFF.
+
+        Phase 1 (both modes) — wait for the spray node's dwell-complete proof
+        (`/spray/point_done` for this point's rank), or the point_hold_max_s
+        backstop (advance anyway, warn — never wedge the mission).
+        Phase 2 (manual only) — after the proof, hold in WAIT_OPERATOR until the
+        operator's `/point/advance` with a matching expect_index, or the optional
+        manual_wait_timeout_s.
+
+        Only ever called under point_handshake_enabled, so the frozen fixed-timer
+        point-hold path is untouched.
+        """
+        rank = self._musthit_rank_by_key.get(target_key, -1)
+        now_ns = self.get_clock().now().nanoseconds
+
+        # Phase 1 — the spray node's dwell-complete proof (or the backstop).
+        if not self._point_spray_done_this_hold:
+            fresh = (
+                self._point_done_index == rank
+                and self._point_done_seq > self._point_done_seq_at_arm
+            )
+            if fresh:
+                self._point_spray_done_this_hold = True
+            else:
+                max_s = float(self.get_parameter("point_hold_max_s").value)
+                if max_s > 0.0 and (now_ns - dwell_start_ns) * 1e-9 >= max_s:
+                    self.get_logger().warn(
+                        f"point handshake: no /spray/point_done for point {rank} "
+                        f"within {max_s:.1f}s — proceeding (backstop)",
+                        throttle_duration_sec=5.0,
+                    )
+                    self._point_spray_done_this_hold = True  # don't wedge
+                else:
+                    return False   # keep holding (phase DWELL_HOLD)
+
+        # Proof in hand. Auto advances immediately.
+        if str(self.get_parameter("point_execution_mode").value) != "manual":
+            return True
+
+        # Phase 2 (manual) — WAIT_OPERATOR until /point/advance for this point.
+        if self._point_wait_start_ns is None:
+            self._point_wait_start_ns = now_ns
+            self._advance_count_at_wait = self._advance_count
+            self.get_logger().info(
+                f"point {rank}: dwell complete — waiting for operator advance"
+            )
+        if (self._advance_count > self._advance_count_at_wait
+                and self._advance_index == rank):
+            return True
+        timeout = float(self.get_parameter("manual_wait_timeout_s").value)
+        if timeout > 0.0 and (now_ns - self._point_wait_start_ns) * 1e-9 >= timeout:
+            self.get_logger().warn(
+                f"point {rank}: manual wait timeout ({timeout:.1f}s) — advancing",
+                throttle_duration_sec=5.0,
+            )
+            return True
+        return False   # keep holding (phase WAIT_OPERATOR)
+
     def _point_hold_tick(
         self,
         pos_n: float,
@@ -1774,6 +1899,11 @@ class RPPControllerNode(Node):
             self._point_hold_active_key = target_key
             self._point_hold_start_ns = None
             self._reset_corner_pivot_state()
+            # G4/G5 — re-arm the handshake for this point (behaviour-neutral when
+            # point_handshake_enabled is OFF; only read by _point_handshake_ready).
+            self._point_done_seq_at_arm = self._point_done_seq
+            self._point_spray_done_this_hold = False
+            self._point_wait_start_ns = None
             if precise:
                 # Capture the engagement speed as the feed-forward decel cap and
                 # re-arm the servo timeout. Floor at creep so a slow entry still
@@ -1815,27 +1945,50 @@ class RPPControllerNode(Node):
         if self._point_hold_start_ns is None:
             self._point_hold_start_ns = now_ns
             self.get_logger().info(f"point hold: dwelling at must-hit {target_key}")
-        hold_s = float(self.get_parameter("point_hold_s").value)
-        elapsed_s = (now_ns - self._point_hold_start_ns) * 1e-9
-        if elapsed_s < hold_s:
-            self._segment_state = SegmentStateCode.CORNER_STOP
-            self._last_speed_cmd = 0.0
-            self._publish_velocity(0.0, 0.0)
-            self._publish_yaw_rate(0.0)
-            self._publish_debug(
-                cross_track=0.0, heading_err=0.0, lookahead=dist_to_goal,
-                speed=0.0, kappa=0.0, dist_goal=dist_to_goal,
-                pose_age_ms=pose_age_s * 1000.0, state=StateCode.TRACKING,
-                l_d_raw=float("nan"), kappa_speed=0.0, yaw_rate=0.0,
-                spray_active=False,
-            )
-            return True
+
+        # G4/G5 point handshake (default OFF). When enabled, the dwell releases on
+        # the spray node's /spray/point_done (auto) — or, in manual mode, after the
+        # operator's /point/advance — instead of the fixed point_hold_s timer, with
+        # point_hold_max_s as a never-wedge backstop. Default OFF ⇒ the frozen
+        # fixed-timer block in the `else` below runs byte-for-byte.
+        if bool(self.get_parameter("point_handshake_enabled").value):
+            if not self._point_handshake_ready(target_key, self._point_hold_start_ns):
+                self._segment_state = SegmentStateCode.CORNER_STOP
+                self._last_speed_cmd = 0.0
+                self._publish_velocity(0.0, 0.0)
+                self._publish_yaw_rate(0.0)
+                self._publish_debug(
+                    cross_track=0.0, heading_err=0.0, lookahead=dist_to_goal,
+                    speed=0.0, kappa=0.0, dist_goal=dist_to_goal,
+                    pose_age_ms=pose_age_s * 1000.0, state=StateCode.TRACKING,
+                    l_d_raw=float("nan"), kappa_speed=0.0, yaw_rate=0.0,
+                    spray_active=False,
+                )
+                return True
+            elapsed_s = (now_ns - self._point_hold_start_ns) * 1e-9
+        else:
+            hold_s = float(self.get_parameter("point_hold_s").value)
+            elapsed_s = (now_ns - self._point_hold_start_ns) * 1e-9
+            if elapsed_s < hold_s:
+                self._segment_state = SegmentStateCode.CORNER_STOP
+                self._last_speed_cmd = 0.0
+                self._publish_velocity(0.0, 0.0)
+                self._publish_yaw_rate(0.0)
+                self._publish_debug(
+                    cross_track=0.0, heading_err=0.0, lookahead=dist_to_goal,
+                    speed=0.0, kappa=0.0, dist_goal=dist_to_goal,
+                    pose_age_ms=pose_age_s * 1000.0, state=StateCode.TRACKING,
+                    l_d_raw=float("nan"), kappa_speed=0.0, yaw_rate=0.0,
+                    spray_active=False,
+                )
+                return True
 
         # Dwell complete — mark done and release to normal tracking this cycle.
         self._point_hold_done_keys.add(target_key)
         self._point_hold_active_key = None
         self._point_hold_start_ns = None
         self._point_servo_start_ns = None
+        self._point_wait_start_ns = None
         self._reset_corner_pivot_state()
         self.get_logger().info(
             f"point hold: released {target_key} after {elapsed_s:.1f}s "
@@ -3273,6 +3426,11 @@ class RPPControllerNode(Node):
             "point_mode": True,
             "point_active": active_key is not None,
             "point_dwelling": self._point_hold_start_ns is not None,
+            # G5 — manual gate: the RPP is holding after dwell for the operator's
+            # /point/advance. Reported so /rpp/progress (→ /spray/status → the app)
+            # can surface WAIT_OPERATOR for the "Next point" button. None unless a
+            # manual handshake is actually waiting.
+            "point_wait_operator": self._point_wait_start_ns is not None,
             "point_target_rank": rank,
             "point_target_vertex": vertex,
             "all_points_done": all_done,

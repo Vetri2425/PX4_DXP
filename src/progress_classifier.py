@@ -78,6 +78,7 @@ def classify(
     point_mode: bool = False,
     point_active: bool = False,
     point_dwelling: bool = False,
+    point_wait_operator: bool = False,
     point_target_rank: int = -1,
     point_target_vertex: int = -1,
     all_points_done: bool = False,
@@ -96,6 +97,7 @@ def classify(
             seg_idx=seg_idx, along_s=along_s, cum_s=cum_s, speed=speed,
             stopped=stopped, signed_xtrack=signed_xtrack,
             point_active=point_active, point_dwelling=point_dwelling,
+            point_wait_operator=point_wait_operator,
             point_target_rank=point_target_rank,
             point_target_vertex=point_target_vertex,
             all_points_done=all_points_done,
@@ -134,13 +136,16 @@ def classify(
 def _classify_point(
     *, seg_idx: int, along_s: float, cum_s: list, speed: float, stopped: bool,
     signed_xtrack: float, point_active: bool, point_dwelling: bool,
-    point_target_rank: int, point_target_vertex: int, all_points_done: bool,
+    point_wait_operator: bool, point_target_rank: int, point_target_vertex: int,
+    all_points_done: bool,
 ) -> ProgressMsg:
     if all_points_done:
         return ProgressMsg(phase=MissionPhase.TRANSIT, segment_index=seg_idx,
                            speed_mps=speed, stopped=stopped, xtrack_m=signed_xtrack,
                            point_index=-1)
-    if point_active and point_dwelling:
+    if point_active and point_wait_operator:
+        phase = MissionPhase.WAIT_OPERATOR    # G5 manual: dwell done, awaiting advance
+    elif point_active and point_dwelling:
         phase = MissionPhase.DWELL_HOLD
     elif point_active:
         phase = MissionPhase.APPROACH_POINT   # braking toward the confirmed stop

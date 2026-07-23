@@ -1486,18 +1486,44 @@ async def set_spray_mode_point(name: str, req: SprayModePointRequest):
     (`point_hold_enabled`, default OFF).
     """
     safe = os.path.basename(name)
+    # G4.5 — carry point_execution_mode to the RPP (design §8 option (a): the
+    # server sets it as an RPP param at load). auto|manual selects whether the
+    # RPP auto-advances on /spray/point_done or holds in WAIT_OPERATOR for the
+    # operator's /point/advance. Behaviour is gated by point_handshake_enabled on
+    # the RPP; setting the mode alone changes nothing until the handshake is on.
+    exec_mode = str(req.point_execution_mode or "auto").lower()
+    warnings = [
+        "point marking-point coordinates are not part of this contract; the "
+        "spray node is not switched here. Stop-and-dwell at each point is the "
+        "RPP point-hold A/B — set `point_hold_enabled true` on /rpp_controller "
+        "and run a mission whose must-hit points carry the coordinates."
+    ]
+    exec_applied = False
+    if exec_mode not in ("auto", "manual"):
+        warnings.append(
+            f"point_execution_mode {exec_mode!r} not in auto|manual; leaving the "
+            f"RPP param unchanged"
+        )
+    else:
+        try:
+            from main import ros_node
+            ok, msg = await ros_node.set_rpp_param_async(
+                "point_execution_mode", exec_mode
+            )
+            exec_applied = bool(ok)
+            if not ok:
+                warnings.append(f"could not set RPP point_execution_mode: {msg}")
+        except Exception as exc:  # noqa: BLE001 — best-effort/off-ROS
+            log.warning("set point_execution_mode failed for %s: %s", safe, exc)
+            warnings.append(f"could not set RPP point_execution_mode: {exc}")
     return {
         "status": "ok",
         "path": safe,
         "mode": "point",
-        "point_execution_mode": req.point_execution_mode,
+        "point_execution_mode": exec_mode,
+        "point_execution_mode_applied": exec_applied,
         "published": False,
-        "warnings": [
-            "point marking-point coordinates are not part of this contract; the "
-            "spray node is not switched here. Stop-and-dwell at each point is the "
-            "RPP point-hold A/B — set `point_hold_enabled true` on /rpp_controller "
-            "and run a mission whose must-hit points carry the coordinates."
-        ],
+        "warnings": warnings,
     }
 
 

@@ -339,6 +339,11 @@ class RosBridgeNode(Node):
         # Manual spray override command — reliable VOLATILE (depth 1): must
         # arrive, but a stale override must never replay to a restarted node.
         self._spray_manual_pub = self.create_publisher(Bool, "/spray/manual", 1)
+        # G5 — manual point advance (server → RPP). Default QoS is RELIABLE
+        # VOLATILE (depth 1), same class as /spray/manual: the operator "next
+        # point" command must arrive, but a restart must never replay a stale
+        # advance (never TRANSIENT_LOCAL).
+        self._point_advance_pub = self.create_publisher(String, "/point/advance", 1)
 
         # ── Service clients (reentrant group, can be called from any thread) ──
         self._arming_cli = None
@@ -612,6 +617,18 @@ class RosBridgeNode(Node):
         msg.data = bool(on)
         self._spray_manual_pub.publish(msg)
         log.info("published /spray/manual: %s", "ON" if on else "OFF")
+
+    def publish_point_advance(self, expect_index: int) -> None:
+        """G5: command the RPP to advance past the point it is holding (manual).
+
+        `expect_index` is the point the frontend saw as WAIT_OPERATOR; the RPP
+        rejects the advance if it is holding a different point (stale double-tap
+        guard). JSON matches mission_progress.AdvanceMsg.
+        """
+        msg = String()
+        msg.data = json.dumps({"advance": True, "expect_index": int(expect_index)})
+        self._point_advance_pub.publish(msg)
+        log.info("published /point/advance: expect_index=%d", int(expect_index))
 
     def publish_spray_session_config(self, config_json: str) -> None:
         """Publish the spray mode/config JSON string on /spray/session_config (B0).

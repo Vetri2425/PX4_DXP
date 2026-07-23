@@ -370,6 +370,10 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._rpp_progress = None
     node._rpp_progress_recv_time = None
     node._rpp_source = ""
+    # G4 point-handshake state.
+    node._at_point_index = -1
+    node._at_point_seq = -1
+    node._point_done_seq = 0
     node._last_auto_source = ""
     node._last_distance_event = ""
     node._last_safety_block_reason = ""
