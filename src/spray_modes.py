@@ -417,4 +417,9 @@ class PointMeter:
             "num_points": len(self.coordinates),
             "skipped": list(self.skipped_indices),
             "done": self.done,
+            # Config echo so /spray/status is self-describing: the point dwell
+            # and arrival tolerance the node is actually running (from the
+            # session_config points_mode, not a server guess).
+            "dwell_s": self.dwell_s,
+            "arrival_tolerance_m": self.arrival_tolerance_m,
         }

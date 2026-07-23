@@ -257,12 +257,38 @@ async def spray_status():
             "spray_active_desired": False,
             "manual_override": False,
             "hold_active": hold_active,
+            # No ROS graph → the spray node is not reporting a mode.
+            "mode": None,
         }
     s = ros_node.get_state()
-    return {
+    resp = {
         "enabled": _spray_enabled,
         "spraying": bool(s.get("spraying", False)),
         "spray_active_desired": bool(s.get("spray_active", False)),
         "manual_override": bool(s.get("spray_manual", False)),
         "hold_active": hold_active,
+        # Live spray mode mirrored from the node's /spray/status. None means the
+        # spray node has not been heard from (not "continuous").
+        "mode": s.get("spray_mode"),
     }
+    # Attach the mode-specific config the node is actually running, so the app
+    # can show it without a separate call. Sourced from the node's mode_state
+    # (single source of truth), not from what the server last published.
+    mode = resp["mode"]
+    mode_state = s.get("spray_mode_state") or {}
+    if mode == "dash":
+        resp["dash"] = {
+            "on_distance_m": mode_state.get("on_distance_m"),
+            "off_distance_m": mode_state.get("off_distance_m"),
+            "phase": mode_state.get("phase"),
+            "armed": mode_state.get("armed"),
+        }
+    elif mode == "point":
+        resp["point"] = {
+            "dwell_s": mode_state.get("dwell_s"),
+            "arrival_tolerance_m": mode_state.get("arrival_tolerance_m"),
+            "num_points": mode_state.get("num_points"),
+            "target_index": mode_state.get("target_index"),
+            "phase": mode_state.get("phase"),
+        }
+    return resp

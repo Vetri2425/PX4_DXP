@@ -18,6 +18,7 @@ shim if ever needed) but **must not** be called from the asyncio loop.
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import threading
 import time
@@ -201,6 +202,11 @@ class RosBridgeNode(Node):
         "spraying": False,
         "spray_active": False,
         "spray_manual": False,
+        # Current spray MODE + mode_state, mirrored from the node's rich
+        # /spray/status (String JSON). None until the spray node is first heard
+        # from, so callers can distinguish "continuous" from "node not reporting".
+        "spray_mode": None,
+        "spray_mode_state": None,
     }
 
     def __init__(self) -> None:
@@ -306,6 +312,16 @@ class RosBridgeNode(Node):
             Bool,
             "/spray/manual_state",
             self._cb_spray_manual_state,
+            _qos_best_effort(),
+            callback_group=self._sub_group,
+        )
+        # Rich spray status (mode + mode_state) — the node's own /spray/status
+        # (std_msgs/String JSON, best-effort). Mirrored so /api/spray/status can
+        # report the live mode and its config without a second ROS hop.
+        self.create_subscription(
+            String,
+            "/spray/status",
+            self._cb_spray_status,
             _qos_best_effort(),
             callback_group=self._sub_group,
         )
@@ -569,6 +585,24 @@ class RosBridgeNode(Node):
     def _cb_spray_manual_state(self, msg: Bool) -> None:
         with self._lock:
             self._state["spray_manual"] = bool(msg.data)
+
+    def _cb_spray_status(self, msg: String) -> None:
+        """Mirror the node's mode + mode_state from /spray/status (JSON String).
+
+        The node is the sole author; we only read `mode` and `mode_state`. A
+        malformed payload is ignored (keep last-known-good) — never crash the
+        subscription over one bad frame.
+        """
+        try:
+            data = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(data, dict):
+            return
+        with self._lock:
+            self._state["spray_mode"] = data.get("mode")
+            ms = data.get("mode_state")
+            self._state["spray_mode_state"] = ms if isinstance(ms, dict) else {}
 
     # ── Public API: spray manual override ────────────────────────────────────
 

@@ -123,6 +123,17 @@ def test_bad_tolerance_rejected():
             pass
 
 
+def test_mode_state_echoes_dwell_and_tolerance():
+    # /spray/status must be self-describing: the dwell + arrival tolerance the
+    # node is actually running are surfaced so /api/spray/status can report them.
+    m = PointMeter([(0.0, 0.0), (5.0, 0.0)], 0.12, arrival_settle_s=0.2, dwell_s=1.5)
+    st = m.mode_state()
+    assert st["dwell_s"] == 1.5
+    assert st["arrival_tolerance_m"] == 0.12
+    assert st["num_points"] == 2
+    assert st["phase"] == "transit"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
