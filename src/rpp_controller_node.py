@@ -1505,8 +1505,12 @@ class RPPControllerNode(Node):
             if turn >= threshold:
                 self._run_align_pending = True
                 self._run_align_turn_rad = turn   # angle-aware pivot budget
-        elif idx == 0 and len(run["poses"]) > 1 and bool(
-            self.get_parameter("entry_prealign_enabled").value
+        elif idx == 0 and len(run["poses"]) > 1 and (
+            bool(self.get_parameter("entry_prealign_enabled").value)
+            # Run 0 starts on a MARK: the rover MUST be on the first-segment
+            # heading before spray is allowed on, or it paints while arcing onto
+            # line. Force the pre-align regardless of the param in that case.
+            or bool(run.get("flags") and run["flags"][0])
         ):
             # D2 — runtime-entry pre-align. Run 0 has no prev_run, so the block
             # above is skipped and the rover would ARC onto the first heading at
