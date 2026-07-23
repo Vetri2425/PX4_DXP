@@ -48,6 +48,8 @@ from mavros_msgs.srv import CommandLong
 from nav_msgs.msg import Path
 from std_msgs.msg import Bool, Float32MultiArray, String
 
+import mission_progress as mp
+from mission_progress import MissionPhase, ProgressMsg
 from spray_fsm import SpraySafetyStateMachine, SprayCommand, SprayState
 from spray_flow_model import FlowModulator
 from spray_modes import DashMeter, PointMeter
@@ -67,12 +69,41 @@ _SERVO_PWM_MAX_US = 2200
 TRANSIT_TO_MARK = "TRANSIT_TO_MARK"
 MARK_TO_TRANSIT = "MARK_TO_TRANSIT"
 
+
+def _rpp_kind_for(in_mark: bool, next_boundary: str) -> str:
+    """Map an `/rpp/progress` boundary onto a local spray boundary kind (G2).
+
+    RPP announces the next MARK↔non-MARK transition as "MARK_START" / "MARK_END"
+    (and "REACHED_END" at the path terminus). Translate to the spray node's own
+    kinds so the existing lead math is unchanged — only the *source* of the
+    distance moves from this node's projection to RPP's single authority:
+
+      * "MARK_START"  → TRANSIT_TO_MARK  (lead the valve ON before entering)
+      * "MARK_END"    → MARK_TO_TRANSIT  (lead the valve OFF before leaving)
+      * "REACHED_END" while inside a mark → MARK_TO_TRANSIT — the mark ends
+        because the *path* ends; this guarantees terminal shutoff even though
+        RPP never emits an explicit MARK_END there.
+      * anything else → "" (no upcoming boundary to lead onto).
+    """
+    if next_boundary == "MARK_START":
+        return TRANSIT_TO_MARK
+    if next_boundary == "MARK_END":
+        return MARK_TO_TRANSIT
+    if next_boundary == "REACHED_END" and in_mark:
+        return MARK_TO_TRANSIT
+    return ""
+
 # Mirrors rpp_controller_node.SegmentStateCode.CORNER_ALIGN, read off
 # /rpp/segment_debug data[1]. Duplicated rather than imported: the spray node
 # must not take a build/runtime dependency on the controller module, and this
 # node already runs standalone in tests. If the RPP's enum ever renumbers, this
 # breaks silently -- test_spray_pivot_gate.py pins the contract.
 _SEGMENT_STATE_CORNER_ALIGN = 3
+
+# G2: MissionPhase values that mean "the nozzle is currently over a MARK region"
+# for RPP-sourced boundary anticipation. Matches progress_classifier._MARK_PHASES
+# (imported by value, not the private name, so the contract is explicit here).
+_RPP_IN_MARK_PHASES = frozenset({MissionPhase.MARK_TRACKING, MissionPhase.MARK_END})
 
 # GPSRAW.fix_type → human name (Phase B RTK gate, §7.6). Same mapping the RPP
 # node's P0.3 gate uses. 6 = RTK_FIXED (the marking bar), 5 = RTK_FLOAT.
@@ -306,6 +337,14 @@ def _make_spray_decision(
     yaw: float = 0.0,
     now_s: float = 0.0,
     off_confirmed: bool = False,
+    # G2 — RPP progress boundary sourcing (continuous mode only). When
+    # rpp_in_mark is None (flag off / stale / absent), the continuous branch
+    # uses this node's own /path projection exactly as before (byte-for-byte
+    # frozen). When provided, RPP is the single authority for the boundary the
+    # lead math anticipates, killing dual-projection drift on moving marks.
+    rpp_in_mark: Optional[bool] = None,
+    rpp_boundary_kind: str = "",
+    rpp_dist_to_boundary_m: float = float("inf"),
 ) -> SprayDecision:
     projection: Optional[SprayProjection] = None
     boundary: Optional[SprayBoundary] = None
@@ -385,30 +424,54 @@ def _make_spray_decision(
             geometry_desired = du.geometry_desired
             boundary = None
             distance_to_boundary = float("inf")
-        elif boundary is not None:
-            distance_to_boundary = boundary.s - projection.s
-            # ON is intentionally early by solenoid delay plus overspray
-            # margin. OFF is early only by close delay; an explicit OFF
-            # overspray margin delays shutoff so the MARK tail is not cut short.
-            on_lead = speed_mps * solenoid_open_delay_s + on_overspray_margin_m
-            off_lead = max(
-                0.0,
-                speed_mps * solenoid_close_delay_s - off_overspray_margin_m,
-            )
-            if (
-                not projection.current_flag
-                and boundary.kind == TRANSIT_TO_MARK
-                and distance_to_boundary <= on_lead
-            ):
-                geometry_desired = True
-                event = "on_early"
-            elif (
-                projection.current_flag
-                and boundary.kind == MARK_TO_TRANSIT
-                and distance_to_boundary <= off_lead
-            ):
-                geometry_desired = False
-                event = "off_early"
+        else:
+            # Continuous lead. The boundary the valve anticipates comes from one
+            # of two sources; the lead equations below are identical either way.
+            #   * RPP progress (G2): rpp_in_mark is not None → single authority,
+            #     no dual projection. `boundary` is re-synthesized for reporting.
+            #   * /path projection (frozen default): rpp_in_mark is None → the
+            #     exact pre-G2 behaviour, byte-for-byte.
+            if rpp_in_mark is not None:
+                geometry_desired = rpp_in_mark
+                src_kind = rpp_boundary_kind or None
+                src_dist = rpp_dist_to_boundary_m
+                boundary = (
+                    SprayBoundary(projection.s + src_dist, src_kind)
+                    if src_kind is not None and math.isfinite(src_dist)
+                    else None
+                )
+            elif boundary is not None:
+                src_kind = boundary.kind
+                src_dist = boundary.s - projection.s
+            else:
+                src_kind = None
+                src_dist = float("inf")
+
+            if src_kind is not None and math.isfinite(src_dist):
+                distance_to_boundary = src_dist
+                # ON is intentionally early by solenoid delay plus overspray
+                # margin. OFF is early only by close delay; an explicit OFF
+                # overspray margin delays shutoff so the MARK tail is not cut
+                # short.
+                on_lead = speed_mps * solenoid_open_delay_s + on_overspray_margin_m
+                off_lead = max(
+                    0.0,
+                    speed_mps * solenoid_close_delay_s - off_overspray_margin_m,
+                )
+                if (
+                    not geometry_desired
+                    and src_kind == TRANSIT_TO_MARK
+                    and src_dist <= on_lead
+                ):
+                    geometry_desired = True
+                    event = "on_early"
+                elif (
+                    geometry_desired
+                    and src_kind == MARK_TO_TRANSIT
+                    and src_dist <= off_lead
+                ):
+                    geometry_desired = False
+                    event = "off_early"
 
     desired = bool(geometry_desired and safety_ok)
     debug = [
@@ -623,6 +686,14 @@ class SprayControllerNode(Node):
         self._vel_recv_time = None
         self._segment_state: Optional[int] = None
         self._segment_state_recv_time = None
+        # G2: latest RPP progress (boundary authority for continuous marks).
+        # None until the first message; recv_time drives the staleness fallback
+        # to /path (progress_timeout_s). _rpp_source tracks which boundary source
+        # the last tick actually used, so a switch is logged once (rate-limited),
+        # not every tick.
+        self._rpp_progress: Optional[ProgressMsg] = None
+        self._rpp_progress_recv_time = None
+        self._rpp_source = ""
         self._last_auto_source = ""
         self._last_distance_event = ""
         self._last_safety_block_reason = ""
@@ -704,6 +775,18 @@ class SprayControllerNode(Node):
             Float32MultiArray,
             "/rpp/segment_debug",
             self._segment_debug_cb,
+            _best_effort_qos(),
+            callback_group=self._group,
+        )
+        # G2: RPP mission-progress channel. BEST_EFFORT depth 1 (matches
+        # mp.PROGRESS_QOS and /rpp/segment_debug) — republished every 50 Hz tick,
+        # so loss is self-healing. Read-only; the frozen controller is untouched.
+        # Only consumed when consume_rpp_progress is set AND the stream is fresh;
+        # otherwise the node falls back to its own /path projection.
+        self.create_subscription(
+            String,
+            mp.TOPIC_PROGRESS,
+            self._rpp_progress_cb,
             _best_effort_qos(),
             callback_group=self._group,
         )
@@ -1132,6 +1215,10 @@ class SprayControllerNode(Node):
         # Phase E: recompute the speed-proportional flow value for this tick
         # (no-op / full-flow when disabled). Feeds the ON command + telemetry.
         self._update_flow(speed, dt_s)
+        # G2: pick the boundary source (RPP progress vs local /path projection).
+        rpp_in_mark, rpp_boundary_kind, rpp_dist_m = self._rpp_boundary_inputs(
+            self._session_mode
+        )
         decision = _make_spray_decision(
             model=model,
             nozzle_n=nozzle_n,
@@ -1166,6 +1253,9 @@ class SprayControllerNode(Node):
                 0.0,
                 float(self.get_parameter("max_xtrack_error_m").value),
             ),
+            rpp_in_mark=rpp_in_mark,
+            rpp_boundary_kind=rpp_boundary_kind,
+            rpp_dist_to_boundary_m=rpp_dist_m,
         )
         # Feeds _fsm_safety_ok() so the FSM's safety_ok input reflects the
         # full distance-aware gate stack (armed/offboard/path/pose/vel/speed
@@ -1225,6 +1315,65 @@ class SprayControllerNode(Node):
             return
         self._segment_state = int(msg.data[1])
         self._segment_state_recv_time = self.get_clock().now()
+
+    def _rpp_progress_cb(self, msg: String) -> None:
+        """Cache the latest RPP progress (G2). Lenient parse never raises."""
+        self._rpp_progress = ProgressMsg.from_json(msg.data)
+        self._rpp_progress_recv_time = self.get_clock().now()
+
+    def _rpp_boundary_inputs(self, mode: str):
+        """Resolve the boundary source for this tick (G2.1/G2.2).
+
+        Returns (rpp_in_mark, rpp_boundary_kind, rpp_dist_m) to pass into
+        `_make_spray_decision`, or (None, "", inf) to fall back to the local
+        /path projection (frozen behaviour). RPP is used only when:
+          * consume_rpp_progress is set,
+          * mode is continuous (dash meters arc-length locally; point uses the
+            handshake, not boundary sourcing), and
+          * a progress message has arrived within progress_timeout_s.
+        A source switch (rpp↔path↔off) is logged once, rate-limited.
+        """
+        off = (None, "", float("inf"))
+        if not bool(self.get_parameter("consume_rpp_progress").value):
+            self._note_rpp_source("off")
+            return off
+        if mode != "continuous":
+            # Only continuous marks are boundary-sourced in G2.
+            self._note_rpp_source("off")
+            return off
+        if self._rpp_progress is None or self._rpp_progress_recv_time is None:
+            self._note_rpp_source("path", reason="no progress yet")
+            return off
+        age_s = (
+            self.get_clock().now() - self._rpp_progress_recv_time
+        ).nanoseconds * 1e-9
+        timeout_s = max(0.0, float(self.get_parameter("progress_timeout_s").value))
+        if age_s > timeout_s:
+            self._note_rpp_source("path", reason=f"progress stale ({age_s:.2f}s)")
+            return off
+        pm = self._rpp_progress
+        try:
+            phase = MissionPhase(int(pm.phase))
+        except ValueError:
+            phase = MissionPhase.IDLE
+        in_mark = phase in _RPP_IN_MARK_PHASES
+        kind = _rpp_kind_for(in_mark, pm.next_boundary)
+        dist = float(pm.dist_to_next_boundary_m)
+        self._note_rpp_source("rpp")
+        return in_mark, kind, dist
+
+    def _note_rpp_source(self, source: str, reason: str = "") -> None:
+        """Log a boundary-source change once (rate-limited), not every tick."""
+        if source == self._rpp_source:
+            return
+        self._rpp_source = source
+        if source == "rpp":
+            self.get_logger().info("spray boundary source: RPP /rpp/progress")
+        elif source == "path":
+            self.get_logger().warn(
+                f"spray boundary source: /path fallback ({reason})",
+                throttle_duration_sec=5.0,
+            )
 
     def _gps_cb(self, msg: GPSRAW) -> None:
         """Track GPS fix quality for the Phase B RTK gate (§7.6)."""

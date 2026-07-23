@@ -291,6 +291,8 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         # Phase B RTK gate — OFF in the fixture (opt-in per test) so the many
         # existing gate tests, which carry no GPSRAW, are unaffected. Production
         # default (declare_parameter) is True.
+        "consume_rpp_progress": _Param(False),
+        "progress_timeout_s": _Param(0.3),
         "spray_require_rtk_fix": _Param(False),
         "spray_min_fix_type": _Param(6),
         "gps_fix_timeout_s": _Param(2.0),
@@ -364,6 +366,10 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._vel_recv_time = None
     node._segment_state = None
     node._segment_state_recv_time = None
+    # G2 RPP boundary-source state.
+    node._rpp_progress = None
+    node._rpp_progress_recv_time = None
+    node._rpp_source = ""
     node._last_auto_source = ""
     node._last_distance_event = ""
     node._last_safety_block_reason = ""
