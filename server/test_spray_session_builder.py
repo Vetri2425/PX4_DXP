@@ -73,9 +73,19 @@ def test_point_round_trips_through_node_parser():
     assert cfg.points_mode.heading_tolerance_deg is None  # position-only
 
 
-def test_point_no_coordinates_falls_back_to_continuous():
-    cfg = parse_session_config(build_session_config("point", point_coordinates=[]))
-    assert cfg.mode == "continuous"
+def test_point_without_coordinates_stays_point_for_path_fill():
+    # New contract: the server cannot know the GPS-placement offset at plan/load
+    # time, so it emits point mode with EMPTY coordinates + params; the spray
+    # node fills the dwell targets from the placed /path must-hit vertices. So
+    # point must NOT fall back to continuous just because no coords were given.
+    cfg = parse_session_config(build_session_config(
+        "point", point_coordinates=[], point_dwell_s=2.0, point_arrival_tolerance_m=0.12,
+    ))
+    assert cfg.mode == "point"
+    assert cfg.points_mode is not None
+    assert cfg.points_mode.coordinates == ()          # node fills from /path
+    assert cfg.points_mode.dwell_s == 2.0
+    assert cfg.points_mode.arrival_tolerance_m == 0.12
 
 
 def test_cleared_config_json_parses_continuous_empty():

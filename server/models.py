@@ -484,6 +484,13 @@ class PathPlanRequest(BaseModel):
     dash_on_distance_m: Optional[float] = Field(None, gt=0.0, le=1000.0)
     dash_off_distance_m: Optional[float] = Field(None, gt=0.0, le=1000.0)
     dash_start_state: str = Field("on", pattern="^(on|off)$")
+    # Point-mode dwell params. Coordinates are NOT set here — the dwell targets
+    # are the mission's must-hit vertices, which reach the spray node on /path
+    # (placed into the live EKF frame at start). These only carry how the node
+    # should behave AT each point: how long to dwell and how close counts as
+    # "arrived". Defaults are field-reasonable (1 s dwell, 10 cm tolerance).
+    point_dwell_s: float = Field(1.0, gt=0.0, le=60.0)
+    point_arrival_tolerance_m: float = Field(0.10, gt=0.0, le=5.0)
 
 
 class SprayModeDashRequest(BaseModel):

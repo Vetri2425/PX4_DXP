@@ -1216,6 +1216,11 @@ def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
             "dash_on_distance_m": req.dash_on_distance_m,
             "dash_off_distance_m": req.dash_off_distance_m,
             "dash_start_state": req.dash_start_state,
+            # Point-mode dwell params. Coordinates are NOT staged — they ride
+            # /path as must-hit vertices and are placed into the live EKF frame
+            # at start; the spray node reads them there.
+            "point_dwell_s": req.point_dwell_s,
+            "point_arrival_tolerance_m": req.point_arrival_tolerance_m,
         },
         "alignment_metadata": alignment_meta,
         "metadata": {
@@ -1355,6 +1360,13 @@ async def load_mission_to_controller(req: LoadMissionRequest):
             dash_on_distance_m=spray_session.get("dash_on_distance_m"),
             dash_off_distance_m=spray_session.get("dash_off_distance_m"),
             dash_start_state=spray_session.get("dash_start_state", "on"),
+            # Point dwell params. Coordinates stay empty on purpose — the node
+            # fills them from the placed /path must-hit vertices (the only
+            # frame-correct source; the placement offset is unknown until start).
+            point_dwell_s=spray_session.get("point_dwell_s", 1.0),
+            point_arrival_tolerance_m=spray_session.get(
+                "point_arrival_tolerance_m", 0.10
+            ),
         )
         ros_node.publish_spray_session_config(cfg_json)
     except Exception as exc:  # noqa: BLE001 — mode publish is best-effort

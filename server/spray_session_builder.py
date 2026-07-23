@@ -38,9 +38,11 @@ def build_session_config(
     """Return a schema-1 SpraySessionConfig dict for the given mode.
 
     Unknown/empty modes fall back to continuous (the safe default). Dash needs
-    both distances; point needs a non-empty coordinate list; if either is
-    incomplete it falls back to continuous so a half-configured request can
-    never silently ship a broken mode.
+    both distances; if incomplete it falls back to continuous so a
+    half-configured dash can never silently ship a broken mode. Point does NOT
+    require coordinates here — its dwell targets come from the /path must-hit
+    vertices (see the point branch below), so point always emits point mode with
+    its params and (usually empty) coordinates.
     """
     mode = (mode or "continuous").lower()
     cfg = {
@@ -58,10 +60,17 @@ def build_session_config(
             "off_distance_m": float(dash_off_distance_m),
             "start_state": "off" if dash_start_state == "off" else "on",
         }
-    elif mode == "point" and point_coordinates:
+    elif mode == "point":
+        # Coordinates are OPTIONAL here: the frame-correct dwell targets are the
+        # must-hit vertices on /path (placed into the live EKF frame at mission
+        # start), which only the spray node sees. The server cannot know the
+        # placement offset at plan/load time, so it emits point mode with the
+        # dwell/tolerance PARAMS and (usually empty) coordinates; the node fills
+        # the coordinates from /path. An explicit list, when given, is a bench
+        # fallback the node uses only when /path carries no must-hit vertices.
         cfg["mode"] = "point"
         cfg["points_mode"] = {
-            "coordinates": [[float(n), float(e)] for n, e in point_coordinates],
+            "coordinates": [[float(n), float(e)] for n, e in (point_coordinates or [])],
             "arrival_tolerance_m": float(point_arrival_tolerance_m),
             "heading_tolerance_deg": (
                 None if point_heading_tolerance_deg is None

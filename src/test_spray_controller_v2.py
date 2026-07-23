@@ -674,6 +674,66 @@ def test_session_config_cb_selects_point():
     assert node._dash_meter is None
 
 
+def _path_msg(points_xyz):
+    """Build a nav_msgs/Path stub: each tuple is (x=north, y=east, z=bitfield)."""
+    poses = [
+        types.SimpleNamespace(
+            pose=types.SimpleNamespace(
+                position=types.SimpleNamespace(x=x, y=y, z=z)
+            )
+        )
+        for (x, y, z) in points_xyz
+    ]
+    return types.SimpleNamespace(poses=poses)
+
+
+def test_point_meter_uses_path_must_hit_over_config_coords():
+    """The fix: point dwell targets are the /path must-hit vertices (placed,
+    frame-correct), not the server-staged coords. Config coords are a fallback
+    used only until a must-hit /path arrives."""
+    node = make_node()
+    # Point mode selected via config carrying only a bench FALLBACK coord.
+    cfg = SpraySessionConfig(
+        SCHEMA_VERSION, "point", (), (), None,
+        PointsModeConfig(((99.0, 99.0),), 0.12, None, 0.2, 2.0),
+    )
+    node._session_config_cb(_Msg(_json.dumps(to_dict(cfg))))
+    # No /path yet → the config fallback coordinate is used.
+    assert node._point_meter is not None
+    assert node._point_meter.coordinates == ((99.0, 99.0),)
+
+    # A placed /path arrives: 4 pts, 2 flagged must-hit (z bit1=2; z=3 = on+must).
+    node._path_cb(_path_msg([
+        (0.0, 0.0, 1.0),   # spray on, not must-hit
+        (1.0, 0.0, 3.0),   # spray on + must-hit  → dwell target
+        (2.0, 0.0, 1.0),
+        (3.0, 0.0, 3.0),   # spray on + must-hit  → dwell target
+    ]))
+    # Meter rebuilt from the /path must-hit vertices, NOT the config fallback.
+    assert node._path_must_hit_points == [(1.0, 0.0), (3.0, 0.0)]
+    assert node._point_meter.coordinates == ((1.0, 0.0), (3.0, 0.0))
+    # Params from the session_config are preserved across the rebuild.
+    assert node._point_meter.dwell_s == 2.0
+    assert node._point_meter.arrival_tolerance_m == 0.12
+    # Still point mode (did NOT fall back to continuous).
+    assert node._session_mode == "point"
+
+
+def test_point_mode_no_meter_commands_off_not_continuous():
+    """Point mode with no resolved coordinates must spray OFF, never fall
+    through to path-projection (continuous) spraying."""
+    d = _make_spray_decision(
+        model=_straight_mark_path(), nozzle_n=1.5, nozzle_e=0.0, speed_mps=1.0,
+        safety_ok=True, safety_reason="",
+        solenoid_open_delay_s=0.0, solenoid_close_delay_s=0.0,
+        on_overspray_margin_m=0.0, off_overspray_margin_m=0.0,
+        max_xtrack_error_m=0.10, mode="point", point_meter=None,
+        yaw=0.0, now_s=1.0, off_confirmed=True,
+    )
+    assert d.geometry_desired is False and d.desired is False
+    assert d.point_update is None
+
+
 def test_point_decision_routes_to_meter():
     """mode=point: geometry comes from the PointMeter, no path projection."""
     meter = PointMeter([(0.0, 0.0)], 0.10, arrival_settle_s=0.0, dwell_s=0.5)

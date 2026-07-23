@@ -344,6 +344,9 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._dash_meter = None
     node._point_meter = None
     node._last_point_update = None
+    node._path_must_hit_points = []
+    node._point_config_coords = []
+    node._point_params = {}
     node._last_tick_monotonic = None
     # Phase E flow state.
     node._flow_modulator = None

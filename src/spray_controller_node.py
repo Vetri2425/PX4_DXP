@@ -316,9 +316,12 @@ def _make_spray_decision(
     # Point mode (plan §7.3): no path projection — arrival is the nozzle vs the
     # coordinate list. Uses the standard safety_ok from the gate stack (armed/
     # offboard/pose/gps/pivot-exempt), computed by the caller.
-    if mode == "point" and point_meter is not None:
+    if mode == "point":
+        # Point mode NEVER falls through to path projection: with no meter yet
+        # (coordinates not resolved from /path), the safe answer is spray OFF —
+        # not continuous spraying off the geometry mirror.
         pu = None
-        if nozzle_n is not None and nozzle_e is not None:
+        if point_meter is not None and nozzle_n is not None and nozzle_e is not None:
             pu = point_meter.update(
                 nozzle_n, nozzle_e, yaw, speed_mps, now_s, off_confirmed
             )
@@ -579,6 +582,16 @@ class SprayControllerNode(Node):
         # runs one step before _make_spray_decision updates the meter).
         self._point_meter: Optional[PointMeter] = None
         self._last_point_update = None
+        # Phase D coordinate source. Point dwell targets are the must-hit
+        # vertices carried on /path (bit1) — the ONLY frame-correct source,
+        # because GPS_SURVEYED placement offsets the whole path into the live
+        # EKF frame at mission start (server-staged coords are pre-placement and
+        # would land the dots off by that offset). _point_config_coords is a
+        # fallback used only when a session_config ships explicit coordinates
+        # and /path has no must-hit vertices (bench/direct use, tests).
+        self._path_must_hit_points: list[tuple[float, float]] = []
+        self._point_config_coords: list[tuple[float, float]] = []
+        self._point_params: dict = {}
         # Measured tick interval for arc-length jump-tolerance (§7.2). Seeded
         # on the first dash tick; monotonic clock, never wall time.
         self._last_tick_monotonic: Optional[float] = None
@@ -787,12 +800,20 @@ class SprayControllerNode(Node):
         # MUST bit-test, not `> 0.5`: a spray-OFF must-hit point encodes as 2.0
         # and a `> 0.5` test would spray a transit leg.
         flags = [bool(int(round(p.pose.position.z)) & 1) for p in msg.poses]
+        # bit1 = must-hit vertex → the point-mode dwell targets, in the SAME
+        # (placed, live-EKF) frame as the pose the meter compares against.
+        must_hit = [bool(int(round(p.pose.position.z)) & 2) for p in msg.poses]
+        self._path_must_hit_points = [
+            pt for pt, m in zip(points, must_hit) if m
+        ]
         if not points:
             self._path_model = None
+            self._path_must_hit_points = []
             self._session_config = cleared_config()
             self._config_fingerprint = self._session_config.path_fingerprint()
             self._fsm.note_event_reset(time.monotonic())
             self._set_auto_desired(False, source="distance")
+            self._rebuild_point_meter()
             self.get_logger().warn("spray path cleared: received empty /path")
             return
         try:
@@ -812,10 +833,53 @@ class SprayControllerNode(Node):
         # stale backoff window left over from whatever happened on the
         # previous one (plan §4's backoff-reset rule).
         self._fsm.note_event_reset(time.monotonic())
+        # Point mode: the dwell targets just changed (new placed /path), so
+        # rebuild the meter from the fresh must-hit vertices. No-op otherwise.
+        self._rebuild_point_meter()
         self.get_logger().info(
             f"spray path loaded: {len(points)} points, "
             f"{len(self._path_model.boundaries)} boundaries"
+            f"{f', {len(self._path_must_hit_points)} must-hit' if self._path_must_hit_points else ''}"
         )
+
+    def _rebuild_point_meter(self) -> None:
+        """(Re)build the point-dwell meter from the current coordinate source.
+
+        Frame-correct source priority: the must-hit vertices on /path (placed
+        into the live EKF frame by the controller) win; explicit session_config
+        coordinates are a fallback for bench/direct use with no must-hit path.
+        No coordinates → no meter (point mode then commands spray OFF, safe).
+        Only acts in point mode; a no-op for continuous/dash.
+        """
+        if self._session_mode != "point":
+            return
+        coords = self._path_must_hit_points or self._point_config_coords
+        if not coords:
+            self._point_meter = None
+            self._last_point_update = None
+            return
+        params = self._point_params
+        try:
+            self._point_meter = PointMeter(
+                coords,
+                params.get("arrival_tolerance_m", 0.05),
+                params.get("arrival_settle_s", 0.2),
+                params.get("dwell_s", 1.0),
+                params.get("heading_tolerance_deg"),
+                point_arrival_max_speed_mps=max(
+                    0.0, float(self.get_parameter("point_arrival_max_speed_mps").value)
+                ),
+                point_arrival_timeout_s=max(
+                    0.0, float(self.get_parameter("point_arrival_timeout_s").value)
+                ),
+            )
+            self._last_point_update = None
+        except ValueError as exc:
+            self.get_logger().warn(
+                f"point meter rebuild failed ({exc}); reverting to continuous"
+            )
+            self._point_meter = None
+            self._session_mode = "continuous"
 
     def _session_config_cb(self, msg: String) -> None:
         """B0 — receive the operator-selected mode + mode params (plan §3).
@@ -860,26 +924,19 @@ class SprayControllerNode(Node):
                 )
                 self._session_mode = "continuous"
         elif cfg.mode == "point" and cfg.points_mode is not None:
+            # Store the dwell/tolerance PARAMS + any config-supplied coordinates
+            # (fallback). The authoritative dwell targets are the /path must-hit
+            # vertices; _rebuild_point_meter prefers them and only uses these
+            # coordinates when /path carries none (bench/direct use).
             pm = cfg.points_mode
-            try:
-                self._point_meter = PointMeter(
-                    pm.coordinates,
-                    pm.arrival_tolerance_m,
-                    pm.arrival_settle_s,
-                    pm.dwell_s,
-                    pm.heading_tolerance_deg,
-                    point_arrival_max_speed_mps=max(
-                        0.0, float(self.get_parameter("point_arrival_max_speed_mps").value)
-                    ),
-                    point_arrival_timeout_s=max(
-                        0.0, float(self.get_parameter("point_arrival_timeout_s").value)
-                    ),
-                )
-            except ValueError as exc:
-                self.get_logger().warn(
-                    f"point config invalid ({exc}); reverting to continuous"
-                )
-                self._session_mode = "continuous"
+            self._point_config_coords = list(pm.coordinates)
+            self._point_params = {
+                "arrival_tolerance_m": pm.arrival_tolerance_m,
+                "arrival_settle_s": pm.arrival_settle_s,
+                "dwell_s": pm.dwell_s,
+                "heading_tolerance_deg": pm.heading_tolerance_deg,
+            }
+            self._rebuild_point_meter()
 
         self._last_tick_monotonic = None  # reseed dt on the next dash tick
         # A mode/config change resets the FSM RECOVERY backoff (plan §4).
