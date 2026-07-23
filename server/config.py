@@ -185,7 +185,7 @@ JOYSTICK_MODE_CONFIRM_TIMEOUT_S = float(
 )
 # Pinned conservative first-field-run defaults (plan §4.5/§7.8/§7.9) — do not
 # inherit whichever default happens to drift between reference sources.
-JOYSTICK_MAX_ABS_THROTTLE = float(os.environ.get("ROVER_JOYSTICK_MAX_ABS_THROTTLE", "0.10"))
+JOYSTICK_MAX_ABS_THROTTLE = float(os.environ.get("ROVER_JOYSTICK_MAX_ABS_THROTTLE", "0.35"))
 JOYSTICK_MAX_ABS_STEERING = float(os.environ.get("ROVER_JOYSTICK_MAX_ABS_STEERING", "0.20"))
 JOYSTICK_MAVROS_REQUIRE_SUBSCRIBER = (
     os.environ.get("ROVER_JOYSTICK_MAVROS_REQUIRE_SUBSCRIBER", "1") == "1"
