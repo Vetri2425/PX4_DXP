@@ -501,6 +501,14 @@ class SprayControllerNode(Node):
         # a discrete state cannot dither the way a threshold does.
         self.declare_parameter("spray_off_during_pivot", True)
         self.declare_parameter("segment_state_timeout_s", 1.0)
+        # ── RPP progress consumption (design RPP_PROGRESS_HANDSHAKE, G2/G4) ──
+        # G0: declared now, default OFF, NOT yet consumed. When enabled, the
+        # boundary for the moving-mark lead math is sourced from /rpp/progress
+        # instead of this node's own /path projection (single source, no dual-
+        # projection drift), falling back to /path if progress is stale beyond
+        # progress_timeout_s. Generalizes the existing pivot-gate pattern.
+        self.declare_parameter("consume_rpp_progress", False)
+        self.declare_parameter("progress_timeout_s", 0.3)   # s → fallback to /path
         self.declare_parameter("max_xtrack_error_m", 0.10)
         self.declare_parameter("pose_timeout_s", 0.5)
         self.declare_parameter("velocity_timeout_s", 0.5)

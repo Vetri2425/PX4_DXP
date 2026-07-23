@@ -402,6 +402,22 @@ class RPPControllerNode(Node):
         self.declare_parameter("point_hold_enabled",                   False)
         self.declare_parameter("point_hold_s",                         2.0)    # s
         self.declare_parameter("point_hold_acceptance_m",              0.10)   # m
+        # ── RPP progress + spray handshake (design RPP_PROGRESS_HANDSHAKE) ───
+        # G0: declared now, defaults = frozen behavior, NOTHING reads them yet.
+        # Each is wired + A/B'd in a later phase (G1/G3/G4/G5). See
+        # docs/Architecture/RPP_PROGRESS_HANDSHAKE_TASKS.md.
+        # G1 — publish /rpp/progress + /rpp/milestone (pure observability):
+        self.declare_parameter("progress_publish_enabled",            False)
+        # G3 — precise 2 cm stop at must-hit points (point mode only):
+        self.declare_parameter("point_precise_stop_enabled",          False)
+        self.declare_parameter("point_arrival_tolerance_m",           0.02)   # m
+        self.declare_parameter("precise_stop_mode",                   "feedforward")  # feedforward|servo
+        self.declare_parameter("precise_stop_creep_speed",            0.05)   # m/s (servo)
+        self.declare_parameter("precise_stop_max_s",                  8.0)    # s
+        # G4/G5 — point handshake + auto/manual advance:
+        self.declare_parameter("point_execution_mode",               "auto")  # auto|manual
+        self.declare_parameter("manual_wait_timeout_s",              0.0)     # s (0 = wait forever)
+        self.declare_parameter("point_hold_max_s",                   10.0)    # s backstop cap
         # Active braking at a corner stop. PX4 velocity-OFFBOARD does not brake
         # on a zero setpoint — it coasts — so a rover that reaches the corner
         # still at ~0.1-0.16 m/s drifts 2-3 cm before the dwell confirms, and
