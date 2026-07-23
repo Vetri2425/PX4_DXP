@@ -546,6 +546,114 @@ def test_stale_exception_reply_ignored_does_not_corrupt_newer_state():
     assert node._fsm.state == SprayState.ON_CONFIRMED
 
 
+# --------------------------------------------------------------------------
+# Phase C — dash mode integration through _make_spray_decision + the node's
+# /spray/session_config callback (B0). The dash arc-length math itself is
+# covered purely in test_spray_dash_v2.py; these tests prove the WIRING:
+# the decision routes to the meter, and the callback selects the mode.
+# --------------------------------------------------------------------------
+
+import json as _json  # noqa: E402
+
+from spray_modes import DashMeter  # noqa: E402
+from spray_session_config import (  # noqa: E402
+    SCHEMA_VERSION,
+    DashConfig,
+    SpraySessionConfig,
+    to_dict,
+)
+
+
+class _Msg:
+    """Minimal std_msgs/String stand-in — the callback only reads .data."""
+
+    def __init__(self, data):
+        self.data = data
+
+
+def _dash_drive(model, meter, n_start, n_end, *, step=0.02, speed=1.0, dt=1.0):
+    """Walk the nozzle n_start→n_end along a straight N-axis MARK path.
+
+    On this path projection.s == nozzle_n, so driving the nozzle drives the
+    meter's arc-length. Fine steps stay inside the jump-tolerance window.
+    """
+    d = None
+    k = max(1, int(round((n_end - n_start) / step)))
+    for i in range(k + 1):
+        n = n_start + i * step
+        d = _make_spray_decision(
+            model=model, nozzle_n=n, nozzle_e=0.0, speed_mps=speed,
+            safety_ok=True, safety_reason="",
+            solenoid_open_delay_s=0.0, solenoid_close_delay_s=0.0,
+            on_overspray_margin_m=0.0, off_overspray_margin_m=0.0,
+            max_xtrack_error_m=0.10, mode="dash", dash_meter=meter, dt_s=dt,
+        )
+    return d
+
+
+def test_dash_decision_routes_to_meter():
+    """6-on/3-off dash: ON in [0,6), OFF in [6,9); no static next_boundary."""
+    model = _build_path_model([(0.0, 0.0), (10.0, 0.0)], [True, True])
+    meter = DashMeter(6.0, 3.0, "on")
+    on_region = _dash_drive(model, meter, 0.0, 5.9)
+    assert on_region.desired is True
+    assert on_region.geometry_desired is True
+    assert on_region.next_boundary is None  # dash boundaries are dynamic (§6)
+    off_region = _dash_drive(model, meter, 5.9, 6.1)
+    assert off_region.desired is False
+
+
+def test_dash_respects_safety_gate():
+    """Even mid-ON dash, a safety_ok=False input forces desired False."""
+    model = _build_path_model([(0.0, 0.0), (10.0, 0.0)], [True, True])
+    meter = DashMeter(6.0, 3.0, "on")
+    _dash_drive(model, meter, 0.0, 3.0)  # arm + into ON region
+    blocked = _make_spray_decision(
+        model=model, nozzle_n=3.0, nozzle_e=0.0, speed_mps=1.0,
+        safety_ok=False, safety_reason="pivoting in place",
+        solenoid_open_delay_s=0.0, solenoid_close_delay_s=0.0,
+        on_overspray_margin_m=0.0, off_overspray_margin_m=0.0,
+        max_xtrack_error_m=0.10, mode="dash", dash_meter=meter, dt_s=1.0,
+    )
+    assert blocked.geometry_desired is True   # pattern still wants ON
+    assert blocked.desired is False           # but safety gate wins
+
+
+def test_session_config_cb_selects_dash():
+    node = make_node()
+    cfg = SpraySessionConfig(
+        schema_version=SCHEMA_VERSION, mode="dash", points=(), flags=(),
+        dash=DashConfig(6.0, 3.0, "on"), points_mode=None,
+    )
+    node._session_config_cb(_Msg(_json.dumps(to_dict(cfg))))
+    assert node._session_mode == "dash"
+    assert node._dash_meter is not None
+    assert node._dash_meter.on_distance_m == 6.0
+    assert node._dash_meter.off_distance_m == 3.0
+
+
+def test_session_config_cb_back_to_continuous_clears_meter():
+    node = make_node()
+    node._session_config_cb(_Msg(_json.dumps(to_dict(SpraySessionConfig(
+        SCHEMA_VERSION, "dash", (), (), DashConfig(6.0, 3.0, "on"), None)))))
+    assert node._dash_meter is not None
+    node._session_config_cb(_Msg(_json.dumps(to_dict(SpraySessionConfig(
+        SCHEMA_VERSION, "continuous", (), (), None, None)))))
+    assert node._session_mode == "continuous"
+    assert node._dash_meter is None
+
+
+def test_bad_session_config_keeps_last_mode():
+    node = make_node()
+    node._session_config_cb(_Msg(_json.dumps(to_dict(SpraySessionConfig(
+        SCHEMA_VERSION, "dash", (), (), DashConfig(6.0, 3.0, "on"), None)))))
+    assert node._session_mode == "dash"
+    node._session_config_cb(_Msg("{ not valid json"))          # malformed
+    assert node._session_mode == "dash"                         # unchanged
+    node._session_config_cb(_Msg(_json.dumps({"schema_version": 999, "mode": "continuous"})))
+    assert node._session_mode == "dash"                         # schema mismatch ignored
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

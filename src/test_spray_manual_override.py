@@ -320,6 +320,10 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._path_model = None
     node._session_config = cleared_config()
     node._config_fingerprint = node._session_config.path_fingerprint()
+    # B0 / Phase C mode state (default continuous == pre-B0 behaviour).
+    node._session_mode = "continuous"
+    node._dash_meter = None
+    node._last_tick_monotonic = None
     node._last_decision = None
     node._pose_ned = None
     node._pose_recv_time = None

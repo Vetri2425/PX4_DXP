@@ -30,6 +30,7 @@ one intended exception: `/spray/state` now reflects a *confirmed* ON only
 
 from __future__ import annotations
 
+import json
 import math
 import signal
 import time
@@ -48,10 +49,13 @@ from nav_msgs.msg import Path
 from std_msgs.msg import Bool, Float32MultiArray, String
 
 from spray_fsm import SpraySafetyStateMachine, SprayCommand, SprayState
+from spray_modes import DashMeter
 from spray_session_config import (
+    ConfigSchemaError,
     SpraySessionConfig,
     cleared_config,
     continuous_config_from_path,
+    parse_session_config,
 )
 from spray_status import make_status, status_to_json_safe
 
@@ -286,6 +290,9 @@ def _make_spray_decision(
     on_overspray_margin_m: float,
     off_overspray_margin_m: float,
     max_xtrack_error_m: float,
+    mode: str = "continuous",
+    dash_meter: Optional["DashMeter"] = None,
+    dt_s: float = 0.0,
 ) -> SprayDecision:
     projection: Optional[SprayProjection] = None
     boundary: Optional[SprayBoundary] = None
@@ -304,7 +311,27 @@ def _make_spray_decision(
                 f"xtrack error {projection.xtrack_error_m:.3f}m "
                 f"> {max_xtrack_error_m:.3f}m"
             )
-        if boundary is not None:
+        if mode == "dash" and dash_meter is not None:
+            # Dash metering (plan §7.2): geometry_desired comes from cumulative
+            # arc-length, not the static MARK/transit flag. Boundaries are
+            # dynamic, so there is no single "next boundary" — null it (status
+            # then reports distance_to_boundary_m=None per §6). The same
+            # solenoid lead as continuous is applied inside the meter so the
+            # physical toggle lands on the ideal grid. Corner deferral is
+            # handled upstream by the pivot-state gate (plan §5), so the meter
+            # keeps integrating through a stop and the phase never drifts.
+            on_lead = speed_mps * solenoid_open_delay_s + on_overspray_margin_m
+            off_lead = max(
+                0.0, speed_mps * solenoid_close_delay_s - off_overspray_margin_m
+            )
+            xtrack_ok = projection.xtrack_error_m <= max_xtrack_error_m
+            du = dash_meter.update(
+                projection.s, speed_mps, dt_s, xtrack_ok, on_lead, off_lead
+            )
+            geometry_desired = du.geometry_desired
+            boundary = None
+            distance_to_boundary = float("inf")
+        elif boundary is not None:
             distance_to_boundary = boundary.s - projection.s
             # ON is intentionally early by solenoid delay plus overspray
             # margin. OFF is early only by close delay; an explicit OFF
@@ -449,13 +476,20 @@ class SprayControllerNode(Node):
         self._fsm = SpraySafetyStateMachine()
         self._path_model: Optional[SprayPathModel] = None
         # Internal SpraySessionConfig representation (plan §3), kept
-        # alongside _path_model. /path (unchanged) is still the Phase A
-        # ingestion source — there is no /spray/session_config subscription
-        # yet (that lands with dash/point modes); this is purely how the
-        # node represents /path geometry internally now, and gives it a
-        # local fingerprint for future change-detection.
+        # alongside _path_model. /path stays the geometry/path-model source
+        # for ALL modes (continuous mode is field-validated off it and is left
+        # byte-identical); /spray/session_config (B0) layers the operator's
+        # MODE + mode params on top. The server publishes both from the same
+        # staged mission, so their geometry agrees by construction.
         self._session_config: SpraySessionConfig = cleared_config()
         self._config_fingerprint: str = self._session_config.path_fingerprint()
+        # B0 / Phase C mode state. Default "continuous" so a node that never
+        # receives a session_config behaves exactly as it did before B0.
+        self._session_mode: str = "continuous"
+        self._dash_meter: Optional[DashMeter] = None
+        # Measured tick interval for arc-length jump-tolerance (§7.2). Seeded
+        # on the first dash tick; monotonic clock, never wall time.
+        self._last_tick_monotonic: Optional[float] = None
         self._last_decision: Optional[SprayDecision] = None
         self._pose_ned: Optional[tuple[float, float, float]] = None
         self._pose_recv_time = None
@@ -506,6 +540,20 @@ class SprayControllerNode(Node):
             Path,
             "/path",
             self._path_cb,
+            _path_qos(),
+            callback_group=self._group,
+        )
+        # B0 (plan §3): the mission-config transport. RELIABLE + TRANSIENT_LOCAL
+        # (same durability class as /path) so a late-joining / restarted spray
+        # node re-latches the current mission's mode automatically. The node is
+        # the ONLY parser of this schema (defect #2/#3 avoidance) and never
+        # trusts a caller-supplied fingerprint. Absent this message the node
+        # stays in its default continuous behaviour — fully backward-compatible
+        # with a mission that publishes only /path.
+        self.create_subscription(
+            String,
+            "/spray/session_config",
+            self._session_config_cb,
             _path_qos(),
             callback_group=self._group,
         )
@@ -654,6 +702,64 @@ class SprayControllerNode(Node):
             f"spray path loaded: {len(points)} points, "
             f"{len(self._path_model.boundaries)} boundaries"
         )
+
+    def _session_config_cb(self, msg: String) -> None:
+        """B0 — receive the operator-selected mode + mode params (plan §3).
+
+        Fail static: any malformed or schema-mismatched config is logged and
+        the last-known-good mode is kept — never fail open into a wrong mode.
+        Geometry is NOT taken from here (it stays on /path); this selects the
+        mode and, for dash, builds the arc-length meter.
+        """
+        try:
+            data = json.loads(msg.data)
+        except (ValueError, TypeError) as exc:
+            self.get_logger().warn(
+                f"spray session_config: bad JSON, keeping mode={self._session_mode}: {exc}"
+            )
+            return
+        try:
+            cfg = parse_session_config(data)
+        except ConfigSchemaError as exc:
+            self.get_logger().warn(
+                f"spray session_config rejected ({exc}); keeping mode={self._session_mode}"
+            )
+            return
+
+        prev_mode = self._session_mode
+        self._session_mode = cfg.mode
+        self._session_config = cfg
+
+        if cfg.mode == "dash" and cfg.dash is not None:
+            try:
+                self._dash_meter = DashMeter(
+                    cfg.dash.on_distance_m,
+                    cfg.dash.off_distance_m,
+                    cfg.dash.start_state,
+                )
+            except ValueError as exc:
+                self.get_logger().warn(
+                    f"dash config invalid ({exc}); reverting to continuous"
+                )
+                self._session_mode = "continuous"
+                self._dash_meter = None
+        else:
+            # continuous / point / cleared → no dash meter. (Point behaviour
+            # is Phase D; until then point mode simply lays no paint.)
+            self._dash_meter = None
+
+        self._last_tick_monotonic = None  # reseed dt on the next dash tick
+        # A mode/config change resets the FSM RECOVERY backoff (plan §4).
+        self._fsm.note_event_reset(time.monotonic())
+        if cfg.mode != prev_mode:
+            extra = ""
+            if cfg.mode == "dash" and self._dash_meter is not None:
+                extra = (
+                    f" (on={self._dash_meter.on_distance_m}m "
+                    f"off={self._dash_meter.off_distance_m}m "
+                    f"start={self._dash_meter.phase})"
+                )
+            self.get_logger().info(f"spray mode: {prev_mode} -> {self._session_mode}{extra}")
 
     def _pose_cb(self, msg: PoseStamped) -> None:
         self._pose_ned = _pose_to_ned(msg)
@@ -817,6 +923,14 @@ class SprayControllerNode(Node):
             speed,
             velocity_fresh=velocity_fresh,
         )
+        # Measured tick interval for dash arc-length jump-tolerance (§7.2).
+        # Monotonic clock; the first tick after a mode change seeds it (dt=0),
+        # which the meter treats as "no travel" — safe (no toggle that tick).
+        now_mono = time.monotonic()
+        dt_s = 0.0
+        if self._last_tick_monotonic is not None:
+            dt_s = max(0.0, now_mono - self._last_tick_monotonic)
+        self._last_tick_monotonic = now_mono
         decision = _make_spray_decision(
             model=model,
             nozzle_n=nozzle_n,
@@ -824,6 +938,9 @@ class SprayControllerNode(Node):
             speed_mps=speed,
             safety_ok=safety_ok,
             safety_reason=safety_reason,
+            mode=self._session_mode,
+            dash_meter=self._dash_meter,
+            dt_s=dt_s,
             solenoid_open_delay_s=max(
                 0.0,
                 float(self.get_parameter("solenoid_open_delay_s").value),
@@ -1205,8 +1322,11 @@ class SprayControllerNode(Node):
                 distance_to_boundary_m = decision.distance_to_boundary_m
             if decision.projection is not None:
                 xtrack_error_m = decision.projection.xtrack_error_m
+        mode_state: dict = {}
+        if self._session_mode == "dash" and self._dash_meter is not None:
+            mode_state = self._dash_meter.mode_state()
         status = make_status(
-            mode="continuous",
+            mode=self._session_mode,
             fsm_state=self._fsm.state.value,
             spraying=self._fsm.spraying,
             desired=desired,
@@ -1221,7 +1341,7 @@ class SprayControllerNode(Node):
             gps_fix_ok=True,
             gps_fix_name="not_evaluated",
             xtrack_error_m=xtrack_error_m,
-            mode_state={},
+            mode_state=mode_state,
         )
         msg = String()
         msg.data = status_to_json_safe(status)
