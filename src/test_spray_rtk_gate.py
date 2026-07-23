@@ -17,10 +17,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from mavros_msgs.msg import GPSRAW  # noqa: E402  (real msg, in-env only)
-
+# Import the harness FIRST — it installs the ROS stubs (incl. the GPSRAW stub),
+# so this test runs on the Mac too. GPSRAW must be imported AFTER that.
 from test_spray_manual_override import _Param, make_node  # noqa: E402
 from spray_controller_node import _build_path_model  # noqa: E402
+from mavros_msgs.msg import GPSRAW  # noqa: E402  (stub after harness import)
 
 
 def _enable_gate(node):
@@ -122,11 +123,14 @@ def test_gate_ordering_in_auto_safety():
     node._path_model = _build_path_model([(0.0, 0.0), (5.0, 0.0)], [True, True])
     ok, reason = node._auto_safety_status(pose_fresh=True, speed=0.3, velocity_fresh=True)
     assert ok is False and reason == "gps stale"
-    # Give a held-good fix → gate opens (no pivot active in the fixture).
+    # Give a good fix; the recover hold starts on this first good tick, so it
+    # takes another tick past gps_recover_hold_s before the gate opens.
     _set_fix(node, 6)
+    ok, _ = node._auto_safety_status(pose_fresh=True, speed=0.3, velocity_fresh=True)
+    assert ok is False  # recovering, hold not yet elapsed
     _advance(node, 1.2)
     ok, reason = node._auto_safety_status(pose_fresh=True, speed=0.3, velocity_fresh=True)
-    assert ok is True and reason == ""
+    assert ok is True and reason == ""  # no pivot active in the fixture
 
 
 if __name__ == "__main__":

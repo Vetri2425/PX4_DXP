@@ -49,7 +49,12 @@ def _install_ros_stubs() -> None:
         armed = False
         mode = ""
 
+    class _GPSRAW:
+        def __init__(self):
+            self.fix_type = 0
+
     mavros_msg.State = _State
+    mavros_msg.GPSRAW = _GPSRAW
     mavros_srv = types.ModuleType("mavros_msgs.srv")
 
     class _CommandLongRequest:
