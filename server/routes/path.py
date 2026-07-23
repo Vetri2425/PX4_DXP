@@ -850,6 +850,65 @@ async def save_path_extensions(name: str, req: PathExtensionConfig):
     )
 
 
+# ── Point-mission CSV ingest (mobile app) ───────────────────────────────────────
+# The app's CSV import posts here BEFORE staging: these routes only parse + return
+# staged-ready points (they do not touch the controller). The frontend then feeds
+# the returned point_mission_points into POST /{name}/plan-and-stage, which bridges
+# them onto /path as must-hit vertices (see plan_and_stage). point_ingest lives in
+# ../src alongside the ROS nodes, so add it to sys.path lazily like the node code.
+
+def _import_point_ingest():
+    import sys
+    from pathlib import Path as _FsPath
+
+    src = _FsPath(__file__).resolve().parents[2] / "src"
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    import point_ingest  # noqa: E402
+    return point_ingest
+
+
+@path_router.post("/parse-point-csv")
+async def parse_point_csv(file: UploadFile = File(...)):
+    """Parse a point-mission CSV (north,east[,dwell_s[,mark]]) into staged-ready points.
+
+    NED metres, anchor-free. Returns the point list only — stage via
+    /{name}/plan-and-stage. Dwell policy uses point_ingest's field defaults
+    (2 s default, 60 s max); the mission's actual dwell is set at stage time from
+    PathPlanRequest.point_dwell_s.
+    """
+    pi = _import_point_ingest()
+    content = (await file.read()).decode("utf-8", errors="replace")
+    try:
+        points = pi.parse_point_csv_text(content)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    return {
+        "num_points": len(points),
+        "point_mission_points": pi.points_to_staged_dict(points),
+    }
+
+
+@path_router.post("/parse-point-gps-csv")
+async def parse_point_gps_csv(file: UploadFile = File(...)):
+    """Parse a GPS point-mission CSV (lat,lon[,dwell_s][,mark]) into staged-ready points.
+
+    The first data row is the survey anchor; every row is projected to
+    anchor-relative NED metres (Karney geodesic). Returns num_points, anchor,
+    point_source_frame="GPS_SURVEYED" and point_mission_points — the exact shape
+    the mobile app hands back to /{name}/plan-and-stage.
+    """
+    pi = _import_point_ingest()
+    content = (await file.read()).decode("utf-8", errors="replace")
+    try:
+        parsed = pi.parse_point_gps_csv_text(content)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    except ImportError as exc:  # geographiclib missing on the host
+        raise HTTPException(500, str(exc))
+    return pi.gps_point_mission_parse_payload(parsed)
+
+
 # ── Upload ────────────────────────────────────────────────────────────────────
 
 @path_router.post("/upload")
@@ -1745,41 +1804,94 @@ async def plan_and_stage(name: str, req: PathPlanRequest):
     ref_points_dxf = [(pt.dxf_y, pt.dxf_x) for pt in req.ref_points] if req.ref_points is not None else None
     ref_points_gps = [(pt.lat, pt.lon) for pt in req.ref_points] if req.ref_points is not None else None
 
-    try:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(
-                path_mgr.plan_path,
-                safe,
-                summary_only=False,
-                line_spacing=req.line_spacing,
-                transit_spacing=req.transit_spacing,
-                marking_speed=req.marking_speed,
-                transit_speed=req.transit_speed,
-                layer_mapping=req.layer_mapping,
-                optimize=req.optimize,
-                compensate_spray=False,   # never: see spray_compensation_warning above
-                corner_smooth_radius_m=req.corner_smooth_radius_m,
-                corner_smooth_arc_pts=req.corner_smooth_arc_pts,
-                use_two_opt=req.use_two_opt,
-                max_two_opt_segments=req.max_two_opt_segments,
-                max_waypoints=req.max_waypoints,
-                max_segments=req.max_segments,
-                origin=origin,
-                start_position=start_position,
-                origin_gps=origin_gps,
-                rotation_deg=req.rotation_deg,
-                ref_points_dxf=ref_points_dxf,
-                ref_points_gps=ref_points_gps,
-                close_loop=req.close_loop,
-            ),
-            timeout=15.0,
+    # Point mission (mobile CSV flow): the waypoints ARE the surveyed points —
+    # there is no file-based line geometry to plan. path_mgr.plan_path() would
+    # read `name` as NED/DXF line geometry and raise on a point CSV, so skip the
+    # planner entirely and synthesize a result that stages the points as must-hit
+    # /path vertices (the native Upgrade_Spray point model: RPP point-hold + the
+    # spray node's per-must-hit dwell). `mark` maps to BOTH the must-hit flag and
+    # the spray flag, so only marked points become stop + spray-dwell targets and
+    # an unmarked point is a plain transit vertex (never sprayed — the spray node
+    # dwells on EVERY must-hit vertex regardless of the spray bit). Requires the
+    # GPS_SURVEYED frame + an origin_gps anchor, matching the app's contract; any
+    # other shape falls through to the ordinary line planner unchanged.
+    is_point_mission = bool(
+        req.point_mission_points
+        and req.point_source_frame == "GPS_SURVEYED"
+        and req.origin_gps
+    )
+
+    if is_point_mission:
+        pts = req.point_mission_points
+        waypoints = [[float(p.north_m), float(p.east_m)] for p in pts]
+        flags = [bool(p.mark) for p in pts]
+        transit_len = sum(
+            math.hypot(waypoints[i + 1][0] - waypoints[i][0],
+                       waypoints[i + 1][1] - waypoints[i][1])
+            for i in range(len(waypoints) - 1)
         )
-    except FileNotFoundError as exc:
-        raise HTTPException(404, str(exc))
-    except asyncio.TimeoutError:
-        raise HTTPException(504, "Planning timed out (15s limit)")
-    except Exception as exc:
-        raise HTTPException(422, f"Planning error: {exc}")
+        # Dots are dwell-sprayed, not line-sprayed → the mission's spray mode is
+        # "point" regardless of the (defaulted) request field; force it so the
+        # staged spray_session tells the node to run its point-dwell FSM.
+        req.spray_mode = "point"
+        result = {
+            "source": safe,
+            "num_waypoints": len(waypoints),
+            "num_segments": 0,
+            "mark_length_m": 0.0,
+            "transit_length_m": transit_len,
+            "total_length_m": transit_len,
+            "segments": [],
+            "merged_waypoints": waypoints,
+            "spray_flags": flags,
+            "must_hit": flags,
+            "alignment_metadata": {
+                "method": "gps_origin",
+                "origin_gps": list(req.origin_gps),
+                "rotation_deg": req.rotation_deg,
+                "scale": 1.0,
+                "fitted_scale": 1.0,
+                "rmse": 0.0,
+            },
+            "planning_metadata": {},
+            "warnings": [],
+        }
+    else:
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    path_mgr.plan_path,
+                    safe,
+                    summary_only=False,
+                    line_spacing=req.line_spacing,
+                    transit_spacing=req.transit_spacing,
+                    marking_speed=req.marking_speed,
+                    transit_speed=req.transit_speed,
+                    layer_mapping=req.layer_mapping,
+                    optimize=req.optimize,
+                    compensate_spray=False,   # never: see spray_compensation_warning above
+                    corner_smooth_radius_m=req.corner_smooth_radius_m,
+                    corner_smooth_arc_pts=req.corner_smooth_arc_pts,
+                    use_two_opt=req.use_two_opt,
+                    max_two_opt_segments=req.max_two_opt_segments,
+                    max_waypoints=req.max_waypoints,
+                    max_segments=req.max_segments,
+                    origin=origin,
+                    start_position=start_position,
+                    origin_gps=origin_gps,
+                    rotation_deg=req.rotation_deg,
+                    ref_points_dxf=ref_points_dxf,
+                    ref_points_gps=ref_points_gps,
+                    close_loop=req.close_loop,
+                ),
+                timeout=15.0,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc))
+        except asyncio.TimeoutError:
+            raise HTTPException(504, "Planning timed out (15s limit)")
+        except Exception as exc:
+            raise HTTPException(422, f"Planning error: {exc}")
 
     alignment_meta = result.get("alignment_metadata") or {}
     rmse = alignment_meta.get("rmse", 0.0)

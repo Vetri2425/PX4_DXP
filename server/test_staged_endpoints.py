@@ -502,3 +502,121 @@ def test_plan_path_default_has_no_segment_points(tmp_path):
     # opt-in flag adds them
     result2 = mgr.plan_path("square.dxf", include_segment_points=True)
     assert all("points" in s for s in result2["segments"])
+
+
+# ── point-mission CSV bridge (mobile flow) ─────────────────────────────────────
+#
+# The app parses a lat,lon CSV (parse-point-gps-csv) then POSTs the resulting
+# point_mission_points to /plan-and-stage with point_source_frame=GPS_SURVEYED.
+# The bridge must stage those points as must-hit /path vertices (spray_mode
+# "point") so the EXISTING load-to-controller + RPP point-hold model drives them —
+# no PointMissionOrchestrator. These pin that bridge and its guard scope.
+
+def _point_req(marks):
+    """A GPS point-mission PathPlanRequest with one point per entry in `marks`."""
+    from models import PointMissionPoint
+    pts = [
+        PointMissionPoint(north_m=float(i), east_m=0.0, dwell_s=2.0,
+                          source_index=i + 1, mark=m)
+        for i, m in enumerate(marks)
+    ]
+    from models import PathPlanRequest
+    return PathPlanRequest(
+        source="pts.csv",
+        point_source_frame="GPS_SURVEYED",
+        origin_gps=[13.0721, 80.2620],
+        point_mission_points=pts,
+        rotation_deg=0.0,
+    )
+
+
+async def test_point_mission_stages_marks_as_must_hit_dots(tmp_path, monkeypatch):
+    _, staging = _setup(tmp_path, monkeypatch)
+
+    plan = await path_route.plan_and_stage("pts.csv", _point_req([True, True, True]))
+
+    assert plan.num_waypoints == 3
+    assert plan.must_hit == [True, True, True]     # every mark is a dwell target
+    assert plan.spray_flags == [True, True, True]
+    mid = plan.mission_summary.mission_id
+
+    with open(os.path.join(staging, f"{mid}.json")) as f:
+        staged = json.load(f)
+    assert staged["waypoints"] == [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]
+    assert staged["must_hit"] == [True, True, True]
+    assert staged["spray_flags"] == [True, True, True]
+    # Forced to point so the spray node runs its dwell FSM, not continuous.
+    assert staged["spray_session"]["mode"] == "point"
+    # Surveyed → must re-bind into the live EKF at start.
+    assert staged["placement_mode"] == "GPS_SURVEYED"
+    assert staged["anchor"]["lat"] == 13.0721 and staged["anchor"]["lon"] == 80.2620
+    assert staged["origin_gps"] == [13.0721, 80.2620]
+
+
+async def test_point_mission_unmarked_point_is_transit_never_sprayed(
+    tmp_path, monkeypatch
+):
+    """mark=False ⇒ must_hit AND spray both False.
+
+    The spray node dwells on EVERY must-hit vertex regardless of the spray bit
+    (spray_controller_node.py: coords = must-hit vertices), so an unmarked point
+    must NOT be must-hit or it would be sprayed. It stays a plain transit vertex.
+    """
+    _, staging = _setup(tmp_path, monkeypatch)
+
+    plan = await path_route.plan_and_stage("pts.csv", _point_req([True, False, True]))
+
+    assert plan.must_hit == [True, False, True]
+    assert plan.spray_flags == [True, False, True]
+    with open(os.path.join(staging, f"{plan.mission_summary.mission_id}.json")) as f:
+        staged = json.load(f)
+    assert staged["must_hit"] == [True, False, True]
+    assert staged["spray_flags"] == [True, False, True]
+
+
+async def test_point_mission_load_to_controller_gets_must_hit_points(
+    tmp_path, monkeypatch
+):
+    """End-to-end: stage → load-to-controller hands the points + must-hit to the
+    controller (the existing must-hit /path load path, unchanged)."""
+    _, staging = _setup(tmp_path, monkeypatch)
+    ctrl = OffboardController(None, deque())
+    monkeypatch.setattr(main, "offboard_ctrl", ctrl)
+
+    plan = await path_route.plan_and_stage("pts.csv", _point_req([True, True, True]))
+    mid = plan.mission_summary.mission_id
+
+    from models import LoadMissionRequest
+    resp = await path_route.load_mission_to_controller(LoadMissionRequest(mission_id=mid))
+
+    assert resp["status"] == "success"
+    assert resp["num_waypoints"] == 3
+    assert resp["placement_mode"] == "GPS_SURVEYED"
+    assert ctrl._loaded_pts == [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)]
+    assert ctrl._loaded_must_hit == [True, True, True]
+
+
+async def test_plan_and_stage_ignores_points_without_gps_frame(tmp_path, monkeypatch):
+    """Guard scope: point_mission_points WITHOUT the GPS_SURVEYED frame must NOT
+    hijack the planner — it falls through to the ordinary DXF/line engine.
+
+    Proven by pointing `name` at the real square.dxf: if the bridge wrongly fired
+    it would stage the two bogus points; instead the engine plans the square.
+    """
+    _, staging = _setup(tmp_path, monkeypatch)  # writes square.dxf
+    from models import PathPlanRequest, PointMissionPoint
+    req = PathPlanRequest(
+        source="square.dxf",
+        point_mission_points=[
+            PointMissionPoint(north_m=0.0, east_m=0.0, dwell_s=2.0, source_index=1),
+            PointMissionPoint(north_m=9.0, east_m=9.0, dwell_s=2.0, source_index=2),
+        ],
+        # no point_source_frame, no origin_gps → not a point mission
+    )
+    plan = await path_route.plan_and_stage("square.dxf", req)
+    # The square planned by the engine has many densified waypoints, never the 2
+    # raw points, and its mode stays continuous (default).
+    assert plan.num_waypoints > 2
+    with open(os.path.join(staging, f"{plan.mission_summary.mission_id}.json")) as f:
+        staged = json.load(f)
+    assert staged["spray_session"]["mode"] == "continuous"

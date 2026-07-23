@@ -422,6 +422,24 @@ class RefPoint(BaseModel):
     lon: float  # WGS84 longitude
 
 
+class PointMissionPoint(BaseModel):
+    """One surveyed marking/stop point in a point-mission (mirrors the mobile app
+    and ``src/point_ingest.SprayPoint``).
+
+    Coordinates are anchor-relative NED metres (the GPS parse endpoint projects
+    lat/lon → NED against the first row as anchor). ``mark`` True = spray a dot
+    here; the point-mission bridge maps ``mark`` to BOTH the /path must-hit flag
+    and the spray flag, so only marked points become RPP stop + spray-dwell
+    targets (an unmarked point is a plain transit vertex, never sprayed).
+    """
+
+    north_m: float
+    east_m: float
+    dwell_s: Optional[float] = None
+    source_index: int = 0
+    mark: bool = True
+
+
 class PathPlanRequest(BaseModel):
     """Request for /api/path/plan."""
 
@@ -491,6 +509,13 @@ class PathPlanRequest(BaseModel):
     # "arrived". Defaults are field-reasonable (1 s dwell, 10 cm tolerance).
     point_dwell_s: float = Field(1.0, gt=0.0, le=60.0)
     point_arrival_tolerance_m: float = Field(0.10, gt=0.0, le=5.0)
+    # Point-mission ingest (mobile CSV flow). When present with
+    # point_source_frame=="GPS_SURVEYED" + origin_gps, /plan-and-stage skips the
+    # line planner and stages these points directly as must-hit /path vertices
+    # (see server/routes/path.py plan_and_stage). None ⇒ ordinary DXF/line plan,
+    # byte-for-byte unchanged.
+    point_source_frame: Optional[str] = None  # "GPS_SURVEYED" | "LOCAL_NED"
+    point_mission_points: Optional[list[PointMissionPoint]] = None
 
 
 class SprayModeDashRequest(BaseModel):
