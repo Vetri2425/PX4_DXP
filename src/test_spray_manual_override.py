@@ -283,6 +283,13 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "max_xtrack_error_m": _Param(0.10),
         "pose_timeout_s": _Param(0.5),
         "velocity_timeout_s": _Param(0.5),
+        # Phase B RTK gate — OFF in the fixture (opt-in per test) so the many
+        # existing gate tests, which carry no GPSRAW, are unaffected. Production
+        # default (declare_parameter) is True.
+        "spray_require_rtk_fix": _Param(False),
+        "spray_min_fix_type": _Param(6),
+        "gps_fix_timeout_s": _Param(2.0),
+        "gps_recover_hold_s": _Param(1.0),
         "allow_legacy_spray_active_fallback": _Param(True),
         "actuator_backend": _Param("mavlink_actuator"),
         "servo_instance": _Param(1),
@@ -324,6 +331,10 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._session_mode = "continuous"
     node._dash_meter = None
     node._last_tick_monotonic = None
+    # Phase B RTK gate state.
+    node._gps_fix_type = 0
+    node._gps_recv_time = None
+    node._gps_recover_since = None
     node._last_decision = None
     node._pose_ned = None
     node._pose_recv_time = None

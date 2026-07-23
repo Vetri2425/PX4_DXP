@@ -43,7 +43,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from geometry_msgs.msg import PoseStamped, TwistStamped
-from mavros_msgs.msg import State
+from mavros_msgs.msg import GPSRAW, State
 from mavros_msgs.srv import CommandLong
 from nav_msgs.msg import Path
 from std_msgs.msg import Bool, Float32MultiArray, String
@@ -72,6 +72,13 @@ MARK_TO_TRANSIT = "MARK_TO_TRANSIT"
 # node already runs standalone in tests. If the RPP's enum ever renumbers, this
 # breaks silently -- test_spray_pivot_gate.py pins the contract.
 _SEGMENT_STATE_CORNER_ALIGN = 3
+
+# GPSRAW.fix_type → human name (Phase B RTK gate, §7.6). Same mapping the RPP
+# node's P0.3 gate uses. 6 = RTK_FIXED (the marking bar), 5 = RTK_FLOAT.
+_GPS_FIX_NAMES = {
+    0: "NO_FIX", 1: "NO_FIX", 2: "2D", 3: "3D",
+    4: "DGPS", 5: "RTK_FLOAT", 6: "RTK_FIXED",
+}
 
 
 def _best_effort_qos(depth: int = 1) -> QoSProfile:
@@ -437,6 +444,21 @@ class SprayControllerNode(Node):
         self.declare_parameter("max_xtrack_error_m", 0.10)
         self.declare_parameter("pose_timeout_s", 0.5)
         self.declare_parameter("velocity_timeout_s", 0.5)
+        # ── Phase B: RTK / GPS fix-quality gate (plan §7.6) ──────────────────
+        # Master enable. True demands a healthy RTK fix before AUTO spray;
+        # set False for SITL / bench runs with no RTK (mirrors the RPP node's
+        # `require_rtk_fix`). Manual /spray/test is unaffected — it uses the
+        # armed-only gate, not this one.
+        self.declare_parameter("spray_require_rtk_fix", True)
+        # Minimum GPSRAW.fix_type to spray. Default 6 = RTK_FIXED, the same bar
+        # the driving controller uses. Lower to 5 for RTK_FLOAT sites.
+        self.declare_parameter("spray_min_fix_type", 6)
+        # A missing GPSRAW is a FAIL ("gps stale"), never "fix ok, just quiet".
+        # Looser than the 0.5 s pose/velocity gates because GPSRAW is slower.
+        self.declare_parameter("gps_fix_timeout_s", 2.0)
+        # Asymmetric hysteresis: drop is instant (unsafe edge, no debounce);
+        # re-enable only after fix has been continuously good this long.
+        self.declare_parameter("gps_recover_hold_s", 1.0)
         self.declare_parameter("allow_legacy_spray_active_fallback", True)
         # Backend selector: "mavlink_actuator" (cmd 187, normalized) or
         # "mavlink_servo_pwm" (cmd 183, absolute PWM µs).
@@ -490,6 +512,12 @@ class SprayControllerNode(Node):
         # Measured tick interval for arc-length jump-tolerance (§7.2). Seeded
         # on the first dash tick; monotonic clock, never wall time.
         self._last_tick_monotonic: Optional[float] = None
+        # Phase B RTK gate state (§7.6). fix_type 0 = no fix; recv_time None
+        # until the first GPSRAW; recover_since is set the moment fix goes good
+        # and reset to None on any bad/stale sample (asymmetric hysteresis).
+        self._gps_fix_type: int = 0
+        self._gps_recv_time = None
+        self._gps_recover_since = None
         self._last_decision: Optional[SprayDecision] = None
         self._pose_ned: Optional[tuple[float, float, float]] = None
         self._pose_recv_time = None
@@ -578,6 +606,15 @@ class SprayControllerNode(Node):
             Float32MultiArray,
             "/rpp/segment_debug",
             self._segment_debug_cb,
+            _best_effort_qos(),
+            callback_group=self._group,
+        )
+        # Phase B (§7.6): RTK fix quality. Same topic/source as the RPP node's
+        # P0.3 gate — read-only, spray-scoped.
+        self.create_subscription(
+            GPSRAW,
+            "/mavros/gpsstatus/gps1/raw",
+            self._gps_cb,
             _best_effort_qos(),
             callback_group=self._group,
         )
@@ -1007,6 +1044,63 @@ class SprayControllerNode(Node):
         self._segment_state = int(msg.data[1])
         self._segment_state_recv_time = self.get_clock().now()
 
+    def _gps_cb(self, msg: GPSRAW) -> None:
+        """Track GPS fix quality for the Phase B RTK gate (§7.6)."""
+        prev = self._gps_fix_type
+        self._gps_fix_type = int(msg.fix_type)
+        self._gps_recv_time = self.get_clock().now()
+        if prev != self._gps_fix_type:
+            self.get_logger().info(
+                f"spray GPS fix: {_GPS_FIX_NAMES.get(prev, '?')} -> "
+                f"{_GPS_FIX_NAMES.get(self._gps_fix_type, '?')} "
+                f"(fix_type={self._gps_fix_type})"
+            )
+
+    def _gps_health(self) -> tuple[bool, bool, str]:
+        """Pure read of GPS health: (fresh, fix_ok, name). No state mutation.
+
+        Used both by the gate and by status telemetry, so it must not touch the
+        recover-hold timer. `fix_ok` is the instantaneous "fix_type >= min AND
+        fresh" check; the recover-hold delay lives only in _gps_gate().
+        """
+        name = _GPS_FIX_NAMES.get(self._gps_fix_type, f"fix_{self._gps_fix_type}")
+        if self._gps_recv_time is None:
+            return False, False, "no_data"
+        age_s = (self.get_clock().now() - self._gps_recv_time).nanoseconds * 1e-9
+        timeout_s = max(0.0, float(self.get_parameter("gps_fix_timeout_s").value))
+        if age_s > timeout_s:
+            return False, False, name
+        min_fix = int(self.get_parameter("spray_min_fix_type").value)
+        return True, self._gps_fix_type >= min_fix, name
+
+    def _gps_gate(self) -> tuple[bool, str]:
+        """RTK gate with asymmetric hysteresis (§7.6). Mutates the recover timer.
+
+        Drop is instant on a below-threshold OR stale sample (unsafe edge, no
+        debounce). Re-enable only after fix has been continuously good for
+        gps_recover_hold_s — a single good sample after a dropout does not
+        re-open spray. Call exactly once per control tick.
+        """
+        if not bool(self.get_parameter("spray_require_rtk_fix").value):
+            return True, ""
+        fresh, fix_ok, _name = self._gps_health()
+        if not fresh:
+            self._gps_recover_since = None  # any stale sample resets recovery
+            return False, "gps stale"
+        if not fix_ok:
+            self._gps_recover_since = None  # any bad fix resets recovery
+            min_fix = int(self.get_parameter("spray_min_fix_type").value)
+            return False, f"gps fix {self._gps_fix_type} < required {min_fix}"
+        # Fix is good this sample — apply the slow re-enable.
+        now = self.get_clock().now()
+        if self._gps_recover_since is None:
+            self._gps_recover_since = now
+        hold_s = max(0.0, float(self.get_parameter("gps_recover_hold_s").value))
+        held_s = (now - self._gps_recover_since).nanoseconds * 1e-9
+        if held_s < hold_s:
+            return False, f"gps recovering ({held_s:.1f}/{hold_s:.1f}s)"
+        return True, ""
+
     def _pivot_is_active(self) -> bool:
         """True only while the RPP is pivoting the rover in place.
 
@@ -1053,6 +1147,12 @@ class SprayControllerNode(Node):
             return False, "pose stale"
         if not velocity_fresh:
             return False, "velocity stale"
+        # Phase B (§7.6): RTK fix-quality gate. Fail fast on a GPS dropout —
+        # ordered before the pivot check so an RTK loss surfaces as the reason,
+        # not "pivoting". No-op when spray_require_rtk_fix is False (SITL/bench).
+        gps_ok, gps_reason = self._gps_gate()
+        if not gps_ok:
+            return False, gps_reason
         # NOTE: `speed` is intentionally NOT compared against a minimum here.
         # See min_spray_speed_mps's declaration for why the old gate was removed.
         # Spraying is a question of WHERE the nozzle is, not how fast it is
@@ -1325,6 +1425,11 @@ class SprayControllerNode(Node):
         mode_state: dict = {}
         if self._session_mode == "dash" and self._dash_meter is not None:
             mode_state = self._dash_meter.mode_state()
+        # Phase B (§7.6): report real GPS health. gps_fix_ok is the instantaneous
+        # (fresh AND fix>=min); the recover-hold nuance shows up in safety_reason
+        # ("gps recovering") when the RTK gate is the blocking cause.
+        gps_fresh, gps_fix_ok_raw, gps_fix_name = self._gps_health()
+        gps_fix_ok = bool(gps_fresh and gps_fix_ok_raw)
         status = make_status(
             mode=self._session_mode,
             fsm_state=self._fsm.state.value,
@@ -1334,12 +1439,11 @@ class SprayControllerNode(Node):
             safety_ok=safety_ok,
             safety_reason=safety_reason,
             distance_to_boundary_m=distance_to_boundary_m,
-            # The RTK/GPS fix-quality gate is Phase B — it is NOT evaluated
-            # in Phase A. Report gps_fix_ok=True (this gate does not yet
-            # block spray) but label it "not_evaluated" so no consumer
-            # mistakes this for a real, checked RTK-healthy signal.
-            gps_fix_ok=True,
-            gps_fix_name="not_evaluated",
+            # Phase B (§7.6): real RTK health (computed above). The gate blocks
+            # AUTO spray when spray_require_rtk_fix is True and fix is bad/stale;
+            # safety_reason carries the specific cause.
+            gps_fix_ok=gps_fix_ok,
+            gps_fix_name=gps_fix_name,
             xtrack_error_m=xtrack_error_m,
             mode_state=mode_state,
         )
