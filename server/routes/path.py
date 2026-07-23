@@ -69,6 +69,8 @@ from models import (
     PathSegmentsResponse,
     RefPointResidual,
     SegmentInfo,
+    SprayModeDashRequest,
+    SprayModePointRequest,
     StagedMissionResponse,
 )
 from path_manager import UploadValidationError
@@ -1369,6 +1371,121 @@ async def load_mission_to_controller(req: LoadMissionRequest):
         "anchor_loaded": anchor is not None,
         "placement_mode": placement_mode,
         "origin_gps": list(origin_gps) if origin_gps else None,
+    }
+
+
+# ── Spray pattern ("Apply pattern" from the mobile app) ─────────────────────────
+# The app sets the spray pattern on a selected PATH, separate from planning:
+#   PUT /api/path/{name}/spray-mode/{continuous|dash|point}
+# Geometry (MARK/transit + must-hit) rides /path from the loaded mission; these
+# routes only publish the MODE overlay on /spray/session_config, which the spray
+# node latches (RELIABLE + TRANSIENT_LOCAL) and applies to the current geometry.
+#
+# Ordering: apply AFTER the mission is loaded. load-to-controller republishes
+# the mission's staged mode (continuous by default), which would override a mode
+# set before load.
+
+def _publish_spray_session(safe_name: str, cfg_json: str, mode: str) -> dict:
+    """Publish a session_config to the spray node. Best-effort; never raises.
+
+    Off-ROS (Mac dev) or with a missing publisher this returns published=False
+    with the reason — the route still succeeds so the contract is verifiable
+    without a live ROS graph.
+    """
+    try:
+        from main import ros_node
+        ros_node.publish_spray_session_config(cfg_json)
+        return {"published": True, "detail": None}
+    except Exception as exc:  # noqa: BLE001 — publish is best-effort/off-ROS
+        log.warning("spray-mode publish failed for %s (mode=%s): %s",
+                    safe_name, mode, exc)
+        return {"published": False, "detail": str(exc)}
+
+
+@path_router.put("/{name}/spray-mode/continuous")
+async def set_spray_mode_continuous(name: str):
+    """Set the selected path to continuous spray (plan-start → plan-stop)."""
+    from spray_session_builder import build_session_config_json
+
+    safe = os.path.basename(name)
+    cfg_json = build_session_config_json("continuous")
+    pub = _publish_spray_session(safe, cfg_json, "continuous")
+    resp = {
+        "status": "ok",
+        "path": safe,
+        "mode": "continuous",
+        "applied_config": json.loads(cfg_json),
+        "published": pub["published"],
+        "warnings": [],
+    }
+    if pub["detail"]:
+        resp["publish_error"] = pub["detail"]
+    return resp
+
+
+@path_router.put("/{name}/spray-mode/dash")
+async def set_spray_mode_dash(name: str, req: SprayModeDashRequest):
+    """Set the selected path to dash spray (ON/OFF by metres over the path)."""
+    from spray_session_builder import build_session_config_json
+
+    safe = os.path.basename(name)
+    cfg_json = build_session_config_json(
+        "dash",
+        dash_on_distance_m=req.dash_on_distance_m,
+        dash_off_distance_m=req.dash_off_distance_m,
+        dash_start_state="on",
+    )
+    cfg = json.loads(cfg_json)
+    warnings: list[str] = []
+    if cfg.get("mode") != "dash":
+        warnings.append(
+            "dash config incomplete — the node stays continuous "
+            "(both on/off distances must be > 0)."
+        )
+    if req.dash_phase_reset == "per_mark_region":
+        warnings.append(
+            "dash_phase_reset='per_mark_region' accepted but not yet honored: "
+            "the shipped meter runs continuous across the mission."
+        )
+    pub = _publish_spray_session(safe, cfg_json, "dash")
+    resp = {
+        "status": "ok",
+        "path": safe,
+        "mode": "dash",
+        "dash_phase_reset": req.dash_phase_reset,
+        "applied_config": cfg,
+        "published": pub["published"],
+        "warnings": warnings,
+    }
+    if pub["detail"]:
+        resp["publish_error"] = pub["detail"]
+    return resp
+
+
+@path_router.put("/{name}/spray-mode/point")
+async def set_spray_mode_point(name: str, req: SprayModePointRequest):
+    """Acknowledge point spray for the selected path.
+
+    The app's point contract carries no marking-point coordinates, so this route
+    deliberately does NOT publish a session_config: publishing point with no
+    coordinates resolves to continuous and would demote a point mission already
+    loaded with its coordinates. Point marking is realized through the staged
+    point mission (coordinates + must-hit on /path) plus the RPP point-hold A/B
+    (`point_hold_enabled`, default OFF).
+    """
+    safe = os.path.basename(name)
+    return {
+        "status": "ok",
+        "path": safe,
+        "mode": "point",
+        "point_execution_mode": req.point_execution_mode,
+        "published": False,
+        "warnings": [
+            "point marking-point coordinates are not part of this contract; the "
+            "spray node is not switched here. Stop-and-dwell at each point is the "
+            "RPP point-hold A/B — set `point_hold_enabled true` on /rpp_controller "
+            "and run a mission whose must-hit points carry the coordinates."
+        ],
     }
 
 

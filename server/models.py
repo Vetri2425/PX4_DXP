@@ -486,6 +486,36 @@ class PathPlanRequest(BaseModel):
     dash_start_state: str = Field("on", pattern="^(on|off)$")
 
 
+class SprayModeDashRequest(BaseModel):
+    """Body for PUT /api/path/{name}/spray-mode/dash — mirrors the mobile app.
+
+    The app sends ``dash_phase_reset`` ("per_mark_region"). The shipped
+    DashMeter runs continuous-across-mission and does NOT yet reset the pattern
+    per mark region, so the field is accepted and echoed but not honored — the
+    endpoint reports that in ``warnings`` rather than silently pretending.
+    """
+
+    dash_on_distance_m: float = Field(..., gt=0.0, le=1000.0)
+    dash_off_distance_m: float = Field(..., gt=0.0, le=1000.0)
+    dash_phase_reset: str = Field(
+        "per_mark_region", pattern="^(per_mark_region|continuous)$"
+    )
+
+
+class SprayModePointRequest(BaseModel):
+    """Body for PUT /api/path/{name}/spray-mode/point — mirrors the mobile app.
+
+    The app sends only ``point_execution_mode``; it does NOT carry marking-point
+    coordinates. Physical stop-and-dwell at each must-hit point is the RPP
+    point-hold A/B (``point_hold_enabled``, default OFF). Per-point spray
+    metering in the node needs a coordinate list this contract does not provide,
+    so this route acknowledges the selection without demoting a loaded point
+    mission — see ``warnings``.
+    """
+
+    point_execution_mode: str = Field("auto", pattern="^(auto|manual)$")
+
+
 class PathPlanResponse(BaseModel):
     """Response from /api/path/plan."""
 
