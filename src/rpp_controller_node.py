@@ -289,6 +289,26 @@ class RPPControllerNode(Node):
         # acquisition cause false triggers.
         self.declare_parameter("ekf_jump_threshold_m",                0.05)
 
+        # A3 — EKF reset compensation (default OFF; named A/B switch)
+        # When an EKF position reset fires (GNSS re-lock, RTK FLOAT→FIXED),
+        # PX4 teleports its own estimate and shifts its internal setpoints by
+        # `delta_xy` so tracking is continuous. That `delta_xy`/`xy_reset_counter`
+        # is NOT reachable over our MAVROS config (the `odometry` plugin — the
+        # only MAVLink carrier of `reset_counter` — is denylisted). So the jump
+        # itself, already flagged by the P0.2 guard, is used as the reset delta:
+        # it is absorbed into a running offset and subtracted from the tracking
+        # pose, holding the path relationship continuous instead of commanding a
+        # lurch back onto the line (which paints a kink at every RTK re-lock).
+        #   FALSE → exact frozen P0.2 behavior (skip one cycle, no compensation).
+        #   TRUE  → absorb the jump, drive through, keep net cross-track ≈ 0.
+        # This is the A3 opt-in; leave FALSE until a named A/B run validates it.
+        self.declare_parameter("ekf_reset_compensation",              False)
+        # Guard: only absorb jumps up to this magnitude. A larger single jump is
+        # more likely a bad-estimate glitch than a clean RTK reset; absorbing it
+        # would bake a bogus offset into the whole mission frame, so we fall back
+        # to the baseline skip-one-cycle behavior above this cap.
+        self.declare_parameter("ekf_reset_max_absorb_m",             0.30)
+
         # P0.3 — RTK FIX gate
         # fix_type = 6 → RTK_FIXED.  Set false for SITL or non-RTK testing.
         self.declare_parameter("require_rtk_fix",                     True)
@@ -546,6 +566,13 @@ class RPPControllerNode(Node):
         # P0.2 — EKF jump detection: last accepted NED position
         self._last_pos: tuple[float, float] | None = None
 
+        # A3 — EKF reset compensation: cumulative offset (NED, m) absorbed from
+        # position jumps this mission, and a count for post-hoc correlation.
+        # Both stay zero unless `ekf_reset_compensation` is enabled. Subtracted
+        # from the tracking pose so absorbed resets do not appear as cross-track.
+        self._ekf_reset_offset: tuple[float, float] = (0.0, 0.0)
+        self._ekf_reset_count: int = 0
+
         # P0.3 — RTK fix tracking
         self._gps_fix_type: int = 0  # 0 = no fix; 6 = RTK_FIXED
 
@@ -758,6 +785,11 @@ class RPPControllerNode(Node):
         self._last_speed_cmd = 0.0
         # P0.2 — reset jump guard; first pose on new path is always "valid"
         self._last_pos = None
+        # A3 — start each mission with a clean reset-offset frame. The path is
+        # re-anchored to the origin on every load, so any offset accumulated on
+        # a prior mission must not carry over.
+        self._ekf_reset_offset = (0.0, 0.0)
+        self._ekf_reset_count = 0
         self._apply_run(0)
         self._publish_conditioned_path(stamp, expected)
 
@@ -3006,34 +3038,81 @@ class RPPControllerNode(Node):
         # _enu_pose_to_ned twice per cycle; that's now consolidated.
         pos_n, pos_e, yaw_ned = self._enu_pose_to_ned(pose_for_projection)
 
-        # ---- P0.2: EKF / position-jump detection ----
+        # ---- P0.2 / A3: EKF / position-jump detection ----
         # If the pose jumps further than is physically possible in one control
         # cycle (max_v * dt + 3σ_pos), it's an EKF reset or RTK acquisition
-        # artefact. Skip this cycle and do NOT update the controller.
-        # We still update _last_pos so the next cycle compares against the
-        # new (post-jump) position — only one cycle is skipped per event.
+        # artefact — the rover did not physically move, only its estimate did.
+        #
+        # Two responses, selected by `ekf_reset_compensation`:
+        #   • OFF (frozen P0.2 baseline): skip this cycle, do NOT update the
+        #     controller. _last_pos still advances to the post-jump position so
+        #     only one cycle is skipped per event — but the path reference does
+        #     NOT move, so subsequent cycles see the reset as cross-track error
+        #     and steer to close it (A3: paints a kink at the reset).
+        #   • ON (A3): absorb the jump vector into `_ekf_reset_offset` and drive
+        #     through. The offset is subtracted from the tracking pose below, so
+        #     the path relationship stays continuous and net cross-track ≈ 0 —
+        #     PX4's own setpoint-shift convention, done companion-side because
+        #     MAVROS does not expose delta_xy/xy_reset_counter here.
+        comp_enabled = self.get_parameter("ekf_reset_compensation").value
+        max_absorb = float(self.get_parameter("ekf_reset_max_absorb_m").value)
         if self._last_pos is not None:
-            jump_m = math.hypot(pos_n - self._last_pos[0],
-                                pos_e - self._last_pos[1])
+            d_n = pos_n - self._last_pos[0]
+            d_e = pos_e - self._last_pos[1]
+            jump_m = math.hypot(d_n, d_e)
             if jump_m > jump_thr:
-                self.get_logger().warn(
-                    f"Position jump {jump_m * 100:.1f} cm > threshold "
-                    f"{jump_thr * 100:.1f} cm — skipping cycle (EKF reset?)",
-                    throttle_duration_sec=0.5,
-                )
-                self._last_pos = (pos_n, pos_e)
-                # Reset segment hint: after a jump we can't trust the old index
-                self._closest_seg_hint = 0
-                # P1.4 fixup — force full scan next cycle so we relocate the
-                # rover's true segment instead of crawling a window forward
-                # from a stale hint.
-                self._hint_valid = False
-                # B2: emit JUMP_SKIP (5) so observers see the cause-of-pause.
-                # Server watchdog and offboard controller treat it the same
-                # as STALE (RPP_UNHEALTHY_CODES) — same response, more info.
-                self._publish_zero(StateCode.JUMP_SKIP, pose_age_ms=pose_age_s * 1000)
-                return
+                # A3 compensation: only for jumps within the absorb cap. A
+                # larger jump is treated as a suspect estimate, not a clean
+                # reset, and falls through to the baseline skip below.
+                if comp_enabled and jump_m <= max_absorb:
+                    self._ekf_reset_offset = (
+                        self._ekf_reset_offset[0] + d_n,
+                        self._ekf_reset_offset[1] + d_e,
+                    )
+                    self._ekf_reset_count += 1
+                    # A3 post-hoc flag: this WARN is the only in-log marker that
+                    # a reset landed here, so a later kink/offset in the painted
+                    # line can be correlated to it. delta_xy is unavailable over
+                    # MAVROS, so the absorbed jump vector is logged in its place.
+                    self.get_logger().warn(
+                        f"A3 EKF reset absorbed: jump {jump_m * 100:.1f} cm "
+                        f"(Δ={d_n * 100:+.1f},{d_e * 100:+.1f} cm) → cumulative "
+                        f"offset ({self._ekf_reset_offset[0] * 100:+.1f},"
+                        f"{self._ekf_reset_offset[1] * 100:+.1f}) cm "
+                        f"[n={self._ekf_reset_count}] — tracking frame held",
+                        throttle_duration_sec=0.5,
+                    )
+                    # Frame is continuous (offset applied below), so the segment
+                    # hint stays valid and we drive on — no skip, no kink.
+                    # _last_pos advances at the shared assignment just below.
+                else:
+                    self.get_logger().warn(
+                        f"Position jump {jump_m * 100:.1f} cm > threshold "
+                        f"{jump_thr * 100:.1f} cm — skipping cycle (EKF reset?)",
+                        throttle_duration_sec=0.5,
+                    )
+                    self._last_pos = (pos_n, pos_e)
+                    # Reset segment hint: after a jump we can't trust the old index
+                    self._closest_seg_hint = 0
+                    # P1.4 fixup — force full scan next cycle so we relocate the
+                    # rover's true segment instead of crawling a window forward
+                    # from a stale hint.
+                    self._hint_valid = False
+                    # B2: emit JUMP_SKIP (5) so observers see the cause-of-pause.
+                    # Server watchdog and offboard controller treat it the same
+                    # as STALE (RPP_UNHEALTHY_CODES) — same response, more info.
+                    self._publish_zero(StateCode.JUMP_SKIP, pose_age_ms=pose_age_s * 1000)
+                    return
         self._last_pos = (pos_n, pos_e)
+
+        # ---- A3: apply the accumulated EKF-reset offset to the tracking pose ----
+        # No-op when compensation is off (offset stays (0,0)). When on, every
+        # absorbed reset shifts the pose we track with, so the path reference
+        # effectively moves with the estimate and the painted line stays smooth.
+        # _last_pos above intentionally holds the RAW pose so jump detection
+        # keeps working in the estimator's own frame.
+        pos_n -= self._ekf_reset_offset[0]
+        pos_e -= self._ekf_reset_offset[1]
 
         # ---- Run-transition alignment (per-entity profile switching) ----
         # After advancing to a new run, pivot toward its initial heading
