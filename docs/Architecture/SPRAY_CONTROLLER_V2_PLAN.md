@@ -1,6 +1,10 @@
 # Spray Controller Architecture V2 — Implementation Plan
 
-Status: PLANNING — not started. Target branch: `Upgrade_extensions`.
+Status (2026-07-23): Phase A **LANDED + deployed** (FSM, typed telemetry,
+config schema for all 3 modes, `rpp_start.sh` isolation). Phases B0/B/C/D/E/F
+**not started** — see `SPRAY_V2_PHASES_BF_IMPLEMENTATION_PLAN.md` for the
+build order. Branch: `Upgrade_Spray`. This doc is the source design; the
+B–F doc is the sequenced work plan that consumes it.
 Rev 2 (2026-07-15): robustness pass — filled the previously-dangling RTK
 gate spec (§7.6), removed the unstated RPP-substate dependency in dash
 mode + added a monotonic-`s` guard (§7.2), added a point-mode
@@ -14,6 +18,29 @@ monotonic-`s` jump rejection (§7.2), defined the dash-start "on path
 proper" criterion (§7.2), pinned flow-update ack semantics (§7.5), and
 specified mission-clear config semantics (§3). No architectural
 decisions changed.
+Rev 4 (2026-07-23): **code-reconciliation pass — the only Rev to change a
+design decision.** Rev 3 predates `6523a84` (2026-07-18, "speed no longer
+gates on/off; pivot state does"). Three sections described a rover that no
+longer exists and are corrected here, so Phase C is not written against a
+stale contract (the exact way `16480d9` became a false fix):
+  • §5 — the min-speed floor is **no longer a gate** (slow → thin, handled
+    by §7.5 flow control, never off). The real mode-relevant gate is now
+    the discrete **pivot-state gate** (`/rpp/segment_debug[1]==CORNER_ALIGN`).
+    The Rev 3 "swap the speed gate per mode" instruction was a no-op and is
+    removed; the gate table is rewritten around the pivot state.
+  • §7.2 — dash corner-deferral is re-specified against the **pivot state**,
+    not a velocity threshold. Rev 3's claim that "the node does not subscribe
+    to RPP state and V2 keeps it that way" is factually wrong against shipped
+    code (`_segment_debug_cb`) — and the discrete state is the *better*
+    substrate (a state can't dither at the 0.08/0.08/0.03 corner-crawl speeds
+    the way a speed threshold does; that was the whole point of `6523a84`).
+  • §7.3 — point-mode dwell sprays at a standstill, which the pivot gate now
+    blocks. A scoped, **node-side** gate exemption is specified (frozen RPP
+    untouched). Rev 3 assumed no such exemption was needed.
+  Also records one **open road-marking decision** (per-segment dash pattern)
+  in §7.2 rather than silently locking continuous-across-corners metering.
+  No other architectural decision changed; §§1–4, §6, §7.1, §7.4–7.6, 8–13
+  stand as Rev 3.
 Author context: written from scratch against this branch's current controller
 (`src/spray_controller_node.py`, 1051 lines, Mode-1-only). `main`'s spray V2
 (`35a1518` Task 17/18/19 + `a62cab2` three-mode work) is used as a **feature
@@ -217,7 +244,8 @@ fast on the cheap/common ones):
 | Pose freshness | `age(pose) <= pose_timeout_s` (default 0.5s) | existing, keep |
 | Velocity freshness | `age(velocity) <= velocity_timeout_s` (default 0.5s) | existing, keep |
 | Cross-track error | `xtrack_error_m <= max_xtrack_error_m` (default 0.10m) | existing, keep |
-| Min spray speed (**mode-conditional**) | continuous/dash: `speed_mps >= min_spray_speed_mps` (default 0.05). **Point mode: this gate is replaced by** `speed_mps <= point_arrival_max_speed_mps` — a dwell sprays at a standstill by definition, so the moving-modes floor would make point spraying structurally impossible (and §7.3's own arrival condition already *requires* near-zero speed). §7.2's pivot-deferral behavior depends on the moving-modes form, so the gate is swapped per mode, not removed | existing, generalized |
+| ~~Min spray speed~~ (**REMOVED as a gate — Rev 4**) | Rev 3 gated `speed_mps >= min_spray_speed_mps`. `6523a84` deleted this: slow no longer means OFF, it means **thin**, which §7.5 flow control handles. `min_spray_speed_mps` is still *declared* but is **not** consulted for on/off. The Rev 3 "swap per mode for point" instruction is therefore a no-op and is dropped. Kept in the table struck-through so no future reader re-adds it thinking it was an omission. | superseded |
+| **Pivot-state gate (the real mode-relevant gate — Rev 4)** | `/rpp/segment_debug[1] != CORNER_ALIGN`. When the driving controller reports it is pivoting in place, moving-mode spray (continuous/dash) is held OFF — a discrete state that cannot dither at the frozen corner-crawl speeds (0.08/0.08/0.03), which a speed threshold would. **Point mode requires a scoped exemption to this gate (§7.3) — a dwell sprays while stopped.** | existing (`_segment_debug_cb`), formalized |
 | **RTK/GPS fix quality (NEW)** | see §7.6 | new |
 | Session config loaded | mode-appropriate config present (path model for continuous/dash, coordinate list for point) | existing (as "path not loaded"), generalized to all 3 modes |
 
@@ -310,20 +338,51 @@ dynamically from `s_at_last_toggle + {on,off}_distance_m` instead of
 statically from flag changes, but consumed by the same boundary-lead-time
 machinery as continuous mode).
 
-Explicit corner-crossing rule (this was previously only decided in prose,
-never formalized — now a hard invariant + test case): if `elapsed` crosses
-`target` while the rover is mid-pivot at a corner (detected **purely from
-the node's own velocity** — `speed_mps < min_spray_speed_mps` — with **no
-dependency on any RPP substate topic**; the spray node does not subscribe
-to RPP state today and V2 deliberately keeps it that way to avoid a new
-inter-node coupling), the **phase still flips** at the correct `s`
-(arc-length doesn't care about time spent stationary), but the *actuator
-command* is deferred until the speed gate re-opens — so a dash segment can
-span a full stop-and-pivot without either (a) leaking paint at a standstill
-or (b) losing metering accuracy. This is stronger than a naive
-implementation that would either freeze `s` during the stop (drifting the
-mark pattern) or fire the solenoid at zero speed (a paint blob at the
-corner).
+Explicit corner-crossing rule (**re-specified in Rev 4 against the pivot
+state**): if `elapsed` crosses `target` while the rover is mid-pivot at a
+corner, the **phase still flips** at the correct `s` (arc-length doesn't
+care about time spent stationary), but the *actuator command* is deferred
+until the pivot ends — so a dash segment can span a full stop-and-pivot
+without either (a) leaking paint at a standstill or (b) losing metering
+accuracy.
+
+Rev 4 change — how "mid-pivot" is detected. Rev 3 said detect it "purely
+from the node's own velocity (`speed_mps < min_spray_speed_mps`), with no
+dependency on any RPP substate topic." That is **wrong against shipped
+code**: the node already subscribes to `/rpp/segment_debug`
+(`_segment_debug_cb`) and `6523a84` made the pivot *state*, not speed, the
+authority. Dash deferral therefore keys off the same **discrete pivot-state
+gate** as §5: defer the actuator command while
+`/rpp/segment_debug[1] == CORNER_ALIGN`, resume when it clears. This is
+strictly better than the velocity test Rev 3 assumed — a discrete state
+cannot chatter, whereas a speed threshold dithers against the frozen
+corner-crawl speeds (0.08 / 0.08 / 0.03) and would flip the solenoid on and
+off through the crawl. The `s`/phase bookkeeping is unchanged; only the
+"is it safe to actuate right now" signal is the pivot state, not a speed
+compare. The inter-node coupling Rev 3 wanted to avoid **already exists and
+is load-bearing** — V2 uses it rather than pretending it away.
+
+**OPEN road-marking decision (Rev 4 — decide before Phase C config is
+frozen): does the dash pattern reset per line segment, or run continuously
+across the whole mission?** Locked decision #2 says continuous mission
+arc-length (a 6-on/3-off pattern flows *through* a corner and does not
+restart at each new line). For road pre-marking the operator may instead
+want the pattern to **restart at each surveyed line** (so every line begins
+with a full 6 m dash, not a partial one), and may even want a **different
+pattern per line** (section A = 6/3, section B = 3/6). Rev 3's single global
+`{on,off}_distance_m` pair cannot express that. This is left OPEN, not
+silently locked:
+  • If continuous-across-mission is acceptable → Rev 3's global pair stands,
+    Phase C is simplest.
+  • If per-line reset / per-line pattern is wanted → Phase C config must
+    carry the pattern **per segment** (natural home: `PathSegment.metadata`,
+    the dict that today carries only `geometry_type`), and the toggle math
+    resets `s_at_last_toggle` at each segment boundary instead of never.
+    Cheap to design in now, expensive to retrofit later.
+  Recommendation: confirm with the operator which road-marking behaviour is
+  required and design Phase C's config for the per-segment case even if the
+  first shipped pattern is a single global pair — the substrate cost is one
+  dict field.
 
 **Monotonic-`s` guard (self-overlapping paths):** `_project_onto_path`
 returns the *nearest*-segment arc-length, so on a retrace/self-overlapping
@@ -405,6 +464,20 @@ server deliverable of Phase D, called out here so Phase D is scoped as
 two-sided (planner + spray node), not spray-node-only.
 
 Notes:
+- **Pivot-gate exemption (NEW — Rev 4, the point-mode blocker Rev 3
+  missed).** §5's pivot-state gate holds moving-mode spray OFF while the
+  driving controller reports `CORNER_ALIGN`. But a point dwell **sprays at a
+  standstill by definition** — and nothing in the shipped code distinguishes
+  "stopped to pivot" from "stopped to dwell," so left alone the gate
+  suppresses *every dot*. Point mode therefore needs a scoped exemption:
+  the pivot gate is bypassed **only when** `mode == "point"` **and** the
+  rover is within `arrival_tolerance_m` of the active target coordinate (i.e.
+  the FSM is in `HOLDING`/`DWELLING`). Two hard constraints on the exemption:
+  (1) it is **node-side only** — the frozen RPP controller is not touched;
+  (2) it is **never mode-wide** — on the transit legs *between* dots the
+  gate stays fully active, or corner leakage returns on those transits. This
+  is the one gate change point mode requires; everything else in this FSM is
+  unchanged from Rev 3.
 - `arrival_settle_s` guards against a momentary tolerance-satisfying blip
   (GPS jitter) triggering a spray at the wrong spot — matches the existing
   RPP corner-align settle-time pattern (`segment_align_settle_s`) already

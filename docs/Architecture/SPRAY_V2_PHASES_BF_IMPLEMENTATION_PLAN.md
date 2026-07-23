@@ -23,7 +23,7 @@ de943e4  §7 geometry-fidelity report      <-- the tool needed to read the runs
 2. **Re-stage every georeferenced mission.** `e483d53` changes projected north by 0.62 %; anything staged before it is that much long. Do not reuse old staged plans.
 3. **Bench check before driving.** Stage `tes_cross_line`, confirm `/rpp/conditioned_path` keeps all 4 vertices. If it still comes out at 2 points, stop — nothing else matters.
 4. **9 georef runs.** 3× `tes_cross_line` (the real test) + 3× `test_line_2` (straight control) + 3× a new long-tangent drawing (15–30 m, 2–3 deflections <2° = the road case). Measure pose vs **raw `/path`** — never `/rpp/debug[0]` (error vs the conditioned path, structurally hides this bug) and never `/spray/debug[5]` (nozzle xtrack).
-5. **Then** this document: **plan Rev 4** (§3 divergence) → **B0** (transport).
+5. **Then** this document: ~~plan Rev 4 (§3 divergence)~~ ✅ **done 2026-07-23** → **B0** (transport). *(Still owed: operator's per-segment-dash answer — §7.2.)*
 
 **Smaller items now open from the ingest work:** CSV quality gating (`require_fix` / `max_lateral_rms_m`) exists in the parser but no API route sets it; a grid-only CSV needs explicit operator CRS confirmation rather than a magnitude guess; the DXF `Codes` MTEXT is still unread (POINTs cover the DXF case for now).
 
@@ -94,6 +94,8 @@ The V2 plan is Rev 3, dated **2026-07-15**. `6523a84` ("speed no longer gates on
 | §7.3 point mode: "a dwell sprays at a standstill by definition" | True, and the pivot gate blocks exactly that | Point mode needs an explicit gate exemption that the plan does not specify. |
 
 **Recommendation:** amend the plan (a Rev 4 touching §5, §7.2, §7.3) *before* writing Phase C code. Roughly a half-day of writing, and it prevents implementing against a stale contract — which is precisely how `16480d9` became a false fix.
+
+> ✅ **DONE 2026-07-23 — `SPRAY_CONTROLLER_V2_PLAN.md` is now Rev 4.** §5 rewrites the gate table around the discrete pivot-state gate (min-speed struck through as a non-gate); §7.2 re-specs dash corner-deferral against `/rpp/segment_debug[1]==CORNER_ALIGN` and records the **open per-segment-dash decision**; §7.3 adds the scoped, node-side point-mode pivot-gate exemption. Phase C may now be written against Rev 4. The one thing still owed the operator is the per-segment-dash answer (does the dash pattern reset per surveyed line, or run continuously across the mission).
 
 **Good news in the divergence:** the pivot-state gate is a *stronger* substrate than the velocity test the plan assumed. §7.2's whole concern was that a dash toggle mid-pivot must flip phase (arc-length doesn't care about time spent stationary) while deferring actuation. A discrete `CORNER_ALIGN` state expresses that more cleanly than a speed threshold that dithers at the frozen corner-crawl speeds (0.08 / 0.08 / 0.03).
 
