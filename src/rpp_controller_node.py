@@ -186,6 +186,7 @@ from nav_msgs.msg import Path
 from std_msgs.msg import Bool, Float32MultiArray, MultiArrayDimension, Float32, String
 
 import mission_progress as mp
+import precise_stop as pstop
 import progress_classifier as pc
 from mission_progress import MilestoneMsg, MissionPhase, ProgressMsg
 from mission_progress_ros import qos_profile
@@ -418,6 +419,7 @@ class RPPControllerNode(Node):
         self.declare_parameter("point_precise_stop_enabled",          False)
         self.declare_parameter("point_arrival_tolerance_m",           0.02)   # m
         self.declare_parameter("precise_stop_mode",                   "feedforward")  # feedforward|servo
+        self.declare_parameter("precise_stop_decel_m_s2",             0.30)   # m/s² (feedforward profile)
         self.declare_parameter("precise_stop_creep_speed",            0.05)   # m/s (servo)
         self.declare_parameter("precise_stop_max_s",                  8.0)    # s
         # G4/G5 — point handshake + auto/manual advance:
@@ -538,6 +540,13 @@ class RPPControllerNode(Node):
         self._point_hold_done_keys: set = set()
         self._point_hold_active_key = None
         self._point_hold_start_ns = None
+        # G3 precise-stop servo (default OFF; only under point_precise_stop_enabled
+        # + precise_stop_mode=servo). Wall-clock start of the creep phase for the
+        # timeout backstop; None while not servoing. _point_approach_speed is the
+        # speed captured when the hold engaged — the kinematic cap for the
+        # feed-forward decel profile.
+        self._point_servo_start_ns = None
+        self._point_approach_speed = 0.0
         # G1 — mission-progress publication (default OFF, observability only).
         # must-hit vertices of the active run in path order + a key→rank map, so
         # the progress classifier can name the point currently held. Rebuilt in
@@ -750,6 +759,8 @@ class RPPControllerNode(Node):
         self._point_hold_done_keys = set()
         self._point_hold_active_key = None
         self._point_hold_start_ns = None
+        self._point_servo_start_ns = None
+        self._point_approach_speed = 0.0
         n_raw = len(raw_pts)
 
         resample_dx = float(self.get_parameter("path_resample_spacing_m").value)
@@ -1723,8 +1734,25 @@ class RPPControllerNode(Node):
             return False
 
         acceptance = float(self.get_parameter("point_hold_acceptance_m").value)
+        # G3 precise stop (default OFF → trigger == acceptance, byte-for-byte).
+        # When enabled, engage the hold earlier so the feed-forward decel can
+        # bring v→0 exactly at the point: trigger = max(acceptance, v²/2a).
+        precise = bool(self.get_parameter("point_precise_stop_enabled").value)
+        approach_speed = (
+            math.hypot(self._latest_vel_ned[0], self._latest_vel_ned[1])
+            if self._vel_is_fresh()
+            else 0.0
+        )
+        trigger = acceptance
+        if precise:
+            trigger = pstop.feedforward_trigger_distance(
+                approach_speed,
+                float(self.get_parameter("precise_stop_decel_m_s2").value),
+                acceptance,
+            )
         target_key = None
-        best = acceptance
+        target_pos = None
+        best = trigger
         for ps in self._path:
             p = ps.pose.position
             key = self._pt_key((p.x, p.y))
@@ -1734,6 +1762,7 @@ class RPPControllerNode(Node):
             if d <= best:
                 best = d
                 target_key = key
+                target_pos = (p.x, p.y)
         if target_key is None:
             # Not near any un-dwelled must-hit point → normal tracking.
             self._point_hold_active_key = None
@@ -1745,8 +1774,27 @@ class RPPControllerNode(Node):
             self._point_hold_active_key = target_key
             self._point_hold_start_ns = None
             self._reset_corner_pivot_state()
+            if precise:
+                # Capture the engagement speed as the feed-forward decel cap and
+                # re-arm the servo timeout. Floor at creep so a slow entry still
+                # crawls the last few cm in (G3).
+                self._point_servo_start_ns = None
+                self._point_approach_speed = max(
+                    approach_speed,
+                    float(self.get_parameter("precise_stop_creep_speed").value),
+                )
 
-        if not self._corner_stop_satisfied():
+        # Approach gate. Precise mode (G3, default OFF) decelerates onto the
+        # coordinate and requires BOTH a confirmed physical stop AND the
+        # along-track residual within tolerance before dwelling; the frozen path
+        # requires only the corner stop-confirm. _precise_stop_ready publishes
+        # its own approach setpoint while returning False.
+        if precise:
+            if not self._precise_stop_ready(
+                target_pos, pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
+            ):
+                return True
+        elif not self._corner_stop_satisfied():
             # Not stopped yet — brake toward zero (same primitive as a corner).
             self._segment_state = SegmentStateCode.CORNER_STOP
             self._last_speed_cmd = 0.0
@@ -1787,10 +1835,87 @@ class RPPControllerNode(Node):
         self._point_hold_done_keys.add(target_key)
         self._point_hold_active_key = None
         self._point_hold_start_ns = None
+        self._point_servo_start_ns = None
         self._reset_corner_pivot_state()
         self.get_logger().info(
             f"point hold: released {target_key} after {elapsed_s:.1f}s "
             f"({len(self._point_hold_done_keys)}/{len(self._must_hit_keys)} done)"
+        )
+        return False
+
+    def _precise_stop_ready(
+        self,
+        target_pos: tuple[float, float],
+        pos_n: float,
+        pos_e: float,
+        yaw_ned: float,
+        pose_age_s: float,
+        dist_to_goal: float,
+    ) -> bool:
+        """G3 precise 2 cm stop onto a must-hit point (design §7). Default OFF.
+
+        Returns True when the rover is confirmed stopped AND within
+        point_arrival_tolerance_m of the point along-track (→ the caller
+        dwells). While False it has already published this tick's approach
+        setpoint:
+
+          * feedforward (default): the kinematic decel profile v = √(2·a·d)
+            toward the coordinate — open-loop, no new closed loop.
+          * servo: after a coarse stop, creep at precise_stop_creep_speed until
+            within tolerance, bounded by precise_stop_max_s (timeout → accept the
+            best position and dwell; never wedge).
+
+        Pure math lives in precise_stop.py; this method is the ROS glue. Called
+        only under point_precise_stop_enabled, so the frozen brake-when-near path
+        is untouched.
+        """
+        tn, te = target_pos
+        residual = pstop.along_track_residual(pos_n, pos_e, tn, te, yaw_ned)
+        tol = float(self.get_parameter("point_arrival_tolerance_m").value)
+        stopped = self._corner_stop_satisfied()
+        mode = str(self.get_parameter("precise_stop_mode").value)
+
+        if pstop.reached(residual, tol) and stopped:
+            self._point_servo_start_ns = None
+            return True
+
+        self._segment_state = SegmentStateCode.CORNER_STOP
+        self._last_speed_cmd = 0.0
+
+        if mode == "servo" and stopped:
+            # Coarse stop reached but off the mark → creep, bounded by a timeout.
+            now_ns = self.get_clock().now().nanoseconds
+            if self._point_servo_start_ns is None:
+                self._point_servo_start_ns = now_ns
+            max_s = float(self.get_parameter("precise_stop_max_s").value)
+            if (now_ns - self._point_servo_start_ns) * 1e-9 >= max_s:
+                self.get_logger().warn(
+                    f"precise stop: servo timeout ({residual * 100.0:.1f} cm "
+                    f"residual) — dwelling at best position",
+                    throttle_duration_sec=5.0,
+                )
+                self._point_servo_start_ns = None
+                return True
+            creep = float(self.get_parameter("precise_stop_creep_speed").value)
+            v_cmd = pstop.servo_speed(residual, creep, tol)
+        else:
+            # Feed-forward decel profile (feedforward mode, or servo's coarse
+            # phase before the physical stop is confirmed).
+            decel = float(self.get_parameter("precise_stop_decel_m_s2").value)
+            profile = pstop.feedforward_brake_speed(
+                abs(residual), decel, self._point_approach_speed
+            )
+            v_cmd = math.copysign(profile, residual) if residual != 0.0 else 0.0
+
+        vel_n, vel_e = v_cmd * math.cos(yaw_ned), v_cmd * math.sin(yaw_ned)
+        self._publish_velocity(vel_n, vel_e)
+        self._publish_yaw_rate(0.0)
+        self._publish_debug(
+            cross_track=0.0, heading_err=0.0, lookahead=dist_to_goal,
+            speed=abs(v_cmd), kappa=0.0, dist_goal=dist_to_goal,
+            pose_age_ms=pose_age_s * 1000.0, state=StateCode.TRACKING,
+            l_d_raw=float("nan"), kappa_speed=0.0, yaw_rate=0.0,
+            spray_active=False,
         )
         return False
 

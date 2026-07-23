@@ -44,13 +44,13 @@ Purpose: RPP announces phase + distance-to-boundary. No consumer. Zero behavior 
 
 Purpose: kill dual-projection drift for moving marks by sourcing the boundary from RPP.
 
-- [ ] **G2.1** In `spray_controller_node.py`, subscribe to `/rpp/progress`; behind `consume_rpp_progress`, feed `dist_to_next_boundary_m` + `next_boundary` into the existing lead math (`solenoid_open_delay_s`, `on/off_overspray_margin_m`) — same equations, single source.
-- [ ] **G2.2** Staleness fallback: if last progress msg older than `progress_timeout_s`, revert to local `/path` projection **for that tick** (proof augments, never strands the valve). Log fallback transitions (rate-limited).
-- [ ] **G2.3** Dash: RPP supplies the MARK-region envelope; `DashMeter` keeps doing the ON/OFF sub-pattern inside it (RPP does not dash-meter). Ensure DashMeter resets at region edges from the envelope.
-- [ ] **G2.4** Unit tests: boundary-sourced lead vs local-projection lead agree within tolerance on a clean stream; fallback-on-stale path.
-- [ ] **G2.5** Bench replay: same mission, `consume_rpp_progress` OFF vs ON — valve-fire count/positions comparable, no new dither.
+- [x] **G2.1** `spray_controller_node.py` subscribes to `/rpp/progress` (`_rpp_progress_cb`); behind `consume_rpp_progress`, `_make_spray_decision` sources `dist_to_next_boundary_m` + `next_boundary` for the continuous lead math (`solenoid_open_delay_s`, `on/off_overspray_margin_m`) — **same equations, single source**. Mapping in `_rpp_kind_for` (MARK_START→TRANSIT_TO_MARK, MARK_END/terminal-REACHED_END→MARK_TO_TRANSIT). The xtrack safety gate stays on the **local** projection (independent, per §12).
+- [x] **G2.2** Staleness fallback in `_rpp_boundary_inputs`: no progress within `progress_timeout_s` (or flag off / non-continuous mode / no message yet) → `(None, "", inf)` → `_make_spray_decision` uses the local `/path` projection **byte-for-byte** for that tick. Source switches (rpp↔path↔off) logged once, rate-limited (`_note_rpp_source`).
+- [x] **G2.3** ~~DashMeter resets at region edges~~ **DECLINED — conflicts with a locked operator decision.** `DashMeter` is *continuous across mission, does NOT reset at entity/corner boundaries* (operator-confirmed 2026-07-23, [[spray_dash_b0_landed]]). Resetting at RPP envelope edges would contradict that. So G2 boundary-sourcing is scoped to **continuous mode only**; dash keeps local arc-length metering (`_rpp_boundary_inputs` returns off for dash). Point uses the handshake (G4), not boundary sourcing. If region-reset is ever wanted it needs a **separate operator A/B** that revisits the locked decision.
+- [x] **G2.4** `test_spray_rpp_boundary.py` (12 tests): `_rpp_kind_for` mapping; RPP-sourced lead == local-projection lead on a clean stream (on_early/off_early); RPP overrides a disagreeing local projection; xtrack gate stays independent; node gate + fresh/stale/no-message/disabled/non-continuous fallback.
+- [ ] **G2.5** Bench replay (Jetson): same mission, `consume_rpp_progress` OFF vs ON — valve-fire count/positions comparable, no new dither. **Needs in-env run.**
 
-**DoD:** OFF = today byte-for-byte; ON produces equivalent-or-tighter boundary timing on bench; field A/B deferred to G6. Do **not** merge as new default until G6 field-proves ≥ frozen.
+**DoD:** OFF = today byte-for-byte; ON produces equivalent-or-tighter boundary timing on bench; field A/B deferred to G6. Do **not** merge as new default until G6 field-proves ≥ frozen. ✅ Mac: 12 new tests + all 95 spray-node tests green (refactor behavior-preserving; the OFF path reuses the exact pre-G2 lead block). ⏳ **Remaining:** G2.5 bench replay in-env.
 
 ---
 
@@ -58,15 +58,15 @@ Purpose: kill dual-projection drift for moving marks by sourcing the boundary fr
 
 Purpose: land the 2 cm along-track stop primitive for must-hit points only.
 
-- [ ] **G3.1** Implement **Option A feed-forward decel** (design §7): trigger braking at `d = v²/2a` before the point (`a` bounded by `segment_brake_velocity_cap_m_s`) so `v→0` at the coordinate. Reuse the brake primitive with a computed trigger point instead of the fixed 10 cm radius.
-- [ ] **G3.2** Gate behind `point_precise_stop_enabled` (default False → today's brake-when-near via `_point_hold_tick`). New primitive is used **only** for must-hit points under point mode; corner stops keep `_corner_stop_satisfied` unchanged.
-- [ ] **G3.3** Implement **Option B low-speed servo** as fallback (`precise_stop_mode=servo`): after coarse stop, creep at `precise_stop_creep_speed` with along-track corrections until `|err| ≤ point_arrival_tolerance_m` (0.02), bounded by `precise_stop_max_s`.
-- [ ] **G3.4** Timeout backstop: if precise stop can't reach tolerance within `precise_stop_max_s`, rest at best position and warn (do not wedge).
-- [ ] **G3.5** Unit tests: feed-forward trigger-distance math over a range of `v`/`a`; servo convergence + timeout.
-- [ ] **G3.6** Bench in-env: drive to a placed point, measure along-track rest error, confirm timeout path.
+- [x] **G3.1** **Option A feed-forward decel** in pure `precise_stop.py` (`feedforward_trigger_distance` = `max(acceptance, v²/2a)`, `feedforward_brake_speed` = `√(2ad)` capped). `_point_hold_tick` engages the hold at the trigger distance (not the fixed 0.10 m radius) and `_precise_stop_ready` publishes the decel profile toward the coordinate so `v→0` at the point. Decel is `precise_stop_decel_m_s2` (new param, default 0.30); the profile cap is the engagement speed (floored at creep).
+- [x] **G3.2** Gated behind `point_precise_stop_enabled` (default False → the frozen brake-when-near path runs byte-for-byte; the `elif not _corner_stop_satisfied()` branch + dwell block untouched). Used **only** for must-hit points under the point-hold overlay; `_corner_stop_satisfied` / corner stops unchanged. Double-gated (also needs `point_hold_enabled`).
+- [x] **G3.3** **Option B low-speed servo** (`precise_stop_mode=servo`): after a coarse stop, `_precise_stop_ready` creeps at `precise_stop_creep_speed` (`servo_speed`, along-track sign) until `|residual| ≤ point_arrival_tolerance_m` (0.02). Feed-forward is the coarse phase before the physical stop; servo closes the residual.
+- [x] **G3.4** Timeout backstop: after the coarse stop, if the servo can't reach tolerance within `precise_stop_max_s`, accept the best position, warn (rate-limited), dwell — never wedge (`_point_servo_start_ns` timer; reset on release / new point / new mission).
+- [x] **G3.5** `test_precise_stop.py` (18 tests): trigger distance over `v`/`a` (v² scaling + floor), decel profile (cap, monotonic, zero-at-point), residual sign convention, servo law + arrival boundary, and a 50 Hz integration that converges to the point **without overshoot**.
+- [ ] **G3.6** `test_precise_stop_node.py` written (in-env): freeze (precise OFF == frozen acceptance radius; overlay off = no-op), feed-forward engages beyond the acceptance radius + decelerates, dwell held until at-point **and** stopped, servo creep, `precise_stop_max_s=0` timeout-accept, release-once. **Needs Jetson run** (rclpy). Field: measure along-track rest error.
 - [ ] **Prereq (parallel, hard):** nozzle-from-antenna offset measured + applied so the *dot* lands on the point, not the antenna (design §7, open-Q #4). Tracked as its own task — blocks G6 meaning, not G3 code.
 
-**DoD:** OFF = frozen brake-when-near byte-for-byte; ON hits tolerance on bench with feed-forward, servo available as tighter fallback; field accuracy A/B deferred to G6.
+**DoD:** OFF = frozen brake-when-near byte-for-byte; ON hits tolerance on bench with feed-forward, servo available as tighter fallback; field accuracy A/B deferred to G6. ✅ Mac: 18 pure tests green; both nodes AST-parse; precise path triple-gated + OFF path structurally the pre-G3 branch. ⏳ **Remaining:** Jetson run of `test_precise_stop_node.py` + frozen regression (smoke + segment_stop + corner_pivot + `test_point_hold_rpp` with precise OFF).
 
 ---
 
