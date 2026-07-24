@@ -54,6 +54,43 @@ def latlon_to_ned(
     return (north, east)
 
 
+def ned_to_latlon(
+    north: float,
+    east: float,
+    origin_lat: float,
+    origin_lon: float,
+) -> tuple[float, float]:
+    """Inverse of latlon_to_ned: NED metres about an origin → WGS84 lat/lon.
+
+    Exact inverse using the same Karney geodesic. Forward maps a lat/lon to
+    (dist, azimuth) then (north, east) = (d·cos, d·sin); this recovers
+    dist = hypot(n, e), azimuth = atan2(east, north), and walks the geodesic
+    from the origin. Used to render a local-frame /path back into geo
+    coordinates for the post-mission geo overlay (tools/analyze_mission.py).
+
+    Args:
+        north: metres north of the origin.
+        east: metres east of the origin.
+        origin_lat: Origin latitude (degrees).
+        origin_lon: Origin longitude (degrees).
+
+    Returns:
+        (lat, lon) in degrees.
+
+    Raises:
+        ImportError: If geographiclib is not installed.
+    """
+    if not _HAS_GEOGRAPHICLIB:
+        raise ImportError(
+            "geographiclib is required for lat/lon conversion. "
+            "Install: pip install geographiclib"
+        )
+    dist = math.hypot(float(north), float(east))
+    azimuth_deg = math.degrees(math.atan2(float(east), float(north)))
+    result = Geodesic.WGS84.Direct(origin_lat, origin_lon, azimuth_deg, dist)
+    return (result["lat2"], result["lon2"])
+
+
 def _fit_similarity_coeffs(
     dxf_points: list[tuple[float, float]],
     ref_ned_points: list[tuple[float, float]],

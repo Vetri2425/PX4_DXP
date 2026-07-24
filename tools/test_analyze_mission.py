@@ -7,6 +7,7 @@ reader (esp. member alignment), and synthetic series validate the stat / corner
 
 Run:  python3 tools/test_analyze_mission.py
 """
+import json
 import math
 import os
 import struct
@@ -337,6 +338,46 @@ def test_absolute_refuses_to_guess_without_independent_ground_truth():
     out = am.analyze_absolute(_series_at(), {"staged_mission": {}})
     assert not out["available"]
     assert "ground truth" in out["reason"]
+
+
+# ── §12 GEO OVERLAY ──────────────────────────────────────────────────────────
+# Renders surveyed / commanded-/path / driven into lat/lon and writes a map
+# overlay. Needs the EKF origin (gp_origin) to geo-reference /path.
+
+def test_geo_overlay_writes_three_layers_and_placement(tmp_path):
+    s = _series_at()
+    s.ekf_origin = (_LAT0, _LON0)                 # local (0,0) == this origin
+    out = am.analyze_geo(s, _manifest(tmp_path), str(tmp_path))
+    assert out["available"], out.get("reason")
+    assert out["n_surveyed"] == 2 and out["n_commanded"] == 2 and out["n_driven"] == 2
+    # commanded = geodesic inverse of the (0,0)->truth path → sits ON the survey
+    assert out["placement_mean_cm"] < 2.0
+    gj = json.loads((tmp_path / "geo_overlay.geojson").read_text())
+    layers = {f["properties"]["layer"] for f in gj["features"]}
+    assert layers == {"surveyed", "commanded_path", "driven"}
+    # GeoJSON coordinates are [lon, lat] — sanity-check the ordering.
+    surveyed = next(f for f in gj["features"] if f["properties"]["layer"] == "surveyed")
+    lon0, lat0 = surveyed["geometry"]["coordinates"][0]
+    assert abs(lat0 - _LAT0) < 1e-6 and abs(lon0 - _LON0) < 1e-6
+    assert (tmp_path / "geo_overlay.csv").is_file()
+
+
+def test_geo_overlay_without_ekf_origin_still_exports_driven(tmp_path):
+    s = _series_at()
+    s.ekf_origin = None                           # no gp_origin captured
+    out = am.analyze_geo(s, _manifest(tmp_path), str(tmp_path))
+    assert out["available"]                       # surveyed + driven still export
+    assert out["n_commanded"] == 0
+    assert "no EKF origin" in out["reason"]
+
+
+def test_geo_overlay_placement_responds_to_a_wrong_origin(tmp_path):
+    """A 30 cm-shifted EKF origin makes commanded-geo miss the survey by ~30 cm."""
+    s = _series_at()
+    mn, _me = _mps(_LAT0)
+    s.ekf_origin = (_LAT0 + 0.30 / mn, _LON0)     # origin 30 cm north
+    out = am.analyze_geo(s, _manifest(tmp_path), str(tmp_path))
+    assert out["placement_mean_cm"] > 25.0
 
 
 def test_absolute_reports_mismatched_counts_rather_than_pairing_blindly(tmp_path):

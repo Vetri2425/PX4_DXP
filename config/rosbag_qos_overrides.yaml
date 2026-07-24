@@ -35,3 +35,12 @@
   depth: 10
   reliability: best_effort
   durability: volatile
+# /mavros/global_position/gp_origin is latched (TRANSIENT_LOCAL): PX4 sends the
+# EKF local-frame origin once early, before the recorder subscribes. Force
+# transient_local so the recorder fetches the retained sample on join (same
+# reason as /path above) — analyze_mission needs it to geo-reference /path.
+/mavros/global_position/gp_origin:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local

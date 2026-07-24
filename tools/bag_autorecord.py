@@ -138,6 +138,11 @@ TOPICS = [
     "/rpp/milestone",                     # discrete edges: MARK_START/AT_POINT/… (RELIABLE)
     "/spray/point_done",                  # spray→RPP dwell-complete proof (RELIABLE)
     "/point/advance",                     # operator "next point" (G5 manual, RELIABLE)
+    # ── added 2026-07-24: EKF local-frame origin (LATCHED — see QoS override).
+    # The datum the local /path is expressed against; analyze_mission uses it to
+    # render /path back into lat/lon for the geo overlay (surveyed vs commanded
+    # vs driven). Published once early (after the server's MAV_CMD_REQUEST_MESSAGE).
+    "/mavros/global_position/gp_origin",  # geographic_msgs/GeoPointStamped (TRANSIENT_LOCAL)
 ]
 
 # QoS profile overrides so the LATCHED (TRANSIENT_LOCAL) topics above are actually

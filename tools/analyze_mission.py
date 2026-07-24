@@ -305,8 +305,20 @@ def _p_navsatfix(d):
     return {"lat": lat, "lon": lon, "alt": alt}
 
 
+def _p_geopoint(d):
+    """geographic_msgs/GeoPointStamped — the EKF local-frame origin (gp_origin).
+
+    header + GeoPoint{float64 latitude, longitude, altitude}. This is the datum
+    the local /path is expressed against; used to render /path back into lat/lon.
+    """
+    r = _CDR(d); r.header()
+    lat = r.f64(); lon = r.f64(); alt = r.f64()
+    return {"lat": lat, "lon": lon, "alt": alt}
+
+
 PARSERS = {
     "sensor_msgs/msg/NavSatFix": _p_navsatfix,
+    "geographic_msgs/msg/GeoPointStamped": _p_geopoint,
     "geometry_msgs/msg/PoseStamped": _p_pose,
     "geometry_msgs/msg/TwistStamped": _p_twist,
     "geometry_msgs/msg/Vector3Stamped": _p_vec3,
@@ -523,6 +535,7 @@ class Series:
         self.gps = []             # (t, fix_type)
         self.global_fix = []      # (t, lat, lon, alt) — rover's own WGS84 position
         self.path_z = None        # z bitfield of the kept /path (bit1 = must-hit)
+        self.ekf_origin = None    # (lat, lon) — EKF local-frame datum (gp_origin)
         self.topics_seen = {}     # name -> count
 
 
@@ -581,6 +594,11 @@ def collect(bag_dir: str) -> Series:
         elif topic == "/mavros/global_position/global":
             if m["lat"] == m["lat"] and abs(m["lat"]) <= 90.0:   # skip NaN / unset
                 s.global_fix.append((t, m["lat"], m["lon"], m["alt"]))
+        elif topic == "/mavros/global_position/gp_origin":
+            # Latched EKF datum; one message. Guard NaN / (0,0) placeholder.
+            if (m["lat"] == m["lat"] and abs(m["lat"]) <= 90.0
+                    and not (m["lat"] == 0.0 and m["lon"] == 0.0)):
+                s.ekf_origin = (m["lat"], m["lon"])
     for lst in (s.pose, s.vel_meas, s.vel_cmd, s.setpoint, s.state, s.rpp, s.seg,
                 s.yaw_rate, s.spray_active, s.spray_desired, s.spray_commanded,
                 s.spray_state, s.statustext, s.gps, s.global_fix):
@@ -1576,11 +1594,138 @@ def _fmt_report(a: dict) -> str:
         line("   worst offenders:")
         for w in a["worst_offenders"]:
             line(f"     - {w}")
+    line("")
+
+    geo = a.get("geo") or {}
+    line("12. GEO OVERLAY (surveyed vs commanded /path vs driven — all in lat/lon)")
+    if not geo.get("available"):
+        line(f"   unavailable — {geo.get('reason', 'no geo layers')}")
+    else:
+        o = geo.get("ekf_origin")
+        line(f"   EKF origin : {o[0]:.7f}, {o[1]:.7f}" if o
+             else "   EKF origin : (none — /path could not be geo-referenced)")
+        line(f"   layers     : surveyed {geo['n_surveyed']}, commanded {geo['n_commanded']}, "
+             f"driven {geo['n_driven']}")
+        if geo.get("placement_mean_cm") is not None:
+            line(f"   placement  : commanded-geo vs surveyed-geo   "
+                 f"mean {geo['placement_mean_cm']:.2f} cm   max {geo['placement_max_cm']:.2f} cm")
+            line("     ^ placement + projection only (§8 = surveyed vs DRIVEN = this + tracking).")
+        if geo.get("commanded_error"):
+            line(f"   NOTE: commanded layer skipped — {geo['commanded_error']}")
+        line(f"   files      : {', '.join(geo.get('files', []))}"
+             "   (open in geojson.io / Google Earth / QGIS)")
     line("=" * 72)
     return "\n".join(L) + "\n"
 
 
-def analyze(root: str, survey_tol_cm: float | None = None) -> dict:
+# ── §12 GEO OVERLAY — surveyed vs commanded /path vs driven, all in lat/lon ────
+def _import_ned_to_latlon():
+    import sys as _sys
+    from pathlib import Path as _Path
+    root = _Path(__file__).resolve().parents[1]
+    if str(root) not in _sys.path:
+        _sys.path.insert(0, str(root))
+    from path_engine.ned import ned_to_latlon
+    return ned_to_latlon
+
+
+def _downsample(pts, cap=2000):
+    if len(pts) <= cap:
+        return list(pts)
+    step = len(pts) / cap
+    return [pts[int(i * step)] for i in range(cap)]
+
+
+def _geo_feature(name, pts, geom, color):
+    coords = [[lon, lat] for (lat, lon) in pts]          # GeoJSON is [lon, lat]
+    g = ({"type": "LineString", "coordinates": coords} if geom == "line"
+         else {"type": "MultiPoint", "coordinates": coords})
+    return {"type": "Feature",
+            "properties": {"layer": name, "count": len(pts),
+                           "stroke": color, "marker-color": color},
+            "geometry": g}
+
+
+def analyze_geo(s: Series, manifest, out_dir: str) -> dict:
+    """Render the mission into GEO coordinates and write a map overlay (§12).
+
+    Three lat/lon layers → geo_overlay.geojson + geo_overlay.csv:
+      * surveyed  — the intent, straight from the source file (independent).
+      * commanded — the local /path converted back to lat/lon via the EKF origin.
+      * driven    — the rover's own /mavros/global_position/global trace.
+
+    Also a PLACEMENT-only miss (commanded-geo vs surveyed-geo at the must-hit
+    vertices): isolates placement + projection residual, the half §8 folds into
+    the total (§8 = surveyed vs DRIVEN = placement + tracking).
+    """
+    out = {"available": False}
+    truth, provenance = _surveyed_latlon_from_source(manifest)
+    origin = s.ekf_origin
+    driven = [(lat, lon) for (_t, lat, lon, _a) in s.global_fix]
+
+    commanded, commanded_musthit = [], []
+    if origin and s.path:
+        try:
+            n2ll = _import_ned_to_latlon()
+            commanded = [n2ll(n, e, origin[0], origin[1]) for (n, e) in s.path]
+            if s.path_z and len(s.path_z) == len(s.path):
+                commanded_musthit = [ll for ll, z in zip(commanded, s.path_z) if z & 2]
+        except Exception as exc:                     # geographiclib missing etc.
+            out["commanded_error"] = f"{type(exc).__name__}: {exc}"
+
+    out["ekf_origin"] = list(origin) if origin else None
+    out["provenance"] = provenance
+    out["n_surveyed"], out["n_commanded"], out["n_driven"] = \
+        len(truth), len(commanded), len(driven)
+    if not origin:
+        out["reason"] = ("no EKF origin in bag (gp_origin) — cannot geo-reference "
+                         "/path; driven + surveyed layers still exported")
+    if not (truth or commanded or driven):
+        out["reason"] = "nothing to export (no surveyed truth, /path, or global fix)"
+        return out
+
+    # placement-only miss: commanded must-hit vertices vs surveyed truth
+    tgt = commanded_musthit or commanded
+    if truth and tgt and len(truth) == len(tgt):
+        rows = [{"i": i, "miss_cm": _geodesic_m(a, b, c, d) * 100.0}
+                for i, ((a, b), (c, d)) in enumerate(zip(truth, tgt))]
+        out["placement_rows"] = rows
+        out["placement_mean_cm"] = round(sum(r["miss_cm"] for r in rows) / len(rows), 2)
+        out["placement_max_cm"] = round(max(r["miss_cm"] for r in rows), 2)
+
+    features = []
+    if truth:
+        features.append(_geo_feature("surveyed", truth, "points", "#2ca02c"))
+    if commanded:
+        features.append(_geo_feature("commanded_path", _downsample(commanded), "line", "#1f77b4"))
+    if driven:
+        features.append(_geo_feature("driven", _downsample(driven), "line", "#d62728"))
+
+    files = []
+    try:
+        gj = os.path.join(out_dir, "geo_overlay.geojson")
+        with open(gj, "w") as f:
+            json.dump({"type": "FeatureCollection", "features": features}, f)
+        files.append(os.path.basename(gj))
+        cf = os.path.join(out_dir, "geo_overlay.csv")
+        with open(cf, "w") as f:
+            f.write("layer,index,lat,lon\n")
+            for name, pts in (("surveyed", truth),
+                              ("commanded_path", _downsample(commanded)),
+                              ("driven", _downsample(driven))):
+                for i, (lat, lon) in enumerate(pts):
+                    f.write(f"{name},{i},{lat:.8f},{lon:.8f}\n")
+        files.append(os.path.basename(cf))
+    except OSError as exc:
+        out["write_error"] = str(exc)
+
+    out["available"] = bool(files)
+    out["files"] = files
+    return out
+
+
+def analyze(root: str, survey_tol_cm: float | None = None,
+            out_dir: str | None = None) -> dict:
     bag_dir, manifest = _find_bag_dir(root)
     if bag_dir is None:
         sys.exit(f"ERROR: no rosbag2 (.db3 / metadata.yaml) found under {root}")
@@ -1599,6 +1744,7 @@ def analyze(root: str, survey_tol_cm: float | None = None) -> dict:
     absolute = analyze_absolute(s, manifest)
     traversal = analyze_traversal(s)
     config = analyze_config(s, manifest)
+    geo = analyze_geo(s, manifest, out_dir or root)
 
     # overall verdict + worst offenders
     offenders = []
@@ -1673,6 +1819,7 @@ def analyze(root: str, survey_tol_cm: float | None = None) -> dict:
         "absolute": absolute,
         "traversal": traversal,
         "config": config,
+        "geo": geo,
         "worst_offenders": offenders,
         "verdict": verdict,
     }
@@ -1696,7 +1843,8 @@ def main() -> int:
     if not os.path.isdir(args.bundle):
         sys.exit(f"ERROR: not a directory: {args.bundle}")
 
-    result = analyze(args.bundle, survey_tol_cm=args.survey_tol_cm)
+    result = analyze(args.bundle, survey_tol_cm=args.survey_tol_cm,
+                     out_dir=(args.outdir or args.bundle))
 
     # A4: fold the traversal verdict back next to outcome, so a partial run is
     # detectable by reading manifest.json alone — no bag, no analysis.json.
