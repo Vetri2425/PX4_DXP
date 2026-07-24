@@ -236,6 +236,67 @@ def test_gps_csv_requires_header():
         assert "expected lat,lon CSV header" in str(exc)
 
 
+# ── survey-export CSV (Emlid/Trimble named header) → point mission ─────────────
+
+# The real 2x2_square.csv shape: Name,Code,…,Longitude,Latitude,… (lon BEFORE lat),
+# 4 RTK-FIX corners of a ~2 m square at the Chennai site. Trimmed columns; DictReader
+# maps by name so position is irrelevant as long as the header names match.
+_EMLID_2X2 = (
+    "Name,Code,Code description,Easting,Northing,Longitude,Latitude,Solution status,Samples,Lateral RMS\n"
+    "1,P,Point,1204636.447,1243756.378,80.26194119,13.07206386,FIX,26,0.017\n"
+    "2,P,Point,1204636.581,1243758.386,80.26194256,13.07208200,FIX,26,0.017\n"
+    "3,P,Point,1204638.580,1243758.261,80.26196097,13.07208073,FIX,26,0.017\n"
+    "4,P,Point,1204638.491,1243756.249,80.26196002,13.07206256,FIX,26,0.017\n"
+)
+
+
+def test_emlid_survey_export_parses_as_point_mission():
+    parsed = parse_point_gps_csv_text(_EMLID_2X2)
+    assert len(parsed.points) == 4
+    # First Name-ordered point is the anchor.
+    assert parsed.anchor_lat == 13.07206386
+    assert parsed.anchor_lon == 80.26194119
+    assert abs(parsed.points[0].north_m) < 1e-6 and abs(parsed.points[0].east_m) < 1e-6
+    # Every surveyed point is a mark with the default dwell.
+    assert all(p.mark is True for p in parsed.points)
+    assert all(p.dwell_s == 2.0 for p in parsed.points)
+    # P2 is ~2 m NORTH of P1 (lat increased), barely any east.
+    assert parsed.points[1].north_m > 1.5
+    assert abs(parsed.points[1].east_m) < 0.5
+
+
+def test_emlid_export_ordered_by_name_not_file_order():
+    shuffled = "\n".join(
+        [_EMLID_2X2.splitlines()[0]] + list(reversed(_EMLID_2X2.splitlines()[1:]))
+    ) + "\n"
+    parsed = parse_point_gps_csv_text(shuffled)
+    # Anchor is still Name==1 despite the rows being reversed in the file.
+    assert parsed.anchor_lat == 13.07206386
+
+
+def test_survey_alias_name_latitude_longitude():
+    # arc_survey.csv shape: name,latitude,longitude (spelled out, lat then lon).
+    text = "name,latitude,longitude\n1,13.07206,80.261941\n2,13.0720781,80.261941\n"
+    parsed = parse_point_gps_csv_text(text)
+    assert len(parsed.points) == 2
+    assert parsed.anchor_lat == 13.07206
+
+
+def test_emlid_payload_is_gps_surveyed():
+    payload = gps_point_mission_parse_payload(parse_point_gps_csv_text(_EMLID_2X2))
+    assert payload["point_source_frame"] == GPS_SURVEYED_FRAME
+    assert payload["num_points"] == 4
+    assert payload["anchor"] == {"lat": 13.07206386, "lon": 80.26194119}
+
+
+def test_bare_latlon_still_takes_precedence_over_survey():
+    # A bare lat,lon,dwell,mark file must go through the bare parser (keeping
+    # dwell + mark), NOT the survey fallback (which forces mark=True/default dwell).
+    parsed = parse_point_gps_csv_text("lat,lon,dwell_s,mark\n13.0,80.0,5.0,false\n")
+    assert parsed.points[0].dwell_s == 5.0
+    assert parsed.points[0].mark is False
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

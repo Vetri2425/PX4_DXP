@@ -82,16 +82,11 @@ def _pick(header_map: dict, aliases: tuple) -> Optional[str]:
     return None
 
 
-def _read_header(filepath: str) -> Optional[dict]:
-    """Return {lowercased column name: original name}, or None if not a survey CSV."""
-    try:
-        with open(filepath, "r", encoding="utf-8-sig", errors="replace") as f:
-            first = f.readline()
-    except OSError:
+def _header_map_from_line(first_line: str) -> Optional[dict]:
+    """{lowercased column: original} from a header LINE, or None if not a survey header."""
+    if not first_line or not first_line.strip():
         return None
-    if not first.strip():
-        return None
-    cols = [c.strip() for c in next(csv.reader([first]), [])]
+    cols = [c.strip() for c in next(csv.reader([first_line]), [])]
     if len(cols) < 3:
         return None
     header_map = {c.strip().lower(): c for c in cols if c.strip()}
@@ -102,6 +97,56 @@ def _read_header(filepath: str) -> Optional[dict]:
     if not (has_geo or has_grid) or hits < 2:
         return None
     return header_map
+
+
+def _read_header(filepath: str) -> Optional[dict]:
+    """Return {lowercased column name: original name}, or None if not a survey CSV."""
+    try:
+        with open(filepath, "r", encoding="utf-8-sig", errors="replace") as f:
+            first = f.readline()
+    except OSError:
+        return None
+    return _header_map_from_line(first)
+
+
+def read_survey_latlon_points(text: str) -> Optional[list[dict]]:
+    """Ordered surveyed lat/lon points from a named-header survey CSV *text*.
+
+    For POINT missions (Emlid/Trimble/Leica field exports, e.g. the 42-column
+    Reach RS3 file): returns ``[{'lat','lon','name','code'}, ...]`` ordered by
+    Name (numeric when possible, else file order). Lat/Lon ONLY — a point
+    mission needs a geographic anchor, so a grid-only (Northing/Easting) export
+    returns None. Returns None when the text is not a survey CSV at all (no
+    named coordinate-pair header), so the caller can fall back to the bare
+    ``lat,lon`` format. Shares the vendor column aliases with read_survey_csv.
+    """
+    if text.startswith("﻿"):    # strip a BOM the endpoint didn't
+        text = text[1:]
+    lines = text.splitlines()
+    header_map = _header_map_from_line(lines[0]) if lines else None
+    if header_map is None:
+        return None
+    c_lat = _pick(header_map, _COL_LAT)
+    c_lon = _pick(header_map, _COL_LON)
+    if not (c_lat and c_lon):
+        return None                      # grid-only: no geo anchor for a point mission
+    c_name = _pick(header_map, _COL_NAME)
+    c_code = _pick(header_map, _COL_CODE)
+    out: list[dict] = []
+    for row in csv.DictReader(lines):
+        lat, lon = _float(row.get(c_lat)), _float(row.get(c_lon))
+        if lat is None or lon is None:
+            continue
+        out.append({
+            "lat": lat,
+            "lon": lon,
+            "name": (row.get(c_name) or "").strip() if c_name else "",
+            "code": (row.get(c_code) or "").strip() if c_code else "",
+        })
+    if not out:
+        return None
+    out.sort(key=lambda r: _order_key(r["name"]))
+    return out
 
 
 def looks_like_survey_csv(filepath: str) -> bool:

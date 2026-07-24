@@ -299,6 +299,31 @@ def _gps_rows_to_spray_points(
     )
 
 
+def _survey_latlon_rows(text: str):
+    """Named-header survey export (Emlid/Trimble/…) → list[_GpsCsvRow], or None.
+
+    Reuses path_engine's survey-CSV column detection (Name/Code/Latitude/
+    Longitude + vendor aliases) so a real 42-column field export becomes a point
+    mission — not only the bare `lat,lon` file. Every surveyed point is a mark;
+    order is the survey Name order; dwell defaults are applied downstream.
+    """
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from path_engine.parsers.survey_csv import read_survey_latlon_points
+
+    pts = read_survey_latlon_points(text)
+    if not pts:
+        return None
+    return [
+        _GpsCsvRow(lat=p["lat"], lon=p["lon"], dwell_s=None, mark=True, source_index=i + 1)
+        for i, p in enumerate(pts)
+    ]
+
+
 def parse_point_gps_csv_text(
     text: str,
     *,
@@ -306,11 +331,48 @@ def parse_point_gps_csv_text(
     max_dwell_s: float = 60.0,
     duplicate_tolerance_m: float = 1e-3,
 ) -> GpsPointMissionParseResult:
-    """Parse CSV rows with header: lat,lon[,dwell_s][,mark].
+    """Parse a GPS point-mission CSV into anchor-relative NED spray points.
 
-    The first data row defines the GPS survey anchor. Every row, including the
-    anchor row, is converted to anchor-relative NED metres via Karney geodesic.
+    Two shapes are accepted, tried in order:
+      1. Bare header ``lat,lon[,dwell_s][,mark]`` (the app's simple export).
+      2. A named-header **survey export** (Emlid/Trimble/Leica —
+         ``Name,Code,…,Longitude,Latitude,…``), via path_engine's survey-CSV
+         column detection. Every surveyed point becomes a mark, in Name order.
+
+    The first data row (1) or the first Name-ordered point (2) is the survey
+    anchor; every point is projected to anchor-relative NED (Karney geodesic).
     """
+    if default_dwell_s <= 0.0 or not math.isfinite(default_dwell_s):
+        raise ValueError("default_dwell_s must be finite and > 0")
+    if max_dwell_s <= 0.0 or not math.isfinite(max_dwell_s):
+        raise ValueError("max_dwell_s must be finite and > 0")
+    try:
+        return _parse_bare_gps_csv_text(
+            text,
+            default_dwell_s=default_dwell_s,
+            max_dwell_s=max_dwell_s,
+            duplicate_tolerance_m=duplicate_tolerance_m,
+        )
+    except ValueError as bare_err:
+        rows = _survey_latlon_rows(text)
+        if rows:
+            return _gps_rows_to_spray_points(
+                rows,
+                default_dwell_s=default_dwell_s,
+                max_dwell_s=max_dwell_s,
+                duplicate_tolerance_m=duplicate_tolerance_m,
+            )
+        raise bare_err
+
+
+def _parse_bare_gps_csv_text(
+    text: str,
+    *,
+    default_dwell_s: float = 2.0,
+    max_dwell_s: float = 60.0,
+    duplicate_tolerance_m: float = 1e-3,
+) -> GpsPointMissionParseResult:
+    """Parse the bare header ``lat,lon[,dwell_s][,mark]`` (first row = anchor)."""
     if default_dwell_s <= 0.0 or not math.isfinite(default_dwell_s):
         raise ValueError("default_dwell_s must be finite and > 0")
     if max_dwell_s <= 0.0 or not math.isfinite(max_dwell_s):
