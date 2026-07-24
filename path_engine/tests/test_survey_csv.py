@@ -6,7 +6,11 @@ import pytest
 
 from path_engine.core import PathSegment, SegmentType
 from path_engine.engine import PathEngine
-from path_engine.parsers.survey_csv import looks_like_survey_csv, read_survey_csv
+from path_engine.parsers.survey_csv import (
+    looks_like_survey_csv,
+    read_survey_csv,
+    read_survey_latlon_points,
+)
 
 # Two real surveyed points from test_line_2.csv (Emlid Reach RS3, RTK FIX,
 # 2026-07-18, code L_2). The full export has 42 columns; these are the ones
@@ -43,6 +47,39 @@ def test_single_axis_header_is_not_enough(tmp_path):
     """A header naming only one axis is ambiguous — reject rather than guess."""
     f = _write(tmp_path, "Name,Northing,Elevation", "1,1243758.291,9.89")
     assert not looks_like_survey_csv(f)
+
+
+# --- trailing-space vendor headers (Book1.csv-style) ------------------------
+# Some exports write headers with a trailing space ("Latitude "). Detection
+# strips them, but DictReader keys rows on the raw header, so before the fix
+# every row silently dropped. These fail before the fix, pass after.
+
+_HEADER_PAD = ("Name ,Code ,Code description,Easting,Northing,Elevation,"
+               "Longitude ,Latitude ,Lateral RMS,Solution status,Samples,"
+               "PDOP,CS name")
+
+
+def test_trailing_space_header_still_parses_rows(tmp_path):
+    res = read_survey_csv(_write(tmp_path, _HEADER_PAD, _ROW3, _ROW4))
+    assert res.coordinate_source == "latlon"
+    assert len(res.segments) == 1
+    assert abs(res.segments[0].length - TRUE_GEODESIC_M) < 0.001
+
+
+def test_trailing_space_header_keeps_code_and_name_columns(tmp_path):
+    """The padded Code/Name headers must still group and order correctly."""
+    res = read_survey_csv(_write(tmp_path, _HEADER_PAD, _ROW4, _ROW3))  # 4 before 3
+    assert res.segments[0].metadata["survey_code"] == "L_2"
+    assert res.segments[0].metadata["survey_names"] == ["3", "4"]
+
+
+def test_trailing_space_header_in_latlon_points_reader(tmp_path):
+    text = "\n".join((_HEADER_PAD, _ROW3, _ROW4)) + "\n"
+    pts = read_survey_latlon_points(text)
+    assert pts is not None
+    assert [p["name"] for p in pts] == ["3", "4"]
+    assert [p["code"] for p in pts] == ["L_2", "L_2"]
+    assert abs(pts[0]["lat"] - 13.07208106) < 1e-9
 
 
 # --- geometry ---------------------------------------------------------------

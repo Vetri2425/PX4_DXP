@@ -133,7 +133,12 @@ def read_survey_latlon_points(text: str) -> Optional[list[dict]]:
     c_name = _pick(header_map, _COL_NAME)
     c_code = _pick(header_map, _COL_CODE)
     out: list[dict] = []
-    for row in csv.DictReader(lines):
+    reader = csv.DictReader(lines)
+    # Vendor headers carry trailing spaces (e.g. "Latitude "). Detection strips
+    # them, but DictReader keys rows on the raw header — so strip its fieldnames
+    # to match the stripped column names picked above, or every row drops.
+    reader.fieldnames = [(h or "").strip() for h in reader.fieldnames or []]
+    for row in reader:
         lat, lon = _float(row.get(c_lat)), _float(row.get(c_lon))
         if lat is None or lon is None:
             continue
@@ -222,7 +227,11 @@ def read_survey_csv(
 
     rows: list[dict] = []
     with open(filepath, "r", encoding="utf-8-sig", errors="replace") as f:
-        for row in csv.DictReader(f):
+        reader = csv.DictReader(f)
+        # Strip trailing-space vendor headers so row keys match the stripped
+        # column names picked from the header (see read_survey_latlon_points).
+        reader.fieldnames = [(h or "").strip() for h in reader.fieldnames or []]
+        for row in reader:
             if not row:
                 continue
             if use_geo:
@@ -248,7 +257,9 @@ def read_survey_csv(
     cs_name = None
     if c_cs:
         with open(filepath, "r", encoding="utf-8-sig", errors="replace") as f:
-            for row in csv.DictReader(f):
+            reader = csv.DictReader(f)
+            reader.fieldnames = [(h or "").strip() for h in reader.fieldnames or []]
+            for row in reader:
                 cs_name = (row.get(c_cs) or "").strip() or None
                 break
 
