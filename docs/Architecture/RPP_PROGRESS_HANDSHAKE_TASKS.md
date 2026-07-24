@@ -105,6 +105,8 @@ Purpose: `WAIT_OPERATOR` + operator-driven advance.
 
 Purpose: A/B every flag at the rover; only after this does a flag become the new default / merge to `baseline_master`.
 
+> **Runnable checklist:** [`docs/PHASE_F_FIELD_CHECKLIST.html`](../PHASE_F_FIELD_CHECKLIST.html) — one operator sheet consolidating Phase F (Spray-V2 modes) + G6 §2 (precise stop, boundary sourcing, auto handshake, manual gate, lat/lon-CSV point flow), with the exact `ros2 param set` enable order, bag topics, revert, and per-run PASS criteria.
+
 - [ ] **G6.1** Precise stop accuracy: RTK truth vs commanded point, feed-forward vs servo vs frozen brake-when-near.
 - [ ] **G6.2** Continuous/dash boundary accuracy: `consume_rpp_progress` ON vs OFF on the same mission — verify ≥ frozen anticipation (no regression of moving-mark lead).
 - [ ] **G6.3** Handshake latency + dwell timing on a real point mission (auto).
