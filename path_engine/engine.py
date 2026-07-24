@@ -202,6 +202,11 @@ class PathEngine:
         fit_arcs: bool = False,
         fit_arcs_rms_m: float = 0.025,
         fit_arcs_corner_deg: float = 35.0,
+        # Paint the closing side of an open MARK shape. Distinct from close_loop
+        # (which closes with spray OFF, a deadhead). Default OFF. On, a MARK
+        # segment whose first and last points differ gets a copy of its first
+        # point appended, so the closing edge is a genuine sprayed MARK edge.
+        close_shape: bool = False,
         use_two_opt: bool = True,
         max_two_opt_segments: int = 80,
         group_shapes: bool = True,
@@ -267,6 +272,7 @@ class PathEngine:
         self.fit_arcs = fit_arcs
         self.fit_arcs_rms_m = fit_arcs_rms_m
         self.fit_arcs_corner_deg = fit_arcs_corner_deg
+        self.close_shape = close_shape
         self.use_two_opt = use_two_opt
         self.max_two_opt_segments = max_two_opt_segments
         self.group_shapes = group_shapes
@@ -585,6 +591,21 @@ class PathEngine:
                     )
                     seg.points = new_pts
                     seg.metadata["control_indices"] = ctrl
+
+        # Close the shape (opt-in): append a copy of the first point to any open
+        # MARK shape so its closing side is a genuine sprayed MARK edge — unlike
+        # close_loop, which closes with spray OFF. Runs after arc fit so the
+        # closing edge is a straight chord back to the start. A shape already
+        # closed (ends within one waypoint spacing) is left untouched.
+        if self.close_shape:
+            for seg in segments:
+                if seg.segment_type == SegmentType.MARK and len(seg.points) >= 3:
+                    first = seg.points[0]
+                    if math.dist(first, seg.points[-1]) > self.mark_spacing:
+                        seg.points = list(seg.points) + [first]
+                        ctrl = list(seg.metadata.get("control_indices", []))
+                        ctrl.append(len(seg.points) - 1)
+                        seg.metadata["control_indices"] = sorted(set(ctrl))
 
         alignment_meta = {}
         has_alignment = False

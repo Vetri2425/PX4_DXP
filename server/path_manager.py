@@ -917,6 +917,9 @@ class PathManager:
         fit_arcs = bool(kwargs.pop("fit_arcs", False))
         fit_arcs_rms_m = kwargs.pop("fit_arcs_rms_m", 0.025)
         fit_arcs_corner_deg = kwargs.pop("fit_arcs_corner_deg", 35.0)
+        # Paint the closing side of an open MARK shape (distinct from close_loop,
+        # which deadheads). Default OFF → every existing plan is unchanged.
+        close_shape = bool(kwargs.pop("close_shape", False))
         use_two_opt = kwargs.pop("use_two_opt", True)
         max_two_opt_segments = kwargs.pop("max_two_opt_segments", 80)
         max_waypoints = kwargs.pop("max_waypoints", 10000)
@@ -1076,6 +1079,7 @@ class PathManager:
             fit_arcs=fit_arcs,
             fit_arcs_rms_m=fit_arcs_rms_m,
             fit_arcs_corner_deg=fit_arcs_corner_deg,
+            close_shape=close_shape,
             use_two_opt=use_two_opt,
             max_two_opt_segments=max_two_opt_segments,
         )

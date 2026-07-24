@@ -1117,6 +1117,7 @@ async def plan_path(req: PathPlanRequest):
                 fit_arcs=req.fit_arcs,
                 fit_arcs_rms_m=req.fit_arcs_rms_m,
                 fit_arcs_corner_deg=req.fit_arcs_corner_deg,
+                close_shape=req.close_shape,
                 use_two_opt=req.use_two_opt,
                 max_two_opt_segments=req.max_two_opt_segments,
                 max_waypoints=req.max_waypoints,

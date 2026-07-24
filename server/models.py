@@ -485,6 +485,9 @@ class PathPlanRequest(BaseModel):
     fit_arcs: bool = False
     fit_arcs_rms_m: float = Field(0.025, gt=0.0, le=1.0)  # straight-vs-arc threshold (~survey RMS)
     fit_arcs_corner_deg: float = Field(35.0, gt=0.0, le=180.0)  # turn that splits runs at a corner
+    # Paint the closing side of an open MARK shape (distinct from close_loop,
+    # which closes with spray OFF). Default OFF → existing plans unchanged.
+    close_shape: bool = False
     use_two_opt: bool = True  # Improve greedy segment order with 2-opt
     max_two_opt_segments: int = Field(80, ge=0, le=1000)  # Skip 2-opt above this MARK count
     max_waypoints: int = Field(10000, ge=100, le=500000)  # Hard publication guard
