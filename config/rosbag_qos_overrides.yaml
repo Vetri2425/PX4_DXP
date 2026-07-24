@@ -25,3 +25,13 @@
   depth: 1
   reliability: reliable
   durability: transient_local
+# /rpp/progress is published BEST_EFFORT (PROGRESS_QOS, 50 Hz, loss-tolerant). A
+# default RELIABLE recorder subscription is INCOMPATIBLE with a BEST_EFFORT
+# publisher and would capture nothing — force best_effort so the phase/xtrack
+# stream is recorded for the point-mode handshake A/B. (milestone/point_done/
+# advance are RELIABLE VOLATILE and captured by the recorder default.)
+/rpp/progress:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile

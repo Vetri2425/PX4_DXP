@@ -130,6 +130,14 @@ TOPICS = [
     "/spray/status",                      # Spray V2 Phase A typed status (std_msgs/String JSON)
     "/spray/manual_state",                # manual-override state (POST /api/spray/test)
     "/dyx/mission/progress",              # 0.0→1.0 completion @1Hz (path_publisher)
+    # ── added 2026-07-24: RPP↔spray progress handshake (G1–G5), needed to
+    # validate the point-mode A/B from the bag. VOLATILE (not latched); progress
+    # is BEST_EFFORT (see the QoS override), the rest RELIABLE. All silent unless
+    # progress_publish_enabled / point_handshake_enabled are set at the rover.
+    "/rpp/progress",                      # mission phase + dist-to-boundary @50Hz (BEST_EFFORT)
+    "/rpp/milestone",                     # discrete edges: MARK_START/AT_POINT/… (RELIABLE)
+    "/spray/point_done",                  # spray→RPP dwell-complete proof (RELIABLE)
+    "/point/advance",                     # operator "next point" (G5 manual, RELIABLE)
 ]
 
 # QoS profile overrides so the LATCHED (TRANSIENT_LOCAL) topics above are actually
