@@ -25,6 +25,7 @@ from .core import (
 from .parsers import load_mission_file, load_mission_segments, parse_dxf, entities_to_segments
 from .parsers.csv_parser import read_ned_csv_enhanced
 from .parsers.waypoints_parser import read_qgc_waypoints_as_segment
+from .planners.arc_chain import fit_line_chain
 from .planners.straight_line import densify_segment
 from .planners.extensions import (
     decompose_line_chain_to_edges,
@@ -192,6 +193,15 @@ class PathEngine:
         per_line_extensions: bool = False,
         corner_smooth_radius_m: float = 0.0,
         corner_smooth_arc_pts: int = 6,
+        # Arc fit for surveyed LINE_CHAINs (survey CSV). Default OFF: with the
+        # flag off a surveyed chain densifies to straight chords exactly as
+        # before, so DXF and line missions are byte-for-byte unchanged. On, a
+        # surveyed curve is split at corners and each curved run is fit to one
+        # circle (see planners/arc_chain.py). rms is the straight-vs-arc
+        # threshold (~ survey lateral RMS); corner_deg the turn that splits runs.
+        fit_arcs: bool = False,
+        fit_arcs_rms_m: float = 0.025,
+        fit_arcs_corner_deg: float = 35.0,
         use_two_opt: bool = True,
         max_two_opt_segments: int = 80,
         group_shapes: bool = True,
@@ -254,6 +264,9 @@ class PathEngine:
         self.per_line_extensions = per_line_extensions
         self.corner_smooth_radius_m = corner_smooth_radius_m
         self.corner_smooth_arc_pts = corner_smooth_arc_pts
+        self.fit_arcs = fit_arcs
+        self.fit_arcs_rms_m = fit_arcs_rms_m
+        self.fit_arcs_corner_deg = fit_arcs_corner_deg
         self.use_two_opt = use_two_opt
         self.max_two_opt_segments = max_two_opt_segments
         self.group_shapes = group_shapes
@@ -552,6 +565,26 @@ class PathEngine:
             )
             for seg in segments
         ]
+
+        # Arc fit (opt-in): replace a surveyed LINE_CHAIN's straight-chord
+        # geometry with fitted straight-runs + circular arcs BEFORE anything
+        # else touches the points. A rigid transform preserves circles, so
+        # running this ahead of alignment is equivalent and keeps the fit in the
+        # raw survey frame. Off by default and only ever LINE_CHAIN MARKs (DXF
+        # never has that geometry_type), so all other missions are untouched.
+        if self.fit_arcs:
+            for seg in segments:
+                if (seg.segment_type == SegmentType.MARK
+                        and str(seg.metadata.get("geometry_type", "")).upper() == "LINE_CHAIN"
+                        and len(seg.points) >= 3):
+                    new_pts, ctrl = fit_line_chain(
+                        seg.points,
+                        rms_m=self.fit_arcs_rms_m,
+                        corner_angle_deg=self.fit_arcs_corner_deg,
+                        max_spacing_m=self.mark_spacing,
+                    )
+                    seg.points = new_pts
+                    seg.metadata["control_indices"] = ctrl
 
         alignment_meta = {}
         has_alignment = False

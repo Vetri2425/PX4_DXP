@@ -912,6 +912,11 @@ class PathManager:
         per_line_extensions = kwargs.pop("per_line_extensions", None)
         corner_smooth_radius_m = kwargs.pop("corner_smooth_radius_m", 0.0)
         corner_smooth_arc_pts = kwargs.pop("corner_smooth_arc_pts", 6)
+        # Arc fit for surveyed LINE_CHAINs. Default OFF → straight chords, so
+        # every existing path (DXF, builtin, line CSV) is byte-for-byte unchanged.
+        fit_arcs = bool(kwargs.pop("fit_arcs", False))
+        fit_arcs_rms_m = kwargs.pop("fit_arcs_rms_m", 0.025)
+        fit_arcs_corner_deg = kwargs.pop("fit_arcs_corner_deg", 35.0)
         use_two_opt = kwargs.pop("use_two_opt", True)
         max_two_opt_segments = kwargs.pop("max_two_opt_segments", 80)
         max_waypoints = kwargs.pop("max_waypoints", 10000)
@@ -1068,6 +1073,9 @@ class PathManager:
             per_line_extensions=per_line_extensions,
             corner_smooth_radius_m=corner_smooth_radius_m,
             corner_smooth_arc_pts=corner_smooth_arc_pts,
+            fit_arcs=fit_arcs,
+            fit_arcs_rms_m=fit_arcs_rms_m,
+            fit_arcs_corner_deg=fit_arcs_corner_deg,
             use_two_opt=use_two_opt,
             max_two_opt_segments=max_two_opt_segments,
         )

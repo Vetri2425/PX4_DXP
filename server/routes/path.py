@@ -1114,6 +1114,9 @@ async def plan_path(req: PathPlanRequest):
                 # PathManager during planning.
                 corner_smooth_radius_m=req.corner_smooth_radius_m,
                 corner_smooth_arc_pts=req.corner_smooth_arc_pts,
+                fit_arcs=req.fit_arcs,
+                fit_arcs_rms_m=req.fit_arcs_rms_m,
+                fit_arcs_corner_deg=req.fit_arcs_corner_deg,
                 use_two_opt=req.use_two_opt,
                 max_two_opt_segments=req.max_two_opt_segments,
                 max_waypoints=req.max_waypoints,

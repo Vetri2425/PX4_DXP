@@ -479,6 +479,12 @@ class PathPlanRequest(BaseModel):
     aft_extension_m: float = Field(0.5, ge=0.0)
     corner_smooth_radius_m: float = Field(0.0, ge=0.0)  # Planner-side corner radius; 0 disables
     corner_smooth_arc_pts: int = Field(6, ge=2)  # Points per smoothed corner arc
+    # Arc fit for surveyed LINE_CHAINs (survey CSV). Default OFF → straight
+    # chords, so DXF/builtin/line-CSV plans are byte-for-byte unchanged. On, a
+    # surveyed curve is split at corners and each curved run fit to one circle.
+    fit_arcs: bool = False
+    fit_arcs_rms_m: float = Field(0.025, gt=0.0, le=1.0)  # straight-vs-arc threshold (~survey RMS)
+    fit_arcs_corner_deg: float = Field(35.0, gt=0.0, le=180.0)  # turn that splits runs at a corner
     use_two_opt: bool = True  # Improve greedy segment order with 2-opt
     max_two_opt_segments: int = Field(80, ge=0, le=1000)  # Skip 2-opt above this MARK count
     max_waypoints: int = Field(10000, ge=100, le=500000)  # Hard publication guard
