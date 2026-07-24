@@ -42,6 +42,37 @@ def test_path_manager_preview_returns_bounds_and_local_ned_points(tmp_path):
     assert all(pt.spray is True for pt in preview.waypoints)
 
 
+def test_path_manager_preview_survey_csv_real_must_hit_and_geo_origin(tmp_path):
+    """A named-header survey CSV previews via the planner: only surveyed vertices
+    are must-hit (not every densified point), and the WGS84 origin is exposed."""
+    mission_file = tmp_path / "survey.csv"
+    lat0, lon0, mn, me = 13.0721, 80.2620, 110900.0, 108400.0
+    rows = ["Name,Code,Latitude,Longitude"]
+    for i, (n, e) in enumerate([(0, 0), (1, 0), (2, 0), (2, 2)]):
+        rows.append(f"{i + 1},L_1,{lat0 + n / mn:.8f},{lon0 + e / me:.8f}")
+    mission_file.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    preview = PathManager(str(tmp_path)).preview_path("survey.csv")
+
+    must_hit = [pt.must_hit for pt in preview.waypoints]
+    assert sum(must_hit) == 4, "exactly the four surveyed vertices"
+    assert not all(must_hit), "densified fill is not must-hit"
+    assert preview.num_points > 4, "the chain was densified"
+    assert preview.geo_origin is not None
+    assert abs(preview.geo_origin[0] - lat0) < 0.01
+
+
+def test_path_manager_preview_legacy_ned_csv_has_no_geo_origin(tmp_path):
+    """A headerless NED CSV is an explicit point list — no geo origin, all vertices."""
+    mission_file = tmp_path / "line.csv"
+    mission_file.write_text("0,0\n1.5,-0.25\n2.0,0.75\n", encoding="utf-8")
+
+    preview = PathManager(str(tmp_path)).preview_path("line.csv")
+
+    assert preview.geo_origin is None
+    assert all(pt.must_hit for pt in preview.waypoints)
+
+
 def test_path_manager_preview_preserves_dxf_spray_flags(tmp_path, monkeypatch):
     mission_file = tmp_path / "field.dxf"
     mission_file.write_text("0\nEOF\n", encoding="utf-8")

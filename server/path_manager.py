@@ -669,8 +669,21 @@ class PathManager:
             return self._load_file(fpath)
         raise FileNotFoundError(f"Path not found: {name!r}")
 
+    @staticmethod
+    def _survey_geo_origin(fpath: str) -> list[float] | None:
+        """WGS84 (lat, lon) a survey CSV's local frame is anchored at, or None."""
+        try:
+            from path_engine.parsers.survey_csv import read_survey_csv
+            res = read_survey_csv(fpath)
+        except Exception:
+            return None
+        if res.geo_origin is None:
+            return None
+        return [float(res.geo_origin[0]), float(res.geo_origin[1])]
+
     def preview_path(self, name: str) -> PathPreviewResponse:
         """Return local-NED points for display without touching mission state."""
+        geo_origin: list[float] | None = None
         lookup_name = (
             name.removeprefix("builtin:")
             if name.startswith("builtin:")
@@ -724,11 +737,26 @@ class PathManager:
                 spray_flags = list(plan.spray_flags)
                 must_hit = list(getattr(plan, "must_hit", []) or [])
             else:
-                pts = self._load_file(fpath)
-                spray_flags = [True] * len(pts)
-                # A CSV/.waypoints file is a list of explicit points — nothing
-                # here was interpolated, so every one of them is a vertex.
-                must_hit = [True] * len(pts)
+                # A survey CSV (named lat/lon or grid header) runs through the
+                # full planner so the preview MATCHES the executed mission:
+                # densified, grouped by feature code, real spray flags and
+                # must-hit provenance (only surveyed vertices, not fill), plus the
+                # WGS84 origin its frame is anchored at — the WYSIWYG contract the
+                # map needs. A legacy headerless NED CSV / .waypoints file is an
+                # explicit point list with no provenance, so every point is a
+                # vertex.
+                from path_engine.parsers.survey_csv import looks_like_survey_csv
+                if fpath.lower().endswith(".csv") and looks_like_survey_csv(fpath):
+                    from path_engine import PathEngine
+                    plan = PathEngine().plan_file(fpath)
+                    pts = list(plan.merged_waypoints)
+                    spray_flags = list(plan.spray_flags)
+                    must_hit = list(getattr(plan, "must_hit", []) or [])
+                    geo_origin = self._survey_geo_origin(fpath)
+                else:
+                    pts = self._load_file(fpath)
+                    spray_flags = [True] * len(pts)
+                    must_hit = [True] * len(pts)
 
         if len(spray_flags) != len(pts):
             spray_flags = [True] * len(pts)
@@ -756,6 +784,7 @@ class PathManager:
             num_points=len(pts),
             bounds=bounds,
             waypoints=waypoints,
+            geo_origin=geo_origin,
         )
         if lookup_name not in BUILTIN_PATHS:
             self._preview_cache[fpath] = (st.st_mtime_ns, st.st_size, response)

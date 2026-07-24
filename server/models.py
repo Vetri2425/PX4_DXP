@@ -151,6 +151,11 @@ class PathPreviewResponse(BaseModel):
     num_points: int
     bounds: Optional[PathPreviewBounds] = None
     waypoints: list[PathPreviewPoint]
+    # WGS84 (lat, lon) the local NED frame is anchored at, when the source is
+    # georeferenced (a survey CSV projected from lat/lon, or a geo DXF). None for
+    # a metric/local source. Lets the map place the preview at its true surveyed
+    # coordinates (WYSIWYG) instead of an arbitrary origin.
+    geo_origin: Optional[list[float]] = None
 
 
 class MissionStatus(BaseModel):
