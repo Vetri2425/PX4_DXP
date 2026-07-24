@@ -62,6 +62,58 @@ def test_path_manager_preview_survey_csv_real_must_hit_and_geo_origin(tmp_path):
     assert abs(preview.geo_origin[0] - lat0) < 0.01
 
 
+def _count_big_kinks(pts, deg=5.0):
+    import math
+    big = 0
+    for i in range(1, len(pts) - 1):
+        v1 = (pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
+        v2 = (pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+        m1 = math.hypot(*v1); m2 = math.hypot(*v2)
+        if m1 < 1e-9 or m2 < 1e-9:
+            continue
+        d = (v1[0] * v2[0] + v1[1] * v2[1]) / (m1 * m2)
+        if math.degrees(math.acos(max(-1.0, min(1.0, d)))) > deg:
+            big += 1
+    return big
+
+
+def test_survey_csv_arc_previews_as_a_true_arc_not_chords(tmp_path):
+    """A surveyed curve auto-arc-fits in the preview (was straight chords)."""
+    import math
+    from path_engine.parsers.georef import metres_per_degree
+    lat0, lon0 = 13.0721, 80.2620
+    mn, me = metres_per_degree(lat0)
+    rows = ["Name,Code,Latitude,Longitude"]
+    for i in range(7):  # 90° arc, radius 5 m, 7 surveyed points
+        a = math.radians(90 * i / 6)
+        n, e = 5.0 * math.sin(a), 5.0 * math.cos(a)
+        rows.append(f"{i + 1},L_1,{lat0 + n / mn:.8f},{lon0 + e / me:.8f}")
+    (tmp_path / "arc.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    pts = [(w.north, w.east)
+           for w in PathManager(str(tmp_path)).preview_path("arc.csv").waypoints]
+    # A true arc bends by a fraction of a degree per densified step: no big kinks.
+    # Straight chords between the 7 vertices would show ~5 big (>5°) kinks.
+    assert _count_big_kinks(pts) == 0
+
+
+def test_survey_csv_square_stays_square_in_preview(tmp_path):
+    """Auto arc-fit must NOT round a square — corner-split keeps sharp corners."""
+    import math
+    from path_engine.parsers.georef import metres_per_degree
+    lat0, lon0 = 13.0721, 80.2620
+    mn, me = metres_per_degree(lat0)
+    rows = ["Name,Code,Latitude,Longitude"]
+    for i, (n, e) in enumerate([(0, 0), (2, 0), (2, 2), (0, 2), (0, 0)], start=1):
+        rows.append(f"{i},L_1,{lat0 + n / mn:.8f},{lon0 + e / me:.8f}")
+    (tmp_path / "square.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    pts = [(w.north, w.east)
+           for w in PathManager(str(tmp_path)).preview_path("square.csv").waypoints]
+    # A closed square keeps its three interior 90° corners as sharp kinks.
+    assert _count_big_kinks(pts) == 3
+
+
 def test_path_manager_preview_legacy_ned_csv_has_no_geo_origin(tmp_path):
     """A headerless NED CSV is an explicit point list — no geo origin, all vertices."""
     mission_file = tmp_path / "line.csv"

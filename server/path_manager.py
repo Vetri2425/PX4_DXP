@@ -656,7 +656,9 @@ class PathManager:
                 origin != (0.0, 0.0) or start_position is not None
             ):
                 from path_engine import PathEngine
-                engine = PathEngine()
+                # Arc-fit surveyed curves (no-op for a legacy NED CSV, which has
+                # no LINE_CHAIN); matches preview_path + plan_path.
+                engine = PathEngine(fit_arcs=self._is_survey_csv(name))
                 plan = engine.plan_file(
                     fpath,
                     origin=origin,
@@ -668,6 +670,22 @@ class PathManager:
                 return [(n + origin[0], e + origin[1]) for n, e in pts]
             return self._load_file(fpath)
         raise FileNotFoundError(f"Path not found: {name!r}")
+
+    def _is_survey_csv(self, name: str) -> bool:
+        """True when *name* is a named-header survey CSV in the missions dir.
+
+        Survey CSVs are the pre-line source: their curves must be arc-fitted, not
+        densified into straight chords. DXF (whose grouped polylines are also
+        LINE_CHAINs) and legacy headerless NED CSVs are excluded, so their frozen
+        behaviour is untouched.
+        """
+        if name.startswith("builtin:"):
+            return False
+        fpath = os.path.join(self._dir, os.path.basename(name))
+        if not fpath.lower().endswith(".csv") or not os.path.isfile(fpath):
+            return False
+        from path_engine.parsers.survey_csv import looks_like_survey_csv
+        return looks_like_survey_csv(fpath)
 
     @staticmethod
     def _survey_geo_origin(fpath: str) -> list[float] | None:
@@ -748,7 +766,10 @@ class PathManager:
                 from path_engine.parsers.survey_csv import looks_like_survey_csv
                 if fpath.lower().endswith(".csv") and looks_like_survey_csv(fpath):
                     from path_engine import PathEngine
-                    plan = PathEngine().plan_file(fpath)
+                    # Arc-fit a surveyed curve so the preview shows a true arc,
+                    # not straight chords between vertices. Matches execution
+                    # (plan_path auto-enables fit_arcs for survey CSVs too).
+                    plan = PathEngine(fit_arcs=True).plan_file(fpath)
                     pts = list(plan.merged_waypoints)
                     spray_flags = list(plan.spray_flags)
                     must_hit = list(getattr(plan, "must_hit", []) or [])
@@ -941,9 +962,12 @@ class PathManager:
         per_line_extensions = kwargs.pop("per_line_extensions", None)
         corner_smooth_radius_m = kwargs.pop("corner_smooth_radius_m", 0.0)
         corner_smooth_arc_pts = kwargs.pop("corner_smooth_arc_pts", 6)
-        # Arc fit for surveyed LINE_CHAINs. Default OFF → straight chords, so
-        # every existing path (DXF, builtin, line CSV) is byte-for-byte unchanged.
-        fit_arcs = bool(kwargs.pop("fit_arcs", False))
+        # Arc fit for surveyed LINE_CHAINs. Auto-ON for a survey CSV (its curves
+        # must come out as arcs, not chords; corner-split keeps squares/lines
+        # unchanged), OFF otherwise so DXF/builtin/legacy stay byte-for-byte
+        # frozen. An explicit fit_arcs kwarg always wins.
+        fit_arcs_kw = kwargs.pop("fit_arcs", None)
+        fit_arcs = self._is_survey_csv(source_name) if fit_arcs_kw is None else bool(fit_arcs_kw)
         fit_arcs_rms_m = kwargs.pop("fit_arcs_rms_m", 0.025)
         fit_arcs_corner_deg = kwargs.pop("fit_arcs_corner_deg", 35.0)
         # Paint the closing side of an open MARK shape (distinct from close_loop,
@@ -1243,7 +1267,8 @@ class PathManager:
             from path_engine.parsers.survey_csv import looks_like_survey_csv
             if looks_like_survey_csv(fpath):
                 from path_engine import PathEngine
-                return PathEngine().plan_file(fpath).merged_waypoints
+                # Arc-fit surveyed curves (matches preview_path + plan_path).
+                return PathEngine(fit_arcs=True).plan_file(fpath).merged_waypoints
             return read_ned_csv(fpath)
         if ext == ".dxf":
             from path_engine import PathEngine
