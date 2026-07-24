@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Spray V2 Phase F + G6 — Field Validation Checklist</title>
+<style>
+  @page { size: A4 portrait; margin: 7mm; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
+    font-size: 9.4px; line-height: 1.28; color: #111;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  .sheet { width: 196mm; }
+  h1 { font-size: 15px; margin: 0 0 1px; letter-spacing: .2px; }
+  .sub { font-size: 8.6px; color: #444; margin-bottom: 4px; }
+  .hdr { display: flex; justify-content: space-between; align-items: flex-end;
+         border-bottom: 2px solid #111; padding-bottom: 3px; margin-bottom: 5px; }
+  .sync { font-size: 8.4px; text-align: right; color: #222; }
+  .sync b { font-family: "SF Mono", Menlo, monospace; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 5px; }
+  th, td { border: 0.7px solid #999; padding: 5px 4px; vertical-align: top; text-align: left; }
+  th { background: #ececec; font-size: 8.6px; text-transform: uppercase; letter-spacing: .3px; }
+  .sec { background: #111; color: #fff; font-weight: 700; font-size: 9.2px;
+         padding: 3px 5px; letter-spacing: .4px; }
+  .sec.g6 { background: #123a63; }
+  code { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 8.4px;
+         background: #f2f2f2; padding: 0 2px; border-radius: 2px; }
+  .ck { text-align: center; width: 20px; font-size: 12px; }
+  .step { width: 22px; text-align: center; font-weight: 700; }
+  .grow { }
+  .note { font-size: 8.4px; color: #333; }
+  .warn { color: #a00; font-weight: 700; }
+  .ok { color: #0a5; font-weight: 700; }
+  .two { display: flex; gap: 6px; }
+  .two > div { flex: 1; }
+  .foot { border-top: 1.5px solid #111; padding-top: 4px; font-size: 8.6px; }
+  .signrow td { height: 26px; }
+  ul { margin: 2px 0 0; padding-left: 14px; }
+  li { margin-bottom: 1px; }
+  .banner { border: 1px solid #123a63; background: #eef4fb; padding: 4px 6px;
+            font-size: 8.6px; margin-bottom: 5px; }
+  .banner b { font-family: "SF Mono", Menlo, monospace; }
+</style>
+</head>
+<body>
+<div class="sheet">
+
+  <div class="hdr">
+    <div>
+      <h1>Spray V2 Phase F + G6 — Field Validation</h1>
+      <div class="sub">Dry-run every mode BEFORE live paint. Never leave the rover unattended while armed. Every enable below is a default-OFF A/B switch — a run always compares ON vs the frozen baseline.</div>
+    </div>
+    <div class="sync">
+      Branch <b>Upgrade_Spray</b> @ <b>a4bce1d</b><br>
+      mac = origin = jetson &nbsp;✓ in sync<br>
+      Date __________ &nbsp; Operator __________
+    </div>
+  </div>
+
+  <div class="banner">
+    <b>SCOPE</b> — §1 is Spray-V2 modes (Phase F). §2 is the RPP↔spray progress handshake (G6): precise stop, boundary sourcing, auto handshake, manual gate, and the new lat/lon-CSV point flow.
+    <b>Auto handshake needs THREE flags ON together</b> — RPP <code>progress_publish_enabled</code> + <code>point_handshake_enabled</code> AND spray <code>consume_rpp_progress</code>. With any one OFF the rover silently falls back to the frozen fixed-timer point-hold (safe). A restart resets all switches to default-OFF.
+  </div>
+
+  <div class="sec">0 · PRE-FLIGHT (before any drive)</div>
+  <table>
+    <tr><th class="ck">✓</th><th style="width:29%">Check</th><th>How / command</th><th style="width:28%">Pass criteria</th></tr>
+    <tr><td class="ck">☐</td><td>Services up</td><td><code>systemctl is-active rpp-pipeline rover-server px4-dxp</code></td><td>all three <code>active</code></td></tr>
+    <tr><td class="ck">☐</td><td>Sync confirmed</td><td><code>cd ~/PX4_DXP &amp;&amp; git rev-parse --short HEAD</code></td><td>= <code>a4bce1d</code> (or newer, noted)</td></tr>
+    <tr><td class="ck">☐</td><td>RTK fix</td><td>QGC / telemetry — dual-antenna heading valid</td><td>fix_type = 6 (RTK_FIXED)</td></tr>
+    <tr><td class="ck">☐</td><td>Bag recorder ready<br>(handshake topics incl.)</td><td><code>ros2 bag record /mavros/local_position/pose /spray/active /spray/status /rpp/debug /rpp/segment_debug /path /rpp/progress /rpp/milestone /spray/point_done /point/advance -o ~/bags/$(date +%Y%m%d_%H%M%S)</code></td><td>recording, one bag per run</td></tr>
+    <tr><td class="ck">☐</td><td>DRY-RUN first</td><td>Physically disconnect / cap the nozzle for the first pass of each mode</td><td>no paint on run #1</td></tr>
+  </table>
+
+  <div class="sec">1 · SPRAY-V2 MODE &amp; GATE MATRIX (Phase F) — one row per run (dry-run, then live)</div>
+  <table>
+    <tr><th class="step">#</th><th style="width:14%">Target</th><th style="width:30%">Set up</th><th>Do</th><th style="width:26%">PASS if</th><th class="ck">✓</th></tr>
+    <tr>
+      <td class="step">1</td><td><b>Continuous</b><br>(baseline parity)</td>
+      <td>Plan mission, <code>spray_mode=continuous</code> (default). No params.</td>
+      <td>Drive a MARK→TRANSIT→MARK path @ 0.35 m/s.</td>
+      <td>Paint only on MARK legs; lifts over transits — same as today.</td><td class="ck">☐</td>
+    </tr>
+    <tr>
+      <td class="step">2</td><td><b>Dash</b></td>
+      <td>Plan with <code>spray_mode=dash</code>, on/off metres (e.g. 6 / 3) from the frontend.</td>
+      <td>Drive a straight run ≥ 3 dash periods; note first dash length.</td>
+      <td>On/off lengths match set metres; pattern flows through corners (not reset).</td><td class="ck">☐</td>
+    </tr>
+    <tr>
+      <td class="step">3</td><td><b>Point</b><br>(node + RPP hold)</td>
+      <td><code>ros2 param set /rpp_controller point_hold_enabled true</code><br><code>ros2 param set /rpp_controller point_hold_s 2.5</code> &nbsp;(≥ settle+dwell+0.5)<br>Plan <code>spray_mode=point</code>; dots = must-hit points.</td>
+      <td>Run a 3-point mission; watch each stop.</td>
+      <td>Rover stops ON each dot, dwells, sprays; leaves only after OFF; no dot skipped.</td><td class="ck">☐</td>
+    </tr>
+    <tr>
+      <td class="step">4</td><td><b>RTK gate</b><br>(default ON)</td>
+      <td>No change — <code>spray_require_rtk_fix</code> already true.</td>
+      <td>Mid-MARK, force an RTK dropout (shade / disconnect base a few s).</td>
+      <td>Spray stops instantly; re-enables only ~1 s after fix returns; <code>safety_reason</code> shows the GPS cause.</td><td class="ck">☐</td>
+    </tr>
+    <tr>
+      <td class="step">5</td><td><b>Flow calib.</b></td>
+      <td>Paint 3 lines @ 0.15 / 0.35 / 0.60 m/s with flow forced to <code>on_value</code>; measure width/opacity.</td>
+      <td>Set <code>rated_marking_speed_mps</code> = fastest mission speed; <code>min_flow_value</code> = lowest unbroken-line value.</td>
+      <td>Calibration values recorded below.</td><td class="ck">☐</td>
+    </tr>
+    <tr>
+      <td class="step">6</td><td><b>Flow live</b></td>
+      <td><code>ros2 param set /spray_controller flow_modulation_enabled true</code> (after #5).</td>
+      <td>One deliberate speed-varying pass (slow → fast → slow) on a MARK leg.</td>
+      <td>Line density looks constant across speeds; <code>flow_source=speed_scaled</code>.</td><td class="ck">☐</td>
+    </tr>
+    <tr>
+      <td class="step">7</td><td><b>Point flow</b></td>
+      <td>Set <code>point_dwell_flow_value</code> for a clean dot (flow enabled + point mode).</td>
+      <td>Re-run one point; inspect a dot.</td>
+      <td>Dot solid; <code>flow_source=point_fixed</code>.</td><td class="ck">☐</td>
+    </tr>
+  </table>
+
+  <div class="sec g6">2 · G6 — RPP↔SPRAY HANDSHAKE &amp; PRECISE-STOP A/B (default-OFF; every run is ON vs frozen)</div>
+  <table>
+    <tr><th class="step">#</th><th style="width:15%">Target (G6.x)</th><th style="width:31%">Enable (runtime <code>ros2 param set</code>)</th><th>Do / A-B</th><th style="width:25%">PASS if</th><th class="ck">✓</th></tr>
+    <tr>
+      <td class="step">G1</td><td><b>Precise 2 cm stop</b><br>(G6.1)</td>
+      <td><code>/rpp_controller point_hold_enabled true</code><br><code>/rpp_controller point_precise_stop_enabled true</code><br><code>/rpp_controller precise_stop_mode feedforward</code> (then <code>servo</code>)</td>
+      <td>3-point mission. Measure RTK rest pose vs the commanded point (raw <code>/path</code> vertex). A/B: precise OFF = frozen brake-when-near.</td>
+      <td>feed-forward rest err ≤ frozen; <code>servo</code> ≤ 2 cm along-track; no overshoot; releases within <code>precise_stop_max_s</code> (never wedges).</td><td class="ck">☐</td>
+    </tr>
+    <tr>
+      <td class="step">G2</td><td><b>Boundary sourcing</b><br>continuous/dash (G6.2)</td>
+      <td><code>/rpp_controller progress_publish_enabled true</code><br><code>/spray_controller consume_rpp_progress true</code></td>
+      <td>Same MARK mission ON vs OFF. Compare MARK on/off boundary timing; then force a progress stall (stop the RPP publish) mid-MARK.</td>
+      <td>ON ≥ frozen anticipation (no lost moving-mark lead); on stale progress spray falls back to <code>/path</code> — <span class="warn">no valve dropout</span>.</td><td class="ck">☐</td>
+    </tr>
+    <tr>
+      <td class="step">G3</td><td><b>Auto handshake</b><br>(G6.3)</td>
+      <td>ALL of: <code>/rpp_controller progress_publish_enabled true</code> + <code>point_handshake_enabled true</code> + <code>point_hold_enabled true</code>; <code>/spray_controller consume_rpp_progress true</code>. <code>point_execution_mode</code> stays <code>auto</code>.</td>
+      <td>Multi-point auto mission. Watch <code>/api/spray/status</code> phase + the <code>/rpp/milestone</code> AT_POINT → <code>/spray/point_done</code> → advance ordering.</td>
+      <td>dwell fires only on AT_POINT proof; advance only after <code>point_done</code> (not a fixed timer); ~0 settle; no skipped/double dots; <code>point_hold_max_s</code> backstop never trips in nominal.</td><td class="ck">☐</td>
+    </tr>
+    <tr>
+      <td class="step">G4</td><td><b>Manual gate</b><br>(G6.4)</td>
+      <td>G3 enables + <code>/rpp_controller point_execution_mode manual</code> (or load the mission with the app's <code>manual</code>). Optional <code>manual_wait_timeout_s</code> (0 = wait forever).</td>
+      <td>Point mission. At each point rover holds. Advance: <code>curl -X POST localhost:5001/api/spray/point/advance -d '{"expect_index":N}'</code> (N = <code>status.point.rpp_point_index</code>).</td>
+      <td>rover holds in <code>WAIT_OPERATOR</code> indefinitely; advances only on matching <code>expect_index</code>; stale/double tap ignored; <code>status.point.wait_operator</code> tracks the hold.</td><td class="ck">☐</td>
+    </tr>
+    <tr>
+      <td class="step">G5</td><td><b>lat/lon-CSV point flow</b><br>(new — a4bce1d)</td>
+      <td><code>point_hold_enabled true</code>. From the app (or curl) upload a real surveyed <code>lat,lon</code> CSV.</td>
+      <td>App CSV import → parse → stage → load; OR curl: <code>parse-point-gps-csv</code> → <code>{name}/plan-and-stage</code> (<code>GPS_SURVEYED</code>) → <code>load-to-controller</code>. Then drive.</td>
+      <td>staged must-hit dots == the surveyed points; rover stops/dwells/sprays each; <code>placement_mode=GPS_SURVEYED</code> re-binds to live EKF; dot on the surveyed coordinate (± nozzle offset).</td><td class="ck">☐</td>
+    </tr>
+    <tr>
+      <td class="step">G6</td><td><b>Nozzle offset + bags</b><br>(G6.5 / G6.6)</td>
+      <td>Measure the nozzle-from-antenna offset; apply it so the <b>dot</b> (not the antenna) lands on the point.</td>
+      <td>Record a bag per run (topics in §0). Analyse per <code>analyse-missions</code>.</td>
+      <td>dot lands on the point within tolerance; pose measured vs <b>raw <code>/path</code></b> — never <code>/rpp/debug[0]</code>.</td><td class="ck">☐</td>
+    </tr>
+  </table>
+
+  <div class="two">
+    <div>
+      <div class="sec">3 · CALIBRATION / A-B VALUES (fill in)</div>
+      <table>
+        <tr><th>Param (node)</th><th>Value</th></tr>
+        <tr><td><code>rated_marking_speed_mps</code> /spray</td><td>______ m/s</td></tr>
+        <tr><td><code>min_flow_value</code> /spray</td><td>______ (0–1)</td></tr>
+        <tr><td><code>point_dwell_flow_value</code> /spray</td><td>______ (0–1)</td></tr>
+        <tr><td><code>point_hold_s</code> /rpp</td><td>______ s</td></tr>
+        <tr><td><code>precise_stop_mode</code> (ff/servo)</td><td>__________</td></tr>
+        <tr><td>precise rest err (ff / servo / frozen)</td><td>__ / __ / __ cm</td></tr>
+        <tr><td>nozzle offset N / E</td><td>______ / ______ m</td></tr>
+        <tr><td>dash on / off</td><td>______ / ______ m</td></tr>
+      </table>
+    </div>
+    <div>
+      <div class="sec">4 · REVERT (after the session — every switch back to default-OFF)</div>
+      <table>
+        <tr><th class="ck">✓</th><th>Command</th></tr>
+        <tr><td class="ck">☐</td><td><code>/rpp_controller point_hold_enabled false</code></td></tr>
+        <tr><td class="ck">☐</td><td><code>/rpp_controller point_precise_stop_enabled false</code></td></tr>
+        <tr><td class="ck">☐</td><td><code>/rpp_controller point_handshake_enabled false</code></td></tr>
+        <tr><td class="ck">☐</td><td><code>/rpp_controller point_execution_mode auto</code></td></tr>
+        <tr><td class="ck">☐</td><td><code>/rpp_controller progress_publish_enabled false</code></td></tr>
+        <tr><td class="ck">☐</td><td><code>/spray_controller consume_rpp_progress false</code></td></tr>
+        <tr><td class="ck">☐</td><td><code>/spray_controller flow_modulation_enabled false</code></td></tr>
+        <tr><td class="ck">☐</td><td>Re-stage any mission back to <code>spray_mode=continuous</code></td></tr>
+        <tr><td class="ck">☐</td><td>Pull all bags to Mac; note bag names vs runs</td></tr>
+      </table>
+      <div class="note" style="margin-top:2px">Or simply <code>sudo systemctl restart rpp-pipeline</code> — resets every switch to default-OFF (no MAVROS drop).</div>
+    </div>
+  </div>
+
+  <div class="grow">
+    <div class="sec">5 · SAFETY &amp; MEASUREMENT NOTES</div>
+    <table>
+      <tr><td class="note">
+        <ul>
+          <li><span class="warn">Dry-run (no paint) precedes every live pass</span> — nozzle capped/disconnected on run #1 of each mode. Never arm-and-walk-away.</li>
+          <li>Param sets are runtime and take effect next tick; <b>no restart needed</b>. A restart resets them to default-OFF.</li>
+          <li><span class="warn">Handshake is compound:</span> the auto path needs RPP <code>progress_publish_enabled</code> + <code>point_handshake_enabled</code> AND spray <code>consume_rpp_progress</code> all ON. Any one OFF ⇒ frozen fixed-timer fallback (no error, no crash) — if the handshake "does nothing", check all three with <code>ros2 param get</code>.</li>
+          <li><b>Proof gates, never replaces:</b> if <code>/rpp/progress</code> goes stale the spray node reverts to its own <code>/path</code> geometry — the valve has no hard dependency on the RPP. That fallback is itself a PASS criterion (§2 G2).</li>
+          <li>Measure driven pose against the <b>raw <code>/path</code></b>, never <code>/rpp/debug[0]</code> (error vs the conditioned path — hides the vertex bug) and never <code>/spray/debug[5]</code> (nozzle xtrack).</li>
+          <li>Node names: spray = <code>/spray_controller</code>, controller = <code>/rpp_controller</code>. If spray does not fire, read <code>/spray/status.safety_reason</code> first — it names the exact blocking gate (disarmed / not OFFBOARD / gps / pivot / xtrack).</li>
+          <li>Manual advance is <code>POST /api/spray/point/advance {expect_index}</code>; <code>expect_index</code> must equal <code>/api/spray/status.point.rpp_point_index</code> or the RPP ignores it (stale-tap guard). The frontend "Next point" button is a separate repo — <b>out of scope here</b>; drive it by curl.</li>
+          <li>DoD per flag (G6): field A/B must show <b>≥ frozen</b>. Anything that does not beat frozen <b>stays default-OFF</b>; only a winner is flipped to default and merged to <code>baseline_master</code>.</li>
+          <li>All G2–G5 code + the CSV point flow are bench/in-env verified only; this session is their <b>first field validation</b>. Log anything unexpected against the run.</li>
+        </ul>
+      </td></tr>
+    </table>
+  </div>
+
+  <div class="foot">
+    <table class="signrow">
+      <tr><th style="width:16%">Run</th><th style="width:9%">Dry ✓</th><th style="width:9%">Live ✓</th><th>Result / notes</th><th style="width:20%">Bag file</th></tr>
+      <tr><td>1 Continuous</td><td class="ck">☐</td><td class="ck">☐</td><td></td><td></td></tr>
+      <tr><td>2 Dash</td><td class="ck">☐</td><td class="ck">☐</td><td></td><td></td></tr>
+      <tr><td>3 Point / 4 RTK</td><td class="ck">☐</td><td class="ck">☐</td><td></td><td></td></tr>
+      <tr><td>5–7 Flow</td><td class="ck">☐</td><td class="ck">☐</td><td></td><td></td></tr>
+      <tr><td>G1 Precise stop</td><td class="ck">☐</td><td class="ck">☐</td><td></td><td></td></tr>
+      <tr><td>G2 Boundary src</td><td class="ck">☐</td><td class="ck">☐</td><td></td><td></td></tr>
+      <tr><td>G3 Auto handshake</td><td class="ck">☐</td><td class="ck">☐</td><td></td><td></td></tr>
+      <tr><td>G4 Manual gate</td><td class="ck">☐</td><td class="ck">☐</td><td></td><td></td></tr>
+      <tr><td>G5 CSV point flow</td><td class="ck">☐</td><td class="ck">☐</td><td></td><td></td></tr>
+    </table>
+    <div style="margin-top:3px;"><b>Overall result:</b> ☐ PASS &nbsp; ☐ PASS w/ notes &nbsp; ☐ FAIL &nbsp;&nbsp;&nbsp; Signature ____________________ &nbsp; Date __________</div>
+  </div>
+
+</div>
+</body>
+</html>
