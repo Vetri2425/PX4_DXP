@@ -120,6 +120,35 @@ def test_arc_then_corner_then_line_joins_cleanly():
     assert out[-1] == pytest.approx(tail[-1])
 
 
+def _bbox(pts):
+    ns = [p[0] for p in pts]; es = [p[1] for p in pts]
+    return (max(ns) - min(ns), max(es) - min(es))
+
+
+def test_near_straight_noisy_run_does_not_blow_up_into_a_circle():
+    """Regression: a near-straight noisy run 'fits' a huge circle; the old code
+    drew it as a ~360° arc (start=-46°, end=-45.5° → +2π). It must stay bounded."""
+    rng = random.Random(11)
+    # 3 m line along +east with ~2 cm wobble — curved enough to trip the arc gate,
+    # but nowhere near a real arc.
+    pts = [(rng.gauss(0.0, 0.02), i * 0.25) for i in range(13)]
+    out, _ = fit_line_chain(pts, rms_m=0.025)
+    inbb = _bbox(pts)
+    outbb = _bbox(out)
+    assert outbb[0] < inbb[0] + 0.2 and outbb[1] < inbb[1] + 0.2, "arc blew up"
+
+
+def test_non_circular_curve_is_kept_as_raw_points_not_a_bad_circle():
+    """A run that isn't a circle (e.g. a gentle S / road) must not be forced onto
+    one circle — the residual guard keeps the raw polyline."""
+    # Half a sine wave: curved but NOT a circular arc.
+    pts = [(math.sin(t) * 2.0, t) for t in [i * 0.3 for i in range(12)]]
+    out, _ = fit_line_chain(pts, rms_m=0.025)
+    inbb = _bbox(pts)
+    outbb = _bbox(out)
+    assert outbb[0] < inbb[0] * 1.4 + 0.5 and outbb[1] < inbb[1] * 1.4 + 0.5
+
+
 def test_short_chain_is_a_noop():
     assert fit_line_chain([(0, 0), (1, 1)]) == ([(0, 0), (1, 1)], [0, 1])
 

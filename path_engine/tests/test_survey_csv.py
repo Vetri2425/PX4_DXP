@@ -149,6 +149,35 @@ def test_rows_out_of_file_order_are_still_sorted_by_name(tmp_path):
     assert res.segments[0].metadata["survey_names"] == ["3", "4"]
 
 
+def test_feature_and_seq_columns_group_and_order(tmp_path):
+    """Planning exports use feature,seq,lat,lon (roundabout/roads style): feature
+    names the line, seq orders points within it."""
+    f = _write(
+        tmp_path,
+        "feature,seq,latitude,longitude,chainage_m",
+        "West circle,1,13.07206390,80.26194110,0.0",
+        "West circle,2,13.07206906,80.26194825,0.5",
+        "East circle,1,13.07208106,80.26195346,0.0",
+        "East circle,2,13.07206010,80.26195184,0.5",
+    )
+    res = read_survey_csv(f)
+    assert len(res.segments) == 2
+    assert [s.metadata["survey_code"] for s in res.segments] == ["West circle", "East circle"]
+
+
+def test_road_column_groups_lines(tmp_path):
+    f = _write(
+        tmp_path,
+        "road,seq,latitude,longitude,zone,chainage_m",
+        "Haddows Road,1,13.06792450,80.24774660,straight,0",
+        "Haddows Road,2,13.06791820,80.24775320,straight,1",
+        "College Road,1,13.06700000,80.24800000,curve,0",
+        "College Road,2,13.06700500,80.24800500,curve,1",
+    )
+    res = read_survey_csv(f)
+    assert [s.metadata["survey_code"] for s in res.segments] == ["Haddows Road", "College Road"]
+
+
 def test_missing_code_column_yields_one_segment_in_file_order(tmp_path):
     f = _write(tmp_path, "Name,Latitude,Longitude",
                "1,13.07206390,80.26194110", "2,13.07206906,80.26194825")

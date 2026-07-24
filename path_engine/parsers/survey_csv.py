@@ -55,8 +55,16 @@ log = logging.getLogger(__name__)
 # Column aliases, lower-cased and stripped. Order within each tuple is
 # preference order. Kept generous because every vendor spells these slightly
 # differently, and a rejected import is worse than a tolerant one.
-_COL_NAME = ("name", "point", "point name", "pointname", "point number", "pt", "id")
-_COL_CODE = ("code", "feature code", "featurecode", "description", "desc")
+# "seq"/"sequence" order the points WITHIN a line (planning-export style:
+# feature,seq,lat,lon,chainage_m). "id" stays last so a per-point unique id
+# never beats a real sequence column.
+_COL_NAME = ("name", "point", "point name", "pointname", "point number", "seq",
+             "sequence", "pt", "id")
+# "feature"/"road"/"line" name WHICH line a point belongs to in a planning
+# export (one segment per distinct value), the same role Code plays for a field
+# survey. "description"/"desc" stay ahead of them for real survey exports.
+_COL_CODE = ("code", "feature code", "featurecode", "description", "desc",
+             "feature", "road", "line")
 _COL_LAT = ("latitude", "lat")
 _COL_LON = ("longitude", "lon", "long", "lng")
 _COL_NORTH = ("northing", "north", "n", "y")

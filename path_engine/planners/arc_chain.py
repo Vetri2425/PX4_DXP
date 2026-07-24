@@ -135,7 +135,7 @@ def _fit_circle_kasa(run: list[Point]) -> tuple[float, float, float] | None:
     return (cy, cx, radius)                # (center_n, center_e, radius)
 
 
-def _fit_arc_run(run: list[Point], chord_error: float,
+def _fit_arc_run(run: list[Point], rms: float, chord_error: float,
                  min_spacing: float, max_spacing: float) -> list[Point] | None:
     """Fit ``run`` to a circle and tessellate the minor arc through its points.
 
@@ -148,15 +148,32 @@ def _fit_arc_run(run: list[Point], chord_error: float,
     cn, ce, r = fit
     if r < 1e-6 or not math.isfinite(r):
         return None
-    start_deg = math.degrees(math.atan2(run[0][0] - cn, run[0][1] - ce))
-    end_deg = math.degrees(math.atan2(run[-1][0] - cn, run[-1][1] - ce))
-    # Net signed sweep about the centre selects the minor-arc direction.
+
+    # Reject a run that is not actually circular. A straight road, or a
+    # near-straight noisy run, "fits" a huge circle that passes through the
+    # points but whose arc bears no relation to the shape — using it produces
+    # the blow-up. Require the points to sit on the fitted circle to within a
+    # few times the survey noise; otherwise keep the raw polyline.
+    resid = max(abs(math.hypot(pn - cn, pe - ce) - r) for pn, pe in run)
+    if resid > max(3.0 * rms, 0.10):
+        return None
+
+    # True signed sweep about the centre (sum of per-chord turns). Its sign is
+    # the traversal direction; its magnitude is the arc actually driven.
     sweep = 0.0
     for i in range(len(run) - 1):
         a_n, a_e = run[i][0] - cn, run[i][1] - ce
         b_n, b_e = run[i + 1][0] - cn, run[i + 1][1] - ce
         sweep += math.atan2(a_e * b_n - a_n * b_e, a_n * b_n + a_e * b_e)
+    if abs(sweep) < math.radians(2.0):
+        return None  # essentially straight — keep it straight, never a full circle
+
+    start_deg = math.degrees(math.atan2(run[0][0] - cn, run[0][1] - ce))
     direction = "CCW" if sweep > 0 else "CW"
+    # Drive the end angle from start + the TRUE sweep, so arc_waypoints traces
+    # exactly this arc and can never wrap to a spurious ~360° circle (the old
+    # bug: a 0.5° run rendered as 359.5°).
+    end_deg = start_deg + math.degrees(sweep)
     pts = arc_waypoints((cn, ce), r, start_deg, end_deg,
                         chord_error=chord_error, min_spacing=min_spacing,
                         max_spacing=max_spacing, direction=direction)
@@ -205,7 +222,7 @@ def fit_line_chain(
         arc_pts: list[Point] | None = None
         straight = _max_chord_deviation(run) <= rms_m
         if not straight:
-            arc_pts = _fit_arc_run(run, chord_error_m, min_spacing_m, max_spacing_m)
+            arc_pts = _fit_arc_run(run, rms_m, chord_error_m, min_spacing_m, max_spacing_m)
 
         if arc_pts is not None:
             fitted_any = True
