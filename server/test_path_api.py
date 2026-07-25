@@ -2586,3 +2586,76 @@ def test_grid_only_survey_csv_emits_control_points_without_latlon(tmp_path):
     assert res.geo_origin is None
     assert all(c.lat is None and c.lon is None for c in res.control_points)
     assert all(c.name is not None for c in res.control_points)
+
+
+# ── preview / plan / load must produce the SAME geometry for a survey CSV ─────
+# The arc fit is automatic for a survey CSV, and preview and load both apply it.
+# PathPlanRequest.fit_arcs used to default to False, and /api/path/plan forwards
+# it unconditionally — so an ordinary plan call sent an EXPLICIT "off" and staged
+# straight chords for the very file the map was drawing as arcs. None now means
+# "not specified"; only a caller who asks gets an override.
+
+def _curving_survey(tmp_path, name="sweep.csv"):
+    """A survey CSV whose points lie on a real arc, so fitting is observable."""
+    import math as _m
+    hdr = ("Name,Code,Code description,Easting,Northing,Elevation,Longitude,"
+           "Latitude,Lateral RMS,Solution status,Samples,PDOP,CS name")
+    lat0, lon0, deg = 13.07206142, 80.26193876, 1.0 / 111320.0
+    rows = []
+    for i in range(12):
+        a = _m.radians(i * 8.0)
+        rows.append(
+            f"{i+1},P,Point,1204636.0,1243756.0,9.9,"
+            f"{lon0 + 6.0 * _m.sin(a) * deg:.8f},"
+            f"{lat0 + 6.0 * (1 - _m.cos(a)) * deg:.8f},"
+            f"0.017,FIX,1,1.8,WGS 84 / Tamil Nadu + EGM96 height"
+        )
+    (tmp_path / name).write_text("\n".join([hdr, *rows]) + "\n")
+    return name
+
+
+def test_plan_matches_preview_for_a_survey_csv(tmp_path):
+    """The WYSIWYG contract: what the map draws is what gets planned."""
+    name = _curving_survey(tmp_path)
+    mgr = PathManager(str(tmp_path))
+    preview = [(w.north, w.east) for w in mgr.preview_path(name).waypoints]
+    planned = mgr.plan_path(name, summary_only=False)["merged_waypoints"]
+    assert planned == preview
+
+
+def test_plan_defaults_do_not_disable_the_survey_arc_fit(tmp_path):
+    """Regression: forwarding the request model's unset arc-fit fields (all None)
+    must be identical to not passing them at all."""
+    name = _curving_survey(tmp_path)
+    mgr = PathManager(str(tmp_path))
+    bare = mgr.plan_path(name, summary_only=False)["merged_waypoints"]
+    forwarded = mgr.plan_path(
+        name, summary_only=False,
+        fit_arcs=None, fit_arcs_rms_m=None,
+        fit_arcs_corner_deg=None, fit_arcs_max_dev_m=None,
+    )["merged_waypoints"]
+    assert forwarded == bare
+    # And the fit really is doing something, or the assertion above is vacuous.
+    chords = mgr.plan_path(name, summary_only=False, fit_arcs=False)["merged_waypoints"]
+    assert chords != bare
+
+
+def test_explicit_fit_arcs_false_still_wins(tmp_path):
+    """None means 'unset', but a caller who genuinely wants chords still gets them."""
+    name = _curving_survey(tmp_path)
+    mgr = PathManager(str(tmp_path))
+    off = mgr.plan_path(name, summary_only=False, fit_arcs=False)["merged_waypoints"]
+    on = mgr.plan_path(name, summary_only=False, fit_arcs=True)["merged_waypoints"]
+    assert off != on
+
+
+def test_plan_honours_the_line_config_sidecar_like_preview_does(tmp_path):
+    """fit_arcs_max_dev_m defaulted to 0.15 in the request model and was always
+    forwarded, overriding the per-file sidecar that preview and load read."""
+    name = _curving_survey(tmp_path)
+    mgr = PathManager(str(tmp_path))
+    mgr.save_line_config(name, 0.0, fit_arcs_max_dev_m=0.002)   # too tight to fit
+    mgr._preview_cache.clear()
+    preview = [(w.north, w.east) for w in mgr.preview_path(name).waypoints]
+    planned = mgr.plan_path(name, summary_only=False)["merged_waypoints"]
+    assert planned == preview

@@ -539,13 +539,20 @@ class PathPlanRequest(BaseModel):
     # Arc fit for surveyed LINE_CHAINs (survey CSV). Default OFF → straight
     # chords, so DXF/builtin/line-CSV plans are byte-for-byte unchanged. On, a
     # surveyed curve is split at corners and each curved run fit to one circle.
-    fit_arcs: bool = False
-    fit_arcs_rms_m: float = Field(0.025, gt=0.0, le=1.0)  # straight-vs-arc threshold (~survey RMS)
-    fit_arcs_corner_deg: float = Field(35.0, gt=0.0, le=180.0)  # turn that splits runs at a corner
+    # These are None-by-default ON PURPOSE. A survey CSV arc-fits automatically
+    # (preview and load both do), so a request model that defaulted fit_arcs to
+    # False sent an EXPLICIT "off" on every call — /api/path/plan then staged
+    # straight chords for the very file preview was drawing as arcs, silently
+    # breaking the WYSIWYG contract. None = "not specified, use the auto/per-file
+    # value"; only an explicit value from the caller overrides it.
+    fit_arcs: Optional[bool] = None
+    fit_arcs_rms_m: Optional[float] = Field(None, gt=0.0, le=1.0)  # straight-vs-arc threshold (~survey RMS)
+    fit_arcs_corner_deg: Optional[float] = Field(None, gt=0.0, le=180.0)  # turn that splits runs at a corner
     # How far a fitted arc may sit from the surveyed points it replaces. Raise it
     # to recover a circle from a survey that sampled it as a coarse polygon;
-    # lower it to keep the reconstruction closer to the raw samples.
-    fit_arcs_max_dev_m: float = Field(0.15, gt=0.0, le=1.0)
+    # lower it to keep the reconstruction closer to the raw samples. None = use
+    # the per-file .linecfg.json sidecar (which is what preview and load read).
+    fit_arcs_max_dev_m: Optional[float] = Field(None, gt=0.0, le=1.0)
     # Paint the closing side of an open MARK shape (distinct from close_loop,
     # which closes with spray OFF). Default OFF → existing plans unchanged.
     close_shape: bool = False

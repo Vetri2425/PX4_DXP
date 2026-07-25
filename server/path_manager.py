@@ -1086,16 +1086,28 @@ class PathManager:
         # must come out as arcs, not chords; corner-split keeps squares/lines
         # unchanged), OFF otherwise so DXF/builtin/legacy stay byte-for-byte
         # frozen. An explicit fit_arcs kwarg always wins.
+        # Every one of these treats None as "not specified" rather than as a
+        # value, so a caller that simply forwards an unset request field cannot
+        # accidentally override the auto/per-file behaviour that preview and
+        # load use. Passing None and omitting the kwarg must be identical.
         fit_arcs_kw = kwargs.pop("fit_arcs", None)
         fit_arcs = self._is_survey_csv(source_name) if fit_arcs_kw is None else bool(fit_arcs_kw)
-        fit_arcs_rms_m = kwargs.pop("fit_arcs_rms_m", 0.025)
-        fit_arcs_corner_deg = kwargs.pop("fit_arcs_corner_deg", 35.0)
+        fit_arcs_rms_m = kwargs.pop("fit_arcs_rms_m", None)
+        if fit_arcs_rms_m is None:
+            fit_arcs_rms_m = 0.025
+        fit_arcs_corner_deg = kwargs.pop("fit_arcs_corner_deg", None)
+        if fit_arcs_corner_deg is None:
+            fit_arcs_corner_deg = 35.0
+        from path_engine.planners.arc_chain import MAX_ARC_DEVIATION_M
         line_cfg = self.load_line_config(source_name) if not name.startswith("builtin:") \
             and os.path.isfile(os.path.join(self._dir, os.path.basename(name))) \
-            else {"fillet_corners_m": 0.0, "fit_arcs_max_dev_m": 0.15}
-        fit_arcs_max_dev_m = kwargs.pop("fit_arcs_max_dev_m",
-                                        line_cfg["fit_arcs_max_dev_m"])
-        fillet_corners_m = kwargs.pop("fillet_corners_m", line_cfg["fillet_corners_m"])
+            else {"fillet_corners_m": 0.0, "fit_arcs_max_dev_m": MAX_ARC_DEVIATION_M}
+        fit_arcs_max_dev_m = kwargs.pop("fit_arcs_max_dev_m", None)
+        if fit_arcs_max_dev_m is None:
+            fit_arcs_max_dev_m = line_cfg["fit_arcs_max_dev_m"]
+        fillet_corners_m = kwargs.pop("fillet_corners_m", None)
+        if fillet_corners_m is None:
+            fillet_corners_m = line_cfg["fillet_corners_m"]
         # Paint the closing side of an open MARK shape (distinct from close_loop,
         # which deadheads). Default OFF → every existing plan is unchanged.
         close_shape = bool(kwargs.pop("close_shape", False))
