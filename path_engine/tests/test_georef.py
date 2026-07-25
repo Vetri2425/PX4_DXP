@@ -144,55 +144,102 @@ def _vincenty_inverse(a_pt, b_pt):
     return b * A * (sigma - d_sigma)
 
 
-def test_side_lengths_match_ellipsoidal_geodesic_ground_truth():
-    """Projected side lengths match true WGS84 geodesic distances."""
+def _px4_project(pt, origin):
+    """PX4 geo.cpp MapProjection::project(), hand-coded independently.
+
+    B6' ground truth: the frame these metres live in is DEFINED by PX4's
+    spherical azimuthal-equidistant projection (R = 6 371 000 m) — the EKF
+    builds local NED by pushing GPS through exactly this. An independent
+    reimplementation here so a transcription error in the production code
+    cannot hide.
+    """
+    r = 6371000.0
+    la, lo = math.radians(pt[0]), math.radians(pt[1])
+    rla, rlo = math.radians(origin[0]), math.radians(origin[1])
+    cos_d_lon = math.cos(lo - rlo)
+    arg = min(1.0, max(-1.0, math.sin(rla) * math.sin(la)
+                       + math.cos(rla) * math.cos(la) * cos_d_lon))
+    c = math.acos(arg)
+    k = c / math.sin(c) if abs(c) > 1e-12 else 1.0
+    return (k * (math.cos(rla) * math.sin(la)
+                 - math.sin(rla) * math.cos(la) * cos_d_lon) * r,
+            k * math.cos(la) * math.sin(lo - rlo) * r)
+
+
+def test_side_lengths_match_px4_frame_ground_truth():
+    """Projected side lengths match the PX4 local frame, NOT the ground (B6').
+
+    The old assertion (projected == WGS84 geodesic) encoded the bug: geometry
+    true-to-ground is geometry WRONG in the frame the EKF navigates, and the
+    mismatch walked the plan −0.51 cm per metre north in the 2026-07-25 bags.
+    """
     ent = _poly(GEO_SQUARE)
-    detect_and_project([ent])
+    origin = detect_and_project([ent])
     proj = ent.geometry["vertices"]
 
+    perim_got = 0.0
+    perim_ground = 0.0
     for i in range(len(GEO_SQUARE)):
-        truth = _vincenty_inverse(GEO_SQUARE[i], GEO_SQUARE[(i + 1) % len(GEO_SQUARE)])
+        a = _px4_project(GEO_SQUARE[i], origin)
+        b = _px4_project(GEO_SQUARE[(i + 1) % len(GEO_SQUARE)], origin)
+        truth = math.dist(a, b)
         got = math.dist(proj[i], proj[(i + 1) % len(proj)])
         assert abs(got - truth) < 0.001, (i, got, truth)  # sub-mm
+        perim_got += got
+        perim_ground += _vincenty_inverse(GEO_SQUARE[i],
+                                          GEO_SQUARE[(i + 1) % len(GEO_SQUARE)])
+
+    # The perimeter must NOT match the ground geodesic (north scale +0.53 %,
+    # east −0.13 % at 13 °N — a mostly-N/S square nets clearly long). If these
+    # ever agree to sub-mm again, someone reverted the frame contract.
+    assert perim_got - perim_ground > 0.004, (perim_got, perim_ground)
 
 
-def test_north_axis_uses_meridional_radius_not_semi_major_axis():
-    """Regression: the north scale must be M(lat), not the semi-major axis.
+def test_scale_is_px4_sphere_not_wgs84():
+    """Regression (B6'): the frame scale is R = 6 371 000 m on BOTH axes' radii.
 
-    Using `a` for north is a +0.62 % scale error at 13 deg latitude — invisible
-    on a 2 m square, +62 cm over a 100 m road tangent.
+    History: semi-major axis until 2026-07-22 (+0.62 % vs ground), WGS84
+    curvature radii until 2026-07-25 (true to ground, −0.52 % vs the PX4
+    frame). Both were wrong for the same reason in opposite directions: the
+    only frame that matters is the one the EKF navigates in.
     """
-    mdeg_n, mdeg_e = metres_per_degree(13.07207058)
+    per_rad = math.radians(1.0)
+    r_px4 = 6371000.0
 
-    # Textbook WGS84 values at the equator.
-    eq_n, eq_e = metres_per_degree(0.0)
-    assert abs(eq_n - 110574.0) < 1.0, eq_n
-    assert abs(eq_e - 111319.5) < 1.0, eq_e
+    for lat in (0.0, 13.07207058, 45.0, 60.0):
+        mdeg_n, mdeg_e = metres_per_degree(lat)
+        assert abs(mdeg_n - r_px4 * per_rad) < 1e-6, (lat, mdeg_n)
+        assert abs(mdeg_e - r_px4 * per_rad * math.cos(math.radians(lat))) < 1e-6
 
-    # The wrong value the code used to use.
-    wrong = math.radians(1.0) * 6378137.0
-    assert abs(mdeg_n - wrong) > 600.0, "north scale still uses the semi-major axis"
+    # Distinguishable from BOTH historical wrong scales at 13 °N
+    # (semi-major: 111319.5 m/deg; meridional M(13.07°): 110603.4 m/deg;
+    # PX4 sphere: 111194.9 m/deg).
+    semi_major = math.radians(1.0) * 6378137.0
+    meridional_13 = 110603.4  # M(13.07°)·π/180, the 2026-07-22..25 north scale
+    mdeg_n_13 = metres_per_degree(13.07207058)[0]
+    assert abs(mdeg_n_13 - semi_major) > 100.0
+    assert abs(mdeg_n_13 - meridional_13) > 500.0
 
-    # North grows toward the poles, east shrinks to zero.
-    assert metres_per_degree(60.0)[0] > mdeg_n
-    assert metres_per_degree(89.9)[1] < 300.0
 
-
-def test_matches_field_survey_ground_truth():
+def test_matches_field_survey_in_px4_frame():
     """Ground truth from a real RTK survey of a line we have driven.
 
     Emlid Reach RS3, RTK FIX, 2026-07-18, points 3 and 4 of test_line_2
-    (code L_2). The surveyor's own projected grid (WGS 84 / Tamil Nadu) reads
-    2.3264 m for this line; the true geodesic is 2.3255 m. The pre-fix code
-    produced 2.3399 m.
+    (code L_2). True WGS84 geodesic: 2.3255 m. In the PX4 local frame that
+    line is 2.3373 m (× the sphere/ellipsoid ratio at 13 °N) — and that is
+    the length the plan must have for the rover to paint 2.3255 m of ground,
+    because the EKF stretches GPS by the same ratio on the way in.
     """
     P3 = (13.07208106, 80.26195346)
     P4 = (13.07206010, 80.26195184)
     ent = _poly([P3, P4])
-    detect_and_project([ent])
+    origin = detect_and_project([ent])
     got = math.dist(*ent.geometry["vertices"])
 
-    truth = _vincenty_inverse(P3, P4)
+    truth = math.dist(_px4_project(P3, origin), _px4_project(P4, origin))
     assert abs(got - truth) < 0.0005, (got, truth)
-    assert abs(got - 2.3255) < 0.002, got          # matches the survey
-    assert abs(got - 2.3399) > 0.010, "reproduced the pre-fix scale error"
+
+    ground = _vincenty_inverse(P3, P4)
+    assert abs(ground - 2.3255) < 0.002, ground     # the survey itself
+    ratio = got / ground
+    assert 1.0035 < ratio < 1.0065, (got, ground, ratio)

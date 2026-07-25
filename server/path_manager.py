@@ -142,15 +142,9 @@ def _path_length(points: list[tuple[float, float]]) -> float:
 # ── File readers ──────────────────────────────────────────────────────────────
 
 def read_qgc_waypoints(filepath: str) -> list[tuple[float, float]]:
-    """QGC WPL 110 → NED metres. Home waypoint (current=1) is the origin."""
-    try:
-        from geographiclib.geodesic import Geodesic
-    except ImportError:
-        raise ImportError(
-            "geographiclib required for .waypoints files. "
-            "Install: pip install geographiclib"
-        )
-    geod = Geodesic.WGS84
+    """QGC WPL 110 → PX4 local NED metres. Home waypoint (current=1) is the
+    origin. Projection is PX4-spherical (path_engine.ned, B6')."""
+    from path_engine.ned import latlon_to_ned
     wps: list[tuple[float, float]] = []
     home_lat = home_lon = None
 
@@ -182,9 +176,7 @@ def read_qgc_waypoints(filepath: str) -> list[tuple[float, float]]:
 
     pts: list[tuple[float, float]] = []
     for lat, lon in wps:
-        r = geod.Inverse(home_lat, home_lon, lat, lon)
-        bearing = math.radians(r["azi1"])
-        pts.append((r["s12"] * math.cos(bearing), r["s12"] * math.sin(bearing)))
+        pts.append(latlon_to_ned(lat, lon, home_lat, home_lon))
     return pts
 
 

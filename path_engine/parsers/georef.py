@@ -10,38 +10,34 @@ polyline collapsed to one waypoint in /preview.
 This module detects that case and projects lat/lon → local ENU metres so the
 rest of the pipeline (which assumes metres) works unchanged.
 
-Method — equirectangular tangent plane about the survey centroid, scaled by the
-WGS84 ellipsoid's LOCAL RADII OF CURVATURE at that origin:
+Method — equirectangular tangent plane about the survey centroid, scaled by
+**PX4's local-frame sphere** (R = 6 371 000 m, geo.cpp
+CONSTANTS_RADIUS_OF_EARTH):
 
-    N = (lat - lat0) * m_per_deg_north      m_per_deg_north from M(lat0)
-    E = (lon - lon0) * m_per_deg_east       m_per_deg_east  from N(lat0)*cos(lat0)
+    N = (lat - lat0) * R * pi/180
+    E = (lon - lon0) * R * pi/180 * cos(lat0)
 
-where M is the meridional radius of curvature and N the prime vertical radius:
+The metres this module emits are consumed as PX4 local NED, and the EKF builds
+that frame by projecting GPS through exactly that sphere — so the frame's own
+scale is the only correct one here (B6', 2026-07-25; see path_engine/ned.py).
 
-    M(lat) = a(1 - e^2) / (1 - e^2 sin^2 lat)^(3/2)
-    N(lat) = a / (1 - e^2 sin^2 lat)^(1/2)
+History of this scale factor, because it has now been wrong in both directions:
 
-Using the semi-major axis `a` for BOTH axes — as this module did until
-2026-07-22 — is wrong on the NORTH axis, because the Earth is flattened: near
-the equator the meridian is more tightly curved than `a` implies. The resulting
-error is a pure scale factor, so it is invisible on small geometry and grows
-linearly with run length:
+  * until 2026-07-22 — WGS84 semi-major axis on BOTH axes: +0.62 % north at
+    13 °N vs ground truth (e483d53, the "north-scale bug").
+  * until 2026-07-25 — WGS84 local radii of curvature M / N·cos(lat):
+    true-to-ground, but 0.52 % SHORT at 13 °N in the frame PX4 navigates —
+    measured as a −0.51 cm-per-metre-north placement walk in the 2026-07-25
+    field bags (docs/FIELD_BUG_REPORT_2026-07-25.md, B6').
 
-    lat  0.00 deg   +0.674 %   -> +67 cm per 100 m
-    lat 13.07 deg   +0.622 %   -> +62 cm per 100 m   (Chennai test site)
-    lat 30.00 deg   +0.421 %   -> +42 cm per 100 m
-    lat 45.00 deg   +0.169 %   -> +17 cm per 100 m
+True ground distance between two lat/lon pairs is a different question and
+lives in path_engine.ned.geodesic_ground_distance_m (WGS84 Karney geodesic).
 
-Verified against a field survey of the same line (Emlid Reach RS3, RTK FIX,
-2026-07-18): the true WGS84 geodesic is 2.3255 m and the surveyor's own
-projected grid reads 2.3264 m (+0.04 %, a normal grid scale factor). The old
-code produced 2.3399 m (+0.62 %); this code reproduces the geodesic.
-
-Beyond the radius fix this remains a tangent-plane approximation. Its residual
-error is of order (extent / R)^2 * extent — sub-millimetre over a marking site —
-so a full projection (UTM via pyproj) still buys nothing here, and pyproj is not
-installed on the rover. The origin's lat/lon is returned so the local frame ties
-back to GPS for GPS_SURVEYED placement.
+This remains a tangent-plane approximation. Its residual error vs PX4's
+azimuthal-equidistant projection is of order (extent / R)^2 * extent —
+sub-micrometre over a marking site — so a full projection buys nothing here.
+The origin's lat/lon is returned so the local frame ties back to GPS for
+GPS_SURVEYED placement.
 
 Parsed geometry stores tuples as (north, east). For a geographic DXF that means
 (latitude, longitude), because the parser maps DXF y->north and x->east and
@@ -53,9 +49,12 @@ import logging
 import math
 from typing import Optional
 
+from ..ned import PX4_EARTH_RADIUS_M
+
 log = logging.getLogger(__name__)
 
-# WGS84 defining parameters.
+# WGS84 defining parameters. Retained for external readers and ground-truth
+# tests; frame projection uses PX4_EARTH_RADIUS_M (see metres_per_degree).
 WGS84_A = 6378137.0            # semi-major axis, metres
 WGS84_F = 1.0 / 298.257223563  # flattening
 WGS84_E2 = WGS84_F * (2.0 - WGS84_F)   # first eccentricity squared
@@ -129,20 +128,29 @@ def looks_geographic(points: list[tuple[float, float]]) -> tuple[bool, str]:
 
 
 def metres_per_degree(lat0_deg: float) -> tuple[float, float]:
-    """(north, east) metres per degree at *lat0_deg* on the WGS84 ellipsoid.
+    """(north, east) PX4 local-frame metres per degree at *lat0_deg*.
 
-    North uses the meridional radius of curvature M, east the prime vertical N
-    times cos(lat). Using the semi-major axis for north instead of M is a
-    +0.62 % scale error at 13 deg latitude — see the module docstring.
+    B6' (2026-07-25): the metres this module produces are consumed as PX4
+    local NED, and PX4 defines that frame with a SPHERICAL projection at
+    R = 6 371 000 m (geo.cpp CONSTANTS_RADIUS_OF_EARTH) — so the scale here
+    must be that sphere's, not the WGS84 ellipsoid's. The 2026-07-22 fix
+    (e483d53) replaced the semi-major axis with the meridional radius of
+    curvature, which made lengths true-to-ground but 0.52 % too short *in the
+    frame the EKF actually navigates* at 13 °N — measured in the 2026-07-25
+    field bags as a −0.51 cm-per-metre-north placement walk. True ground
+    distance belongs to path_engine.ned.geodesic_ground_distance_m, never to
+    frame coordinates.
+
+    Small-extent equirectangular form of PX4's azimuthal-equidistant sphere:
+    identical to it to second order in (extent / R) — sub-micrometre over a
+    marking site.
     """
     lat0 = math.radians(lat0_deg)
-    s = math.sin(lat0)
-    w2 = 1.0 - WGS84_E2 * s * s
-    w = math.sqrt(w2)
-    m_meridional = WGS84_A * (1.0 - WGS84_E2) / (w2 * w)   # a(1-e^2)/(1-e^2 sin^2)^1.5
-    n_prime_vertical = WGS84_A / w                          # a/(1-e^2 sin^2)^0.5
     per_rad = math.radians(1.0)
-    return (m_meridional * per_rad, n_prime_vertical * per_rad * math.cos(lat0))
+    return (
+        PX4_EARTH_RADIUS_M * per_rad,
+        PX4_EARTH_RADIUS_M * per_rad * math.cos(lat0),
+    )
 
 
 def _project_point(lat: float, lon: float, lat0: float, lon0: float,

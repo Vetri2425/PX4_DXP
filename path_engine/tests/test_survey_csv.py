@@ -23,6 +23,11 @@ _ROW4 = ("4,L_2,Line,1204637.606,1243755.970,9.886,80.26195184,13.07206010,"
          "0.017,FIX,1,1.7,WGS 84 / Tamil Nadu + EGM96 height")
 
 TRUE_GEODESIC_M = 2.3255
+# The same line in the PX4 local frame (spherical R = 6 371 000 projection —
+# the frame the EKF navigates; B6', 2026-07-25). Nearly a pure-north line, so
+# it carries the full sphere/meridional ratio at 13 °N (+0.505 %). This is the
+# length the plan MUST have for the rover to paint 2.3255 m of ground.
+PX4_FRAME_M = 2.33724
 
 
 def _write(tmp_path, *lines, name="survey.csv"):
@@ -63,7 +68,7 @@ def test_trailing_space_header_still_parses_rows(tmp_path):
     res = read_survey_csv(_write(tmp_path, _HEADER_PAD, _ROW3, _ROW4))
     assert res.coordinate_source == "latlon"
     assert len(res.segments) == 1
-    assert abs(res.segments[0].length - TRUE_GEODESIC_M) < 0.001
+    assert abs(res.segments[0].length - PX4_FRAME_M) < 0.001
 
 
 def test_trailing_space_header_keeps_code_and_name_columns(tmp_path):
@@ -84,13 +89,20 @@ def test_trailing_space_header_in_latlon_points_reader(tmp_path):
 
 # --- geometry ---------------------------------------------------------------
 
-def test_latlon_is_preferred_and_matches_the_geodesic(tmp_path):
-    """Lat/lon -> local ENU gives true ground distance, which is what the EKF frame is."""
+def test_latlon_is_preferred_and_matches_the_px4_frame(tmp_path):
+    """Lat/lon -> local metres in the PX4 frame, NOT ground metres (B6').
+
+    The old assertion (length == WGS84 geodesic) encoded the bug: the EKF
+    projects GPS through PX4's R=6371 km sphere, so a plan true-to-ground is
+    0.5 % short in the frame the rover actually navigates at 13 degN.
+    """
     res = read_survey_csv(_write(tmp_path, _HEADER, _ROW3, _ROW4))
 
     assert res.coordinate_source == "latlon"
     assert len(res.segments) == 1
-    assert abs(res.segments[0].length - TRUE_GEODESIC_M) < 0.001
+    assert abs(res.segments[0].length - PX4_FRAME_M) < 0.001
+    # ...and visibly NOT the ground geodesic any more.
+    assert res.segments[0].length - TRUE_GEODESIC_M > 0.008
 
 
 def test_grid_fallback_when_no_latlon_and_it_warns(tmp_path):
@@ -203,7 +215,7 @@ def test_control_declaration_survives_the_full_planner(tmp_path):
     assert len(plan.merged_waypoints) > 40, "should densify"
     assert sum(plan.must_hit) == 2, "exactly the two surveyed points"
     flagged = [p for p, m in zip(plan.merged_waypoints, plan.must_hit) if m]
-    assert math.dist(flagged[0], flagged[1]) == pytest.approx(TRUE_GEODESIC_M, abs=0.001)
+    assert math.dist(flagged[0], flagged[1]) == pytest.approx(PX4_FRAME_M, abs=0.001)
 
 
 # --- quality columns are surfaced, never silently dropped -------------------
