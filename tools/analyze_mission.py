@@ -474,13 +474,20 @@ def _pctl(sorted_vals, q):
 
 
 def _stat_block(vals):
-    """RMS / median / p95 / max / mean over |vals| in cm, plus signed bias."""
+    """RMS / median / p95 / max / mean over |vals| in cm, plus signed bias.
+
+    ``zero_frac`` makes left + right + zero sum to 1: the controller publishes
+    hardcoded cross_track=0.0 while braking/aligning (not tracking), and those
+    placeholder samples used to vanish from the L/R split — the missing 32%
+    in the 2026-07-25 bags (B7).
+    """
     if not vals:
         return None
     absv = sorted(abs(v) for v in vals)
     rms = math.sqrt(sum(v * v for v in vals) / len(vals))
     left = sum(1 for v in vals if v < 0)
     right = sum(1 for v in vals if v > 0)
+    zero = len(vals) - left - right
     return {
         "n": len(vals),
         "rms_cm": round(rms * 100, 2),
@@ -490,6 +497,7 @@ def _stat_block(vals):
         "mean_signed_cm": round((sum(vals) / len(vals)) * 100, 2),
         "left_frac": round(left / len(vals), 3),
         "right_frac": round(right / len(vals), 3),
+        "zero_frac": round(zero / len(vals), 3),
     }
 
 
@@ -626,13 +634,25 @@ def analyze_tracking(s: Series) -> dict:
             if on:
                 xt_mark.append(d[0])
         out["marking_only"] = _stat_block(xt_mark) if xt_mark else None
-    ov = out["overall"]
-    out["verdict"] = ("PASS" if ov and ov["rms_cm"] <= XTRACK_PROD_CM else "FAIL") if ov else "WARN"
+    # B7: the verdict grades the PAINTED span when a spray signal exists. The
+    # overall block averages in pivot/idle placeholder zeros (32% of samples in
+    # the 2026-07-25 bags) and can dilute a 5 cm marking error below the gate.
+    basis = out.get("marking_only") or out["overall"]
+    out["verdict_basis"] = "marking_only" if out.get("marking_only") else "overall"
+    out["verdict"] = (("PASS" if basis["rms_cm"] <= XTRACK_PROD_CM else "FAIL")
+                      if basis else "WARN")
     return out
 
 
 def _pivot_windows(seg):
-    """Yield (i_stop, i_align, i_rel) index triples for each STOP→ALIGN→TRACK pivot."""
+    """Yield (i_stop, i_align, i_rel) index triples for each STOP→ALIGN→TRACK pivot.
+
+    ``i_rel`` is None when no S_TRACK ever follows the ALIGN (e.g. the topic
+    goes silent because the next run is the smooth profile — B3). B12a: the old
+    fallback to n-1 silently measured ALIGN-start → end-of-bag as a "settle
+    time" and let post-mission DONE samples (heading_err = NaN) leak into the
+    reverse-flip scan.
+    """
     wins = []
     i = 0
     n = len(seg)
@@ -642,9 +662,9 @@ def _pivot_windows(seg):
             i_align = next((j for j in range(i_stop + 1, n) if seg[j][1] == S_ALIGN), None)
             if i_align is None:
                 break
-            i_rel = next((j for j in range(i_align + 1, n) if seg[j][1] == S_TRACK), n - 1)
+            i_rel = next((j for j in range(i_align + 1, n) if seg[j][1] == S_TRACK), None)
             wins.append((i_stop, i_align, i_rel))
-            i = i_rel + 1
+            i = (i_rel if i_rel is not None else i_align) + 1
         else:
             i += 1
     return wins
@@ -658,13 +678,18 @@ def analyze_pivots(s: Series) -> dict:
         return {"available": True, "count": 0, "pivots": [],
                 "note": "no CORNER_STOP→ALIGN→TRACK pivots in this mission"}
     pivots = []
-    worst_settle = 0.0
+    settles: list[float] = []      # finite settle errors only (B12b)
     any_flip = False
+    any_unreleased = False
     for k, (i_stop, i_align, i_rel) in enumerate(wins):
-        t_stop, t_align, t_rel = s.seg[i_stop][0], s.seg[i_align][0], s.seg[i_rel][0]
-        herr0 = math.degrees(abs(s.seg[i_align][2]))
+        released = i_rel is not None
+        i_end = i_rel if released else len(s.seg) - 1
+        t_stop, t_align = s.seg[i_stop][0], s.seg[i_align][0]
+        t_end = s.seg[i_end][0]
+        herr0_raw = s.seg[i_align][2]
+        herr0 = math.degrees(abs(herr0_raw)) if math.isfinite(herr0_raw) else None
         # turn magnitude — pose-yaw swept between stop and release
-        yaws = [y for (t, _n, _e, y) in s.pose if t_stop <= t <= t_rel]
+        yaws = [y for (t, _n, _e, y) in s.pose if t_stop <= t <= t_end]
         swept = 0.0
         for a, b in zip(yaws, yaws[1:]):
             swept += _wrap(b - a)
@@ -673,7 +698,9 @@ def analyze_pivots(s: Series) -> dict:
         min_fwd = math.inf
         vc_series = [(t, (vn, ve)) for (t, vn, ve) in s.vel_cmd]
         yw_series = [(pt, py) for (pt, _n, _e, py) in s.pose]
-        for (t, st, he) in s.seg[i_align:i_rel + 1]:
+        for (t, st, he) in s.seg[i_align:i_end + 1]:
+            if not math.isfinite(he):
+                continue  # B12c: NaN heartbeat (DONE/IDLE) — not a turning sample
             if abs(math.degrees(he)) <= TURNING_BAND_DEG:
                 continue  # align-brake (intentional reverse) — not a flip
             vc = _nearest(vc_series, t)
@@ -684,12 +711,18 @@ def analyze_pivots(s: Series) -> dict:
             min_fwd = min(min_fwd, fwd)
         flip = (min_fwd is not math.inf) and (min_fwd < FWD_EPS)
         any_flip = any_flip or flip
-        # settle — |heading_err| at release
-        settle_deg = math.degrees(abs(s.seg[i_rel][2] if s.seg[i_rel][1] == S_TRACK
-                                       else s.seg[i_rel - 1][2]))
-        worst_settle = max(worst_settle, settle_deg)
-        # oscillation count during ALIGN
-        herr = [abs(s.seg[j][2]) for j in range(i_align, i_rel + 1)]
+        # settle — |heading_err| at release. Only meaningful when the pivot
+        # actually released; a NaN there is "unknown", never 0.0 (B12b).
+        settle_deg = None
+        if released:
+            he_rel = (s.seg[i_rel][2] if s.seg[i_rel][1] == S_TRACK
+                      else s.seg[i_rel - 1][2])
+            if math.isfinite(he_rel):
+                settle_deg = math.degrees(abs(he_rel))
+                settles.append(settle_deg)
+        # oscillation count during ALIGN (finite samples only)
+        herr = [abs(s.seg[j][2]) for j in range(i_align, i_end + 1)
+                if math.isfinite(s.seg[j][2])]
         rises = 0
         if herr:
             run_min = herr[0]
@@ -699,23 +732,26 @@ def analyze_pivots(s: Series) -> dict:
                     run_min = h
                 else:
                     run_min = min(run_min, h)
-        # settle time
-        settle_s = round(t_rel - t_align, 2)
+        any_unreleased = any_unreleased or not released
         pivots.append({
             "index": k,
-            "initial_heading_err_deg": round(herr0, 1),
+            "released": released,
+            "initial_heading_err_deg": (round(herr0, 1) if herr0 is not None else None),
             "turn_magnitude_deg": round(turn_deg, 1),
-            "settle_time_s": settle_s,
-            "settle_err_deg": round(settle_deg, 2),
+            "settle_time_s": (round(t_end - t_align, 2) if released else None),
+            "settle_err_deg": (round(settle_deg, 2) if settle_deg is not None else None),
             "min_fwd_component_m_s": (None if min_fwd is math.inf else round(min_fwd, 3)),
             "reverse_flip": flip,
             "oscillations": rises,
         })
+    worst_settle = max(settles) if settles else None
     verdict = "PASS"
-    if any_flip or worst_settle > SETTLE_TOL_DEG:
+    if any_flip or (worst_settle is not None and worst_settle > SETTLE_TOL_DEG):
         verdict = "FAIL"
     return {"available": True, "count": len(pivots), "pivots": pivots,
-            "any_reverse_flip": any_flip, "worst_settle_deg": round(worst_settle, 2),
+            "any_reverse_flip": any_flip,
+            "worst_settle_deg": (round(worst_settle, 2) if worst_settle is not None else None),
+            "unreleased_pivots": any_unreleased,
             "verdict": verdict}
 
 
@@ -905,8 +941,12 @@ def analyze_health(s: Series) -> dict:
     for (t1, n1, e1, _), (t2, n2, e2, _) in zip(s.pose, s.pose[1:]):
         if math.hypot(n2 - n1, e2 - e1) > EKF_JUMP_M and (t2 - t1) < 0.5:
             jumps += 1
-    # pose staleness from rpp/debug[6] (pose_age_ms)
-    stale = sum(1 for (_t, d) in s.rpp if d and len(d) > 6 and d[6] > POSE_STALE_MS)
+    # pose staleness from rpp/debug[6] (pose_age_ms). B12: `nan > thresh` is
+    # False, so NaN heartbeats used to count as HEALTHY — count them apart.
+    stale = sum(1 for (_t, d) in s.rpp
+                if d and len(d) > 6 and math.isfinite(d[6]) and d[6] > POSE_STALE_MS)
+    stale_unknown = sum(1 for (_t, d) in s.rpp
+                        if d and len(d) > 6 and not math.isfinite(d[6]))
     # statustext failsafe / reject lines
     st_flags = [{"t": round(t, 2), "severity": sev, "text": txt}
                 for (t, sev, txt) in s.statustext
@@ -922,6 +962,7 @@ def analyze_health(s: Series) -> dict:
             "rtk_degraded_samples": rtk_bad,
             "ekf_position_jumps": jumps,
             "pose_stale_samples": stale,
+            "pose_age_unknown_samples": stale_unknown,
             "statustext_flags": st_flags[:20],
             "events": events[:20],
             "verdict": verdict}
@@ -958,7 +999,10 @@ def resolve_survey_tol_cm(manifest, cli_cm: float | None = None) -> tuple[float,
     if cli_cm is not None:
         return float(cli_cm), "--survey-tol-cm"
 
-    staged = ((manifest or {}).get("staged_mission") or {})
+    # B9: the recorder writes "plan_provenance"; "staged_mission" never existed
+    # in a real manifest (only in test fixtures). Accept both, prefer the real one.
+    staged = ((manifest or {}).get("plan_provenance")
+              or (manifest or {}).get("staged_mission") or {})
     raw = staged.get("survey_tolerance_m")
     if raw is not None:
         try:
@@ -1212,7 +1256,10 @@ def _surveyed_latlon_from_source(manifest) -> tuple[list, str]:
 
     Returns (points, provenance) where points is [(lat, lon), ...].
     """
-    staged = ((manifest or {}).get("staged_mission") or {})
+    # B9: the recorder writes "plan_provenance"; accept the legacy fixture key
+    # too so old test bundles keep working.
+    staged = ((manifest or {}).get("plan_provenance")
+              or (manifest or {}).get("staged_mission") or {})
     src = staged.get("source_file")
     if not src or not os.path.isfile(src):
         return [], f"source file unavailable ({src or 'not recorded'})"
@@ -1377,8 +1424,13 @@ def analyze_config(s: Series, manifest) -> dict:
         38: "mission_speed",
     }
     if s.rpp:
-        d = s.rpp[len(s.rpp) // 2][1]
-        out["rpp_from_bag"] = {lbl: (round(d[i], 4) if i < len(d) else None)
+        # B12: a midpoint frame can be a stop-debug heartbeat whose whole RPP
+        # block is NaN — pick the first frame whose config indices are finite.
+        d = next((d for (_t, d) in s.rpp
+                  if d and len(d) > 38 and all(math.isfinite(d[i]) for i in labels)),
+                 s.rpp[len(s.rpp) // 2][1])
+        out["rpp_from_bag"] = {lbl: (round(d[i], 4) if i < len(d) and math.isfinite(d[i])
+                                     else None)
                                for i, lbl in labels.items()}
     return out
 
@@ -1410,11 +1462,14 @@ def _fmt_report(a: dict) -> str:
         line(f"   overall : RMS {o['rms_cm']}  median {o['median_cm']}  "
              f"p95 {o['p95_cm']}  max {o['max_cm']} cm   (n={o['n']})")
         line(f"   bias    : {o['mean_signed_cm']:+} cm  "
-             f"(L {o['left_frac']*100:.0f}% / R {o['right_frac']*100:.0f}%)")
+             f"(L {o['left_frac']*100:.0f}% / R {o['right_frac']*100:.0f}% / "
+             f"zero {o.get('zero_frac', 0)*100:.0f}%)")
         if tr.get("marking_only"):
             mo = tr["marking_only"]
-            line(f"   marking : RMS {mo['rms_cm']}  p95 {mo['p95_cm']}  max {mo['max_cm']} cm")
-        line(f"   verdict : {tr['verdict']}  (production class RMS ≤ {XTRACK_PROD_CM} cm)")
+            line(f"   marking : RMS {mo['rms_cm']}  p95 {mo['p95_cm']}  max {mo['max_cm']} cm"
+                 f"   (n={mo['n']})")
+        line(f"   verdict : {tr['verdict']}  on {tr.get('verdict_basis', 'overall')} "
+             f"(production class RMS ≤ {XTRACK_PROD_CM} cm)")
     else:
         line(f"   WARN — {tr.get('reason', 'unavailable')}")
     line("")
@@ -1438,12 +1493,17 @@ def _fmt_report(a: dict) -> str:
     line("3. PIVOTS (per corner / run boundary)")
     if pv.get("available") and pv.get("count"):
         for p in pv["pivots"]:
+            if p.get("released", True):
+                tail = (f"settle {p['settle_err_deg']}° in {p['settle_time_s']}s")
+            else:
+                tail = "NEVER RELEASED (no S_TRACK followed — topic went silent, see B3)"
             line(f"   pivot{p['index']}: turn {p['turn_magnitude_deg']}°  "
-                 f"init-err {p['initial_heading_err_deg']}°  settle {p['settle_err_deg']}° "
-                 f"in {p['settle_time_s']}s  osc {p['oscillations']}  "
+                 f"init-err {p['initial_heading_err_deg']}°  {tail}  "
+                 f"osc {p['oscillations']}  "
                  f"min-fwd {p['min_fwd_component_m_s']}  flip={p['reverse_flip']}")
+        ws = pv.get("worst_settle_deg")
         line(f"   any reverse-flip {pv['any_reverse_flip']}  worst settle "
-             f"{pv['worst_settle_deg']}°  verdict {pv['verdict']}")
+             f"{ws if ws is not None else 'n/a (no released pivot)'}°  verdict {pv['verdict']}")
     elif pv.get("available"):
         line(f"   none — {pv.get('note', 'no pivots')}")
     else:
@@ -1776,8 +1836,13 @@ def analyze(root: str, survey_tol_cm: float | None = None,
             f"the rover did not drive the "
             f"surveyed shape"
         )
-    if tracking.get("overall") and tracking["overall"]["rms_cm"] > XTRACK_PROD_CM:
-        offenders.append(f"tracking RMS {tracking['overall']['rms_cm']}cm > {XTRACK_PROD_CM}cm")
+    # B7: grade the painted span when a spray signal exists — the overall block
+    # is diluted by pivot/idle placeholders and can PASS a bad marking run.
+    _xt_block = tracking.get("marking_only") or tracking.get("overall")
+    _xt_label = "marking" if tracking.get("marking_only") else "overall"
+    if _xt_block and _xt_block["rms_cm"] > XTRACK_PROD_CM:
+        offenders.append(
+            f"tracking RMS ({_xt_label}) {_xt_block['rms_cm']}cm > {XTRACK_PROD_CM}cm")
     if stops.get("available") and stops["worst_coast_cm"] > COAST_MAX_CM:
         offenders.append(f"coast-past {stops['worst_coast_cm']}cm > {COAST_MAX_CM}cm")
     if stops.get("available") and (stops.get("endpoint_resting_cm") or 0) > FINAL_STOP_MAX_CM:
@@ -1785,8 +1850,12 @@ def analyze(root: str, survey_tol_cm: float | None = None,
             f"endpoint resting {stops['endpoint_resting_cm']}cm > {FINAL_STOP_MAX_CM}cm")
     if pivots.get("available") and pivots.get("any_reverse_flip"):
         offenders.append("reverse-flip detected during a pivot")
-    if pivots.get("available") and pivots.get("worst_settle_deg", 0) > SETTLE_TOL_DEG:
+    if pivots.get("available") and (pivots.get("worst_settle_deg") or 0) > SETTLE_TOL_DEG:
         offenders.append(f"pivot settle {pivots['worst_settle_deg']}° > {SETTLE_TOL_DEG}°")
+    if pivots.get("available") and pivots.get("unreleased_pivots"):
+        offenders.append(
+            "pivot never released (no S_TRACK after ALIGN — segment_debug went "
+            "silent; settle unmeasurable)")
     if health.get("offboard_drops"):
         offenders.append(f"{health['offboard_drops']} OFFBOARD drop(s)")
     if absolute.get("available") and absolute.get("bias_cm", 0) > ABS_BIAS_FAIL_CM:
