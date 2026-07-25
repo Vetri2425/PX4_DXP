@@ -348,17 +348,20 @@ class RPPControllerNode(Node):
         # velocity bearing by −gain·signed_xtrack (xtrack + = right of path,
         # NED bearing + = clockwise, so a rover right of path steers left),
         # clamped to ±smooth_lateral_max_deg. Steady-state model: the offset
-        # shrinks by 1/(1 + L·gain). 0.0 = byte-for-byte frozen behaviour.
-        # A/B run value: 1.5 (crossover k·v ≈ 0.5 rad/s, 3× inside RO_YAW_P).
-        self.declare_parameter("smooth_lateral_gain",                 0.0)
+        # shrinks by 1/(1 + L·gain). 0.0 restores the pre-B2 frozen behaviour.
+        # Default 1.5 FIELD-VALIDATED 2026-07-25 (runs 182055 + 190115 —
+        # marking RMS 5.13 → 1.00/1.41 cm; crossover k·v ≈ 0.5 rad/s at
+        # 0.35 m/s, 3× inside RO_YAW_P=1.5).
+        self.declare_parameter("smooth_lateral_gain",                 1.5)
         self.declare_parameter("smooth_lateral_max_deg",              8.0)
         # B2 root cause 2 — the curvature lookahead floor l_d ≥ coeff/κ
         # (= coeff·R) was hardcoded 0.35 and BINDS on gentle arcs (R=2.43 m →
         # 0.85 m lookahead vs 0.56 m velocity-scaled), and the inside-cut
-        # scales ~L². 0.35 = frozen behaviour. A/B run value: 0.20 (floor
-        # 0.49 m < raw 0.56 m, so the velocity-scaled lookahead wins; the
-        # IDLE-fallback retry at l_min still protects the lookahead walk).
-        self.declare_parameter("smooth_curvature_ld_coeff",           0.35)
+        # scales ~L². 0.35 restores the pre-B2 frozen behaviour. Default 0.20
+        # FIELD-VALIDATED with the gain above (floor 0.49 m < raw 0.56 m, so
+        # the velocity-scaled lookahead wins; the IDLE-fallback retry at
+        # l_min still protects the lookahead walk).
+        self.declare_parameter("smooth_curvature_ld_coeff",           0.20)
 
         # P1.3 — Path conditioning on receipt
         # path_resample_spacing_m: if > 0, linearly resample the path to this
