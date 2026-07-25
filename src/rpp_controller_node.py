@@ -339,6 +339,27 @@ class RPPControllerNode(Node):
         # 1.0 means a 10 cm cross-track adds 10 cm of lookahead.
         self.declare_parameter("xtrack_lookahead_gain",               0.05)
 
+        # B2 (2026-07-25) — smooth-profile lateral correction. The smooth RPP
+        # had NO signed lateral term anywhere in the control law (the only use
+        # of signed_xtrack was abs()'d into the lookahead length), so with
+        # PX4's pure-P yaw loop a steady offset on an arc was structurally
+        # permanent: measured 5.1-5.4 cm INSIDE the R=2.4 m curve in all three
+        # 2026-07-25 field runs. smooth_lateral_gain rotates the commanded
+        # velocity bearing by −gain·signed_xtrack (xtrack + = right of path,
+        # NED bearing + = clockwise, so a rover right of path steers left),
+        # clamped to ±smooth_lateral_max_deg. Steady-state model: the offset
+        # shrinks by 1/(1 + L·gain). 0.0 = byte-for-byte frozen behaviour.
+        # A/B run value: 1.5 (crossover k·v ≈ 0.5 rad/s, 3× inside RO_YAW_P).
+        self.declare_parameter("smooth_lateral_gain",                 0.0)
+        self.declare_parameter("smooth_lateral_max_deg",              8.0)
+        # B2 root cause 2 — the curvature lookahead floor l_d ≥ coeff/κ
+        # (= coeff·R) was hardcoded 0.35 and BINDS on gentle arcs (R=2.43 m →
+        # 0.85 m lookahead vs 0.56 m velocity-scaled), and the inside-cut
+        # scales ~L². 0.35 = frozen behaviour. A/B run value: 0.20 (floor
+        # 0.49 m < raw 0.56 m, so the velocity-scaled lookahead wins; the
+        # IDLE-fallback retry at l_min still protects the lookahead walk).
+        self.declare_parameter("smooth_curvature_ld_coeff",           0.35)
+
         # P1.3 — Path conditioning on receipt
         # path_resample_spacing_m: if > 0, linearly resample the path to this
         #   uniform spacing on receipt. Densifies sparse polylines so the
@@ -3776,12 +3797,16 @@ class RPPControllerNode(Node):
         l_d = self._clamp(l_d_raw, l_min, l_max)
 
         # Fix 1: curvature-aware minimum lookahead — on arcs, ensure l_d
-        # spans at least 1/3 of the radius so the lookahead walk reliably
+        # spans a fraction of the radius so the lookahead walk reliably
         # reaches past the foot. Without this, short lookaheads on tight
         # arcs can land at the rover position, triggering the IDLE path.
+        # B2: coefficient is a parameter (0.35 = frozen); this floor is
+        # applied after the [l_min, l_max] clamp and can exceed
+        # max_lookahead_dist — the inside-cut on arcs scales ~L².
         kappa_path = self._path_curvature_at(seg_idx)
-        if kappa_path > 1e-6:
-            l_d = max(l_d, 0.35 / kappa_path)
+        ld_coeff = float(self.get_parameter("smooth_curvature_ld_coeff").value)
+        if kappa_path > 1e-6 and ld_coeff > 0.0:
+            l_d = max(l_d, ld_coeff / kappa_path)
 
         # ---- Step 3: Lookahead point (NED), then body-frame for κ ----
         lh_n, lh_e, hit_end = self._get_lookahead_point(seg_idx, foot_n, foot_e, l_d)
@@ -3923,6 +3948,22 @@ class RPPControllerNode(Node):
         unit_e = de / l_actual if l_actual > 1e-9 else 0.0
         v_n = speed * unit_n
         v_e = speed * unit_e
+
+        # B2 — signed lateral correction (default OFF: gain 0.0 keeps the
+        # frozen controller byte-for-byte). Rotate the commanded bearing
+        # toward the path: signed_xtrack + = right of path and NED bearing +
+        # = clockwise (rightward), so the correction is −gain·xtrack. Without
+        # this the smooth profile has no lateral feedback at all and PX4's
+        # pure-P yaw loop parks the rover at a permanent offset on arcs.
+        lat_gain = float(self.get_parameter("smooth_lateral_gain").value)
+        if lat_gain > 0.0 and speed > 1e-6:
+            max_corr = math.radians(
+                float(self.get_parameter("smooth_lateral_max_deg").value))
+            delta = self._clamp(-lat_gain * signed_xtrack, -max_corr, max_corr)
+            bearing = math.atan2(v_e, v_n) + delta
+            v_n = speed * math.cos(bearing)
+            v_e = speed * math.sin(bearing)
+
         # BUG-T3 fix: clamp velocity bearing into forward cone so PX4
         # reverse-detection never flips the turn, even on the first run
         # (idx==0) where _run_alignment_hold is skipped.
