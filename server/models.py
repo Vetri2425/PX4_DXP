@@ -51,6 +51,14 @@ class MissionStartRequest(BaseModel):
     path_name: Optional[str] = None
     mission_file: Optional[str] = None
     auto_origin: bool = False
+    # The staged mission the caller believes is loaded. Optional, and never used
+    # to LOAD anything — start always drives whatever the controller already
+    # holds. Supplying it turns "start the loaded mission" into "start the
+    # mission I verified", so a stale client cannot start something it never
+    # checked. Previously the mobile app sent this field and Pydantic silently
+    # dropped it (extras are ignored), which happened to be safe only because it
+    # left path_name None; nothing actually validated the two agreed.
+    mission_id: Optional[str] = None
 
 
 class MissionLoadRequest(BaseModel):

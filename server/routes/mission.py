@@ -75,6 +75,33 @@ async def start_mission(req: MissionStartRequest | None = None):
 
     auto_origin = req.auto_origin if req else False
     name = (req.path_name or req.mission_file) if req else None
+
+    # A caller may name the staged mission it verified. Cross-check it against
+    # what the controller actually holds rather than trusting either side: this
+    # is the guard against starting a mission the client never inspected (e.g.
+    # after a background re-stage, or a second device loading something else).
+    expected_id = (req.mission_id or "").strip() if req else ""
+    if expected_id:
+        if name:
+            raise HTTPException(
+                422,
+                "start: pass mission_id OR path_name, not both — mission_id starts "
+                "the already-loaded staged mission, path_name re-loads from disk "
+                "and would discard its surveyed placement",
+            )
+        loaded_id = (offboard_ctrl.loaded_path_summary(sample=0).get("mission_id") or "")
+        if not loaded_id:
+            raise HTTPException(
+                409,
+                f"start: mission {expected_id} was requested but no staged mission "
+                f"is loaded — load it to the controller first",
+            )
+        if loaded_id != expected_id:
+            raise HTTPException(
+                409,
+                f"start: requested mission {expected_id} but {loaded_id} is loaded "
+                f"— re-load before starting",
+            )
     origin = (0.0, 0.0)
     start_position = None
     origin_pre_applied = False
