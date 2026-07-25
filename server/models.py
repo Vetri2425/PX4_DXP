@@ -490,6 +490,10 @@ class PathPlanRequest(BaseModel):
     fit_arcs: bool = False
     fit_arcs_rms_m: float = Field(0.025, gt=0.0, le=1.0)  # straight-vs-arc threshold (~survey RMS)
     fit_arcs_corner_deg: float = Field(35.0, gt=0.0, le=180.0)  # turn that splits runs at a corner
+    # How far a fitted arc may sit from the surveyed points it replaces. Raise it
+    # to recover a circle from a survey that sampled it as a coarse polygon;
+    # lower it to keep the reconstruction closer to the raw samples.
+    fit_arcs_max_dev_m: float = Field(0.15, gt=0.0, le=1.0)
     # Paint the closing side of an open MARK shape (distinct from close_loop,
     # which closes with spray OFF). Default OFF → existing plans unchanged.
     close_shape: bool = False

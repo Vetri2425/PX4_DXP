@@ -25,7 +25,7 @@ from .core import (
 from .parsers import load_mission_file, load_mission_segments, parse_dxf, entities_to_segments
 from .parsers.csv_parser import read_ned_csv_enhanced
 from .parsers.waypoints_parser import read_qgc_waypoints_as_segment
-from .planners.arc_chain import fit_line_chain
+from .planners.arc_chain import MAX_ARC_DEVIATION_M, fit_line_chain
 from .planners.straight_line import densify_segment
 from .planners.extensions import (
     decompose_line_chain_to_edges,
@@ -202,6 +202,11 @@ class PathEngine:
         fit_arcs: bool = False,
         fit_arcs_rms_m: float = 0.025,
         fit_arcs_corner_deg: float = 35.0,
+        # How far a fitted arc may sit from the surveyed points it replaces.
+        # The binding case is a survey that samples a curve as a coarse polygon
+        # (the Egmore roundabout CSV is a ~20-gon whose facets sit 13 cm inside
+        # the true circle) — tighten this and such a circle stays a polygon.
+        fit_arcs_max_dev_m: float = MAX_ARC_DEVIATION_M,
         # Paint the closing side of an open MARK shape. Distinct from close_loop
         # (which closes with spray OFF, a deadhead). Default OFF. On, a MARK
         # segment whose first and last points differ gets a copy of its first
@@ -272,6 +277,7 @@ class PathEngine:
         self.fit_arcs = fit_arcs
         self.fit_arcs_rms_m = fit_arcs_rms_m
         self.fit_arcs_corner_deg = fit_arcs_corner_deg
+        self.fit_arcs_max_dev_m = fit_arcs_max_dev_m
         self.close_shape = close_shape
         self.use_two_opt = use_two_opt
         self.max_two_opt_segments = max_two_opt_segments
@@ -588,6 +594,7 @@ class PathEngine:
                         rms_m=self.fit_arcs_rms_m,
                         corner_angle_deg=self.fit_arcs_corner_deg,
                         max_spacing_m=self.mark_spacing,
+                        max_dev_m=self.fit_arcs_max_dev_m,
                     )
                     seg.points = new_pts
                     seg.metadata["control_indices"] = ctrl

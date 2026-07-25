@@ -970,6 +970,9 @@ class PathManager:
         fit_arcs = self._is_survey_csv(source_name) if fit_arcs_kw is None else bool(fit_arcs_kw)
         fit_arcs_rms_m = kwargs.pop("fit_arcs_rms_m", 0.025)
         fit_arcs_corner_deg = kwargs.pop("fit_arcs_corner_deg", 35.0)
+        # Lazy, like every other path_engine import in this module.
+        from path_engine.planners.arc_chain import MAX_ARC_DEVIATION_M
+        fit_arcs_max_dev_m = kwargs.pop("fit_arcs_max_dev_m", MAX_ARC_DEVIATION_M)
         # Paint the closing side of an open MARK shape (distinct from close_loop,
         # which deadheads). Default OFF → every existing plan is unchanged.
         close_shape = bool(kwargs.pop("close_shape", False))
@@ -1132,6 +1135,7 @@ class PathManager:
             fit_arcs=fit_arcs,
             fit_arcs_rms_m=fit_arcs_rms_m,
             fit_arcs_corner_deg=fit_arcs_corner_deg,
+            fit_arcs_max_dev_m=fit_arcs_max_dev_m,
             close_shape=close_shape,
             use_two_opt=use_two_opt,
             max_two_opt_segments=max_two_opt_segments,
