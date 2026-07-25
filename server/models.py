@@ -138,6 +138,26 @@ class PathPreviewPoint(BaseModel):
     must_hit: bool = False
 
 
+class SurveyControlPoint(BaseModel):
+    """One ORIGINAL surveyed shot, before any fitting moved it.
+
+    Emitted so a client can draw the measurements as their own map layer and see
+    them against the reconstructed path. The waypoint list cannot serve this: the
+    arc fit and corner fillet deliberately move geometry off the raw shots (that
+    is the whole point of fitting), so a `must_hit` waypoint is the fitted
+    vertex, not the measurement.
+    """
+
+    north: float
+    east: float
+    # Original WGS84 from the source file — NOT re-projected from north/east.
+    # None when the source carried projected grid coordinates instead.
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    name: Optional[str] = None      # survey point Name (label)
+    code: Optional[str] = None      # survey Code (feature / line id)
+
+
 class PathPreviewBounds(BaseModel):
     north_min: float
     north_max: float
@@ -156,6 +176,10 @@ class PathPreviewResponse(BaseModel):
     # a metric/local source. Lets the map place the preview at its true surveyed
     # coordinates (WYSIWYG) instead of an arbitrary origin.
     geo_origin: Optional[list[float]] = None
+    # The original surveyed shots behind this path, in the SAME local NED frame
+    # as `waypoints`, each also carrying its source lat/lon. Empty for a source
+    # with no surveyed provenance (builtin, legacy NED CSV, plain DXF).
+    control_points: list[SurveyControlPoint] = []
 
 
 class MissionStatus(BaseModel):

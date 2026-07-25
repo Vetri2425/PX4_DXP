@@ -755,6 +755,47 @@ class PathManager:
         from path_engine.parsers.survey_csv import looks_like_survey_csv
         return looks_like_survey_csv(fpath)
 
+    @classmethod
+    def _survey_provenance(cls, fpath: str) -> tuple[list[float] | None, list[dict]]:
+        """(geo_origin, control_points) from a single parse of the survey CSV."""
+        try:
+            from path_engine.parsers.survey_csv import read_survey_csv
+            res = read_survey_csv(fpath)
+        except Exception as exc:
+            log.warning("survey provenance unavailable for %s: %s", fpath, exc)
+            return None, []
+        origin = ([float(res.geo_origin[0]), float(res.geo_origin[1])]
+                  if res.geo_origin is not None else None)
+        return origin, cls._control_points_from(res)
+
+    @staticmethod
+    def _control_points_from(res) -> list[dict]:
+        """The ORIGINAL surveyed shots for a survey CSV, in the preview's frame.
+
+        Read from the SOURCE file, not from the planned path: the arc fit and the
+        corner fillet deliberately move geometry off the raw measurements, so the
+        planned waypoints no longer carry them. Same local NED frame as the
+        waypoints (both project about the file's own geo_origin), so a client can
+        overlay the two directly.
+        """
+        out: list[dict] = []
+        for seg in res.segments:
+            meta = seg.metadata or {}
+            latlon = meta.get("survey_latlon") or []
+            names = meta.get("survey_names") or []
+            code = meta.get("survey_code")
+            for i, (n, e) in enumerate(seg.points):
+                ll = latlon[i] if i < len(latlon) else None
+                out.append({
+                    "north": float(n),
+                    "east": float(e),
+                    "lat": float(ll[0]) if ll else None,
+                    "lon": float(ll[1]) if ll else None,
+                    "name": names[i] if i < len(names) else None,
+                    "code": code,
+                })
+        return out
+
     @staticmethod
     def _survey_geo_origin(fpath: str) -> list[float] | None:
         """WGS84 (lat, lon) a survey CSV's local frame is anchored at, or None."""
@@ -770,6 +811,7 @@ class PathManager:
     def preview_path(self, name: str) -> PathPreviewResponse:
         """Return local-NED points for display without touching mission state."""
         geo_origin: list[float] | None = None
+        control_points: list[dict] = []
         lookup_name = (
             name.removeprefix("builtin:")
             if name.startswith("builtin:")
@@ -848,7 +890,9 @@ class PathManager:
                     pts = list(plan.merged_waypoints)
                     spray_flags = list(plan.spray_flags)
                     must_hit = list(getattr(plan, "must_hit", []) or [])
-                    geo_origin = self._survey_geo_origin(fpath)
+                    # One parse for both — read_survey_csv is not free on a
+                    # 2475-row road export.
+                    geo_origin, control_points = self._survey_provenance(fpath)
                 else:
                     pts = self._load_file(fpath)
                     spray_flags = [True] * len(pts)
@@ -881,6 +925,7 @@ class PathManager:
             bounds=bounds,
             waypoints=waypoints,
             geo_origin=geo_origin,
+            control_points=control_points,
         )
         if lookup_name not in BUILTIN_PATHS:
             self._preview_cache[fpath] = (st.st_mtime_ns, st.st_size, response)

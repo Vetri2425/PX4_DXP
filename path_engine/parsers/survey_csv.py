@@ -393,6 +393,14 @@ def read_survey_csv(
                 "line_like": True,
                 "survey_code": key if key != "_" else None,
                 "survey_names": [r["name"] for r in pts_rows],
+                # The ORIGINAL parsed WGS84 coordinates, one per surveyed point,
+                # index-aligned with `points`. The pipeline works in local NED,
+                # so without this the raw shots are unrecoverable downstream:
+                # the arc fit legitimately MOVES points off their measurement,
+                # and a client re-projecting NED can only get them back through
+                # its own projection. None for a grid-coordinate source.
+                "survey_latlon": ([(r["a"], r["b"]) for r in pts_rows]
+                                  if source == "latlon" else None),
                 # Every point here came from a surveyed measurement, so all of
                 # them are declared control points, not densification fill.
                 "control_indices": list(range(len(pts))),

@@ -2489,3 +2489,100 @@ def test_preview_spray_flags_match_executed_path_with_extensions(tmp_path):
     # PRE/AFT extensions are TRANSIT → spray OFF at the ends.
     assert preview.waypoints[0].spray is False
     assert preview.waypoints[-1].spray is False
+
+
+# ── Survey control points in the preview ──────────────────────────────────────
+# The pipeline works in local NED and previously emitted ONLY that, so a client
+# could not draw the raw surveyed shots: the arc fit and corner fillet
+# deliberately move geometry off the measurements, and re-projecting NED back to
+# lat/lon goes through the client's own projection rather than the source data.
+
+_SURVEY_HDR = ("Name,Code,Code description,Easting,Northing,Elevation,Longitude,"
+               "Latitude,Lateral RMS,Solution status,Samples,PDOP,CS name")
+
+
+def _survey_row(name, code, lon, lat):
+    return (f"{name},{code},Point,1204636.0,1243756.0,9.9,{lon:.8f},{lat:.8f},"
+            f"0.017,FIX,1,1.8,WGS 84 / Tamil Nadu + EGM96 height")
+
+
+def _write_survey(tmp_path, n=6, name="curve.csv"):
+    """A gently curving chain of n surveyed shots ~0.6 m apart."""
+    import math as _m
+    lat0, lon0 = 13.07206142, 80.26193876
+    deg = 1.0 / 111320.0
+    rows = []
+    for i in range(n):
+        a = _m.radians(i * 12.0)
+        rows.append(_survey_row(i + 1, "P",
+                                lon0 + (0.6 * i) * deg * 0.9,
+                                lat0 + (0.6 * (1 - _m.cos(a))) * deg))
+    (tmp_path / name).write_text("\n".join([_SURVEY_HDR, *rows]) + "\n")
+    return name
+
+
+def test_preview_emits_control_points_with_source_latlon(tmp_path):
+    name = _write_survey(tmp_path)
+    mgr = PathManager(str(tmp_path))
+    res = mgr.preview_path(name)
+
+    assert len(res.control_points) == 6
+    assert all(c.lat is not None and c.lon is not None for c in res.control_points)
+    # Exactly the values in the file, not re-projected from NED.
+    import csv as _csv
+    with open(tmp_path / name) as f:
+        src = list(_csv.DictReader(f))
+    assert [c.lat for c in res.control_points] == [float(r["Latitude"]) for r in src]
+    assert [c.lon for c in res.control_points] == [float(r["Longitude"]) for r in src]
+    assert [c.name for c in res.control_points] == [r["Name"] for r in src]
+    assert all(c.code == "P" for c in res.control_points)
+
+
+def test_control_points_share_the_waypoint_ned_frame(tmp_path):
+    """north/east must be directly overlayable on the waypoints — i.e. the same
+    projection about the same geo_origin the preview reports."""
+    from path_engine.parsers.georef import metres_per_degree
+
+    name = _write_survey(tmp_path)
+    res = PathManager(str(tmp_path)).preview_path(name)
+    lat0, lon0 = res.geo_origin
+    mdeg_n, mdeg_e = metres_per_degree(lat0)
+    for c in res.control_points:
+        assert abs((c.lat - lat0) * mdeg_n - c.north) < 1e-6
+        assert abs((c.lon - lon0) * mdeg_e - c.east) < 1e-6
+
+
+def test_control_points_are_the_raw_shots_not_the_fitted_path(tmp_path):
+    """They must NOT move when the fitted geometry does — that is what makes
+    them useful as a separate map layer."""
+    name = _write_survey(tmp_path)
+    mgr = PathManager(str(tmp_path))
+    before = mgr.preview_path(name).control_points
+
+    mgr.save_line_config(name, 5.0)          # fillet on: waypoints change
+    mgr._preview_cache.clear()
+    after = mgr.preview_path(name)
+    assert [(c.north, c.east, c.lat, c.lon) for c in after.control_points] == \
+           [(c.north, c.east, c.lat, c.lon) for c in before]
+
+
+def test_non_survey_sources_emit_no_control_points(tmp_path):
+    mgr = PathManager(str(tmp_path))
+    assert mgr.preview_path("builtin:square_2x2").control_points == []
+    # Legacy headerless NED CSV has no surveyed provenance either.
+    (tmp_path / "legacy.csv").write_text("0,0\n1,0\n2,0\n")
+    assert mgr.preview_path("legacy.csv").control_points == []
+
+
+def test_grid_only_survey_csv_emits_control_points_without_latlon(tmp_path):
+    """A Northing/Easting export has no geographic anchor; the points still come
+    through so they can be drawn, but lat/lon is null rather than invented."""
+    hdr = "Name,Code,Northing,Easting"
+    rows = [f"{i+1},L_1,{1243756.0 + i * 0.6:.3f},{1204636.0 + i * 0.2:.3f}"
+            for i in range(4)]
+    (tmp_path / "grid.csv").write_text("\n".join([hdr, *rows]) + "\n")
+    res = PathManager(str(tmp_path)).preview_path("grid.csv")
+    assert len(res.control_points) == 4
+    assert res.geo_origin is None
+    assert all(c.lat is None and c.lon is None for c in res.control_points)
+    assert all(c.name is not None for c in res.control_points)
