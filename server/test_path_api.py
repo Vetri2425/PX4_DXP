@@ -1283,12 +1283,17 @@ def test_plan_preflight_rejects_oversized_mission(tmp_path):
     doc.saveas(str(tmp_path / "long.dxf"))
 
     mgr = PathManager(str(tmp_path))
-    # Default 5 cm spacing → ~12000 waypoints > 10000 cap → reject fast.
+    # 5 cm spacing → ~12000 waypoints. The cap is 100k (raised so a 2.4 km road
+    # survey can load at all), so pin an explicit lower cap here — the point of
+    # this test is the preflight guard, not the value of the default.
     with pytest.raises(ValueError, match="Too many waypoints"):
-        mgr.plan_path("long.dxf", summary_only=True)
+        mgr.plan_path("long.dxf", summary_only=True, max_waypoints=10000)
     # Coarser 20 cm spacing → ~3000 waypoints → the guard does not fire.
-    result = mgr.plan_path("long.dxf", summary_only=True, line_spacing=0.20)
+    result = mgr.plan_path("long.dxf", summary_only=True, line_spacing=0.20,
+                           max_waypoints=10000)
     assert result["num_waypoints"] > 0
+    # And the raised default lets the 12000-waypoint mission through.
+    assert mgr.plan_path("long.dxf", summary_only=True)["num_waypoints"] > 10000
 
 
 @pytest.mark.anyio

@@ -283,6 +283,69 @@ class PathManager:
         return os.path.join(dirname, f".{basename}.extensions.json")
 
     @staticmethod
+    def _line_config_path(fpath: str) -> str:
+        """Hidden sidecar path for per-file survey-LINE reconstruction settings."""
+        dirname = os.path.dirname(fpath)
+        basename = os.path.basename(fpath)
+        return os.path.join(dirname, f".{basename}.linecfg.json")
+
+    def load_line_config(self, filename: str) -> dict[str, float]:
+        """Per-file survey-line reconstruction settings.
+
+        Read by preview_path(), plan_path() AND load_path() so the previewed
+        geometry, the planned mission and the executed path are the same shape —
+        the WYSIWYG contract. Missing or malformed sidecar falls back to the
+        defaults, which are behaviour-preserving (no fillet).
+        """
+        from path_engine.planners.arc_chain import MAX_ARC_DEVIATION_M
+        default = {
+            "fillet_corners_m": 0.0,
+            "fit_arcs_max_dev_m": float(MAX_ARC_DEVIATION_M),
+        }
+        fpath = os.path.join(self._dir, os.path.basename(filename))
+        sidecar = self._line_config_path(fpath)
+        try:
+            with open(sidecar, encoding="utf-8") as f:
+                payload = json.load(f)
+        except FileNotFoundError:
+            return default
+        except (OSError, ValueError) as exc:
+            log.warning("ignoring invalid line config sidecar %s: %s", sidecar, exc)
+            return default
+        try:
+            fillet = float(payload.get("fillet_corners_m", default["fillet_corners_m"]))
+            dev = float(payload.get("fit_arcs_max_dev_m", default["fit_arcs_max_dev_m"]))
+        except (TypeError, ValueError):
+            return default
+        if fillet < 0.0 or not (0.0 < dev <= 1.0):
+            return default
+        return {"fillet_corners_m": fillet, "fit_arcs_max_dev_m": dev}
+
+    def save_line_config(self, filename: str, fillet_corners_m: float,
+                         fit_arcs_max_dev_m: float | None = None) -> dict[str, float]:
+        """Persist survey-line reconstruction settings for a CSV mission file."""
+        if fillet_corners_m < 0.0:
+            raise ValueError("fillet_corners_m must be >= 0.0")
+        safe = os.path.basename(filename)
+        fpath = os.path.join(self._dir, safe)
+        if not os.path.isfile(fpath):
+            raise FileNotFoundError(f"Path not found: {filename!r}")
+        if not self._is_survey_csv(safe):
+            raise ValueError("Line settings apply only to a survey CSV")
+        if fit_arcs_max_dev_m is None:
+            # Sticky, like save_extension_config's per_line.
+            fit_arcs_max_dev_m = float(self.load_line_config(safe)["fit_arcs_max_dev_m"])
+        if not (0.0 < fit_arcs_max_dev_m <= 1.0):
+            raise ValueError("fit_arcs_max_dev_m must be in (0.0, 1.0]")
+        config = {
+            "fillet_corners_m": float(fillet_corners_m),
+            "fit_arcs_max_dev_m": float(fit_arcs_max_dev_m),
+        }
+        self._write_sidecar(self._line_config_path(fpath), {"source": safe, **config})
+        self._preview_cache.pop(fpath, None)
+        return config
+
+    @staticmethod
     def _entity_order_path(fpath: str) -> str:
         """Hidden sidecar path for per-file entity execution order."""
         dirname = os.path.dirname(fpath)
@@ -658,7 +721,12 @@ class PathManager:
                 from path_engine import PathEngine
                 # Arc-fit surveyed curves (no-op for a legacy NED CSV, which has
                 # no LINE_CHAIN); matches preview_path + plan_path.
-                engine = PathEngine(fit_arcs=self._is_survey_csv(name))
+                cfg = self.load_line_config(name)
+                engine = PathEngine(
+                    fit_arcs=self._is_survey_csv(name),
+                    fit_arcs_max_dev_m=cfg["fit_arcs_max_dev_m"],
+                    fillet_corners_m=cfg["fillet_corners_m"],
+                )
                 plan = engine.plan_file(
                     fpath,
                     origin=origin,
@@ -768,8 +836,15 @@ class PathManager:
                     from path_engine import PathEngine
                     # Arc-fit a surveyed curve so the preview shows a true arc,
                     # not straight chords between vertices. Matches execution
-                    # (plan_path auto-enables fit_arcs for survey CSVs too).
-                    plan = PathEngine(fit_arcs=True).plan_file(fpath)
+                    # (plan_path auto-enables fit_arcs for survey CSVs too) and
+                    # honours the same per-file line config, so a corner fillet
+                    # the operator asked for is visible BEFORE they drive it.
+                    cfg = self.load_line_config(os.path.basename(fpath))
+                    plan = PathEngine(
+                        fit_arcs=True,
+                        fit_arcs_max_dev_m=cfg["fit_arcs_max_dev_m"],
+                        fillet_corners_m=cfg["fillet_corners_m"],
+                    ).plan_file(fpath)
                     pts = list(plan.merged_waypoints)
                     spray_flags = list(plan.spray_flags)
                     must_hit = list(getattr(plan, "must_hit", []) or [])
@@ -970,15 +1045,18 @@ class PathManager:
         fit_arcs = self._is_survey_csv(source_name) if fit_arcs_kw is None else bool(fit_arcs_kw)
         fit_arcs_rms_m = kwargs.pop("fit_arcs_rms_m", 0.025)
         fit_arcs_corner_deg = kwargs.pop("fit_arcs_corner_deg", 35.0)
-        # Lazy, like every other path_engine import in this module.
-        from path_engine.planners.arc_chain import MAX_ARC_DEVIATION_M
-        fit_arcs_max_dev_m = kwargs.pop("fit_arcs_max_dev_m", MAX_ARC_DEVIATION_M)
+        line_cfg = self.load_line_config(source_name) if not name.startswith("builtin:") \
+            and os.path.isfile(os.path.join(self._dir, os.path.basename(name))) \
+            else {"fillet_corners_m": 0.0, "fit_arcs_max_dev_m": 0.15}
+        fit_arcs_max_dev_m = kwargs.pop("fit_arcs_max_dev_m",
+                                        line_cfg["fit_arcs_max_dev_m"])
+        fillet_corners_m = kwargs.pop("fillet_corners_m", line_cfg["fillet_corners_m"])
         # Paint the closing side of an open MARK shape (distinct from close_loop,
         # which deadheads). Default OFF → every existing plan is unchanged.
         close_shape = bool(kwargs.pop("close_shape", False))
         use_two_opt = kwargs.pop("use_two_opt", True)
         max_two_opt_segments = kwargs.pop("max_two_opt_segments", 80)
-        max_waypoints = kwargs.pop("max_waypoints", 10000)
+        max_waypoints = kwargs.pop("max_waypoints", 100000)
         max_segments = kwargs.pop("max_segments", 2000)
         line_spacing = kwargs.pop("line_spacing", 0.05)
         transit_spacing = kwargs.pop("transit_spacing", 0.15)
@@ -1136,6 +1214,7 @@ class PathManager:
             fit_arcs_rms_m=fit_arcs_rms_m,
             fit_arcs_corner_deg=fit_arcs_corner_deg,
             fit_arcs_max_dev_m=fit_arcs_max_dev_m,
+            fillet_corners_m=fillet_corners_m,
             close_shape=close_shape,
             use_two_opt=use_two_opt,
             max_two_opt_segments=max_two_opt_segments,
@@ -1272,7 +1351,12 @@ class PathManager:
             if looks_like_survey_csv(fpath):
                 from path_engine import PathEngine
                 # Arc-fit surveyed curves (matches preview_path + plan_path).
-                return PathEngine(fit_arcs=True).plan_file(fpath).merged_waypoints
+                cfg = self.load_line_config(os.path.basename(fpath))
+                return PathEngine(
+                    fit_arcs=True,
+                    fit_arcs_max_dev_m=cfg["fit_arcs_max_dev_m"],
+                    fillet_corners_m=cfg["fillet_corners_m"],
+                ).plan_file(fpath).merged_waypoints
             return read_ned_csv(fpath)
         if ext == ".dxf":
             from path_engine import PathEngine

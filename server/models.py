@@ -403,6 +403,34 @@ class PathExtensionConfigResponse(PathExtensionConfig):
     saved: bool = True
 
 
+class SurveyLineConfig(BaseModel):
+    """Per-file survey-LINE reconstruction settings (survey CSV only).
+
+    Read by preview, plan AND load, so what the map draws is what the rover
+    drives.
+    """
+
+    # Radius of the arc inserted at each surveyed corner. 0 = leave corners as
+    # surveyed. This INVENTS geometry — a road survey captures a bend as two
+    # straights meeting at one vertex, so there is no arc to recover and the
+    # radius has to come from the marking spec.
+    fillet_corners_m: float = Field(0.0, ge=0.0, le=200.0)
+    # How far a fitted arc may sit from the surveyed points it replaces. Raise it
+    # to recover a circle from a survey that sampled it as a coarse polygon;
+    # lower it to keep the reconstruction closer to the raw samples.
+    # None on save = leave unchanged.
+    fit_arcs_max_dev_m: Optional[float] = Field(None, gt=0.0, le=1.0)
+
+
+class SurveyLineConfigResponse(BaseModel):
+    """Response from GET/POST /api/path/{name}/line-config."""
+
+    name: str
+    saved: bool = True
+    fillet_corners_m: float
+    fit_arcs_max_dev_m: float
+
+
 class DXFParseResponse(BaseModel):
     """Response from /api/path/parse-dxf."""
 
@@ -499,7 +527,7 @@ class PathPlanRequest(BaseModel):
     close_shape: bool = False
     use_two_opt: bool = True  # Improve greedy segment order with 2-opt
     max_two_opt_segments: int = Field(80, ge=0, le=1000)  # Skip 2-opt above this MARK count
-    max_waypoints: int = Field(10000, ge=100, le=500000)  # Hard publication guard
+    max_waypoints: int = Field(100000, ge=100, le=500000)  # Hard publication guard
     max_segments: int = Field(2000, ge=1, le=100000)  # Hard segment-count guard
     include_waypoints: bool = True  # If False, return summary only (no waypoint arrays)
     # How far a surveyed vertex may sit off the driven chord before that counts

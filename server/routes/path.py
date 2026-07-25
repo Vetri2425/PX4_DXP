@@ -61,6 +61,8 @@ from models import (
     MissionSummary,
     PathExtensionConfig,
     PathExtensionConfigResponse,
+    SurveyLineConfig,
+    SurveyLineConfigResponse,
     PathPlanRequest,
     PathPlanResponse,
     PathPreviewBounds,
@@ -847,6 +849,38 @@ async def save_path_extensions(name: str, req: PathExtensionConfig):
         name=os.path.basename(name),
         saved=True,
         **config,
+    )
+
+
+@path_router.get("/{name}/line-config", response_model=SurveyLineConfigResponse)
+async def get_line_config(name: str):
+    """Return saved survey-line reconstruction settings for a CSV file."""
+    from main import path_mgr
+
+    config = await _sidecar_call(
+        path_mgr.load_line_config, name, what="Loading line config",
+    )
+    return SurveyLineConfigResponse(
+        name=os.path.basename(name), saved=True, **config,
+    )
+
+
+@path_router.post("/{name}/line-config", response_model=SurveyLineConfigResponse)
+async def save_line_config(name: str, req: SurveyLineConfig):
+    """Persist survey-line reconstruction settings for a CSV file.
+
+    Applies to preview, plan and load alike, so raising the corner radius
+    changes what the operator sees before it changes what the rover drives.
+    """
+    from main import path_mgr
+
+    config = await _sidecar_call(
+        path_mgr.save_line_config,
+        name, req.fillet_corners_m, req.fit_arcs_max_dev_m,
+        what="Saving line config",
+    )
+    return SurveyLineConfigResponse(
+        name=os.path.basename(name), saved=True, **config,
     )
 
 

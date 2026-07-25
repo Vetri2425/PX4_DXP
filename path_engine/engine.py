@@ -26,6 +26,7 @@ from .parsers import load_mission_file, load_mission_segments, parse_dxf, entiti
 from .parsers.csv_parser import read_ned_csv_enhanced
 from .parsers.waypoints_parser import read_qgc_waypoints_as_segment
 from .planners.arc_chain import MAX_ARC_DEVIATION_M, fit_line_chain
+from .planners.corner_fillet import fillet_corners
 from .planners.straight_line import densify_segment
 from .planners.extensions import (
     decompose_line_chain_to_edges,
@@ -207,6 +208,13 @@ class PathEngine:
         # (the Egmore roundabout CSV is a ~20-gon whose facets sit 13 cm inside
         # the true circle) — tighten this and such a circle stays a polygon.
         fit_arcs_max_dev_m: float = MAX_ARC_DEVIATION_M,
+        # Round every surveyed corner in a LINE_CHAIN into a tangent arc of this
+        # radius. 0 = off. UNLIKE fit_arcs this INVENTS geometry — the radius is
+        # a marking-spec value, not something the surveyor measured — so it is
+        # never enabled implicitly; the operator has to ask for it and choose the
+        # radius. Needed because a road survey captures a bend as two straights
+        # meeting at one vertex, leaving no arc for fit_arcs to recover.
+        fillet_corners_m: float = 0.0,
         # Paint the closing side of an open MARK shape. Distinct from close_loop
         # (which closes with spray OFF, a deadhead). Default OFF. On, a MARK
         # segment whose first and last points differ gets a copy of its first
@@ -278,6 +286,11 @@ class PathEngine:
         self.fit_arcs_rms_m = fit_arcs_rms_m
         self.fit_arcs_corner_deg = fit_arcs_corner_deg
         self.fit_arcs_max_dev_m = fit_arcs_max_dev_m
+        if fillet_corners_m < 0.0:
+            raise ValueError(
+                f"fillet_corners_m must be >= 0.0, got {fillet_corners_m}"
+            )
+        self.fillet_corners_m = fillet_corners_m
         self.close_shape = close_shape
         self.use_two_opt = use_two_opt
         self.max_two_opt_segments = max_two_opt_segments
@@ -595,6 +608,24 @@ class PathEngine:
                         corner_angle_deg=self.fit_arcs_corner_deg,
                         max_spacing_m=self.mark_spacing,
                         max_dev_m=self.fit_arcs_max_dev_m,
+                    )
+                    seg.points = new_pts
+                    seg.metadata["control_indices"] = ctrl
+
+        # Corner fillet (opt-in, radius from the operator). Runs AFTER the arc
+        # fit so a genuinely surveyed arc is recovered first and only what is
+        # still a corner gets rounded. Same LINE_CHAIN-only gate, so DXF and
+        # legacy missions cannot be touched.
+        if self.fillet_corners_m > 0.0:
+            for seg in segments:
+                if (seg.segment_type == SegmentType.MARK
+                        and str(seg.metadata.get("geometry_type", "")).upper() == "LINE_CHAIN"
+                        and len(seg.points) >= 3):
+                    new_pts, ctrl = fillet_corners(
+                        seg.points,
+                        seg.metadata.get("control_indices"),
+                        radius_m=self.fillet_corners_m,
+                        max_spacing_m=self.mark_spacing,
                     )
                     seg.points = new_pts
                     seg.metadata["control_indices"] = ctrl
