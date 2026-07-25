@@ -143,6 +143,14 @@ TOPICS = [
     # render /path back into lat/lon for the geo overlay (surveyed vs commanded
     # vs driven). Published once early (after the server's MAV_CMD_REQUEST_MESSAGE).
     "/mavros/global_position/gp_origin",  # geographic_msgs/GeoPointStamped (TRANSIENT_LOCAL)
+    # ── added 2026-07-26: the receiver's OWN lat/lon (NavSatFix from GPS_RAW_INT,
+    # global_position plugin — not denylisted, so present). This is the only
+    # dense position stream UPSTREAM of the EKF: /mavros/global_position/global
+    # is ekf_origin + local NED (the EKF grading itself), and GPSRAW is only
+    # ~5 Hz. Needed as the independent ruler for the WENC A/B drift analysis.
+    # VOLATILE sensor topic — captured via the recorder's QoS adaptation, same
+    # as /mavros/global_position/global; no override entry required.
+    "/mavros/global_position/raw/fix",    # sensor_msgs/NavSatFix (EKF-independent)
 ]
 
 # QoS profile overrides so the LATCHED (TRANSIENT_LOCAL) topics above are actually

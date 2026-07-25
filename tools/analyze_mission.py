@@ -285,9 +285,26 @@ def _p_statustext(d):
 
 
 def _p_gpsraw(d):
-    # header + uint8 fix_type is all we need; deeper fields vary by version.
+    """mavros_msgs/GPSRAW — the receiver's OWN lat/lon, upstream of the EKF.
+
+    This is the only position in the bag that is NOT downstream of the EKF:
+    pose-derived geo is the EKF grading its own homework (it IS ekf_origin +
+    local_NED), so run-to-run physical separation must be measured here.
+    Field layout validated against the 2026-07-25 bags
+    (bags/25_07_2026/Analysis/scripts/gpsraw.py): lat/lon land at the site,
+    fix_type 6, h_acc 1.4-2.1 cm — reading anything shifted produces garbage
+    coordinates, which is the sanity check.
+    """
     r = _CDR(d); r.header()
-    return {"fix_type": r.u8()}
+    fix = r.u8()
+    lat = r.i32(); lon = r.i32(); alt = r.i32()          # degE7 / degE7 / mm
+    eph = r.u16(); epv = r.u16(); vel = r.u16(); cog = r.u16()
+    sats = r.u8()
+    r.i32()                                              # alt_ellipsoid (mm)
+    h_acc = r.u32(); v_acc = r.u32()                     # mm
+    return {"fix_type": fix, "lat": lat * 1e-7, "lon": lon * 1e-7,
+            "alt": alt * 1e-3, "eph": eph, "epv": epv, "vel": vel, "cog": cog,
+            "sats": sats, "h_acc": h_acc * 1e-3, "v_acc": v_acc * 1e-3}
 
 
 def _p_navsatfix(d):
@@ -541,7 +558,9 @@ class Series:
         self.spray_state = []     # (t, bool)
         self.statustext = []      # (t, severity, text)
         self.gps = []             # (t, fix_type)
-        self.global_fix = []      # (t, lat, lon, alt) — rover's own WGS84 position
+        self.gps_raw = []         # (t, lat, lon, sats, h_acc) — receiver's own fix (GPSRAW, ~5 Hz, EKF-independent)
+        self.raw_fix = []         # (t, lat, lon, alt) — receiver's own fix (raw/fix NavSatFix, denser, EKF-independent)
+        self.global_fix = []      # (t, lat, lon, alt) — EKF WGS84 position (= ekf_origin + local NED; NOT independent)
         self.path_z = None        # z bitfield of the kept /path (bit1 = must-hit)
         self.ekf_origin = None    # (lat, lon) — EKF local-frame datum (gp_origin)
         self.topics_seen = {}     # name -> count
@@ -599,6 +618,13 @@ def collect(bag_dir: str) -> Series:
             s.statustext.append((t, m["severity"], m["text"]))
         elif topic == "/mavros/gpsstatus/gps1/raw":
             s.gps.append((t, m["fix_type"]))
+            # receiver's own position — guard the (0,0) no-fix placeholder
+            if abs(m["lat"]) <= 90.0 and not (m["lat"] == 0.0 and m["lon"] == 0.0):
+                s.gps_raw.append((t, m["lat"], m["lon"], m["sats"], m["h_acc"]))
+        elif topic == "/mavros/global_position/raw/fix":
+            if m["lat"] == m["lat"] and abs(m["lat"]) <= 90.0 \
+                    and not (m["lat"] == 0.0 and m["lon"] == 0.0):
+                s.raw_fix.append((t, m["lat"], m["lon"], m["alt"]))
         elif topic == "/mavros/global_position/global":
             if m["lat"] == m["lat"] and abs(m["lat"]) <= 90.0:   # skip NaN / unset
                 s.global_fix.append((t, m["lat"], m["lon"], m["alt"]))
@@ -609,7 +635,8 @@ def collect(bag_dir: str) -> Series:
                 s.ekf_origin = (m["lat"], m["lon"])
     for lst in (s.pose, s.vel_meas, s.vel_cmd, s.setpoint, s.state, s.rpp, s.seg,
                 s.yaw_rate, s.spray_active, s.spray_desired, s.spray_commanded,
-                s.spray_state, s.statustext, s.gps, s.global_fix):
+                s.spray_state, s.statustext, s.gps, s.gps_raw, s.raw_fix,
+                s.global_fix):
         lst.sort(key=lambda r: r[0])
     return s
 
