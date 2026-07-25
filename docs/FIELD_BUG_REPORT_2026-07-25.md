@@ -857,3 +857,68 @@ the visible frame-scale change (PX4 sphere vs WGS84).
 Still open, reproduced on this run: **B1** (must_hit = endpoints only → §8 cannot pair
 8 vs 2), **B3/B4/B5** (operator e-stopped ~15 s after completion to close the valve —
 B4 signature), **B14, B15, B16, B8, B10, B13**.
+
+---
+
+## FIX VERIFICATION 2 — spray trio + disarm (run `stg_a0dd0306_1784986262_20260725_190115`)
+
+Deployed **`d0ae176`** (B4 terminal spray shutoff + disarm-on-complete) and **`8da931d`**
+(B3 stale-latch fail-open + smooth-profile `/rpp/segment_debug` `TRACK_SEGMENT` + B5
+awaiting-tracking gate). Jetson git `8da931d7`. B2 runtime params still live
+(`smooth_lateral_gain 1.5`, `smooth_curvature_ld_coeff 0.20`). Same mission/CSV as the
+whole day (`curve_6_points-1.csv`); marking = the fitted arc run (97 pts, s=4.811 m,
+last spray-flagged station idx 95 @ s=4.711, i.e. MARK ends 10 cm before the trailing
+transit). Bag 47.2 s, 1419 pose samples.
+
+### Verdict: **B3, B4, B5 all fixed; disarm confirmed.** Tracking held class (marginally worse this run, not from these fixes).
+
+**Timeline (arc/MARK run):** run-boundary pivot `ALIGN` 293.24→302.94 s; first
+`TRACK_SEGMENT` 302.938; spray desired ON 303.003; `TRACK`→`PRE_CORNER` 318.537; spray
+desired OFF 319.086; `STOP`/`DONE` 322.0. Bag ends 323.77.
+
+| Bug | Baseline signature (164xxx / 182055) | New bag `…_190115` | Verdict |
+|---|---|---|---|
+| **B5** spurious pulse on load | spray ON **+0.075–0.081 s** after marking `/path` lands, rover **stationary** at vertex 0 (~0.1 cm travel), 0.32–0.36 s blob; `desired 4 edges` | marking `/path` lands 292.895 s (rover parked 2.05 cm from v0, v=0.003 m/s); first `desired` ON **+10.108 s** later, only after tracking began (5.4 cm past v0, moving); **no pulse during the 9.7 s pivot**; `desired 3 edges` | **FIXED** |
+| **B3** spray opens ~1 s late | spray ON **+1.0 s** after tracking start → 9.5–9.9 cm unpainted; smooth run publishes **zero** `/rpp/segment_debug`, pivot logged `NEVER RELEASED (topic went silent)` | first `TRACK_SEGMENT` 302.938 → spray ON 303.003 = **+0.065 s** (~a few mm); **1295 `TRACK`(state 1) msgs during the arc**; pivot now measurably released | **FIXED** |
+| **B4** never OFF at mission end | `desired` held **True to bag end** (4.9–5.5 s stationary, operator e-stop closed valve); actuator open the whole time | last `desired` True→False **319.086 s**, projection **exactly at last spray station** (idx 95, 0.0 cm past MARK boundary), v=0.053 m/s; `desired` **False for the remaining 4.68 s / 243 samples to bag end**; actuator (`/spray/state`) closes 319.086, `/spray/active` 318.537 | **FIXED** |
+| **Disarm** on complete | — | not in bag (`/mavros/state` = 0 samples recorded); **confirmed from live journal**: "completion disarm ok" **+45 ms** after mission-completed, FCU ended `armed:false` | **CONFIRMED (journal)** |
+
+Edge counts: baselines `desired 4 edges` (initial-off + spurious ON + spurious OFF +
+real ON-that-never-closed). New bag `desired 3 edges` (initial-off + one ON + one OFF)
+= exactly **one clean pulse**. `commanded 3 / state 3` match; state↔desired latency
+0.011 s; **0 misfire samples**.
+
+### Tracking / placement — no functional regression, one metric marginally worse
+
+| §  | metric | 164xxx baseline | 182055 (B2-tuned) | **new `…_190115`** | note |
+|---|---|---|---|---|---|
+| 1 | marking xtrack RMS / p95 / max | 5.13 / 5.96 / 6.1 cm (FAIL) | 1.00 / 2.17 / 2.31 cm | **1.41 / 3.91 / 4.14 cm** (PASS) | within class (≤2.0), but ~40% worse than 182055 |
+| 2 | endpoint closest / resting, DONE | 1.7 / 1.9, True | 1.6 / 1.9, True | **1.7 / 1.8, True** (PASS) | unchanged |
+| 6 | OFFBOARD drops / gaps>0.5 s / RTK deg / EKF jumps / pose-stale | 0 all | 0 all | **0 all** (PASS) | clean |
+| 7 | driven-vs-planned RMS / max | 3.86 / 6.13 cm | 0.92 / 2.35 cm | **1.88 / 4.17 cm** (WARN*) | ~2× 182055; *WARN is the B8 "any node removed" artifact, geom Δ ≤0.04 cm |
+| 9 | traversal | 97/97 | 97/97 | **97/97** (PASS) | complete |
+
+The marking-RMS and §7 rise (vs 182055) is **run-to-run arc-entry driving variation, not
+attributable to the spray/disarm commits** — those add a `/rpp/segment_debug` publish in
+the smooth branch and touch the spray node + completion disarm; none alter the velocity
+control law. B2 (arc inside-cut equilibrium) is still the structural driver and its runtime
+gains were live in both runs. **Both figures remain within production class; flag and watch
+on the next run, but nothing here regressed.**
+
+### Side-effect sweep
+
+- **§3 now reports FAIL** (`pivot settle 3.76° > 3.0°`) where baselines showed
+  `NEVER RELEASED … PASS`. This is **not a regression** — it is a direct consequence of the
+  B3 fix: with `TRACK_SEGMENT` now following the `ALIGN`, the analyzer can finally *measure*
+  the pivot settle instead of vacuously passing. The 3.76° dither is **known-open B15**
+  (release band collides with `RD_TRANS_TRN_DRV`), unrelated to spray.
+- `/rpp/segment_debug` state histogram: `TRACK 1295 · PRE_CORNER 397 · ALIGN 485 · STOP 68 · DONE 121`.
+  All `TRACK` fall inside the arc MARK span; `ALIGN/STOP/DONE` only at run boundaries. **No unexpected states during the smooth run.**
+- No spray chatter (2 real transitions, ON then OFF), **0 OFFBOARD drops, 0 setpoint gaps**, RTK FIXED throughout.
+- **B1 still open as expected:** `must_hit = [0, 95]` (endpoints only); §8 still `cannot pair 8 surveyed vs 2 local`. Not in scope for this run.
+
+**Owners:** B3/B4/B5 → deployed `d0ae176`+`8da931d`, verified here. Marking-RMS watch → controller/B2. §3 FAIL → B15. B1/§8 pairing → still open.
+
+**Reproduce:** `.venv/bin/python tools/analyze_mission.py bags/25_07_2026/stg_a0dd0306_1784986262_20260725_190115/`
+(spray-edge / segment-state timings pulled via the library `collect()` — `s.seg` state codes
+`1=TRACK 2=PRECORNER 3=ALIGN 4=DONE 5=STOP`, `s.spray_desired`, `s.path_z & 1` = spray bit).
