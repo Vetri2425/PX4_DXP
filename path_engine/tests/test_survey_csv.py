@@ -136,9 +136,12 @@ def test_code_column_groups_points_into_separate_lines(tmp_path):
 
 def test_name_column_orders_points_numerically_not_lexically(tmp_path):
     """Point 10 must come after point 9, not after point 1."""
+    # Space them ~11 m apart. The original fixture varied the 8th decimal, i.e.
+    # 1-10 MM, which the re-occupied-station collapse now (correctly) reads as
+    # one point sampled three times.
     rows = ["Name,Code,Latitude,Longitude"]
     for i in (1, 10, 2):
-        rows.append(f"{i},L_1,13.0720{600 + i:04d},80.2619{4000 + i:04d}")
+        rows.append(f"{i},L_1,{13.0720 + i * 0.0001:.8f},{80.26194 + i * 0.0001:.8f}")
     res = read_survey_csv(_write(tmp_path, *rows))
 
     assert res.segments[0].metadata["survey_names"] == ["1", "2", "10"]
@@ -263,3 +266,67 @@ def test_single_point_code_is_kept_and_warned(tmp_path):
     res = read_survey_csv(f)
     assert len(res.segments) == 2
     assert any("only 1 point" in w for w in res.warnings)
+
+
+# --- re-occupied stations ---------------------------------------------------
+#
+# An operator standing still and triggering two or three shots is routine RTK
+# practice — curve_6_points.csv ends with three, 0.8 s apart and 2-3 mm apart.
+# Geometrically they are poison: the heading between two points 3 mm apart is
+# noise, so they manufacture 130-160 deg "corners" that split a genuine
+# single-sweep arc and declare several must-hit vertices inside one 3 mm spot.
+
+def _pt(name, code, easting, northing, lon, lat):
+    return (f"{name},{code},Point,{easting:.3f},{northing:.3f},9.9,"
+            f"{lon:.8f},{lat:.8f},0.017,FIX,1,1.8,"
+            f"WGS 84 / Tamil Nadu + EGM96 height")
+
+
+def _chain(tmp_path, offsets):
+    """A chain of shots at the given (d_lon, d_lat) offsets in degrees."""
+    lon0, lat0 = 80.26193876, 13.07206142
+    rows = [
+        _pt(i + 1, "P", 1204636.0 + i, 1243756.0 + i, lon0 + dlon, lat0 + dlat)
+        for i, (dlon, dlat) in enumerate(offsets)
+    ]
+    return _write(tmp_path, _HEADER, *rows, name="restation.csv")
+
+
+def test_repeat_shots_at_one_station_are_collapsed(tmp_path):
+    # ~1 m steps, then two shots ~2 mm away from the third point.
+    deg = 1.0 / 111320.0
+    offsets = [(0.0, 0.0), (0.0, deg), (0.0, 2 * deg),
+               (0.0, 2 * deg + 2e-8), (0.0, 2 * deg - 1e-8)]
+    res = read_survey_csv(_chain(tmp_path, offsets))
+    pts = res.segments[0].points
+    assert len(pts) == 3, f"re-occupied shots not collapsed: {pts}"
+    assert any("re-occupied station" in w for w in res.warnings)
+
+
+def test_collapse_keeps_the_first_shot_of_a_cluster(tmp_path):
+    deg = 1.0 / 111320.0
+    offsets = [(0.0, 0.0), (0.0, deg), (0.0, deg + 3e-8)]
+    res = read_survey_csv(_chain(tmp_path, offsets))
+    pts = res.segments[0].points
+    assert len(pts) == 2
+    # The kept second point is the FIRST of the pair, not the repeat.
+    assert res.segments[0].metadata["survey_names"] == ["1", "2"]
+
+
+def test_genuinely_distinct_points_are_never_collapsed(tmp_path):
+    """0.5 m apart is a real vertex — only sub-2 cm repeats go."""
+    deg = 1.0 / 111320.0
+    offsets = [(0.0, 0.0), (0.0, 0.5 * deg), (0.0, 1.0 * deg)]
+    res = read_survey_csv(_chain(tmp_path, offsets))
+    assert len(res.segments[0].points) == 3
+    assert not any("re-occupied station" in w for w in res.warnings)
+
+
+def test_control_indices_track_the_collapsed_chain(tmp_path):
+    """Every surviving point is still declared a surveyed control point."""
+    deg = 1.0 / 111320.0
+    offsets = [(0.0, 0.0), (0.0, deg), (0.0, deg + 2e-8), (0.0, 2 * deg)]
+    res = read_survey_csv(_chain(tmp_path, offsets))
+    seg = res.segments[0]
+    assert seg.metadata["control_indices"] == list(range(len(seg.points)))
+    assert len(seg.metadata["survey_names"]) == len(seg.points)

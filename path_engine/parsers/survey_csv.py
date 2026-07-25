@@ -195,6 +195,46 @@ class SurveyCsvResult:
         self.coordinate_source = source    # "latlon" | "grid"
 
 
+# Two consecutive shots closer together than this are the SAME station occupied
+# twice, not two path vertices. Comfortably above RTK single-epoch lateral RMS
+# (1.6-1.8 cm in the field files) and far below any spacing an operator could
+# mean as two distinct points.
+RESTATION_TOL_M = 0.02
+
+
+def _collapse_restations(pts_rows: list[dict], code: str,
+                         warnings: list[str]) -> list[dict]:
+    """Drop consecutive shots that re-occupy the same station.
+
+    An operator standing still and triggering two or three samples is routine
+    (the curve_6_points file ends with three shots 2-3 mm apart, 0.8 s apart).
+    Geometrically those are poison: the heading between two points 3 mm apart is
+    pure noise, so they manufacture 130-160 deg "corners" out of nothing. That
+    trips the arc fitter's corner split and can cut a genuine single-sweep arc
+    into pieces, and it declares several must-hit vertices inside one 3 mm spot.
+
+    Keeps the FIRST shot of each cluster — it is the one the operator aimed.
+    """
+    if len(pts_rows) < 2:
+        return pts_rows
+    kept = [pts_rows[0]]
+    dropped: list[str] = []
+    for r in pts_rows[1:]:
+        prev = kept[-1]
+        if math.hypot(r["n"] - prev["n"], r["e"] - prev["e"]) <= RESTATION_TOL_M:
+            dropped.append(str(r["name"]))
+            continue
+        kept.append(r)
+    if dropped:
+        shown = ", ".join(dropped[:4])
+        more = f" (+{len(dropped) - 4} more)" if len(dropped) > 4 else ""
+        warnings.append(
+            f"code {code!r}: dropped {len(dropped)} re-occupied station(s) "
+            f"[{shown}{more}] within {RESTATION_TOL_M * 100:.0f} cm of the "
+            f"previous shot — repeat samples of one point, not path vertices")
+    return kept
+
+
 def read_survey_csv(
     filepath: str,
     *,
@@ -337,6 +377,7 @@ def read_survey_csv(
     segments: list[PathSegment] = []
     for idx, key in enumerate(order):
         pts_rows = sorted(groups[key], key=lambda r: _order_key(r["name"]))
+        pts_rows = _collapse_restations(pts_rows, key, warnings)
         pts = [(r["n"], r["e"]) for r in pts_rows]
         if len(pts) < 2:
             warnings.append(
