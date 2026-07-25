@@ -451,14 +451,24 @@ async def _telemetry_loop() -> None:
                     and offboard_ctrl.state == MissionState.RUNNING
                     and ros_node.get_rpp_monitor().is_done()
                 ):
-                    offboard_ctrl.mark_completed()
-                    await _emit_authenticated(
-                        "mission_completed",
-                        {
-                            "state": offboard_ctrl.state.value,
-                            "name": offboard_ctrl.loaded_path_name,
-                        },
-                    )
+                    if offboard_ctrl.mark_completed():
+                        await _emit_authenticated(
+                            "mission_completed",
+                            {
+                                "state": offboard_ctrl.state.value,
+                                "name": offboard_ctrl.loaded_path_name,
+                            },
+                        )
+                        # B4: end the mission spray-OFF + DISARMED without an
+                        # operator E-stop. Self-gated on DISARM_ON_COMPLETE; runs
+                        # strictly AFTER the COMPLETED transition (never keyed on
+                        # a raw DONE — B16: /rpp/debug can flash DONE mid-mission,
+                        # but the RPP monitor's settle logic gates the transition
+                        # above). Never raises.
+                        try:
+                            await offboard_ctrl.disarm_on_complete_async()
+                        except Exception:
+                            log.exception("disarm-on-complete failed")
 
                 # ── 3. Watchdog: RUNNING + unhealthy/disconnected → estop ──────
                 # B2: RPP_UNHEALTHY_CODES covers STALE (-1), RTK_WAIT (4),

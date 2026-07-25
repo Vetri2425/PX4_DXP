@@ -95,6 +95,11 @@ STAGING_TTL_S = float(os.environ.get("ROVER_STAGING_TTL_S", "3600"))
 SPRAY_LITERS_PER_METER = float(os.environ.get("ROVER_SPRAY_L_PER_M", "0.012"))
 # Default MARK flags for built-in / legacy non-DXF paths that carry no spray metadata.
 SPRAY_DEFAULT_ON = os.environ.get("ROVER_SPRAY_DEFAULT_ON", "1") == "1"
+# On natural mission completion (RPP DONE settled), command spray OFF and disarm
+# the rover so it ends the mission safe without an operator E-stop (field bug
+# B4, 2026-07-25). Default ON. Set ROVER_DISARM_ON_COMPLETE=0 to keep the rover
+# armed at completion (old behaviour: mark COMPLETED only).
+DISARM_ON_COMPLETE = os.environ.get("ROVER_DISARM_ON_COMPLETE", "1") == "1"
 
 # ── Safety / watchdog thresholds ──────────────────────────────────────────────
 POSE_STALE_MS = 500.0  # consider pose stale above this

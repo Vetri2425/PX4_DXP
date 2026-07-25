@@ -106,6 +106,17 @@ def _rpp_kind_for(in_mark: bool, next_boundary: str) -> str:
 # breaks silently -- test_spray_pivot_gate.py pins the contract.
 _SEGMENT_STATE_CORNER_ALIGN = 3
 
+# B5: SegmentStateCode values that mean "the RPP is actively driving along the
+# line" (TRACK_SEGMENT=1, PRE_CORNER_SLOWDOWN=2). Seeing any of these on
+# /rpp/segment_debug since the last /path load is the positive evidence that the
+# run has actually started — the B5 gate below suppresses geometry-desired spray
+# until then, so path arrival alone (rover parked ON a spray-flagged vertex 0,
+# armed + OFFBOARD) cannot open the valve. CORNER_ALIGN(3)/DONE(4)/CORNER_STOP(5)
+# /INACTIVE(0) are NOT tracking and never satisfy the gate. With the B3(a) RPP
+# fix the SMOOTH profile also emits TRACK_SEGMENT, so this works for both
+# profiles.
+_SEGMENT_TRACKING_STATES = frozenset({1, 2})
+
 # G2: MissionPhase values that mean "the nozzle is currently over a MARK region"
 # for RPP-sourced boundary anticipation. Matches progress_classifier._MARK_PHASES
 # (imported by value, not the private name, so the contract is explicit here).
@@ -357,6 +368,15 @@ def _make_spray_decision(
     yaw: float = 0.0,
     now_s: float = 0.0,
     off_confirmed: bool = False,
+    # B4 — terminal shutoff (speed-independent). The OFF lead is speed-scaled
+    # (speed x solenoid_close_delay_s), so at the terminal creep speed it is
+    # ~1 mm against a ~14 mm stopping gap: the geometric MARK->TRANSIT boundary
+    # at the FINAL station is never crossed and the valve latches ON after the
+    # rover stops short. When the nozzle is within terminal_off_epsilon_m of the
+    # final path station AND the rover has effectively stopped, force geometry
+    # OFF. Gated on near-zero speed, so a moving MARK tail is never cut.
+    terminal_off_epsilon_m: float = 0.05,
+    terminal_off_speed_mps: float = 0.05,
     # G2 — RPP progress boundary sourcing (continuous mode only). When
     # rpp_in_mark is None (flag off / stale / absent), the continuous branch
     # uses this node's own /path projection exactly as before (byte-for-byte
@@ -498,6 +518,20 @@ def _make_spray_decision(
                     geometry_desired = False
                     event = "off_early"
 
+            # B4 terminal shutoff — fires independently of any boundary/lead so
+            # it works even when the rover stops short of the final MARK station
+            # (the off_early path above cannot: its lead is ~1 mm at creep
+            # speed). END-specific, NOT a speed gate: it requires proximity to
+            # the FINAL station, so a slow mid-line MARK keeps painting.
+            if (
+                geometry_desired
+                and model.cumulative_s
+                and speed_mps <= terminal_off_speed_mps
+                and (model.cumulative_s[-1] - projection.s) <= terminal_off_epsilon_m
+            ):
+                geometry_desired = False
+                event = "terminal_off"
+
     desired = bool(geometry_desired and safety_ok)
     debug = [
         1.0 if model is not None else 0.0,
@@ -569,6 +603,16 @@ class SprayControllerNode(Node):
         self.declare_parameter("anticipatory_margin_m", 0.02)
         self.declare_parameter("on_overspray_margin_m", 0.02)
         self.declare_parameter("off_overspray_margin_m", 0.0)
+        # ── B4: terminal shutoff (speed-independent) ─────────────────────────
+        # Guarantees the valve closes at the end of the path. The rover finishes
+        # at a creep speed (0.005-0.03 m/s), where the speed-scaled off_lead is
+        # sub-millimetre and the geometric MARK->TRANSIT boundary at the final
+        # station is never crossed. When the nozzle is within
+        # terminal_off_epsilon_m of the final station AND effectively stopped,
+        # spray is forced OFF. End-specific (proximity to the LAST station), so
+        # a slow mid-line MARK is unaffected.
+        self.declare_parameter("terminal_off_epsilon_m", 0.05)
+        self.declare_parameter("terminal_off_speed_mps", 0.05)
         # DEPRECATED as an on/off gate (2026-07-17). Still declared because the
         # server's param serializer sends it and an undeclared param is a hard
         # load rejection. It no longer decides whether to spray: speed governs
@@ -646,6 +690,12 @@ class SprayControllerNode(Node):
         self._desired_debounced = False
         self._last_active_time = None
         self._legacy_active_raw = False
+        # B4 fail-closed watchdog: when /spray/active first went False (cleared
+        # to None on True). Lets the DEFAULT distance-aware path force spray OFF
+        # once the RPP has stopped asserting a MARK for active_timeout_s, even
+        # though it computes geometry locally and does not consume /spray/active
+        # for the decision. Mission end publishes active=False continuously.
+        self._active_false_since = None
         self._manual_active = False
         self._manual_deadline_ns: Optional[int] = None
         self._armed = False
@@ -711,6 +761,17 @@ class SprayControllerNode(Node):
         self._vel_recv_time = None
         self._segment_state: Optional[int] = None
         self._segment_state_recv_time = None
+        # B5: has the RPP reported an actively-tracking state since the last
+        # /path load? Default True (permissive) so a node that is driven by
+        # direct model injection — never by a real /path message — behaves as
+        # before. A real /path arrival (`_path_cb`) resets it to False; the
+        # first TRACK_SEGMENT/PRE_CORNER_SLOWDOWN on /rpp/segment_debug sets it
+        # back to True. Until then, `_auto_safety_status` refuses geometry ON
+        # ("awaiting tracking"), so path load onto a spray-flagged vertex 0
+        # cannot blip the valve. Two-stage entry missions reset it on EACH new
+        # path (entry path first, then marking path) — correct: no spray during
+        # entry, and the entry path carries no spray flags anyway.
+        self._tracking_seen_since_path_load = True
         # G2: latest RPP progress (boundary authority for continuous marks).
         # None until the first message; recv_time drives the staleness fallback
         # to /path (progress_timeout_s). _rpp_source tracks which boundary source
@@ -926,8 +987,16 @@ class SprayControllerNode(Node):
         self._drive_fsm_tick("state changed")
 
     def _active_cb(self, msg: Bool) -> None:
-        self._last_active_time = self.get_clock().now()
-        self._legacy_active_raw = bool(msg.data)
+        now = self.get_clock().now()
+        self._last_active_time = now
+        raw = bool(msg.data)
+        # B4: track the start of a sustained-False span so the distance-aware
+        # watchdog can time it against active_timeout_s (below). True clears it.
+        if raw:
+            self._active_false_since = None
+        elif self._active_false_since is None:
+            self._active_false_since = now
+        self._legacy_active_raw = raw
         if (
             not bool(self.get_parameter("use_distance_aware_spray").value)
             and bool(self.get_parameter("allow_legacy_spray_active_fallback").value)
@@ -935,6 +1004,11 @@ class SprayControllerNode(Node):
             self._set_auto_desired(self._legacy_active_raw, source="legacy")
 
     def _path_cb(self, msg: Path) -> None:
+        # B5: any new /path resets the "run has started" evidence. Auto-spray is
+        # then held ("awaiting tracking") until the RPP reports an actively-
+        # tracking state, so path arrival onto a spray-flagged vertex 0 cannot
+        # open the valve before the rover is actually driving the line.
+        self._tracking_seen_since_path_load = False
         points = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
         # position.z is a bitfield: bit0 = spray ON, bit1 = must-hit vertex.
         # MUST bit-test, not `> 0.5`: a spray-OFF must-hit point encodes as 2.0
@@ -1223,6 +1297,34 @@ class SprayControllerNode(Node):
         # disable or any safety loss is enforced within one watchdog tick.
         self._drive_fsm_tick(reason)
 
+    def _active_heartbeat_forces_off(self) -> bool:
+        """B4 mission-level fail-closed watchdog, live in distance-aware mode.
+
+        The RPP's /spray/active is the authority on whether a mission MARK is in
+        progress at all; it is republished every control tick (True during a
+        MARK, False otherwise, and False continuously once the mission ends).
+        Distance-aware mode decides geometry locally from /path and previously
+        ignored /spray/active entirely, so at mission end the valve stayed open
+        with the rover stopped short of the final station. Force OFF when
+        /spray/active has been absent (RPP silent) OR False for longer than
+        active_timeout_s. Returns False until the first /spray/active is ever
+        seen, so a deployment that never wires the topic keeps geometry
+        authoritative (and every existing distance-aware test, which sends no
+        /spray/active, is unaffected).
+        """
+        if self._last_active_time is None:
+            return False
+        timeout_s = max(0.0, float(self.get_parameter("active_timeout_s").value))
+        now = self.get_clock().now()
+        age_s = (now - self._last_active_time).nanoseconds * 1e-9
+        if age_s > timeout_s:
+            return True  # RPP stopped publishing — fail closed
+        if self._active_false_since is not None:
+            false_age_s = (now - self._active_false_since).nanoseconds * 1e-9
+            if false_age_s > timeout_s:
+                return True  # RPP has held not-active (e.g. mission ended)
+        return False
+
     def _distance_aware_tick(self) -> None:
         model = self._path_model
         pose_fresh, pose_age_s = self._pose_is_fresh()
@@ -1313,6 +1415,14 @@ class SprayControllerNode(Node):
                 0.0,
                 float(self.get_parameter("max_xtrack_error_m").value),
             ),
+            terminal_off_epsilon_m=max(
+                0.0,
+                float(self.get_parameter("terminal_off_epsilon_m").value),
+            ),
+            terminal_off_speed_mps=max(
+                0.0,
+                float(self.get_parameter("terminal_off_speed_mps").value),
+            ),
             rpp_in_mark=rpp_in_mark,
             rpp_boundary_kind=rpp_boundary_kind,
             rpp_dist_to_boundary_m=rpp_dist_m,
@@ -1348,6 +1458,8 @@ class SprayControllerNode(Node):
                 self.get_logger().info("Spray ON early before MARK start")
             elif decision.event == "off_early":
                 self.get_logger().info("Spray OFF early before MARK end")
+            elif decision.event == "terminal_off":
+                self.get_logger().info("Spray OFF at path end (terminal shutoff)")
         self._last_distance_event = decision.event
 
         if decision.geometry_desired and not decision.safety_ok:
@@ -1359,7 +1471,19 @@ class SprayControllerNode(Node):
         elif decision.safety_ok:
             self._last_safety_block_reason = ""
 
-        self._set_auto_desired(decision.desired, source="distance")
+        desired = decision.desired
+        # B4 mission-level fail-closed watchdog (default distance-aware path):
+        # override geometry OFF when the RPP has stopped asserting a MARK. This
+        # is the safety net behind the terminal shutoff — it also covers a dead
+        # RPP and any dual-projection drift past mission end.
+        if desired and self._active_heartbeat_forces_off():
+            desired = False
+            self.get_logger().warn(
+                "Spray forced OFF: /spray/active stale/inactive beyond "
+                "active_timeout_s (mission-level fail-closed watchdog)",
+                throttle_duration_sec=5.0,
+            )
+        self._set_auto_desired(desired, source="distance")
 
     def _pose_is_fresh(self) -> tuple[bool, float]:
         if self._pose_recv_time is None:
@@ -1381,6 +1505,11 @@ class SprayControllerNode(Node):
             return
         self._segment_state = int(msg.data[1])
         self._segment_state_recv_time = self.get_clock().now()
+        # B5: an actively-tracking state is the positive evidence the run has
+        # started. Latch it for the rest of this /path so a later pivot/stop
+        # does not re-arm the gate (the pivot gate handles those separately).
+        if self._segment_state in _SEGMENT_TRACKING_STATES:
+            self._tracking_seen_since_path_load = True
 
     def _rpp_progress_cb(self, msg: String) -> None:
         """Cache the latest RPP progress (G2). Lenient parse never raises."""
@@ -1587,6 +1716,14 @@ class SprayControllerNode(Node):
             self.get_clock().now() - self._segment_state_recv_time
         ).nanoseconds * 1e-9
         if age_s > timeout_s:
+            # B3(b): fail OPEN on staleness *immediately*. A latched CORNER_ALIGN
+            # with no fresh message would otherwise keep this branch re-latching
+            # the gate every tick (and, before B3(a), the smooth profile went
+            # silent for the whole MARK span — 1.0 s of unpainted line). Clear
+            # the stale state so the gate releases and stays released until a
+            # genuinely fresh message arrives.
+            self._segment_state = None
+            self._segment_state_recv_time = None
             return False
         return self._segment_state == _SEGMENT_STATE_CORNER_ALIGN
 
@@ -1618,6 +1755,20 @@ class SprayControllerNode(Node):
         gps_ok, gps_reason = self._gps_gate()
         if not gps_ok:
             return False, gps_reason
+        # B5: require positive evidence the run has started before honouring
+        # geometry. On path load the rover is parked ON vertex 0 (which carries
+        # the spray bit), already armed + OFFBOARD, so geometry alone would open
+        # the valve the instant /path lands (a paint blob at the start vertex).
+        # Hold until the RPP reports an actively-tracking state SINCE this /path
+        # load. This gate dominates the pivot gate: even if no CORNER_ALIGN is
+        # ever seen, spray stays OFF until real tracking begins. Point mode is
+        # exempt — it dwells at a standstill and never "tracks" a segment, and
+        # it has its own arrival/dwell FSM gating.
+        if (
+            self._session_mode != "point"
+            and not getattr(self, "_tracking_seen_since_path_load", True)
+        ):
+            return False, "awaiting tracking"
         # NOTE: `speed` is intentionally NOT compared against a minimum here.
         # See min_spray_speed_mps's declaration for why the old gate was removed.
         # Spraying is a question of WHERE the nozzle is, not how fast it is

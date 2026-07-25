@@ -547,6 +547,126 @@ def test_stale_exception_reply_ignored_does_not_corrupt_newer_state():
 
 
 # --------------------------------------------------------------------------
+# B4 — terminal shutoff + mission-level fail-closed watchdog. Field bug
+# 2026-07-25: the valve never closed at mission end. The rover finishes at a
+# creep speed (0.005-0.03 m/s) where the speed-scaled off_lead is ~1 mm, so it
+# stops ~14 mm short of the final station and the geometric MARK->TRANSIT
+# boundary is never crossed. Every pre-existing decision test used speed 1.0,
+# where off_lead = 0.05 m swallows the gap — which is exactly why this was
+# missed. These use the real terminal speed regime.
+# --------------------------------------------------------------------------
+
+def _terminal_mark_path():
+    """A path that ends ON a MARK — the final station carries the terminal
+    MARK->TRANSIT boundary (real mission geometry, 4.804 m long)."""
+    return _build_path_model([(0.0, 0.0), (4.804, 0.0)], [True, True])
+
+
+def test_terminal_shutoff_when_stopped_short_at_endpoint():
+    """Reproduces B4: stop 13.7 mm short at 0.008 m/s -> valve must go OFF.
+
+    Before the fix this returned geometry_desired=True with event='' — the
+    valve latched ON and only a disarm/e-stop could close it."""
+    d = _make_spray_decision(
+        model=_terminal_mark_path(), nozzle_n=4.790, nozzle_e=0.0,
+        speed_mps=0.008, safety_ok=True, safety_reason="",
+        solenoid_open_delay_s=0.10, solenoid_close_delay_s=0.05,
+        on_overspray_margin_m=0.02, off_overspray_margin_m=0.0,
+        max_xtrack_error_m=0.10,
+    )
+    assert d.geometry_desired is False
+    assert d.event == "terminal_off"
+    assert d.desired is False
+
+
+def test_terminal_shutoff_at_exact_endpoint():
+    d = _make_spray_decision(
+        model=_terminal_mark_path(), nozzle_n=4.804, nozzle_e=0.0,
+        speed_mps=0.0, safety_ok=True, safety_reason="",
+        solenoid_open_delay_s=0.10, solenoid_close_delay_s=0.05,
+        on_overspray_margin_m=0.02, off_overspray_margin_m=0.0,
+        max_xtrack_error_m=0.10,
+    )
+    assert d.geometry_desired is False
+
+
+def test_terminal_shutoff_is_end_specific_not_a_speed_gate():
+    """Stopped mid-MARK (far from the final station) must KEEP painting — the
+    terminal shutoff keys on proximity to the last station, not on speed."""
+    d = _make_spray_decision(
+        model=_terminal_mark_path(), nozzle_n=2.0, nozzle_e=0.0,
+        speed_mps=0.008, safety_ok=True, safety_reason="",
+        solenoid_open_delay_s=0.10, solenoid_close_delay_s=0.05,
+        on_overspray_margin_m=0.02, off_overspray_margin_m=0.0,
+        max_xtrack_error_m=0.10,
+    )
+    assert d.geometry_desired is True
+    assert d.event == ""
+
+
+def test_terminal_shutoff_does_not_fire_while_moving_near_end():
+    """Near the end but moving at cruise: the terminal path stays inactive
+    (off_early owns that regime); terminal shutoff must not pre-empt the tail
+    at speed. off_lead = 1.0*0.05 = 0.05 >= 0.014 gap -> off_early here."""
+    d = _make_spray_decision(
+        model=_terminal_mark_path(), nozzle_n=4.790, nozzle_e=0.0,
+        speed_mps=1.0, safety_ok=True, safety_reason="",
+        solenoid_open_delay_s=0.10, solenoid_close_delay_s=0.05,
+        on_overspray_margin_m=0.02, off_overspray_margin_m=0.0,
+        max_xtrack_error_m=0.10,
+    )
+    assert d.event == "off_early"          # NOT terminal_off
+    assert d.geometry_desired is False
+
+
+def test_active_stale_forces_off_in_distance_aware_mode():
+    """RPP stops publishing /spray/active -> fail-closed OFF after the timeout."""
+    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=1.0)
+    node._active_cb(_bool_msg(True))       # RPP asserting a MARK
+    node._distance_aware_tick()
+    assert node._fsm.commanded is True     # geometry sprays
+
+    node._clock.ns += 600_000_000          # 0.6 s since last /spray/active > 0.5
+    node._pose_recv_time = node.get_clock().now()
+    node._vel_recv_time = node.get_clock().now()
+    node._distance_aware_tick()
+    assert node._fsm.commanded is False
+    # ...and the fail-closed watchdog is what named the cause.
+    assert any(
+        rec[0] == "warn" and "watchdog" in rec[1][0]
+        for rec in node._logger.records
+    )
+
+
+def test_active_false_sustained_forces_off_in_distance_aware_mode():
+    """/spray/active held False (mission ended) forces OFF after active_timeout_s
+    even while the topic is still fresh."""
+    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=1.0)
+    node._active_cb(_bool_msg(False))      # RPP: not in a MARK
+    node._distance_aware_tick()            # within timeout: geometry still sprays
+    assert node._fsm.commanded is True
+
+    node._clock.ns += 600_000_000
+    node._active_cb(_bool_msg(False))      # fresh False, but false_since is old
+    node._pose_recv_time = node.get_clock().now()
+    node._vel_recv_time = node.get_clock().now()
+    node._distance_aware_tick()
+    assert node._fsm.commanded is False
+
+
+def test_active_true_does_not_force_off():
+    """A fresh, True /spray/active must never trip the watchdog."""
+    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=1.0)
+    for _ in range(5):
+        node._active_cb(_bool_msg(True))
+        node._clock.ns += 100_000_000
+        node._pose_recv_time = node.get_clock().now()
+        node._vel_recv_time = node.get_clock().now()
+        node._distance_aware_tick()
+    assert node._fsm.commanded is True
+
+
+# --------------------------------------------------------------------------
 # Phase C — dash mode integration through _make_spray_decision + the node's
 # /spray/session_config callback (B0). The dash arc-length math itself is
 # covered purely in test_spray_dash_v2.py; these tests prove the WIRING:
@@ -823,6 +943,81 @@ def test_flow_not_modulated_during_manual():
     node._fsm._state = SprayState.ON_CONFIRMED
     node._update_flow(0.35, 0.02)
     assert node._commanded_flow_value is None and node._flow_source == "n/a"
+
+
+# --------------------------------------------------------------------------
+# B5 — spurious spray pulse on path load. Field bug 2026-07-25: the mission
+# /path lands with the rover parked ON vertex 0 (spray bit set), already armed
+# + OFFBOARD, so geometry alone opened the valve (~271 ms actuator ON — a paint
+# blob at the start vertex) until the RPP's first CORNER_ALIGN suppressed it.
+# The fix: auto-spray waits for positive evidence the run has started — an
+# actively-tracking state on /rpp/segment_debug SINCE the /path load. These
+# tests drive the real _path_cb (which arms the gate); the many other distance-
+# aware tests inject _path_model directly, so they stay permissive as before.
+# --------------------------------------------------------------------------
+
+
+def _b5_node_on_vertex0():
+    node = make_node()  # armed + OFFBOARD
+    node._params["use_distance_aware_spray"] = _Param(True)
+    node._pose_ned = (0.0, 0.0, 0.0)  # parked ON vertex 0
+    node._pose_recv_time = node.get_clock().now()
+    node._vel_ned = (0.0, 0.0)  # stationary
+    node._vel_recv_time = node.get_clock().now()
+    # Mission /path arrives via the real callback (resets the tracking gate).
+    # z=3 => spray bit + must-hit bit set on both vertices (a MARK line).
+    node._path_cb(_path_msg([(0.0, 0.0, 3.0), (2.0, 0.0, 3.0)]))
+    return node
+
+
+def test_b5_path_load_on_vertex0_does_not_spray_before_tracking():
+    node = _b5_node_on_vertex0()
+    assert node._tracking_seen_since_path_load is False
+    # Geometry wants ON (nozzle over MARK at s=0), but the run has not started.
+    ok, reason = node._auto_safety_status(
+        pose_fresh=True, speed=0.0, velocity_fresh=True)
+    assert ok is False and reason == "awaiting tracking"
+    node._distance_aware_tick()
+    assert node._fsm.commanded is False  # no blob at vertex 0
+    assert node._last_safety_block_reason == "awaiting tracking"
+
+
+def test_b5_geometry_rules_once_tracking_seen():
+    node = _b5_node_on_vertex0()
+    node._segment_debug_cb(_Msg([1.0, 1.0]))  # RPP starts tracking: TRACK_SEGMENT
+    assert node._tracking_seen_since_path_load is True
+    node._pose_recv_time = node.get_clock().now()
+    node._vel_recv_time = node.get_clock().now()
+    node._distance_aware_tick()
+    assert node._fsm.commanded is True  # now geometry rules -> ON
+
+
+def test_b5_pretracking_states_do_not_release_gate():
+    """The pre-tracking states the RPP actually emits at a run boundary
+    (CORNER_STOP / DONE) are NOT tracking and must NOT release the B5 gate —
+    only a genuinely-tracking state does. Guards against B3's fix (the extra
+    segment_debug edge) accidentally re-opening B5."""
+    node = _b5_node_on_vertex0()
+    node._segment_debug_cb(_Msg([1.0, 5.0]))  # CORNER_STOP
+    node._segment_debug_cb(_Msg([1.0, 4.0]))  # DONE
+    node._segment_debug_cb(_Msg([1.0, 3.0]))  # CORNER_ALIGN
+    assert node._tracking_seen_since_path_load is False
+    ok, reason = node._auto_safety_status(
+        pose_fresh=True, speed=0.0, velocity_fresh=True)
+    assert ok is False and reason == "awaiting tracking"
+
+
+def test_b5_new_path_re_arms_gate():
+    """Two-stage entry: after the entry path is tracked, the marking /path
+    lands and must re-arm the gate — no spray until it, too, is tracked."""
+    node = _b5_node_on_vertex0()
+    node._segment_debug_cb(_Msg([1.0, 1.0]))  # tracked the (entry) path
+    assert node._tracking_seen_since_path_load is True
+    node._path_cb(_path_msg([(0.0, 0.0, 3.0), (2.0, 0.0, 3.0)]))  # marking path
+    assert node._tracking_seen_since_path_load is False
+    ok, reason = node._auto_safety_status(
+        pose_fresh=True, speed=0.0, velocity_fresh=True)
+    assert ok is False and reason == "awaiting tracking"
 
 
 def main():

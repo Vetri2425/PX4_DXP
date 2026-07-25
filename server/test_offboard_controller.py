@@ -36,6 +36,9 @@ class FakeNode:
                      must_hit_flags=None):
         self.calls.append(("publish_path", list(points), spray_flags))
 
+    def publish_spray_manual(self, on):
+        self.calls.append(("spray_manual", bool(on)))
+
     async def arm_async(self, arm):
         self.calls.append(("arm", arm))
         return True, ""
@@ -327,3 +330,50 @@ def test_start_relinquishes_arbiter_on_failure():
 
     assert ok is False
     assert arb.owner == ControlOwner.IDLE
+
+
+# ── B4: spray-OFF + disarm on natural completion ────────────────────────────
+
+def _running_ctrl(node=None):
+    node = node or FakeNode([{"connected": True, "rpp_state": RPP_TRACKING}])
+    ctrl = OffboardController(node, deque())
+    ctrl._state = MissionState.RUNNING
+    return ctrl, node
+
+
+def test_mark_completed_reports_transition_edge():
+    ctrl, _ = _running_ctrl()
+    assert ctrl.mark_completed() is True          # RUNNING → COMPLETED
+    assert ctrl.state == MissionState.COMPLETED
+    assert ctrl.mark_completed() is False         # already COMPLETED — no edge
+
+
+def test_completion_commands_spray_off_then_disarm():
+    old = offboard_module.config.DISARM_ON_COMPLETE
+    offboard_module.config.DISARM_ON_COMPLETE = True
+    try:
+        ctrl, node = _running_ctrl()
+        assert ctrl.mark_completed() is True
+        result = run(ctrl.disarm_on_complete_async())
+        assert result["spray_off_sent"] is True
+        assert result["disarmed"] is True
+        # Spray commanded OFF BEFORE the disarm, and disarm actually called.
+        assert node.calls == [("spray_manual", False), ("arm", False)]
+        # Mission stays COMPLETED (arm_async, not disarm_async → not IDLE).
+        assert ctrl.state == MissionState.COMPLETED
+    finally:
+        offboard_module.config.DISARM_ON_COMPLETE = old
+
+
+def test_completion_flag_off_leaves_rover_armed():
+    old = offboard_module.config.DISARM_ON_COMPLETE
+    offboard_module.config.DISARM_ON_COMPLETE = False
+    try:
+        ctrl, node = _running_ctrl()
+        assert ctrl.mark_completed() is True
+        result = run(ctrl.disarm_on_complete_async())
+        assert result == {"attempted": False, "spray_off_sent": False,
+                          "disarmed": False}
+        assert node.calls == []                    # old behaviour: no commands
+    finally:
+        offboard_module.config.DISARM_ON_COMPLETE = old

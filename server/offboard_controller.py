@@ -18,6 +18,7 @@ import math
 from collections import deque
 from typing import Any, Optional
 
+import config
 from config import (
     RPP_IDLE,
     RPP_STALE,
@@ -711,10 +712,55 @@ class OffboardController:
             return ok
 
     # Called from telemetry loop — no async lock to avoid blocking the loop.
-    def mark_completed(self) -> None:
+    # Returns True iff it actually transitioned RUNNING→COMPLETED (so the caller
+    # runs the completion sequence exactly once, on the edge).
+    def mark_completed(self) -> bool:
         if self._state == MissionState.RUNNING:
             self._state = MissionState.COMPLETED
             self._log_entry("info", f"mission completed: {self._path_name}")
+            return True
+        return False
+
+    # Called from the telemetry loop immediately after mark_completed() reports
+    # the RUNNING→COMPLETED edge. Ends the mission spray-OFF and DISARMED without
+    # an operator E-stop (field bug B4, 2026-07-25). The RPP has already settled
+    # DONE (the mission-complete gate upstream), so the rover is stationary
+    # before this runs. Self-gates on config.DISARM_ON_COMPLETE — when OFF the
+    # rover is left armed (old behaviour). No lifecycle lock (mirrors
+    # mark_completed): it only sends a spray-OFF command and a single disarm and
+    # must not block the telemetry loop. Never raises.
+    async def disarm_on_complete_async(self) -> dict[str, Any]:
+        result = {"attempted": False, "spray_off_sent": False, "disarmed": False}
+        if not config.DISARM_ON_COMPLETE:
+            return result
+        result["attempted"] = True
+        if self._node is None:
+            self._log_entry("warning", "complete: ROS node unavailable — cannot disarm")
+            return result
+        # 1. Command spray OFF — the same primitive /api/spray/off and the
+        #    emergency disable path use. The disarm below also forces the spray
+        #    node's actuator OFF via its disarm fail-safe, so this is belt-and-
+        #    suspenders that closes any lingering manual hold immediately.
+        try:
+            self._node.publish_spray_manual(False)
+            result["spray_off_sent"] = True
+        except Exception as exc:
+            self._log_entry("warning", f"complete spray-off raised: {exc}")
+            log.exception("completion spray-off raised")
+        # 2. Disarm. arm_async(False) (not disarm_async) so the mission stays in
+        #    COMPLETED rather than being reset to IDLE. The spray node's disarm
+        #    fail-safe drives the AUX output OFF as the hard guarantee.
+        try:
+            ok, why = await self._node.arm_async(False)
+            result["disarmed"] = bool(ok)
+            self._log_entry(
+                "info" if ok else "error",
+                f"completion disarm {'ok' if ok else f'failed: {why}'}",
+            )
+        except Exception as exc:
+            self._log_entry("error", f"completion disarm raised: {exc}")
+            log.exception("completion disarm raised")
+        return result
 
     # Called from telemetry loop when state==ENTRY and RPP has settled DONE at
     # the entry point (D1 phase 2). Publishes the stashed marking path and

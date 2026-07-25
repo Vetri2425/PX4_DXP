@@ -282,6 +282,8 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "anticipatory_margin_m": _Param(0.02),
         "on_overspray_margin_m": _Param(0.02),
         "off_overspray_margin_m": _Param(0.0),
+        "terminal_off_epsilon_m": _Param(0.05),
+        "terminal_off_speed_mps": _Param(0.05),
         "min_spray_speed_mps": _Param(0.05),
         "spray_off_during_pivot": _Param(True),
         "segment_state_timeout_s": _Param(1.0),
@@ -329,6 +331,7 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._desired_debounced = False
     node._last_active_time = None
     node._legacy_active_raw = False
+    node._active_false_since = None
     node._manual_active = False
     node._manual_deadline_ns = None
     node._armed = armed
@@ -366,6 +369,9 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._vel_recv_time = None
     node._segment_state = None
     node._segment_state_recv_time = None
+    # B5: permissive by default (matches __init__). Direct-model tests never
+    # call _path_cb, so the tracking-seen gate stays open unless a test arms it.
+    node._tracking_seen_since_path_load = True
     # G2 RPP boundary-source state.
     node._rpp_progress = None
     node._rpp_progress_recv_time = None
