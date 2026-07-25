@@ -3999,6 +3999,29 @@ class RPPControllerNode(Node):
             spray_active=spray_active,
         )
 
+        # B3(a): the smooth profile must ALSO publish /rpp/segment_debug with a
+        # TRACK_SEGMENT edge. Without this the smooth branch only ever emits
+        # segment_debug via the SEGMENT profile / pivot paths, so the LAST state
+        # on the wire before a smooth MARK run is the run-boundary pivot's
+        # CORNER_ALIGN — which the spray node's pivot gate then latches for the
+        # full segment_state_timeout_s, holding spray OFF for ~1 s (9.5-9.9 cm of
+        # unpainted line at the start of every smooth run — field bug B3). It
+        # also gives the spray B5 tracking-seen gate a real "run has started"
+        # edge for BOTH profiles. Diagnostics ONLY: it publishes after the
+        # velocity/yaw commands and does not mutate _segment_state (which the
+        # SEGMENT profile owns), so no control path is affected. Corner-specific
+        # fields carry NaN-free placeholders (this is a straight-tracking edge).
+        self._publish_segment_debug(
+            SegmentStateCode.TRACK_SEGMENT,
+            seg_idx,
+            dist_to_goal,       # [3] dist_to_segment_end (goal-relative here)
+            dist_to_goal,       # [4] dist_to_corner (no corner in smooth)
+            0.0,                # [5] corner angle — none
+            yaw_target_ned,     # [6] target heading NED
+            theta_e,            # [7] heading error
+            yaw_rate_body,      # [8] yaw-rate command
+        )
+
         r_eff = (1.0 / kappa_speed) if kappa_speed > 1e-9 else float("inf")
         self.get_logger().debug(
             f"[{state_code.name}] xtrack={signed_xtrack * 100:+.2f}cm "

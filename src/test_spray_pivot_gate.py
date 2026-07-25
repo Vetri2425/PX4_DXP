@@ -112,11 +112,37 @@ def test_absent_segment_state_is_permissive():
 
 
 def test_stale_segment_state_is_permissive():
+    """B3(b) NEW spec: a message-free CORNER_ALIGN must FAIL OPEN once stale.
+
+    The old spec (this test used to assert it) held spray off for the full
+    segment_state_timeout_s after the last message — a 1.0 s / ~10 cm unpainted
+    gap at the start of every smooth MARK run, because the smooth profile went
+    silent right after a run-boundary CORNER_ALIGN. The gate must now clear the
+    latched state on the first stale tick, releasing spray and staying released
+    until a genuinely fresh message arrives.
+    """
     node = _armed_node()
     node._segment_debug_cb(_Msg([1.0, float(_SEGMENT_STATE_CORNER_ALIGN)]))
     assert not _safety(node, 0.30)[0]  # fresh -> suppressed
-    node._clock.ns += 2_000_000_000  # past segment_state_timeout_s=1.0
-    assert _safety(node, 0.30)[0], "stale pivot state must not latch spray off"
+    node._clock.ns += 1_100_000_000  # just past segment_state_timeout_s=1.0
+    assert _safety(node, 0.30)[0], "stale pivot state must fail open"
+    # New spec: the stale state is CLEARED, not merely ignored for this tick.
+    assert node._segment_state is None
+    assert node._segment_state_recv_time is None
+
+
+def test_fresh_tracking_message_releases_pivot_gate_promptly():
+    """B3(a): the RPP now publishes a TRACK_SEGMENT edge in the smooth profile,
+    so a real tracking message releases the gate immediately — without waiting
+    out segment_state_timeout_s. This is what closes the ~1 s / ~10 cm gap; the
+    spray node needs no timeout at all once a fresh non-pivot edge is on the
+    wire."""
+    node = _armed_node()
+    node._segment_debug_cb(_Msg([1.0, float(_SEGMENT_STATE_CORNER_ALIGN)]))
+    assert not _safety(node, 0.30)[0]  # pivoting -> suppressed
+    node._clock.ns += 20_000_000  # 20 ms later (one 50 Hz RPP tick)
+    node._segment_debug_cb(_Msg([1.0, 1.0]))  # TRACK_SEGMENT arrives
+    assert _safety(node, 0.30)[0], "a fresh tracking edge must release the gate at once"
 
 
 def test_short_message_ignored():
