@@ -129,6 +129,53 @@ def test_fcu_link_regained_invalidates_the_cached_origin():
     assert node._state["ekf_origin_invalidations"] == 1
 
 
+def test_process_startup_does_not_invalidate_the_origin_it_just_received():
+    """Regression, observed live on the Jetson 2026-07-27 16:55:18.
+
+    `connected` starts False in _DEFAULT_STATE, so the FIRST /mavros/state
+    message of a fresh process is a False->True transition — but it is the
+    INITIAL connection, not a re-establishment. The deployed build read it as a
+    reboot and invalidated a good origin 47 ms after it arrived (received
+    :18.057, invalidated :18.104), forcing a ~10 s refusal window and burning a
+    request attempt on every single `rover-server` restart.
+
+    This is the exact startup ORDER seen in the field: gp_origin latches from
+    MAVROS *before* the first State message arrives.
+
+    Fails if the fix is wrong: if `_cb_state` ever invalidates on the first
+    message, `ekf_origin_received` flips False and the coordinates are zeroed,
+    so all three assertions break. It cannot pass by accident — the origin is
+    set up before the only State message the test sends.
+    """
+    node = _bare_node()
+    node._cb_gp_origin(_FakeGpOrigin(*ORIGIN_A))          # MAVROS latched value
+    assert node._state["ekf_origin_received"] is True
+
+    node._cb_state(_FakeState(connected=True))            # first State message
+
+    assert node._state["ekf_origin_received"] is True, (
+        "the initial connection is not a re-establishment — invalidating here "
+        "cries wolf on every restart and trains the operator to ignore it")
+    assert node._state["ekf_origin_lat"] == ORIGIN_A[0]
+    assert node._state["ekf_origin_invalidations"] == 0
+
+
+def test_a_real_reconnect_still_invalidates_after_a_startup_message():
+    """Scope guard for the test above: suppressing the FIRST message must not
+    suppress the SECOND. If the fix over-reached (e.g. a latch that never
+    re-arms), this catches it — a genuine reboot after startup still drops the
+    datum."""
+    node = _bare_node()
+    node._cb_state(_FakeState(connected=True))            # startup, suppressed
+    node._cb_gp_origin(_FakeGpOrigin(*ORIGIN_A))
+
+    node._cb_state(_FakeState(connected=False))
+    node._cb_state(_FakeState(connected=True))            # real reconnect
+
+    assert node._state["ekf_origin_received"] is False
+    assert node._state["ekf_origin_invalidations"] == 1
+
+
 def test_mavros_restart_gap_invalidates_even_when_connected_never_flips():
     """A MAVROS process restart re-publishes connected=True with no False in
     between (TRANSIENT_LOCAL), so the flip test cannot see it. The /mavros/state

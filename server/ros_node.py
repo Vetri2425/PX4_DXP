@@ -474,8 +474,25 @@ class RosBridgeNode(Node):
         # Neither is trusted to be complete: the consistency gate in
         # origin_health is the mechanism-independent backstop. This half is
         # about RECOVERY (re-arm the request path), not detection.
+        # The FIRST /mavros/state message of this process is the INITIAL
+        # connection, not a re-establishment: `connected` starts False in
+        # _DEFAULT_STATE, so every startup produced a spurious False->True and
+        # invalidated a perfectly good origin ~50 ms after it arrived (observed
+        # live 2026-07-27 16:55:18). It self-healed in ~10 s via the re-request
+        # path, but it burned a request attempt and cried wolf on every restart,
+        # which trains the operator to ignore the one warning that matters.
+        #
+        # Skipping it is safe because this half is only RECOVERY. A fresh
+        # process holds no cached origin to invalidate; the one real hazard —
+        # MAVROS handing us a STALE latched gp_origin from a dead EKF session —
+        # is caught by the consistency gate in origin_health, which measures the
+        # declared origin against the frame PX4 is actually publishing and does
+        # not care how the value got there.
         gap_s = (now - prev_recv) if prev_recv is not None else None
-        if bool(msg.connected) and not prev_connected:
+        first_state_msg = prev_recv is None
+        if first_state_msg:
+            pass
+        elif bool(msg.connected) and not prev_connected:
             self._invalidate_ekf_origin("FCU link re-established (connected False->True)")
         elif gap_s is not None and gap_s > ORIGIN_LINK_GAP_S:
             self._invalidate_ekf_origin(
