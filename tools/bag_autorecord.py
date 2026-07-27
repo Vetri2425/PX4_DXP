@@ -59,10 +59,17 @@ IST = timezone(timedelta(hours=5, minutes=30), name="IST")
 CAPTURE_FCU_PARAMS = os.environ.get("BAG_FCU_PARAMS", "1") == "1"
 FCU_PARAM_NAMES = [
     "COM_OF_LOSS_T", "RO_YAW_P", "RO_YAW_RATE_LIM", "RO_MAX_THR_SPEED",
-    "RD_TRANS_TRN_ARM", "RD_TRANS_ARM_TRN",
+    # Correct names (2026-07-27): the old RD_TRANS_TRN_ARM/RD_TRANS_ARM_TRN do
+    # not exist on this firmware — every manifest flagged them `missing`.
+    "RD_TRANS_DRV_TRN", "RD_TRANS_TRN_DRV",
     "EKF2_WENC_CTRL", "RBCLW_COUNTS_REV",
     "NAV_ACC_RAD",
     "PWM_AUX_FUNC1", "PWM_AUX_MIN1", "PWM_AUX_MAX1", "PWM_AUX_DIS1",
+    # WENC A/B provenance (2026-07-27): the fusion-trust knobs under test and
+    # the heading offset they interact with — without these a param A/B's
+    # manifest cannot prove which tuning actually ran.
+    "EKF2_GPS_P_NOISE", "EKF2_WENC_NOISE", "EKF2_WENC_LAT_N", "EKF2_WENC_GATE",
+    "EKF2_GPS_YAW_OFF",
 ]
 # The RPP tuning block lives in /rpp/debug[11..38] (see rpp_controller_node.py).
 # index -> readable label, so the manifest names each number.
