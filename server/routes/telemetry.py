@@ -7,7 +7,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 
 from auth import require_token
-from config import GPS_FIX_NAMES, RPP_STATE_NAMES
+from config import GPS_FIX_NAMES, RPP_STATE_NAMES, format_gps_coord
 from models import MissionState, TelemetryData
 
 router = APIRouter(
@@ -57,13 +57,15 @@ async def telemetry_latest():
         battery_v       = s.get("battery_v"),
         battery_pct     = s.get("battery_pct"),
         gps_fix         = s.get("gps_fix"),
-        gps_fix_name    = GPS_FIX_NAMES.get(s.get("gps_fix", 0), "UNKNOWN"),
+        gps_fix_name    = GPS_FIX_NAMES.get(
+            s.get("gps_fix", 0), f"FIX_{s.get('gps_fix', 0)}"
+        ),
         gps_sat         = s.get("gps_sat"),
         hrms            = s.get("hrms"),
         vrms            = s.get("vrms"),
-        lat             = s.get("lat"),
-        lon             = s.get("lon"),
-        alt             = s.get("alt"),
+        lat             = format_gps_coord(s.get("lat")),
+        lon             = format_gps_coord(s.get("lon")),
+        alt             = format_gps_coord(s.get("alt")),
         rpp_debug_age_ms      = s.get("rpp_debug_age_ms"),
         local_pose_age_ms     = s.get("local_pose_age_ms"),
         global_position_age_ms= s.get("global_position_age_ms"),

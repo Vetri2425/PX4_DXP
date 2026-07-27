@@ -230,8 +230,14 @@ class RosBridgeNode(Node):
         self._rpp_debug_recv_time: float | None = None
         self._MAVROS_STATE_TIMEOUT_S = 2.0  # MAVROS publishes /state ~10 Hz
 
-        # Callback groups: subs mutually exclusive, services reentrant
+        # Callback groups: subs mutually exclusive, services reentrant.
+        # /mavros/state gets its OWN group: it is the liveness + mode signal
+        # (get_state() flips connected=False after 2 s without it, and the
+        # joystick MANUAL-mode check reads it). In the shared group a burst of
+        # pose/GPS/rpp callbacks can starve it, which cascades into joystick
+        # transport/mode rejections → gateway deadman neutral → jerky drive.
         self._sub_group = MutuallyExclusiveCallbackGroup()
+        self._state_sub_group = MutuallyExclusiveCallbackGroup()
         self._svc_group = ReentrantCallbackGroup()
 
         if not _HAS_MAVROS:
@@ -244,7 +250,7 @@ class RosBridgeNode(Node):
                 "/mavros/state",
                 self._cb_state,
                 _qos_reliable_tl(),
-                callback_group=self._sub_group,
+                callback_group=self._state_sub_group,
             )
             self.create_subscription(
                 PoseStamped,
@@ -464,6 +470,16 @@ class RosBridgeNode(Node):
             self._state["battery_pct"] = pct if pct is not None else 0.0
 
     def _cb_global_pos(self, msg) -> None:
+        lat = float(msg.latitude)
+        lon = float(msg.longitude)
+        alt = float(msg.altitude)
+        # NaN lat/lon is the driver's "no fix yet" sentinel (same convention
+        # _cb_gp_origin and tools/analyze_mission.py already guard against).
+        # Never let it into state: Socket.IO nulls NaN via _sanitize, but the
+        # REST /telemetry/latest path would serialize it as a bare NaN token —
+        # invalid JSON that throws in the client's JSON.parse.
+        if not (math.isfinite(lat) and math.isfinite(lon)):
+            return
         hrms = 0.0
         vrms = 0.0
         try:
@@ -472,12 +488,17 @@ class RosBridgeNode(Node):
             vrms = round(math.sqrt(abs(cov[8])), 3)
         except (ValueError, IndexError, TypeError):
             pass
+        if not math.isfinite(hrms):
+            hrms = 0.0
+        if not math.isfinite(vrms):
+            vrms = 0.0
 
         with self._lock:
             self._global_pos_recv_time = time.monotonic()
-            self._state["lat"] = msg.latitude
-            self._state["lon"] = msg.longitude
-            self._state["alt"] = msg.altitude
+            self._state["lat"] = lat
+            self._state["lon"] = lon
+            if math.isfinite(alt):
+                self._state["alt"] = alt
             self._state["hrms"] = hrms
             self._state["vrms"] = vrms
             self._state["global_position_received"] = True

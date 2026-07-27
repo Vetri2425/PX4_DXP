@@ -24,6 +24,8 @@ from enum import Enum
 from typing import Any
 
 from config import (
+    JOYSTICK_ARM_CONFIRM_TIMEOUT_S,
+    JOYSTICK_AUTO_ARM_ENABLED,
     JOYSTICK_COMMAND_RATE_HZ,
     JOYSTICK_GATEWAY_STALE_TIMEOUT_S,
     JOYSTICK_LEASE_EXPIRY_S,
@@ -81,6 +83,8 @@ class JoystickController:
         lease_revoke_timeout_s: float = JOYSTICK_LEASE_REVOKE_TIMEOUT_S,
         lease_expiry_s: float = JOYSTICK_LEASE_EXPIRY_S,
         mode_confirm_timeout_s: float = JOYSTICK_MODE_CONFIRM_TIMEOUT_S,
+        auto_arm_enabled: bool = JOYSTICK_AUTO_ARM_ENABLED,
+        arm_confirm_timeout_s: float = JOYSTICK_ARM_CONFIRM_TIMEOUT_S,
         neutral_prestream_s: float = JOYSTICK_NEUTRAL_PRESTREAM_S,
         max_abs_throttle: float = JOYSTICK_MAX_ABS_THROTTLE,
         max_abs_steering: float = JOYSTICK_MAX_ABS_STEERING,
@@ -96,6 +100,8 @@ class JoystickController:
         self._lease_revoke_timeout_s = float(lease_revoke_timeout_s)
         self._lease_expiry_s = float(lease_expiry_s)
         self._mode_confirm_timeout_s = float(mode_confirm_timeout_s)
+        self._auto_arm_enabled = bool(auto_arm_enabled)
+        self._arm_confirm_timeout_s = float(arm_confirm_timeout_s)
         self._neutral_prestream_s = float(neutral_prestream_s)
         self._max_abs_throttle = float(max_abs_throttle)
         self._max_abs_steering = float(max_abs_steering)
@@ -153,6 +159,7 @@ class JoystickController:
         self._coalesced_command_count = 0
         self._stop_reason = None
 
+        armed_by_us = False
         try:
             self._check_fcu_ready_for_acquire()
             self._check_transport_healthy()
@@ -166,6 +173,15 @@ class JoystickController:
                 raise JoystickError("mode_unavailable", f"MANUAL request failed: {why}")
             if not await self._wait_for_mode("MANUAL", self._mode_confirm_timeout_s):
                 raise JoystickError("mode_unavailable", "MANUAL mode was not confirmed")
+            # Arm-on-acquire: MANUAL is confirmed and neutral MANUAL_CONTROL is
+            # already streaming, so PX4's manual-control arming check passes.
+            if self._auto_arm_enabled and not self._ros_node.get_state().get("armed", False):
+                ok, why = await self._ros_node.arm_async(True)
+                if not ok:
+                    raise JoystickError("arm_failed", f"arm request rejected: {why}")
+                armed_by_us = True
+                if not await self._wait_for_armed(self._arm_confirm_timeout_s):
+                    raise JoystickError("arm_failed", "vehicle did not confirm armed")
             if (
                 self._owner_sid != sid
                 or self._session_id != session_id
@@ -195,6 +211,13 @@ class JoystickController:
                 "max_steering": self._max_abs_steering,
             }
         except Exception:
+            if armed_by_us:
+                # Never leave the rover armed after a failed open — best-effort
+                # disarm; PX4's manual-control-loss failsafe is the backstop.
+                try:
+                    await self._ros_node.arm_async(False)
+                except Exception:
+                    log.exception("disarm after failed joystick acquire failed")
             await asyncio.to_thread(self._gateway.deactivate_neutral)
             self._clear_local(reason="acquire_failed")
             raise
@@ -308,7 +331,7 @@ class JoystickController:
         state = self._ros_node.get_state()
         if not state.get("connected", False):
             raise JoystickError("fcu_disconnected", "FCU is not connected")
-        if not state.get("armed", False):
+        if not self._auto_arm_enabled and not state.get("armed", False):
             raise JoystickError("not_armed", "vehicle must be armed before joystick acquire")
 
     def _check_transport_healthy(self) -> None:
@@ -321,6 +344,14 @@ class JoystickController:
         mode = self._ros_node.get_state().get("mode")
         if str(mode).upper() != "MANUAL":
             raise JoystickError("mode_unavailable", "PX4 is not in confirmed MANUAL mode")
+
+    async def _wait_for_armed(self, timeout_s: float) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self._ros_node.get_state().get("armed", False):
+                return True
+            await asyncio.sleep(0.05)
+        return False
 
     async def _wait_for_mode(self, mode: str, timeout_s: float) -> bool:
         deadline = time.monotonic() + timeout_s

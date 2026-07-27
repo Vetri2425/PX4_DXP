@@ -24,9 +24,11 @@ from models import MissionState
 
 
 class FakeRosNode:
-    def __init__(self, *, connected=True, armed=True, mode="OFFBOARD"):
+    def __init__(self, *, connected=True, armed=True, mode="OFFBOARD", arm_ok=True):
         self._state = {"connected": connected, "armed": armed, "mode": mode}
         self.mode_calls: list[str] = []
+        self.arm_calls: list[bool] = []
+        self._arm_ok = arm_ok
 
     def get_state(self):
         return dict(self._state)
@@ -34,6 +36,13 @@ class FakeRosNode:
     async def set_mode_async(self, mode):
         self.mode_calls.append(mode)
         self._state["mode"] = mode
+        return True, ""
+
+    async def arm_async(self, arm):
+        self.arm_calls.append(bool(arm))
+        if not self._arm_ok:
+            return False, "fake arm rejected"
+        self._state["armed"] = bool(arm)
         return True, ""
 
 
@@ -125,14 +134,58 @@ def test_acquire_requires_session_id():
     assert exc.value.code == "malformed"
 
 
-def test_acquire_requires_armed_fcu():
+def test_acquire_auto_arms_disarmed_fcu():
     node = FakeRosNode(armed=False)
     ctrl, node, offboard, gateway, arbiter = _controller(node=node)
+    result = run(ctrl.acquire("sid1", {"session_id": "s1"}))
+    assert result["type"] == "joystick_acquired"
+    assert node.arm_calls == [True]
+    assert node.get_state()["armed"] is True
+    # arm must happen only after MANUAL is requested (neutral already streaming)
+    assert node.mode_calls == ["MANUAL"]
+    run(ctrl.force_release())
+
+
+def test_acquire_requires_armed_fcu_when_auto_arm_disabled():
+    node = FakeRosNode(armed=False)
+    ctrl, node, offboard, gateway, arbiter = _controller(
+        node=node, auto_arm_enabled=False
+    )
     with pytest.raises(JoystickError) as exc:
         run(ctrl.acquire("sid1", {"session_id": "s1"}))
     assert exc.value.code == "not_armed"
+    assert node.arm_calls == []
     assert ctrl.snapshot()["joystick_state"] == JoystickState.INACTIVE.value
     assert arbiter.owner == ControlOwner.IDLE  # claim rolled back, not stuck ACQUIRING
+
+
+def test_acquire_arm_rejection_rolls_back():
+    node = FakeRosNode(armed=False, arm_ok=False)
+    ctrl, node, offboard, gateway, arbiter = _controller(node=node)
+    with pytest.raises(JoystickError) as exc:
+        run(ctrl.acquire("sid1", {"session_id": "s1"}))
+    assert exc.value.code == "arm_failed"
+    assert ctrl.snapshot()["joystick_state"] == JoystickState.INACTIVE.value
+    assert arbiter.owner == ControlOwner.IDLE
+    assert gateway.deactivated is True
+
+
+def test_acquire_arm_timeout_disarms_back():
+    class NeverArmsNode(FakeRosNode):
+        async def arm_async(self, arm):
+            self.arm_calls.append(bool(arm))
+            return True, ""  # accepted but armed state never appears
+
+    node = NeverArmsNode(armed=False)
+    ctrl, node, offboard, gateway, arbiter = _controller(
+        node=node, arm_confirm_timeout_s=0.1
+    )
+    with pytest.raises(JoystickError) as exc:
+        run(ctrl.acquire("sid1", {"session_id": "s1"}))
+    assert exc.value.code == "arm_failed"
+    # best-effort disarm after we initiated the arm
+    assert node.arm_calls == [True, False]
+    assert arbiter.owner == ControlOwner.IDLE
 
 
 def test_acquire_requires_connected_fcu():

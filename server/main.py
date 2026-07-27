@@ -41,6 +41,7 @@ from config import (
     CORS_ALLOW_ORIGINS,
     DEFAULT_PORT,
     GPS_FIX_NAMES,
+    format_gps_coord,
     MAX_ACTIVITY_LOG,
     MISSION_DIR,
     POSE_STALE_MS,
@@ -387,13 +388,15 @@ async def _telemetry_loop() -> None:
                     "battery_v": s.get("battery_v"),
                     "battery_pct": s.get("battery_pct"),
                     "gps_fix": s.get("gps_fix"),
-                    "gps_fix_name": GPS_FIX_NAMES.get(s.get("gps_fix", 0), "UNKNOWN"),
+                    "gps_fix_name": GPS_FIX_NAMES.get(
+                        s.get("gps_fix", 0), f"FIX_{s.get('gps_fix', 0)}"
+                    ),
                     "gps_sat": s.get("gps_sat"),
                     "hrms": s.get("hrms"),
                     "vrms": s.get("vrms"),
-                    "lat": s.get("lat"),
-                    "lon": s.get("lon"),
-                    "alt": s.get("alt"),
+                    "lat": format_gps_coord(s.get("lat")),
+                    "lon": format_gps_coord(s.get("lon")),
+                    "alt": format_gps_coord(s.get("alt")),
                     # Freshness. These were already computed but never streamed, so
                     # the client had no way to tell "RTK_FIXED now" from "was
                     # RTK_FIXED five minutes ago" — local pose keeps updating from

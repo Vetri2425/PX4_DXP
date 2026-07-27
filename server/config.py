@@ -52,20 +52,42 @@ RPP_STATE_NAMES = {
     RPP_JUMP_SKIP: "JUMP_SKIP",
 }
 
-# GPS Fix Type Names (from MAVROS sensor_msgs/NavSatStatus.msg fix_type)
+# GPS Fix Type Names — MAVLink GPS_FIX_TYPE enum, fed by mavros_msgs/GPSRAW
+# .fix_type (/mavros/gpsstatus/gps1/raw). NOT the ROS NavSatStatus.status enum
+# (-1..2), which is what the old table here was written against: it had no
+# key 3, so a plain 3D fix (the receiver's state whenever RTK corrections are
+# absent) fell through to "UNKNOWN" on every telemetry frame. Keep in sync
+# with the copies in src/spray_controller_node.py and src/rpp_controller_node.py.
 GPS_FIX_NAMES = {
-    0: "NO_FIX",
-    1: "GPS",
-    2: "DGPS",
-    4: "DGPS",  # duplicate for compatibility
+    0: "NO_GPS",
+    1: "NO_FIX",
+    2: "2D_FIX",
+    3: "3D_FIX",
+    4: "DGPS",
     5: "RTK_FLOAT",
     6: "RTK_FIXED",
+    7: "STATIC",
+    8: "PPP",
 }
 
 # B2: codes that mean "controller is not driving safely". Treat the same as
 # STALE for safety-abort and OFFBOARD-start guard purposes. Centralised here
 # so server/main.py and server/offboard_controller.py stay in sync.
 RPP_UNHEALTHY_CODES = {RPP_STALE, RPP_RTK_WAIT, RPP_JUMP_SKIP}
+
+# Decimal places for lat/lon/alt in outbound telemetry (WS + REST) only.
+# 8 decimal degrees is sub-millimetre resolution — finer than RTK's real
+# ~1-2 cm — so nothing is lost; this just replaces the variable 6-17 digit
+# count of Python's shortest-round-trip float repr with a consistent wire
+# format at both client-facing boundaries. Internal state (ros_node.py) and
+# mission placement (resolve_surveyed_points) keep full float64 for
+# anchor/EKF math.
+GPS_TELEMETRY_DECIMALS = 8
+
+
+def format_gps_coord(value: float | None) -> float | None:
+    """Round a lat/lon/alt value to GPS_TELEMETRY_DECIMALS for client emit."""
+    return None if value is None else round(value, GPS_TELEMETRY_DECIMALS)
 
 # ── Server Defaults ───────────────────────────────────────────────────────────
 DEFAULT_HOST = "0.0.0.0"  # overridden below when ROVER_DISABLE_AUTH is set
@@ -187,6 +209,14 @@ JOYSTICK_NEUTRAL_PRESTREAM_S = float(
 )
 JOYSTICK_MODE_CONFIRM_TIMEOUT_S = float(
     os.environ.get("ROVER_JOYSTICK_MODE_CONFIRM_TIMEOUT_S", "3.0")
+)
+# Arm-on-acquire: acquire() arms the vehicle itself after MANUAL is confirmed
+# and neutral MANUAL_CONTROL is already streaming (so PX4's manual-control-loss
+# arming check is satisfied). Gives open→drive without a separate arm
+# round-trip from the client. Still master-gated by JOYSTICK_MANUAL_ENABLED.
+JOYSTICK_AUTO_ARM_ENABLED = os.environ.get("ROVER_JOYSTICK_AUTO_ARM", "1") == "1"
+JOYSTICK_ARM_CONFIRM_TIMEOUT_S = float(
+    os.environ.get("ROVER_JOYSTICK_ARM_CONFIRM_TIMEOUT_S", "5.0")
 )
 # Pinned conservative first-field-run defaults (plan §4.5/§7.8/§7.9) — do not
 # inherit whichever default happens to drift between reference sources.

@@ -68,6 +68,10 @@ class LoraRtcmNode(Node):
         self._frames = 0
         self._bytes = 0
         self._last_frame_wall_time = None
+        # Wall time this serial session opened. last_frame_time survives
+        # reopen cycles, so the health consumer (server/rtk_manager.py) needs
+        # a per-session anchor to judge a fresh reopen fairly.
+        self._connected_since_wall_time = None
         self._last_error = None
         self._reconnect_count = 0
         self._window_frames = 0
@@ -96,6 +100,7 @@ class LoraRtcmNode(Node):
                 "frames": self._frames,
                 "bytes": self._bytes,
                 "last_frame_time": self._last_frame_wall_time,
+                "connected_since": self._connected_since_wall_time,
                 "last_error": self._last_error,
                 "updated_at": time.time(),
             }
@@ -182,6 +187,7 @@ class LoraRtcmNode(Node):
                     with self._stats_lock:
                         self._connected = True
                         self._last_error = None
+                        self._connected_since_wall_time = time.time()
                     self._write_status("connected")
                     attempt = 0  # reset backoff on successful open
 
@@ -209,6 +215,7 @@ class LoraRtcmNode(Node):
             except serial.SerialException as exc:
                 with self._stats_lock:
                     self._connected = False
+                    self._connected_since_wall_time = None
                     self._last_error = str(exc)
                     self._reconnect_count += 1
                 self.get_logger().error(
@@ -218,6 +225,7 @@ class LoraRtcmNode(Node):
             except Exception as exc:
                 with self._stats_lock:
                     self._connected = False
+                    self._connected_since_wall_time = None
                     self._last_error = str(exc)
                     self._reconnect_count += 1
                 self.get_logger().error(
@@ -228,6 +236,7 @@ class LoraRtcmNode(Node):
                 # Clean exit from inner loop — stop was requested
                 with self._stats_lock:
                     self._connected = False
+                    self._connected_since_wall_time = None
                 break
 
             if self._stop_event.is_set():

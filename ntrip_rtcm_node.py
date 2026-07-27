@@ -142,6 +142,10 @@ class NtripNode(Node):
         self._connected = False
         self._last_error = None
         self._last_frame_wall_time = None
+        # Wall time of THIS connection's completed handshake. last_frame_time
+        # survives reconnects, so the health consumer (server/rtk_manager.py)
+        # needs a per-connection anchor to judge a fresh reconnect fairly.
+        self._connected_since_wall_time = None
         self.create_timer(30.0, self._check_health)
         self.create_timer(1.0, lambda: self._write_status("connected" if self._connected else "connecting"))
 
@@ -196,6 +200,7 @@ class NtripNode(Node):
                 "frames": self._total_frame_count,
                 "bytes": self._total_byte_count,
                 "last_frame_time": self._last_frame_wall_time,
+                "connected_since": self._connected_since_wall_time,
                 "last_error": self._last_error,
                 "updated_at": time.time(),
             }
@@ -369,6 +374,7 @@ class NtripNode(Node):
         with self._stats_lock:
             self._connected = True
             self._last_error = None
+            self._connected_since_wall_time = time.time()
         self._write_status("connected")
         return s, leftover
 
@@ -486,6 +492,7 @@ class NtripNode(Node):
             finally:
                 with self._stats_lock:
                     self._connected = False
+                    self._connected_since_wall_time = None
                 with self._gga_lock:
                     self._gga_sock = None
                 if sock is not None:
