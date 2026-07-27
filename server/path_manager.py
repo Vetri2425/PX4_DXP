@@ -142,15 +142,9 @@ def _path_length(points: list[tuple[float, float]]) -> float:
 # ── File readers ──────────────────────────────────────────────────────────────
 
 def read_qgc_waypoints(filepath: str) -> list[tuple[float, float]]:
-    """QGC WPL 110 → NED metres. Home waypoint (current=1) is the origin."""
-    try:
-        from geographiclib.geodesic import Geodesic
-    except ImportError:
-        raise ImportError(
-            "geographiclib required for .waypoints files. "
-            "Install: pip install geographiclib"
-        )
-    geod = Geodesic.WGS84
+    """QGC WPL 110 → PX4 local NED metres. Home waypoint (current=1) is the
+    origin. Projection is PX4-spherical (path_engine.ned, B6')."""
+    from path_engine.ned import latlon_to_ned
     wps: list[tuple[float, float]] = []
     home_lat = home_lon = None
 
@@ -182,9 +176,7 @@ def read_qgc_waypoints(filepath: str) -> list[tuple[float, float]]:
 
     pts: list[tuple[float, float]] = []
     for lat, lon in wps:
-        r = geod.Inverse(home_lat, home_lon, lat, lon)
-        bearing = math.radians(r["azi1"])
-        pts.append((r["s12"] * math.cos(bearing), r["s12"] * math.sin(bearing)))
+        pts.append(latlon_to_ned(lat, lon, home_lat, home_lon))
     return pts
 
 
@@ -260,6 +252,37 @@ class PathManager:
             raise ValueError(f"{what} only available for DXF files")
         return safe, fpath
 
+    def _require_extendable(self, filename: str, what: str) -> tuple[str, str]:
+        """Validate *filename* is a DXF **or a survey CSV** in the missions dir.
+
+        A16 (2026-07-27): extensions were gated to DXF only, which locked the
+        pre-line CSV product out of the one feature that fixes both of its
+        measured endpoint defects — the entry transient (station 1 missed by
+        4.05 cm on the 07-27 curve run) and the terminal shutoff that leaves the
+        LAST surveyed station unpainted (5.03 cm on the same run, 13.7 cm on the
+        square). With extensions on, the mark is approached with a run-up and
+        overrun by a run-out, so both transients happen OFF the painted line —
+        and `engine.py` takes `runout = aft_extension_m` instead of the 0.10 m
+        stub.
+
+        The engine already supported it: planning both 07-27 field CSVs with
+        explicit extension kwargs produced correct geometry with the MARK length
+        byte-for-byte unchanged (curve 4.711 m, square 6.045 m) — only deadhead
+        transit was added. Only this guard stood in the way.
+
+        Legacy headerless NED CSVs stay excluded, matching `_is_survey_csv`,
+        so their frozen behaviour is untouched.
+        """
+        safe = os.path.basename(filename)
+        fpath = os.path.join(self._dir, safe)
+        if not os.path.isfile(fpath):
+            raise FileNotFoundError(f"Path not found: {filename!r}")
+        if os.path.splitext(fpath)[1].lower() == ".dxf":
+            return safe, fpath
+        if self._is_survey_csv(safe):
+            return safe, fpath
+        raise ValueError(f"{what} only available for DXF files and survey CSVs")
+
     @staticmethod
     def _write_sidecar(sidecar: str, payload: dict) -> None:
         """Atomically write a JSON sidecar (tmp + os.replace)."""
@@ -281,6 +304,69 @@ class PathManager:
         dirname = os.path.dirname(fpath)
         basename = os.path.basename(fpath)
         return os.path.join(dirname, f".{basename}.extensions.json")
+
+    @staticmethod
+    def _line_config_path(fpath: str) -> str:
+        """Hidden sidecar path for per-file survey-LINE reconstruction settings."""
+        dirname = os.path.dirname(fpath)
+        basename = os.path.basename(fpath)
+        return os.path.join(dirname, f".{basename}.linecfg.json")
+
+    def load_line_config(self, filename: str) -> dict[str, float]:
+        """Per-file survey-line reconstruction settings.
+
+        Read by preview_path(), plan_path() AND load_path() so the previewed
+        geometry, the planned mission and the executed path are the same shape —
+        the WYSIWYG contract. Missing or malformed sidecar falls back to the
+        defaults, which are behaviour-preserving (no fillet).
+        """
+        from path_engine.planners.arc_chain import MAX_ARC_DEVIATION_M
+        default = {
+            "fillet_corners_m": 0.0,
+            "fit_arcs_max_dev_m": float(MAX_ARC_DEVIATION_M),
+        }
+        fpath = os.path.join(self._dir, os.path.basename(filename))
+        sidecar = self._line_config_path(fpath)
+        try:
+            with open(sidecar, encoding="utf-8") as f:
+                payload = json.load(f)
+        except FileNotFoundError:
+            return default
+        except (OSError, ValueError) as exc:
+            log.warning("ignoring invalid line config sidecar %s: %s", sidecar, exc)
+            return default
+        try:
+            fillet = float(payload.get("fillet_corners_m", default["fillet_corners_m"]))
+            dev = float(payload.get("fit_arcs_max_dev_m", default["fit_arcs_max_dev_m"]))
+        except (TypeError, ValueError):
+            return default
+        if fillet < 0.0 or not (0.0 < dev <= 1.0):
+            return default
+        return {"fillet_corners_m": fillet, "fit_arcs_max_dev_m": dev}
+
+    def save_line_config(self, filename: str, fillet_corners_m: float,
+                         fit_arcs_max_dev_m: float | None = None) -> dict[str, float]:
+        """Persist survey-line reconstruction settings for a CSV mission file."""
+        if fillet_corners_m < 0.0:
+            raise ValueError("fillet_corners_m must be >= 0.0")
+        safe = os.path.basename(filename)
+        fpath = os.path.join(self._dir, safe)
+        if not os.path.isfile(fpath):
+            raise FileNotFoundError(f"Path not found: {filename!r}")
+        if not self._is_survey_csv(safe):
+            raise ValueError("Line settings apply only to a survey CSV")
+        if fit_arcs_max_dev_m is None:
+            # Sticky, like save_extension_config's per_line.
+            fit_arcs_max_dev_m = float(self.load_line_config(safe)["fit_arcs_max_dev_m"])
+        if not (0.0 < fit_arcs_max_dev_m <= 1.0):
+            raise ValueError("fit_arcs_max_dev_m must be in (0.0, 1.0]")
+        config = {
+            "fillet_corners_m": float(fillet_corners_m),
+            "fit_arcs_max_dev_m": float(fit_arcs_max_dev_m),
+        }
+        self._write_sidecar(self._line_config_path(fpath), {"source": safe, **config})
+        self._preview_cache.pop(fpath, None)
+        return config
 
     @staticmethod
     def _entity_order_path(fpath: str) -> str:
@@ -445,7 +531,9 @@ class PathManager:
         saved. This stops an older frontend that POSTs without the per_line field
         from silently resetting it to False. Pass an explicit True/False to set it.
         """
-        safe, fpath = self._require_dxf(filename, "Path extensions are")
+        # A16: extensions now apply to survey CSVs too (the pre-line product);
+        # entity ordering and overrides stay DXF-only.
+        safe, fpath = self._require_extendable(filename, "Path extensions are")
         if pre_extension_m < 0.0:
             raise ValueError("pre_extension_m must be >= 0.0")
         if aft_extension_m < 0.0:
@@ -639,11 +727,12 @@ class PathManager:
         fpath = os.path.join(self._dir, os.path.basename(name))
         if os.path.isfile(fpath):
             ext = os.path.splitext(fpath)[1].lower()
-            if ext == ".dxf":
-                # Route DXF through the full planning pipeline so the executed
-                # mission honors the saved per-file extension config + tuning
-                # (and extension-aware auto-origin), matching the preview. A bare
-                # PathEngine() here would silently drop PRE/AFT legs and tuning.
+            if ext == ".dxf" or self._is_survey_csv(name):
+                # Route DXF and survey CSVs through the full planning pipeline so
+                # the executed mission honors the saved per-file extension config
+                # + tuning (and extension-aware auto-origin), matching the
+                # preview. A bare PathEngine() here would silently drop PRE/AFT
+                # legs and tuning. Legacy headerless NED CSVs stay below.
                 result = self.plan_path(
                     name,
                     summary_only=False,
@@ -656,7 +745,14 @@ class PathManager:
                 origin != (0.0, 0.0) or start_position is not None
             ):
                 from path_engine import PathEngine
-                engine = PathEngine()
+                # Legacy headerless NED CSV with an origin/start — densify only.
+                # Survey CSVs are handled above via plan_path.
+                cfg = self.load_line_config(name)
+                engine = PathEngine(
+                    fit_arcs=False,
+                    fit_arcs_max_dev_m=cfg["fit_arcs_max_dev_m"],
+                    fillet_corners_m=cfg["fillet_corners_m"],
+                )
                 plan = engine.plan_file(
                     fpath,
                     origin=origin,
@@ -669,8 +765,79 @@ class PathManager:
             return self._load_file(fpath)
         raise FileNotFoundError(f"Path not found: {name!r}")
 
+    def _is_survey_csv(self, name: str) -> bool:
+        """True when *name* is a named-header survey CSV in the missions dir.
+
+        Survey CSVs are the pre-line source: their curves must be arc-fitted, not
+        densified into straight chords. DXF (whose grouped polylines are also
+        LINE_CHAINs) and legacy headerless NED CSVs are excluded, so their frozen
+        behaviour is untouched.
+        """
+        if name.startswith("builtin:"):
+            return False
+        fpath = os.path.join(self._dir, os.path.basename(name))
+        if not fpath.lower().endswith(".csv") or not os.path.isfile(fpath):
+            return False
+        from path_engine.parsers.survey_csv import looks_like_survey_csv
+        return looks_like_survey_csv(fpath)
+
+    @classmethod
+    def _survey_provenance(cls, fpath: str) -> tuple[list[float] | None, list[dict]]:
+        """(geo_origin, control_points) from a single parse of the survey CSV."""
+        try:
+            from path_engine.parsers.survey_csv import read_survey_csv
+            res = read_survey_csv(fpath)
+        except Exception as exc:
+            log.warning("survey provenance unavailable for %s: %s", fpath, exc)
+            return None, []
+        origin = ([float(res.geo_origin[0]), float(res.geo_origin[1])]
+                  if res.geo_origin is not None else None)
+        return origin, cls._control_points_from(res)
+
+    @staticmethod
+    def _control_points_from(res) -> list[dict]:
+        """The ORIGINAL surveyed shots for a survey CSV, in the preview's frame.
+
+        Read from the SOURCE file, not from the planned path: the arc fit and the
+        corner fillet deliberately move geometry off the raw measurements, so the
+        planned waypoints no longer carry them. Same local NED frame as the
+        waypoints (both project about the file's own geo_origin), so a client can
+        overlay the two directly.
+        """
+        out: list[dict] = []
+        for seg in res.segments:
+            meta = seg.metadata or {}
+            latlon = meta.get("survey_latlon") or []
+            names = meta.get("survey_names") or []
+            code = meta.get("survey_code")
+            for i, (n, e) in enumerate(seg.points):
+                ll = latlon[i] if i < len(latlon) else None
+                out.append({
+                    "north": float(n),
+                    "east": float(e),
+                    "lat": float(ll[0]) if ll else None,
+                    "lon": float(ll[1]) if ll else None,
+                    "name": names[i] if i < len(names) else None,
+                    "code": code,
+                })
+        return out
+
+    @staticmethod
+    def _survey_geo_origin(fpath: str) -> list[float] | None:
+        """WGS84 (lat, lon) a survey CSV's local frame is anchored at, or None."""
+        try:
+            from path_engine.parsers.survey_csv import read_survey_csv
+            res = read_survey_csv(fpath)
+        except Exception:
+            return None
+        if res.geo_origin is None:
+            return None
+        return [float(res.geo_origin[0]), float(res.geo_origin[1])]
+
     def preview_path(self, name: str) -> PathPreviewResponse:
         """Return local-NED points for display without touching mission state."""
+        geo_origin: list[float] | None = None
+        control_points: list[dict] = []
         lookup_name = (
             name.removeprefix("builtin:")
             if name.startswith("builtin:")
@@ -679,6 +846,9 @@ class PathManager:
         if lookup_name in BUILTIN_PATHS:
             pts = list(_cached_builtin(lookup_name))
             spray_flags = [True] * len(pts)
+            # Builtins are pre-densified, so which points are "vertices" is not
+            # recoverable. Claim none rather than claim all.
+            must_hit = [False] * len(pts)
         else:
             fpath = os.path.join(self._dir, os.path.basename(name))
             if not os.path.isfile(fpath):
@@ -719,16 +889,61 @@ class PathManager:
                     plan = engine.plan_file(fpath)
                 pts = list(plan.merged_waypoints)
                 spray_flags = list(plan.spray_flags)
+                must_hit = list(getattr(plan, "must_hit", []) or [])
             else:
-                pts = self._load_file(fpath)
-                spray_flags = [True] * len(pts)
+                # A survey CSV (named lat/lon or grid header) runs through the
+                # full planner so the preview MATCHES the executed mission:
+                # densified, grouped by feature code, real spray flags and
+                # must-hit provenance (only surveyed vertices, not fill), plus the
+                # WGS84 origin its frame is anchored at — the WYSIWYG contract the
+                # map needs. A legacy headerless NED CSV / .waypoints file is an
+                # explicit point list with no provenance, so every point is a
+                # vertex.
+                from path_engine.parsers.survey_csv import looks_like_survey_csv
+                if fpath.lower().endswith(".csv") and looks_like_survey_csv(fpath):
+                    from path_engine import PathEngine
+                    # Arc-fit a surveyed curve so the preview shows a true arc,
+                    # not straight chords between vertices. Matches execution
+                    # (plan_path auto-enables fit_arcs for survey CSVs too) and
+                    # honours the same per-file line config + extension sidecar
+                    # (A16), so PRE/AFT run-ups and a corner fillet the operator
+                    # asked for are visible BEFORE they drive it. A bare
+                    # PathEngine() here would drop PRE/AFT and desync spray-flag
+                    # length from plan_path / load_path — the DXF preview
+                    # branch already documents that trap.
+                    safe = os.path.basename(fpath)
+                    enabled, pre_m, aft_m, per_line = (
+                        self.resolve_extension_settings(safe)
+                    )
+                    cfg = self.load_line_config(safe)
+                    plan = PathEngine(
+                        fit_arcs=True,
+                        fit_arcs_max_dev_m=cfg["fit_arcs_max_dev_m"],
+                        fillet_corners_m=cfg["fillet_corners_m"],
+                        enable_path_extensions=enabled,
+                        pre_extension_m=pre_m,
+                        aft_extension_m=aft_m,
+                        per_line_extensions=per_line,
+                    ).plan_file(fpath)
+                    pts = list(plan.merged_waypoints)
+                    spray_flags = list(plan.spray_flags)
+                    must_hit = list(getattr(plan, "must_hit", []) or [])
+                    # One parse for both — read_survey_csv is not free on a
+                    # 2475-row road export.
+                    geo_origin, control_points = self._survey_provenance(fpath)
+                else:
+                    pts = self._load_file(fpath)
+                    spray_flags = [True] * len(pts)
+                    must_hit = [True] * len(pts)
 
         if len(spray_flags) != len(pts):
             spray_flags = [True] * len(pts)
+        if len(must_hit) != len(pts):
+            must_hit = [False] * len(pts)
 
         waypoints = [
-            {"north": n, "east": e, "spray": spray}
-            for (n, e), spray in zip(pts, spray_flags)
+            {"north": n, "east": e, "spray": spray, "must_hit": vertex}
+            for (n, e), spray, vertex in zip(pts, spray_flags, must_hit)
         ]
         if pts:
             norths = [n for n, _ in pts]
@@ -747,6 +962,8 @@ class PathManager:
             num_points=len(pts),
             bounds=bounds,
             waypoints=waypoints,
+            geo_origin=geo_origin,
+            control_points=control_points,
         )
         if lookup_name not in BUILTIN_PATHS:
             self._preview_cache[fpath] = (st.st_mtime_ns, st.st_size, response)
@@ -903,9 +1120,38 @@ class PathManager:
         per_line_extensions = kwargs.pop("per_line_extensions", None)
         corner_smooth_radius_m = kwargs.pop("corner_smooth_radius_m", 0.0)
         corner_smooth_arc_pts = kwargs.pop("corner_smooth_arc_pts", 6)
+        # Arc fit for surveyed LINE_CHAINs. Auto-ON for a survey CSV (its curves
+        # must come out as arcs, not chords; corner-split keeps squares/lines
+        # unchanged), OFF otherwise so DXF/builtin/legacy stay byte-for-byte
+        # frozen. An explicit fit_arcs kwarg always wins.
+        # Every one of these treats None as "not specified" rather than as a
+        # value, so a caller that simply forwards an unset request field cannot
+        # accidentally override the auto/per-file behaviour that preview and
+        # load use. Passing None and omitting the kwarg must be identical.
+        fit_arcs_kw = kwargs.pop("fit_arcs", None)
+        fit_arcs = self._is_survey_csv(source_name) if fit_arcs_kw is None else bool(fit_arcs_kw)
+        fit_arcs_rms_m = kwargs.pop("fit_arcs_rms_m", None)
+        if fit_arcs_rms_m is None:
+            fit_arcs_rms_m = 0.025
+        fit_arcs_corner_deg = kwargs.pop("fit_arcs_corner_deg", None)
+        if fit_arcs_corner_deg is None:
+            fit_arcs_corner_deg = 35.0
+        from path_engine.planners.arc_chain import MAX_ARC_DEVIATION_M
+        line_cfg = self.load_line_config(source_name) if not name.startswith("builtin:") \
+            and os.path.isfile(os.path.join(self._dir, os.path.basename(name))) \
+            else {"fillet_corners_m": 0.0, "fit_arcs_max_dev_m": MAX_ARC_DEVIATION_M}
+        fit_arcs_max_dev_m = kwargs.pop("fit_arcs_max_dev_m", None)
+        if fit_arcs_max_dev_m is None:
+            fit_arcs_max_dev_m = line_cfg["fit_arcs_max_dev_m"]
+        fillet_corners_m = kwargs.pop("fillet_corners_m", None)
+        if fillet_corners_m is None:
+            fillet_corners_m = line_cfg["fillet_corners_m"]
+        # Paint the closing side of an open MARK shape (distinct from close_loop,
+        # which deadheads). Default OFF → every existing plan is unchanged.
+        close_shape = bool(kwargs.pop("close_shape", False))
         use_two_opt = kwargs.pop("use_two_opt", True)
         max_two_opt_segments = kwargs.pop("max_two_opt_segments", 80)
-        max_waypoints = kwargs.pop("max_waypoints", 10000)
+        max_waypoints = kwargs.pop("max_waypoints", 100000)
         max_segments = kwargs.pop("max_segments", 2000)
         line_spacing = kwargs.pop("line_spacing", 0.05)
         transit_spacing = kwargs.pop("transit_spacing", 0.15)
@@ -1059,6 +1305,12 @@ class PathManager:
             per_line_extensions=per_line_extensions,
             corner_smooth_radius_m=corner_smooth_radius_m,
             corner_smooth_arc_pts=corner_smooth_arc_pts,
+            fit_arcs=fit_arcs,
+            fit_arcs_rms_m=fit_arcs_rms_m,
+            fit_arcs_corner_deg=fit_arcs_corner_deg,
+            fit_arcs_max_dev_m=fit_arcs_max_dev_m,
+            fillet_corners_m=fillet_corners_m,
+            close_shape=close_shape,
             use_two_opt=use_two_opt,
             max_two_opt_segments=max_two_opt_segments,
         )
@@ -1173,6 +1425,8 @@ class PathManager:
         if not summary_only:
             result["merged_waypoints"] = plan.merged_waypoints
             result["spray_flags"] = plan.spray_flags
+            # Provenance: True = source geometry vertex, never simplify away.
+            result["must_hit"] = list(getattr(plan, "must_hit", []) or [])
 
         return result
 
@@ -1183,6 +1437,31 @@ class PathManager:
         if ext == ".waypoints":
             return read_qgc_waypoints(fpath)
         if ext == ".csv":
+            # A named-header survey export (Emlid/Trimble point file) is a
+            # different format from the legacy headerless NED metres CSV, and
+            # feeding one to read_ned_csv would read lat/lon or grid metres as
+            # NED. Route it through the full planner so it is densified,
+            # grouped by feature code and projected like any other mission.
+            from path_engine.parsers.survey_csv import looks_like_survey_csv
+            if looks_like_survey_csv(fpath):
+                from path_engine import PathEngine
+                # Arc-fit + honor the extension sidecar (matches preview_path /
+                # plan_path / load_path). load_path normally routes survey CSVs
+                # through plan_path; this keeps any leftover caller consistent.
+                safe = os.path.basename(fpath)
+                enabled, pre_m, aft_m, per_line = (
+                    self.resolve_extension_settings(safe)
+                )
+                cfg = self.load_line_config(safe)
+                return PathEngine(
+                    fit_arcs=True,
+                    fit_arcs_max_dev_m=cfg["fit_arcs_max_dev_m"],
+                    fillet_corners_m=cfg["fillet_corners_m"],
+                    enable_path_extensions=enabled,
+                    pre_extension_m=pre_m,
+                    aft_extension_m=aft_m,
+                    per_line_extensions=per_line,
+                ).plan_file(fpath).merged_waypoints
             return read_ned_csv(fpath)
         if ext == ".dxf":
             from path_engine import PathEngine

@@ -26,6 +26,7 @@ import os
 import tempfile
 import time
 import uuid
+from typing import Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
@@ -51,6 +52,7 @@ from models import (
     DXFEntityInfo,
     DXFParseResponse,
     EntityExtensionPreview,
+    EntityExtensionRun,
     EntityOrderUpdateRequest,
     EntityOrderUpdateResponse,
     EntityTransitPreview,
@@ -59,6 +61,8 @@ from models import (
     MissionSummary,
     PathExtensionConfig,
     PathExtensionConfigResponse,
+    SurveyLineConfig,
+    SurveyLineConfigResponse,
     PathPlanRequest,
     PathPlanResponse,
     PathPreviewBounds,
@@ -67,6 +71,8 @@ from models import (
     PathSegmentsResponse,
     RefPointResidual,
     SegmentInfo,
+    SprayModeDashRequest,
+    SprayModePointRequest,
     StagedMissionResponse,
 )
 from path_manager import UploadValidationError
@@ -127,6 +133,19 @@ def _ned_point(pt) -> dict[str, float]:
     return {"north": float(pt[0]), "east": float(pt[1])}
 
 
+def _geo_origin_of(entities) -> Optional[list[float]]:
+    """The DXF's WGS84 origin if georef projected it, else None.
+
+    georef stamps the same (lat, lon) on every entity, so the first non-None
+    wins. Returned as a JSON list [lat, lon] for the response.
+    """
+    for ent in entities:
+        geo = getattr(ent, "geo_origin", None)
+        if geo is not None:
+            return [float(geo[0]), float(geo[1])]
+    return None
+
+
 def _arc_points(
     center: tuple[float, float],
     radius: float,
@@ -166,93 +185,156 @@ def _subsample_points(
 # Matches PathEngine.group_join_tol_m: two mark endpoints this close are the
 # same chain junction, so neither is a free end eligible for an extension.
 _EXTENSION_JUNCTION_TOL_M = 0.05
+# Same value as engine.py's _COLLINEAR_DOT (~20 deg): at a junction this steep
+# the two runs continue straight through each other, so a run-out there can only
+# be retraced by the connector.
+#
+# Equal VALUE, deliberately weaker TEST. The planner (engine.py _retraces) knows
+# its traversal order, so it takes a signed dot of exit->entry between segments
+# it already knows are adjacent. The preview keeps DXF order while /plan reorders
+# via TSP, so it knows neither: it compares |dot| against every other mark end.
+# That is the conservative direction — the preview may suppress a run-up the
+# planner would keep at an anti-collinear or non-adjacent junction. Both agree
+# wherever it matters today (square corners are perpendicular, |dot|~0). Keeping
+# the value in sync is necessary but NOT sufficient for preview==plan; changing
+# either predicate needs a paired check, not just a matching constant.
+_EXTENSION_COLLINEAR_DOT = 0.94
+
+
+def _unit_dir(
+    a: tuple[float, float], b: tuple[float, float]
+) -> Optional[tuple[float, float]]:
+    """Unit vector a->b, or None when the two points are coincident."""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    h = math.hypot(dx, dy)
+    if h < 1e-9:
+        return None
+    return (dx / h, dy / h)
 
 
 def _extension_endpoint_freeness(
-    endpoints: list[tuple[tuple[float, float], tuple[float, float]]],
+    runs: list[tuple[
+        tuple[float, float], tuple[float, float],
+        Optional[tuple[float, float]], Optional[tuple[float, float]],
+    ]],
     tol: float = _EXTENSION_JUNCTION_TOL_M,
+    per_line: bool = False,
 ) -> list[tuple[bool, bool]]:
-    """Per mark entity (start, end), decide whether each end is a FREE end.
+    """Per mark entity (start, end, start_dir, end_dir), is each end FREE?
 
-    An end is *free* when it does not coincide with any OTHER mark entity's
-    endpoint — i.e. it is the outer end of a chain, not an internal junction.
-    A self-closed entity (start ≈ end) has no free end.
+    Two policies, matching the two the planner actually runs:
 
-    This mirrors the vertex-anchored planner policy: extensions live only at a
-    chain's true open ends, never at internal corners or on closed loops. Doing
-    it by endpoint connectivity (not entity order) means preview and plan agree
-    even though the preview keeps DXF order while the planner reorders via TSP.
+    * per_line=False (chain ends) — an end is free only when it coincides with
+      no OTHER mark entity's endpoint: extensions live at a chain's true open
+      ends, never at internal corners or on closed loops. Mirrors
+      split_mark_segment_with_extensions(suppress_closed_loops=True).
+
+    * per_line=True — every CAD edge is an independent PRE→MARK→AFT pass, so a
+      shared corner does NOT block a run-up; each side of a closed square gets
+      its own. Only a *collinear* junction blocks, because there the run-out and
+      the next run-in lie along the same line and the connector can only double
+      straight back over them (the d82317d retrace field failure). Mirrors the
+      planner's decompose_line_chain_to_edges() + suppress_closed_loops=False,
+      whose _touches() is a DIRECTION test (_COLLINEAR_DOT), not a shared point.
+
+    Collinearity is compared as |dot| so it holds regardless of which way each
+    entity happens to be drawn or traversed. Doing this by endpoint geometry
+    (not entity order) keeps preview and plan agreeing even though the preview
+    keeps DXF order while the planner reorders via TSP.
     """
-    def _shared(pt, skip_idx) -> bool:
-        for j, (s, e) in enumerate(endpoints):
+    def _collinear(d1, d2) -> bool:
+        if d1 is None or d2 is None:
+            return False
+        return abs(d1[0] * d2[0] + d1[1] * d2[1]) > _EXTENSION_COLLINEAR_DOT
+
+    def _blocked(pt, my_dir, skip_idx) -> bool:
+        for j, (s, e, s_dir, e_dir) in enumerate(runs):
             if j == skip_idx:
                 continue
-            if math.hypot(pt[0] - s[0], pt[1] - s[1]) <= tol:
-                return True
-            if math.hypot(pt[0] - e[0], pt[1] - e[1]) <= tol:
-                return True
+            for other_pt, other_dir in ((s, s_dir), (e, e_dir)):
+                if math.hypot(pt[0] - other_pt[0], pt[1] - other_pt[1]) > tol:
+                    continue
+                if not per_line:
+                    return True  # chain ends: any junction blocks
+                if _collinear(my_dir, other_dir):
+                    return True  # per-line: only a retrace blocks
         return False
 
     freeness = []
-    for i, (start, end) in enumerate(endpoints):
+    for i, (start, end, s_dir, e_dir) in enumerate(runs):
         if math.hypot(start[0] - end[0], start[1] - end[1]) <= tol:
-            freeness.append((False, False))  # self-closed loop — no free end
+            # Self-closed entity (circle / closed polyline): no linear free end
+            # to run off, in either mode.
+            freeness.append((False, False))
             continue
-        freeness.append((not _shared(start, i), not _shared(end, i)))
+        freeness.append((not _blocked(start, s_dir, i), not _blocked(end, e_dir, i)))
     return freeness
 
 
-def _entity_extension_preview(
+def _entity_extension_edges(
     ent,
-    preview_pts: list[tuple[float, float]],
-    enabled: bool,
-    is_mark: bool,
-    pre_extension_m: float,
-    aft_extension_m: float,
-    start_is_free: bool = True,
-    end_is_free: bool = True,
-) -> EntityExtensionPreview:
-    # Direction math is shared with the planner (analytic arc tangents,
-    # finite differences for line-like geometry) so the preview cannot
-    # drift from what split_mark_segment_with_extensions() actually plans.
-    # start_is_free/end_is_free gate WHERE a run-up may appear: only at a
-    # chain's true open ends, matching the vertex-anchored planner — an
-    # internal corner or a closed loop yields no preview extension.
+    tangent_pts: list[tuple[float, float]],
+    per_line: bool,
+) -> list[tuple[list[tuple[float, float]], Optional[tuple[float, float]], Optional[tuple[float, float]]]]:
+    """The edges a mark entity's extensions attach to, matching the planner.
+
+    In per-line mode a line-like polyline is split at its corners exactly as
+    ``decompose_line_chain_to_edges`` does in the plan (engine.py, gated on
+    ``per_line_extensions``), so each side is an independent PRE/MARK/AFT pass.
+    This is what lets a single *closed* LWPOLYLINE (a square drawn as one
+    polyline) grow the same per-side run-ups the mission actually drives —
+    previously the preview treated it as one self-closed run and produced none,
+    disagreeing with the plan.
+
+    Everything else stays whole (one edge):
+      - chain-ends mode (per_line=False) never decomposes, same as the planner;
+      - ARC / CIRCLE / SPLINE / ELLIPSE are curved — decompose returns them
+        unchanged and they keep their analytic tangents, never finite-difference.
+
+    Returns ``[(points, start_dir, end_dir)]``; dirs are None when a direction
+    cannot be inferred (caller then emits no run for that end).
+    """
+    from path_engine.core import PathSegment, SegmentType
     from path_engine.planners.extensions import (
+        decompose_line_chain_to_edges,
         entity_extension_directions,
-        offset_point,
     )
 
-    if not enabled or not is_mark or len(preview_pts) < 2:
-        return EntityExtensionPreview(enabled=False)
+    whole_dirs = entity_extension_directions(ent, tangent_pts)
 
-    dirs = entity_extension_directions(ent, preview_pts)
-    if dirs is None:
-        return EntityExtensionPreview(enabled=False)
-    start_dir, end_dir = dirs
+    def _whole():
+        s = whole_dirs[0] if whole_dirs else None
+        e = whole_dirs[1] if whole_dirs else None
+        return [(list(tangent_pts), s, e)]
 
-    pre_points = []
-    aft_points = []
-    if pre_extension_m > 0 and start_is_free:
-        start = preview_pts[0]
-        pre_points = [
-            _ned_point(offset_point(start, start_dir, -pre_extension_m)),
-            _ned_point(start),
-        ]
-    if aft_extension_m > 0 and end_is_free:
-        end = preview_pts[-1]
-        aft_points = [
-            _ned_point(end),
-            _ned_point(offset_point(end, end_dir, aft_extension_m)),
-        ]
+    if not per_line or len(tangent_pts) < 3:
+        return _whole()
 
-    return EntityExtensionPreview(
-        enabled=bool(pre_points or aft_points),
-        pre_length_m=pre_extension_m if pre_points else 0.0,
-        aft_length_m=aft_extension_m if aft_points else 0.0,
-        pre_points=pre_points,
-        aft_points=aft_points,
+    # geometry_type drives _is_line_like_segment: line-like polylines split at
+    # corners, curved geometry is returned unchanged (single edge).
+    seg = PathSegment(
+        segment_type=SegmentType.MARK,
+        points=list(tangent_pts),
+        source_entity=str(ent.entity_id),
+        metadata={"geometry_type": str(ent.entity_type).upper()},
     )
+    parts = decompose_line_chain_to_edges(seg)
+    if len(parts) <= 1:
+        # Not split (curved, or already a single straight edge) — keep analytic
+        # tangents rather than a finite-difference approximation.
+        return _whole()
+
+    edges = []
+    for p in parts:
+        pts = p.points
+        if len(pts) < 2:
+            continue
+        edges.append((
+            list(pts),
+            _unit_dir(pts[0], pts[1]),
+            _unit_dir(pts[-2], pts[-1]),
+        ))
+    return edges or _whole()
 
 
 def _entity_transit_previews(
@@ -260,10 +342,20 @@ def _entity_transit_previews(
 ) -> list[EntityTransitPreview]:
     """Straight no-spray connectors between consecutive MARK entities.
 
-    *mark_endpoints* is (entity_id, first_pt, last_pt) per drawable MARK
-    entity, in DXF/entity order. Callers must already have dropped entities
-    with no preview points, so a degenerate entity cannot break the chain —
-    its drawable neighbours still get connected, like the planner would.
+    *mark_endpoints* is (entity_id, entry_pt, exit_pt) per drawable MARK entity,
+    in DXF/entity order. Callers must already have dropped entities with no
+    preview points, so a degenerate entity cannot break the chain — its drawable
+    neighbours still get connected, like the planner would.
+
+    entry/exit are the extension TIPS when that end has a run-up, so a connector
+    spans AFT-tip -> next PRE-start — matching the planner, which routes travel
+    only AFTER extension (_insert_transit_connectors_between_segments). In
+    per-line mode this is what makes a square's corners grow real connectors:
+    the edges no longer touch once each has run off its own end.
+
+    NOTE (known, pre-existing): the order here is DXF order, while /plan reorders
+    via TSP. These connectors are therefore honest about GEOMETRY per junction,
+    but not about which junctions the mission will actually drive.
     """
     transits = []
     for (from_id, _, start), (to_id, end, _) in zip(mark_endpoints, mark_endpoints[1:]):
@@ -414,6 +506,37 @@ def _assert_origin_gps_usable(origin_gps) -> None:
         )
 
 
+def _surveyed_origin_health():
+    """(health_dict, reason_if_unavailable) for the live EKF local-frame origin."""
+    from main import ros_node
+    if ros_node is None:
+        return None, "ROS bridge not available — the EKF origin cannot be verified"
+    try:
+        return ros_node.get_origin_health(), None
+    except Exception as exc:  # noqa: BLE001 — never let a health probe 500 a route
+        return None, f"EKF origin health probe failed: {exc}"
+
+
+def _assert_origin_trusted_for_surveyed(mission_id: str) -> None:
+    """Refuse a GPS_SURVEYED commitment when the EKF origin cannot be trusted.
+
+    Fail CLOSED: an unavailable probe is a refusal, not a pass. A surveyed
+    mission placed against a stale origin is displaced by the origin delta
+    (measured 2.15 m / 2.25 m on 2026-07-27) and shows no symptom at all until
+    the rover drives.
+    """
+    health, unavailable = _surveyed_origin_health()
+    if unavailable is not None:
+        raise HTTPException(503, f"Refusing surveyed mission {mission_id}: {unavailable}")
+    if not health.get("trusted"):
+        raise HTTPException(
+            409,
+            f"Refusing surveyed mission {mission_id}: EKF local-frame origin is "
+            f"not trustworthy [{health.get('status')}] — {health.get('detail')} "
+            "See GET /api/health/origin.",
+        )
+
+
 def _jsonable_geometry(geometry: dict) -> dict:
     def convert(value):
         if isinstance(value, tuple):
@@ -499,9 +622,16 @@ async def path_entities(name: str):
     # closed loops get none — same rule split_mark_segment_with_extensions()
     # applies. Computed here (before the build loop) because freeness of one
     # entity's end depends on every other mark entity's endpoints.
+    per_line = bool(extension_config.per_line)
     resolved: list[tuple] = []  # (ent, preview_pts, tangent_pts, default_is_mark, is_mark)
-    mark_endpoints_for_freeness: list[tuple[tuple[float, float], tuple[float, float]]] = []
-    mark_slot_of_entity: dict[int, int] = {}
+    # Freeness runs over EDGES, not whole entities: in per-line mode a polyline
+    # is split at its corners (see _entity_extension_edges) so each side is its
+    # own run — this is why a single closed square grows the same per-side
+    # run-ups the plan drives. A lone LINE/ARC contributes one edge, so this is
+    # a superset of the old per-entity behaviour, not a change to it.
+    entity_edges: dict[int, list[tuple]] = {}   # order_index -> [(pts, sdir, edir)]
+    edge_freeness_input: list[tuple] = []       # (start, end, sdir, edir) per edge
+    edge_ref: list[tuple[int, int]] = []        # parallel: (order_index, local_edge_i)
     for idx, ent in enumerate(entities):
         preview_pts = _entity_preview_tuples(ent)
         # SPLINE/ELLIPSE previews are subsampled for payload size. Compute
@@ -514,34 +644,84 @@ async def path_entities(name: str):
         )
         default_is_mark = ent.is_mark()
         is_mark = overrides.get(ent.entity_id, default_is_mark)
+        order_index = len(resolved)
         resolved.append((ent, preview_pts, tangent_pts, default_is_mark, is_mark))
-        if is_mark and tangent_pts:
-            mark_slot_of_entity[idx] = len(mark_endpoints_for_freeness)
-            mark_endpoints_for_freeness.append((tangent_pts[0], tangent_pts[-1]))
+        if is_mark and tangent_pts and len(tangent_pts) >= 2:
+            edges = _entity_extension_edges(ent, tangent_pts, per_line)
+            entity_edges[order_index] = edges
+            for local_i, (pts, sdir, edir) in enumerate(edges):
+                edge_ref.append((order_index, local_i))
+                edge_freeness_input.append((pts[0], pts[-1], sdir, edir))
 
-    freeness = _extension_endpoint_freeness(mark_endpoints_for_freeness)
+    freeness_list = _extension_endpoint_freeness(edge_freeness_input, per_line=per_line)
+    edge_freeness: dict[tuple[int, int], tuple[bool, bool]] = {
+        edge_ref[i]: freeness_list[i] for i in range(len(edge_ref))
+    }
 
-    # (entity_id, first_pt, last_pt) per drawable MARK entity — endpoints
-    # only, so large per-entity point lists aren't retained past the loop.
-    mark_endpoints: list[tuple[str, tuple[float, float], tuple[float, float]]] = []
+    # (entity_id, entry, exit) per drawable MARK EDGE, in order — endpoints only,
+    # so large point lists aren't retained past the loop. entry/exit are the
+    # extension TIPS where a run-up exists, so connectors span AFT-tip -> next
+    # PRE-start like the planner routes them; they fall back to the mark vertex
+    # when that end has no extension. Per-edge (not per-entity) so a split
+    # polyline's sides get their corner connectors.
+    from path_engine.planners.extensions import offset_point
+
+    edge_endpoints: list[tuple[str, tuple[float, float], tuple[float, float]]] = []
+    extension_runs: list[EntityExtensionRun] = []
     for order_index, (ent, preview_pts, tangent_pts, default_is_mark, is_mark) in enumerate(resolved):
         all_pts.extend(preview_pts)
-        if is_mark and tangent_pts:
-            mark_endpoints.append((ent.entity_id, tangent_pts[0], tangent_pts[-1]))
-        slot = mark_slot_of_entity.get(order_index)
-        start_is_free, end_is_free = freeness[slot] if slot is not None else (True, True)
-        extension_preview = _entity_extension_preview(
-            ent,
-            tangent_pts,
-            enabled=extension_config.enabled,
-            is_mark=is_mark,
-            pre_extension_m=extension_config.pre_extension_m,
-            aft_extension_m=extension_config.aft_extension_m,
-            start_is_free=start_is_free,
-            end_is_free=end_is_free,
+        pre_m = extension_config.pre_extension_m
+        aft_m = extension_config.aft_extension_m
+        make_ext = extension_config.enabled and is_mark
+
+        # Per-edge run-ups, matching the plan. For a lone LINE/ARC there is one
+        # edge, so this reduces to the previous single PRE/AFT pair. For a split
+        # polyline every side is handled independently.
+        edges = entity_edges.get(order_index, [])
+        entity_pre_pts: list = []   # first free PRE across this entity's edges
+        entity_aft_pts: list = []   # last  free AFT across this entity's edges
+        for local_i, (pts, sdir, edir) in enumerate(edges):
+            sfree, efree = edge_freeness.get((order_index, local_i), (True, True))
+            pre_pts: list = []
+            aft_pts: list = []
+            if make_ext and pre_m > 0 and sfree and sdir is not None:
+                pre_pts = [_ned_point(offset_point(pts[0], sdir, -pre_m)), _ned_point(pts[0])]
+            if make_ext and aft_m > 0 and efree and edir is not None:
+                aft_pts = [_ned_point(pts[-1]), _ned_point(offset_point(pts[-1], edir, aft_m))]
+            if pre_pts:
+                extension_runs.append(EntityExtensionRun(
+                    entity_id=ent.entity_id, role="pre", edge_index=local_i,
+                    length_m=round(pre_m, 3), points=pre_pts))
+                if not entity_pre_pts:
+                    entity_pre_pts = pre_pts
+            if aft_pts:
+                extension_runs.append(EntityExtensionRun(
+                    entity_id=ent.entity_id, role="aft", edge_index=local_i,
+                    length_m=round(aft_m, 3), points=aft_pts))
+                entity_aft_pts = aft_pts
+            for ext_pt in pre_pts + aft_pts:
+                all_pts.append((ext_pt["north"], ext_pt["east"]))
+            # Per-EDGE connector endpoints. A connector runs from this edge's
+            # exit tip to the NEXT edge's entry tip, so the sides of a split
+            # polyline grow the corner connectors the plan drives — previously a
+            # single polyline was one endpoint and produced none. Travel starts
+            # at the run-up tip when present (rover drives out along AFT, turns,
+            # comes back to the next PRE), else the mark vertex.
+            edge_entry = (pre_pts[0]["north"], pre_pts[0]["east"]) if pre_pts else pts[0]
+            edge_exit = (aft_pts[-1]["north"], aft_pts[-1]["east"]) if aft_pts else pts[-1]
+            edge_endpoints.append((ent.entity_id, edge_entry, edge_exit))
+
+        # Per-entity summary (single PRE/AFT pair). Authoritative, complete
+        # geometry is `extensions[]` above; this stays for per-entity display and
+        # is the entity's outermost run-up pair. Identical to the old field for a
+        # single-edge entity.
+        extension_preview = EntityExtensionPreview(
+            enabled=bool(entity_pre_pts or entity_aft_pts),
+            pre_length_m=pre_m if entity_pre_pts else 0.0,
+            aft_length_m=aft_m if entity_aft_pts else 0.0,
+            pre_points=entity_pre_pts,
+            aft_points=entity_aft_pts,
         )
-        for ext_pt in extension_preview.pre_points + extension_preview.aft_points:
-            all_pts.append((ext_pt.north, ext_pt.east))
         geometry = ent.geometry
         if ent.entity_type in ("SPLINE", "ELLIPSE"):
             # Flattened spline/ellipse vertices duplicate preview_points
@@ -564,7 +744,7 @@ async def path_entities(name: str):
 
     # Transit connectors join entity endpoints that are already in all_pts,
     # so bounds cover them without re-adding the points.
-    transit_preview = _entity_transit_previews(mark_endpoints)
+    transit_preview = _entity_transit_previews(edge_endpoints)
 
     bounds = None
     if all_pts:
@@ -577,12 +757,16 @@ async def path_entities(name: str):
             east_max=max(easts),
         )
 
+    geo_origin = _geo_origin_of(entities)
     return DXFEntitiesResponse(
         name=safe,
         num_entities=len(previews),
+        is_geographic=geo_origin is not None,
+        geo_origin=geo_origin,
         bounds=bounds,
         extension_config=extension_config,
         transit_preview=transit_preview,
+        extensions=extension_runs,
         entities=previews,
     )
 
@@ -604,12 +788,23 @@ async def update_entity_order(name: str, req: EntityOrderUpdateRequest):
         path_mgr.parse_dxf, fpath,
         what="Parsing DXF for entity order validation",
     )
-    valid_ids = [ent.entity_id for ent in entities]
-    valid_set = set(valid_ids)
+    # The order sequences DRIVABLE shapes only. POINT entities (survey markers)
+    # carry no traversable path and the planner drops them; entities on ignore
+    # layers (DIM/DEFPOINTS/...) are never driven either. The client orders the
+    # drawable line/curve shapes and legitimately omits these, so requiring them
+    # in a "full order" would reject every valid order for a DXF that has any
+    # survey points — which is exactly what happened for a georeferenced square
+    # (one LWPOLYLINE + 5 POINTs). Exclude them from the contract.
+    orderable = [
+        ent for ent in entities
+        if ent.entity_type != "POINT" and ent.classify() != "ignore"
+    ]
+    valid_set = {ent.entity_id for ent in orderable}
     posted = req.entity_order
     posted_set = set(posted)
 
-    # Full-order contract: must contain exactly the current entity ID set.
+    # Full-order contract over the ORDERABLE set: no dup, no unknown, and every
+    # orderable entity present (so the traversal sequence stays deterministic).
     if len(posted) != len(posted_set):
         raise HTTPException(422, "Duplicate entity IDs in entity_order")
 
@@ -652,8 +847,13 @@ def _load_extension_config_checked(path_mgr, name: str) -> dict:
     fpath = os.path.join(MISSION_DIR, safe)
     if not os.path.isfile(fpath):
         raise FileNotFoundError(f"Path not found: {name!r}")
-    if os.path.splitext(fpath)[1].lower() != ".dxf":
-        raise ValueError("Path extensions are only configurable for DXF files")
+    # A16: the pre-line CSV product needs extensions too — they are what move
+    # the entry transient and the terminal shutoff OFF the painted line. Mirror
+    # PathManager._require_extendable rather than re-deriving the rule.
+    if os.path.splitext(fpath)[1].lower() != ".dxf" and not path_mgr._is_survey_csv(safe):
+        raise ValueError(
+            "Path extensions are only configurable for DXF files and survey CSVs"
+        )
     return path_mgr.load_extension_config(safe)
 
 
@@ -686,6 +886,97 @@ async def save_path_extensions(name: str, req: PathExtensionConfig):
         saved=True,
         **config,
     )
+
+
+@path_router.get("/{name}/line-config", response_model=SurveyLineConfigResponse)
+async def get_line_config(name: str):
+    """Return saved survey-line reconstruction settings for a CSV file."""
+    from main import path_mgr
+
+    config = await _sidecar_call(
+        path_mgr.load_line_config, name, what="Loading line config",
+    )
+    return SurveyLineConfigResponse(
+        name=os.path.basename(name), saved=True, **config,
+    )
+
+
+@path_router.post("/{name}/line-config", response_model=SurveyLineConfigResponse)
+async def save_line_config(name: str, req: SurveyLineConfig):
+    """Persist survey-line reconstruction settings for a CSV file.
+
+    Applies to preview, plan and load alike, so raising the corner radius
+    changes what the operator sees before it changes what the rover drives.
+    """
+    from main import path_mgr
+
+    config = await _sidecar_call(
+        path_mgr.save_line_config,
+        name, req.fillet_corners_m, req.fit_arcs_max_dev_m,
+        what="Saving line config",
+    )
+    return SurveyLineConfigResponse(
+        name=os.path.basename(name), saved=True, **config,
+    )
+
+
+# ── Point-mission CSV ingest (mobile app) ───────────────────────────────────────
+# The app's CSV import posts here BEFORE staging: these routes only parse + return
+# staged-ready points (they do not touch the controller). The frontend then feeds
+# the returned point_mission_points into POST /{name}/plan-and-stage, which bridges
+# them onto /path as must-hit vertices (see plan_and_stage). point_ingest lives in
+# ../src alongside the ROS nodes, so add it to sys.path lazily like the node code.
+
+def _import_point_ingest():
+    import sys
+    from pathlib import Path as _FsPath
+
+    src = _FsPath(__file__).resolve().parents[2] / "src"
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    import point_ingest  # noqa: E402
+    return point_ingest
+
+
+@path_router.post("/parse-point-csv")
+async def parse_point_csv(file: UploadFile = File(...)):
+    """Parse a point-mission CSV (north,east[,dwell_s[,mark]]) into staged-ready points.
+
+    NED metres, anchor-free. Returns the point list only — stage via
+    /{name}/plan-and-stage. Dwell policy uses point_ingest's field defaults
+    (2 s default, 60 s max); the mission's actual dwell is set at stage time from
+    PathPlanRequest.point_dwell_s.
+    """
+    pi = _import_point_ingest()
+    content = (await file.read()).decode("utf-8", errors="replace")
+    try:
+        points = pi.parse_point_csv_text(content)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    return {
+        "num_points": len(points),
+        "point_mission_points": pi.points_to_staged_dict(points),
+    }
+
+
+@path_router.post("/parse-point-gps-csv")
+async def parse_point_gps_csv(file: UploadFile = File(...)):
+    """Parse a GPS point-mission CSV (lat,lon[,dwell_s][,mark]) into staged-ready points.
+
+    The first data row is the survey anchor; every row is projected to
+    anchor-relative NED metres (Karney geodesic). Returns num_points, anchor,
+    point_source_frame="GPS_SURVEYED" and point_mission_points — the exact shape
+    the mobile app hands back to /{name}/plan-and-stage.
+    """
+    pi = _import_point_ingest()
+    content = (await file.read()).decode("utf-8", errors="replace")
+    try:
+        parsed = pi.parse_point_gps_csv_text(content)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    except ImportError as exc:  # geographiclib missing on the host
+        raise HTTPException(500, str(exc))
+    return pi.gps_point_mission_parse_payload(parsed)
 
 
 # ── Upload ────────────────────────────────────────────────────────────────────
@@ -798,12 +1089,15 @@ async def parse_dxf_file(file: UploadFile = File(...)):
         path_mgr.clear_extension_config(safe)
         path_mgr.clear_entity_order(safe)
 
+        geo_origin = _geo_origin_of(entities)
         return DXFParseResponse(
             filename=safe,
             num_entities=len(entities),
             entities=entity_infos,
             unit_scale=unit_scale,
             layer_names=sorted(layer_names),
+            is_geographic=geo_origin is not None,
+            geo_origin=geo_origin,
         )
     except ImportError:
         os.unlink(fpath)
@@ -890,6 +1184,11 @@ async def plan_path(req: PathPlanRequest):
                 # PathManager during planning.
                 corner_smooth_radius_m=req.corner_smooth_radius_m,
                 corner_smooth_arc_pts=req.corner_smooth_arc_pts,
+                fit_arcs=req.fit_arcs,
+                fit_arcs_rms_m=req.fit_arcs_rms_m,
+                fit_arcs_corner_deg=req.fit_arcs_corner_deg,
+                fit_arcs_max_dev_m=req.fit_arcs_max_dev_m,
+                close_shape=req.close_shape,
                 use_two_opt=req.use_two_opt,
                 max_two_opt_segments=req.max_two_opt_segments,
                 max_waypoints=req.max_waypoints,
@@ -949,6 +1248,7 @@ async def plan_path(req: PathPlanRequest):
         segments=result["segments"],
         merged_waypoints=result.get("merged_waypoints", []),
         spray_flags=result.get("spray_flags", []),
+        must_hit=result.get("must_hit", []),
         alignment_metadata=alignment_meta or None,
         planning_metadata=result.get("planning_metadata"),
         warnings=result.get("warnings"),
@@ -971,6 +1271,38 @@ def _prune_staging() -> None:
                 continue
     except FileNotFoundError:
         pass
+
+
+def _source_detail(result: dict) -> dict | None:
+    """Provenance of the file this plan was built from, for the staged artifact.
+
+    PathEngine.plan_file() records ``filepath`` / ``extension`` /
+    ``unit_scale_m_per_unit`` under planning_metadata. The entity-list planner
+    records the same block minus ``filepath`` (it never opened a file by name),
+    so resolve the flat source name against MISSION_DIR to fill the gap —
+    ``tools/analyze_mission.py`` needs a real path to re-read the surveyed
+    geometry and report absolute accuracy.
+
+    Returns None when there is nothing useful to record (e.g. a builtin path),
+    so the field is absent rather than a dict of nulls.
+    """
+    planning = result.get("planning_metadata") or {}
+    src = planning.get("source")
+    detail = dict(src) if isinstance(src, dict) else {}
+
+    name = result.get("source")
+    if isinstance(name, str) and name and not name.startswith("builtin:"):
+        detail.setdefault("name", name)
+        if not detail.get("filepath"):
+            candidate = os.path.join(MISSION_DIR, os.path.basename(name))
+            if os.path.isfile(candidate):
+                detail["filepath"] = candidate
+        if not detail.get("extension"):
+            ext = os.path.splitext(name)[1].lower()
+            if ext:
+                detail["extension"] = ext
+
+    return detail or None
 
 
 def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
@@ -1008,9 +1340,36 @@ def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
         "origin_gps": list(origin_gps) if origin_gps else None,
         "waypoints": result.get("merged_waypoints", []),
         "spray_flags": result.get("spray_flags", []),
+        # Vertex provenance: True = source geometry, never simplify away.
+        "must_hit": result.get("must_hit", []),
+        # Spray mode (B0/Phase C). Rides to the controller at load and is
+        # published on /spray/session_config. Geometry stays in spray_flags/
+        # waypoints; this carries only the mode + dash metering distances.
+        "spray_session": {
+            "mode": req.spray_mode,
+            "dash_on_distance_m": req.dash_on_distance_m,
+            "dash_off_distance_m": req.dash_off_distance_m,
+            "dash_start_state": req.dash_start_state,
+            # Point-mode dwell params. Coordinates are NOT staged — they ride
+            # /path as must-hit vertices and are placed into the live EKF frame
+            # at start; the spray node reads them there.
+            "point_dwell_s": req.point_dwell_s,
+            "point_arrival_tolerance_m": req.point_arrival_tolerance_m,
+        },
         "alignment_metadata": alignment_meta,
         "metadata": {
             "source": result["source"],
+            # metadata.source is the flat filename and stays a string — the
+            # frontend renders it. The bag recorder needs the file's provenance
+            # (absolute path, extension, unit scale) to run §8 absolute accuracy,
+            # so carry the planner's own source block alongside it. PathEngine
+            # already builds exactly this dict in plan_file(); see
+            # path_engine/engine.py:366.
+            "source_detail": _source_detail(result),
+            # Operator-set, per survey. Absent (None) means "use the analyser's
+            # default" — deliberately NOT defaulted to a number here, or every
+            # mission would claim an explicit tolerance it never chose.
+            "survey_tolerance_m": req.survey_tolerance_m,
             "mark_length_m": result["mark_length_m"],
             "transit_length_m": result["transit_length_m"],
             "total_length_m": result["total_length_m"],
@@ -1022,6 +1381,22 @@ def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
     with open(tmp, "w") as f:
         json.dump(staged_payload, f)
     os.replace(tmp, staging_file)  # atomic publish
+
+    # Advisory only. Staging is a planning act and legitimately happens with the
+    # rover off or still acquiring RTK, so it is NOT refused here — the hard
+    # gates are /load-to-controller and mission start, which are the points that
+    # actually bind the mission to the ground. This warning exists so a stale
+    # origin leaves a trace in the log at the moment the mission was authored.
+    if origin_gps:
+        health, unavailable = _surveyed_origin_health()
+        if unavailable is not None:
+            log.info("staged surveyed mission %s — origin not checkable: %s",
+                     mission_id, unavailable)
+        elif not health.get("trusted"):
+            log.warning(
+                "staged surveyed mission %s while the EKF local-frame origin is "
+                "NOT trustworthy [%s]: %s — load and start will refuse until this "
+                "clears", mission_id, health.get("status"), health.get("detail"))
 
     # Commercial estimates. Speeds are > 0 (engine validates before we get here).
     paint_l = result["mark_length_m"] * SPRAY_LITERS_PER_METER
@@ -1097,11 +1472,25 @@ async def load_mission_to_controller(req: LoadMissionRequest):
             anchor.get("rotation_deg", 0.0), anchor.get("scale", 1.0),
         )
 
+    placement_mode = staged.get("placement_mode") or (
+        "GPS_SURVEYED" if staged.get("origin_gps") else "LOCAL_NED"
+    )
+
+    # ── Fail closed on an untrustworthy EKF local-frame origin ───────────────
+    # A surveyed mission is bound to the ground at START, through the EKF's
+    # declared local-frame origin. Refusing only at start is too late to be
+    # useful: load is the commitment point — it publishes the mission geometry
+    # the spray node latches, and it is what the operator does before walking
+    # the rover out. So the same verdict start enforces is checked here, and
+    # the operator finds out at the desk instead of in the field.
+    # (Staging is deliberately NOT gated: planning legitimately happens with the
+    # rover off. It logs a warning instead — see _stage_mission.)
+    if placement_mode == "GPS_SURVEYED":
+        _assert_origin_trusted_for_surveyed(safe_id)
+
     try:
         spray_flags = [bool(f) for f in staged.get("spray_flags", [])]
-        placement_mode = staged.get("placement_mode") or (
-            "GPS_SURVEYED" if staged.get("origin_gps") else "LOCAL_NED"
-        )
+        must_hit = [bool(f) for f in staged.get("must_hit", [])]
         origin_gps = staged.get("origin_gps")
         if origin_gps is not None:
             origin_gps = (float(origin_gps[0]), float(origin_gps[1]))
@@ -1109,6 +1498,7 @@ async def load_mission_to_controller(req: LoadMissionRequest):
             waypoints,
             name=safe_id,
             spray_flags=spray_flags,
+            must_hit=must_hit,
             placement_mode=placement_mode,
             origin_gps=origin_gps,
             is_staged=True,
@@ -1118,6 +1508,37 @@ async def load_mission_to_controller(req: LoadMissionRequest):
     except Exception as exc:
         raise HTTPException(409, f"Controller load failed: {exc}")
 
+    # B0/Phase C: publish the spray mode on /spray/session_config right after
+    # /path so geometry and mode reach the spray node from the same load. The
+    # node is the sole parser and fails static on anything it rejects, so a
+    # publish failure here must never fail the mission load — log and continue.
+    spray_session = staged.get("spray_session") or {}
+    spray_mode = spray_session.get("mode", "continuous")
+    try:
+        from main import ros_node
+        from spray_session_builder import build_session_config_json
+
+        cfg_json = build_session_config_json(
+            spray_mode,
+            dash_on_distance_m=spray_session.get("dash_on_distance_m"),
+            dash_off_distance_m=spray_session.get("dash_off_distance_m"),
+            dash_start_state=spray_session.get("dash_start_state", "on"),
+            # Point dwell params. Coordinates stay empty on purpose — the node
+            # fills them from the placed /path must-hit vertices (the only
+            # frame-correct source; the placement offset is unknown until start).
+            point_dwell_s=spray_session.get("point_dwell_s", 1.0),
+            point_arrival_tolerance_m=spray_session.get(
+                "point_arrival_tolerance_m", 0.10
+            ),
+        )
+        ros_node.publish_spray_session_config(cfg_json)
+    except Exception as exc:  # noqa: BLE001 — mode publish is best-effort
+        import logging
+        logging.getLogger("server.path").warning(
+            "spray session_config publish failed for %s (mode=%s): %s — "
+            "spray node keeps its last mode", safe_id, spray_mode, exc,
+        )
+
     return {
         "status": "success",
         "mission_id": safe_id,
@@ -1125,6 +1546,147 @@ async def load_mission_to_controller(req: LoadMissionRequest):
         "anchor_loaded": anchor is not None,
         "placement_mode": placement_mode,
         "origin_gps": list(origin_gps) if origin_gps else None,
+    }
+
+
+# ── Spray pattern ("Apply pattern" from the mobile app) ─────────────────────────
+# The app sets the spray pattern on a selected PATH, separate from planning:
+#   PUT /api/path/{name}/spray-mode/{continuous|dash|point}
+# Geometry (MARK/transit + must-hit) rides /path from the loaded mission; these
+# routes only publish the MODE overlay on /spray/session_config, which the spray
+# node latches (RELIABLE + TRANSIENT_LOCAL) and applies to the current geometry.
+#
+# Ordering: apply AFTER the mission is loaded. load-to-controller republishes
+# the mission's staged mode (continuous by default), which would override a mode
+# set before load.
+
+def _publish_spray_session(safe_name: str, cfg_json: str, mode: str) -> dict:
+    """Publish a session_config to the spray node. Best-effort; never raises.
+
+    Off-ROS (Mac dev) or with a missing publisher this returns published=False
+    with the reason — the route still succeeds so the contract is verifiable
+    without a live ROS graph.
+    """
+    try:
+        from main import ros_node
+        ros_node.publish_spray_session_config(cfg_json)
+        return {"published": True, "detail": None}
+    except Exception as exc:  # noqa: BLE001 — publish is best-effort/off-ROS
+        log.warning("spray-mode publish failed for %s (mode=%s): %s",
+                    safe_name, mode, exc)
+        return {"published": False, "detail": str(exc)}
+
+
+@path_router.put("/{name}/spray-mode/continuous")
+async def set_spray_mode_continuous(name: str):
+    """Set the selected path to continuous spray (plan-start → plan-stop)."""
+    from spray_session_builder import build_session_config_json
+
+    safe = os.path.basename(name)
+    cfg_json = build_session_config_json("continuous")
+    pub = _publish_spray_session(safe, cfg_json, "continuous")
+    resp = {
+        "status": "ok",
+        "path": safe,
+        "mode": "continuous",
+        "applied_config": json.loads(cfg_json),
+        "published": pub["published"],
+        "warnings": [],
+    }
+    if pub["detail"]:
+        resp["publish_error"] = pub["detail"]
+    return resp
+
+
+@path_router.put("/{name}/spray-mode/dash")
+async def set_spray_mode_dash(name: str, req: SprayModeDashRequest):
+    """Set the selected path to dash spray (ON/OFF by metres over the path)."""
+    from spray_session_builder import build_session_config_json
+
+    safe = os.path.basename(name)
+    cfg_json = build_session_config_json(
+        "dash",
+        dash_on_distance_m=req.dash_on_distance_m,
+        dash_off_distance_m=req.dash_off_distance_m,
+        dash_start_state="on",
+    )
+    cfg = json.loads(cfg_json)
+    warnings: list[str] = []
+    if cfg.get("mode") != "dash":
+        warnings.append(
+            "dash config incomplete — the node stays continuous "
+            "(both on/off distances must be > 0)."
+        )
+    if req.dash_phase_reset == "per_mark_region":
+        warnings.append(
+            "dash_phase_reset='per_mark_region' accepted but not yet honored: "
+            "the shipped meter runs continuous across the mission."
+        )
+    pub = _publish_spray_session(safe, cfg_json, "dash")
+    resp = {
+        "status": "ok",
+        "path": safe,
+        "mode": "dash",
+        "dash_phase_reset": req.dash_phase_reset,
+        "applied_config": cfg,
+        "published": pub["published"],
+        "warnings": warnings,
+    }
+    if pub["detail"]:
+        resp["publish_error"] = pub["detail"]
+    return resp
+
+
+@path_router.put("/{name}/spray-mode/point")
+async def set_spray_mode_point(name: str, req: SprayModePointRequest):
+    """Acknowledge point spray for the selected path.
+
+    The app's point contract carries no marking-point coordinates, so this route
+    deliberately does NOT publish a session_config: publishing point with no
+    coordinates resolves to continuous and would demote a point mission already
+    loaded with its coordinates. Point marking is realized through the staged
+    point mission (coordinates + must-hit on /path) plus the RPP point-hold A/B
+    (`point_hold_enabled`, default OFF).
+    """
+    safe = os.path.basename(name)
+    # G4.5 — carry point_execution_mode to the RPP (design §8 option (a): the
+    # server sets it as an RPP param at load). auto|manual selects whether the
+    # RPP auto-advances on /spray/point_done or holds in WAIT_OPERATOR for the
+    # operator's /point/advance. Behaviour is gated by point_handshake_enabled on
+    # the RPP; setting the mode alone changes nothing until the handshake is on.
+    exec_mode = str(req.point_execution_mode or "auto").lower()
+    warnings = [
+        "point marking-point coordinates are not part of this contract; the "
+        "spray node is not switched here. Stop-and-dwell at each point is the "
+        "RPP point-hold A/B — set `point_hold_enabled true` on /rpp_controller "
+        "and run a mission whose must-hit points carry the coordinates."
+    ]
+    exec_applied = False
+    if exec_mode not in ("auto", "manual"):
+        warnings.append(
+            f"point_execution_mode {exec_mode!r} not in auto|manual; leaving the "
+            f"RPP param unchanged"
+        )
+    else:
+        try:
+            from main import ros_node
+            ok, msg = await ros_node.set_rpp_param_async(
+                "point_execution_mode", exec_mode
+            )
+            exec_applied = bool(ok)
+            if not ok:
+                warnings.append(f"could not set RPP point_execution_mode: {msg}")
+        except Exception as exc:  # noqa: BLE001 — best-effort/off-ROS
+            log.warning("set point_execution_mode failed for %s: %s", safe, exc)
+            warnings.append(f"could not set RPP point_execution_mode: {exc}")
+    return {
+        "status": "ok",
+        "path": safe,
+        "mode": "point",
+        "point_execution_mode": exec_mode,
+        "point_execution_mode_applied": exec_applied,
+        "published": False,
+        "warnings": warnings,
     }
 
 
@@ -1346,41 +1908,118 @@ async def plan_and_stage(name: str, req: PathPlanRequest):
     ref_points_dxf = [(pt.dxf_y, pt.dxf_x) for pt in req.ref_points] if req.ref_points is not None else None
     ref_points_gps = [(pt.lat, pt.lon) for pt in req.ref_points] if req.ref_points is not None else None
 
-    try:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(
-                path_mgr.plan_path,
-                safe,
-                summary_only=False,
-                line_spacing=req.line_spacing,
-                transit_spacing=req.transit_spacing,
-                marking_speed=req.marking_speed,
-                transit_speed=req.transit_speed,
-                layer_mapping=req.layer_mapping,
-                optimize=req.optimize,
-                compensate_spray=False,   # never: see spray_compensation_warning above
-                corner_smooth_radius_m=req.corner_smooth_radius_m,
-                corner_smooth_arc_pts=req.corner_smooth_arc_pts,
-                use_two_opt=req.use_two_opt,
-                max_two_opt_segments=req.max_two_opt_segments,
-                max_waypoints=req.max_waypoints,
-                max_segments=req.max_segments,
-                origin=origin,
-                start_position=start_position,
-                origin_gps=origin_gps,
-                rotation_deg=req.rotation_deg,
-                ref_points_dxf=ref_points_dxf,
-                ref_points_gps=ref_points_gps,
-                close_loop=req.close_loop,
-            ),
-            timeout=15.0,
+    # Point mission (mobile CSV flow): the waypoints ARE the surveyed points —
+    # there is no file-based line geometry to plan. path_mgr.plan_path() would
+    # read `name` as NED/DXF line geometry and raise on a point CSV, so skip the
+    # planner entirely and synthesize a result that stages the points as must-hit
+    # /path vertices (the native Upgrade_Spray point model: RPP point-hold + the
+    # spray node's per-must-hit dwell). `mark` maps to BOTH the must-hit flag and
+    # the spray flag, so only marked points become stop + spray-dwell targets and
+    # an unmarked point is a plain transit vertex (never sprayed — the spray node
+    # dwells on EVERY must-hit vertex regardless of the spray bit). Requires the
+    # GPS_SURVEYED frame + an origin_gps anchor, matching the app's contract; any
+    # other shape falls through to the ordinary line planner unchanged.
+    is_point_mission = bool(
+        req.point_mission_points
+        and req.point_source_frame == "GPS_SURVEYED"
+        and req.origin_gps
+    )
+
+    if is_point_mission:
+        pts = req.point_mission_points
+        waypoints = [[float(p.north_m), float(p.east_m)] for p in pts]
+        flags = [bool(p.mark) for p in pts]
+        transit_len = sum(
+            math.hypot(waypoints[i + 1][0] - waypoints[i][0],
+                       waypoints[i + 1][1] - waypoints[i][1])
+            for i in range(len(waypoints) - 1)
         )
-    except FileNotFoundError as exc:
-        raise HTTPException(404, str(exc))
-    except asyncio.TimeoutError:
-        raise HTTPException(504, "Planning timed out (15s limit)")
-    except Exception as exc:
-        raise HTTPException(422, f"Planning error: {exc}")
+        # Dots are dwell-sprayed, not line-sprayed → the mission's spray mode is
+        # "point" regardless of the (defaulted) request field; force it so the
+        # staged spray_session tells the node to run its point-dwell FSM.
+        req.spray_mode = "point"
+        result = {
+            "source": safe,
+            "num_waypoints": len(waypoints),
+            "num_segments": 0,
+            "mark_length_m": 0.0,
+            "transit_length_m": transit_len,
+            "total_length_m": transit_len,
+            "segments": [],
+            "merged_waypoints": waypoints,
+            "spray_flags": flags,
+            "must_hit": flags,
+            "alignment_metadata": {
+                "method": "gps_origin",
+                "origin_gps": list(req.origin_gps),
+                "rotation_deg": req.rotation_deg,
+                "scale": 1.0,
+                "fitted_scale": 1.0,
+                "rmse": 0.0,
+            },
+            "planning_metadata": {},
+            "warnings": [],
+        }
+    else:
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    path_mgr.plan_path,
+                    safe,
+                    summary_only=False,
+                    line_spacing=req.line_spacing,
+                    transit_spacing=req.transit_spacing,
+                    marking_speed=req.marking_speed,
+                    transit_speed=req.transit_speed,
+                    layer_mapping=req.layer_mapping,
+                    optimize=req.optimize,
+                    compensate_spray=False,   # never: see spray_compensation_warning above
+                    corner_smooth_radius_m=req.corner_smooth_radius_m,
+                    corner_smooth_arc_pts=req.corner_smooth_arc_pts,
+                    use_two_opt=req.use_two_opt,
+                    max_two_opt_segments=req.max_two_opt_segments,
+                    max_waypoints=req.max_waypoints,
+                    max_segments=req.max_segments,
+                    origin=origin,
+                    start_position=start_position,
+                    origin_gps=origin_gps,
+                    rotation_deg=req.rotation_deg,
+                    ref_points_dxf=ref_points_dxf,
+                    ref_points_gps=ref_points_gps,
+                    close_loop=req.close_loop,
+                    # A15 (2026-07-27): these five were accepted by the request
+                    # model, documented, and then SILENTLY DROPPED on the way to
+                    # the planner — only /api/path/plan forwarded them. So the
+                    # preview route honoured `fit_arcs` while plan-and-stage, the
+                    # route that produces the mission the rover actually drives,
+                    # ignored it and always took path_manager's survey-CSV
+                    # auto-ON default. Measured on curve_6_points-1: preview with
+                    # fit_arcs=false gave 98 wp / 8 of 8 must-hit / 0.00 cm from
+                    # the surveyed stations; the staged mission gave 97 wp / 2 of
+                    # 8 / 1.95 cm mean, 3.36 cm max — HTTP 200, no warning.
+                    #
+                    # Passing them straight through (not conditionally) is
+                    # deliberate: all four fit_arcs fields default to None in
+                    # PathPlanRequest, and path_manager reads None as "auto"
+                    # (`fit_arcs = _is_survey_csv(name) if kw is None else ...`),
+                    # so omitting them from the request is byte-for-byte
+                    # unchanged. close_shape defaults False in both. This mirrors
+                    # /api/path/plan exactly, which is the point — the two routes
+                    # disagreeing is the bug.
+                    fit_arcs=req.fit_arcs,
+                    fit_arcs_rms_m=req.fit_arcs_rms_m,
+                    fit_arcs_corner_deg=req.fit_arcs_corner_deg,
+                    fit_arcs_max_dev_m=req.fit_arcs_max_dev_m,
+                    close_shape=req.close_shape,
+                ),
+                timeout=15.0,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc))
+        except asyncio.TimeoutError:
+            raise HTTPException(504, "Planning timed out (15s limit)")
+        except Exception as exc:
+            raise HTTPException(422, f"Planning error: {exc}")
 
     alignment_meta = result.get("alignment_metadata") or {}
     rmse = alignment_meta.get("rmse", 0.0)
@@ -1418,6 +2057,7 @@ async def plan_and_stage(name: str, req: PathPlanRequest):
         segments=result["segments"],
         merged_waypoints=result.get("merged_waypoints", []),
         spray_flags=result.get("spray_flags", []),
+        must_hit=result.get("must_hit", []),
         alignment_metadata=alignment_meta or None,
         planning_metadata=result.get("planning_metadata"),
         warnings=warnings or None,
@@ -1464,6 +2104,7 @@ async def get_staged_mission(mission_id: str):
         num_waypoints=len(wp_out),
         waypoints=wp_out,
         spray_flags=[bool(f) for f in spray_flags],
+        must_hit=[bool(f) for f in (staged.get("must_hit", []) or [])],
         segment_runs=_spray_runs(wp_out, spray_flags),
         alignment_metadata=staged.get("alignment_metadata"),
         metadata=staged.get("metadata"),

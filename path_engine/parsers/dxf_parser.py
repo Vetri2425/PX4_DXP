@@ -461,10 +461,25 @@ def parse_dxf(
             log.warning("Skipping unsupported DXF entity type: %s (layer=%s, handle=%s)",
                        etype, layer, handle)
 
+    # Georeferenced DXFs (raw WGS84 lat/lon in the coordinate fields) must be
+    # projected to local ENU metres before anything metric touches them, or the
+    # whole drawing collapses under metre-based tolerances. No-op for a metric
+    # DXF, so the ordinary path is unchanged.
+    from .georef import detect_and_project
+    detect_and_project(entities)
+
     return entities
 
 
 MAX_ENTITIES = 10000
+# Coincidence tolerance when matching a POINT entity to a polyline vertex.
+# In a survey field-to-finish export the two are generated from the same
+# measurement and land exactly on top of each other (measured: 0.0 cm on
+# tes_cross_line.dxf), so this only needs to absorb float noise. Kept well
+# under the 5 cm densification spacing so a control point can never snap to
+# interpolated fill.
+CONTROL_SNAP_M = 0.01
+
 MAX_WAYPOINTS_PER_ENTITY = 50000
 MAX_TOTAL_WAYPOINTS = 500000
 
@@ -680,4 +695,87 @@ def entities_to_segments(
                 f"limit {MAX_TOTAL_WAYPOINTS}"
             )
 
+    _annotate_control_points(entities, segments)
     return segments
+
+
+def _annotate_control_points(
+    entities: list[DXFEntity],
+    segments: list[PathSegment],
+    tol: float = CONTROL_SNAP_M,
+) -> None:
+    """Mark polyline vertices that a POINT entity explicitly declares.
+
+    In a survey export (Emlid/Trimble field-to-finish) the drawing carries the
+    linework on one layer AND the surveyed measurements as POINT entities on
+    another — coincident to the millimetre. The POINTs are the operator's
+    explicit statement of *which coordinates matter*, which is strictly more
+    information than "this is a source vertex":
+
+      - No POINTs in the drawing  -> every source vertex is treated as intent
+        (the safe default; a tessellated arc IS its geometry).
+      - POINTs present            -> only the declared vertices are must-hit,
+        and the rest of the linework may be simplified. This is what makes a
+        long road tangent tractable: 200 exported vertices, 6 declared control
+        points, and simplification is free to drop the other 194.
+
+    POINT entities remain non-drivable (they are reference markers, not spray
+    targets — see the CAD POINT decision) so this only annotates; it never adds
+    geometry. Sets ``metadata["control_indices"]`` (indices into the segment's
+    own point list) on any segment that has at least one declared vertex.
+    """
+    if not entities or not segments or tol <= 0:
+        return
+
+    controls: list[tuple[float, float]] = []
+    for ent in entities:
+        if getattr(ent, "entity_type", None) != "POINT":
+            continue
+        pos = (ent.geometry or {}).get("position")
+        if isinstance(pos, (tuple, list)) and len(pos) >= 2:
+            controls.append((float(pos[0]), float(pos[1])))
+    if not controls:
+        return
+
+    # Grid hash at the tolerance so this stays O(points), not O(points x controls)
+    # — a large drawing can carry hundreds of thousands of waypoints.
+    buckets: dict[tuple[int, int], list[tuple[float, float]]] = {}
+    for c in controls:
+        key = (int(math.floor(c[0] / tol)), int(math.floor(c[1] / tol)))
+        buckets.setdefault(key, []).append(c)
+
+    matched_total = 0
+    for seg in segments:
+        idxs: list[int] = []
+        for i, pt in enumerate(seg.points):
+            gx, gy = int(math.floor(pt[0] / tol)), int(math.floor(pt[1] / tol))
+            hit = False
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for c in buckets.get((gx + dx, gy + dy), ()):
+                        if math.hypot(pt[0] - c[0], pt[1] - c[1]) <= tol:
+                            hit = True
+                            break
+                    if hit:
+                        break
+                if hit:
+                    break
+            if hit:
+                idxs.append(i)
+        if idxs:
+            seg.metadata["control_indices"] = idxs
+            matched_total += len(idxs)
+
+    if matched_total:
+        log.info(
+            "Control points: %d POINT entit%s matched %d vertex/vertices across "
+            "%d segment(s) — only declared vertices are must-hit",
+            len(controls), "y" if len(controls) == 1 else "ies", matched_total,
+            sum(1 for s in segments if "control_indices" in s.metadata),
+        )
+    else:
+        log.info(
+            "Control points: %d POINT entit%s found but none coincide with any "
+            "linework vertex (tol %.3f m) — falling back to all-source-vertices",
+            len(controls), "y" if len(controls) == 1 else "ies", tol,
+        )

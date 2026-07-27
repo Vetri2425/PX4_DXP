@@ -217,22 +217,54 @@ class AsyncRTKManager:
             task.cancel()
         self._watch_task = None
 
+    # Max age (s) of the newest health anchor before the stream is unhealthy.
+    _HEALTHY_MAX_AGE_S = 10.0
+
+    @classmethod
+    def _health_anchor_age_s(cls, child_status: dict[str, Any], now: float) -> float | None:
+        """Age since the newest of: last valid RTCM frame, or the current
+        connection's establishment (``connected_since``).
+
+        ``last_frame_time`` in the child's status file survives reconnects, so
+        judging health on it alone marks every fresh reconnect after a
+        >_HEALTHY_MAX_AGE_S outage unhealthy before the new connection has any
+        chance to stream (NTRIP VRS casters may not send frames until the
+        first GGA back-feed, up to 10 s after handshake). Anchoring on the
+        newest of the two gives each new connection one honest grace window,
+        after which missing frames correctly turn the stream unhealthy.
+        Children predating ``connected_since`` degrade to the old behaviour.
+        """
+        anchors = [
+            float(t)
+            for t in (
+                child_status.get("last_frame_time"),
+                child_status.get("connected_since"),
+            )
+            if isinstance(t, (int, float)) and not isinstance(t, bool)
+        ]
+        if not anchors:
+            return None
+        return max(0.0, now - max(anchors))
+
     def _status_locked(self) -> RTKStatus:
         process = self._process
         running = process is not None and process.returncode is None
         child_status = self._read_child_status() if running else {}
+        now = time.time()
         last_frame_time = child_status.get("last_frame_time")
+        # Honest frame age for display; health is judged on the anchor age.
         last_frame_age_s = (
-            max(0.0, time.time() - float(last_frame_time))
+            max(0.0, now - float(last_frame_time))
             if isinstance(last_frame_time, (int, float))
             else None
         )
+        anchor_age_s = self._health_anchor_age_s(child_status, now)
         source_state = str(child_status.get("state") or ("running" if running else "idle"))
         healthy = bool(
             running
             and child_status.get("connected", False)
-            and last_frame_age_s is not None
-            and last_frame_age_s <= 10.0
+            and anchor_age_s is not None
+            and anchor_age_s <= self._HEALTHY_MAX_AGE_S
         )
         return RTKStatus(
             mode=self._mode if running else "idle",

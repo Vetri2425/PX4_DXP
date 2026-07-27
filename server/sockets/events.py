@@ -44,7 +44,12 @@ def register_handlers(sio) -> None:
 
     @sio.event
     async def disconnect(sid):
-        from main import activity_log
+        from main import activity_log, joystick_ctrl
+        if joystick_ctrl is not None and joystick_ctrl.owner_sid == sid:
+            try:
+                await joystick_ctrl.release(sid, reason="disconnect", force=True)
+            except Exception:
+                log.exception("joystick release-on-disconnect failed for sid=%s", sid)
         unbind_socket_sid(sid)
         activity_log.append({"timestamp": _now(), "level": "info",
                               "message": f"Socket disconnected: {sid}"})
@@ -109,9 +114,12 @@ def register_handlers(sio) -> None:
             return
         try:
             pts = path_mgr.load_path(name)
-            from mission_loading import spray_flags_for_path
+            from mission_loading import must_hit_for_path, spray_flags_for_path
             spray_flags = spray_flags_for_path(path_mgr, name, len(pts))
-            offboard_ctrl.load_path(pts, name=name, spray_flags=spray_flags)
+            must_hit = must_hit_for_path(path_mgr, name, len(pts))
+            offboard_ctrl.load_path(
+                pts, name=name, spray_flags=spray_flags, must_hit=must_hit
+            )
             await sio.emit("mission_loaded",
                            {"name": name, "num_points": len(pts)}, to=sid)
         except Exception as exc:
@@ -161,3 +169,81 @@ def register_handlers(sio) -> None:
             ok, value, _ = await ros_node.get_param_async(name)
             out[name] = value if ok else None
         await sio.emit("params_result", out, to=sid)
+
+    # ── Joystick / manual control ──────────────────────────────────────────────
+    # docs/Architecture/JOYSTICK_CONTROLLER_PLAN.md §4.4. Auth is enforced the
+    # same way as every other handler in this file: `_auth_ok(sid)` against the
+    # session bound at socket connect (auth.bind_socket_sid). The client
+    # contract still sends `auth` in every payload for schema parity with the
+    # other client (DYX_GCS_V) and forward-compat with per-event re-validation;
+    # the server does not currently re-check it per event.
+
+    @sio.on("joystick_acquire")
+    async def on_joystick_acquire(sid, data):
+        from main import joystick_ctrl
+        data = data if isinstance(data, dict) else {}
+        if not _auth_ok(sid):
+            return await _emit_unauth(sio, sid)
+        if joystick_ctrl is None:
+            await sio.emit(
+                "joystick_error",
+                {"type": "joystick_error", "code": "unavailable", "message": "joystick subsystem not initialised"},
+                to=sid,
+            )
+            return
+        try:
+            result = await joystick_ctrl.acquire(sid, data)
+        except Exception as exc:
+            code = getattr(exc, "code", "acquire_failed")
+            await sio.emit(
+                "joystick_error",
+                {"type": "joystick_error", "code": code, "message": str(exc)},
+                to=sid,
+            )
+            return
+        await sio.emit("joystick_acquired", result, to=sid)
+
+    @sio.on("joystick_command")
+    async def on_joystick_command(sid, data):
+        from main import joystick_ctrl
+        data = data if isinstance(data, dict) else {}
+        if not _auth_ok(sid):
+            return await _emit_unauth(sio, sid)
+        if joystick_ctrl is None:
+            return
+        try:
+            joystick_ctrl.handle_command(sid, data)
+        except Exception as exc:
+            code = getattr(exc, "code", "command_rejected")
+            await sio.emit(
+                "joystick_error",
+                {"type": "joystick_error", "code": code, "message": str(exc)},
+                to=sid,
+            )
+        # Successful commands are not individually acked (plan §4.2) — the
+        # client reconciles via the periodic telemetry snapshot instead.
+
+    @sio.on("joystick_release")
+    async def on_joystick_release(sid, data):
+        from main import joystick_ctrl
+        data = data if isinstance(data, dict) else {}
+        if not _auth_ok(sid):
+            return await _emit_unauth(sio, sid)
+        if joystick_ctrl is None:
+            return
+        try:
+            result = await joystick_ctrl.release(
+                sid,
+                session_id=data.get("session_id"),
+                lease_id=data.get("lease_id"),
+                reason="explicit",
+            )
+        except Exception as exc:
+            code = getattr(exc, "code", "release_failed")
+            await sio.emit(
+                "joystick_error",
+                {"type": "joystick_error", "code": code, "message": str(exc)},
+                to=sid,
+            )
+            return
+        await sio.emit("joystick_released", result)

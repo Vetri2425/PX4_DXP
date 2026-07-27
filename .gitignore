@@ -68,8 +68,11 @@ nul
 front-end.zip
 
 # Uploaded mission files (runtime user data). Committed templates are negated below.
-server/missions/*.dxf
-server/missions/*.csv
+# Case classes, not *.dxf: CAD tools emit .DXF as often as .dxf, and gitignore
+# matching is case-sensitive — a plain *.dxf leaves every uppercase upload
+# untracked-but-not-ignored, which is what buried real changes in git status.
+server/missions/*.[dD][xX][fF]
+server/missions/*.[cC][sS][vV]
 !server/missions/soccer_field_penalty_area.dxf
 
 # Staged aligned-DXF missions (runtime handoff artifacts)
@@ -116,7 +119,7 @@ image_ref/
 tools/rosbag.txt
 
 # Generated DXF sidecars (entities/extensions cache, regenerated on parse)
-server/missions/.*.dxf.*.json
+server/missions/.*.[dD][xX][fF].*.json
 
 # Local bag/trajectory analysis output (data + plots, not for tracking)
 analysis/
@@ -130,3 +133,29 @@ Simple Demo/sample_dxf/videos/
 
 # DXF verification harness generated artifacts (PNGs, MP4s, summaries)
 verification_output/
+
+# Local dev server log (uvicorn run from server/ on the Mac) — never tracked.
+server/_local_server.log
+
+# Operator checklist PDFs kept alongside the tree, not source.
+Checklists /
+docs/FRONTEND_SURVEY_CONTROL_POINTS.md
+docs/Fujipress_JACIII-29-4-23.pdf
+docs/PRELINE_GAP_CLOSURE_PLAN.md
+docs/PRELINE_GAP_CLOSURE_PLAN.pdf
+docs/PRELINE_ROBUST_METHODS.md
+docs/PRELINE_ROBUST_METHODS.pdf
+docs/PreMarking_Rover_Reading_List.pdf
+docs/PROJECT_MATURITY_AUDIT_2026-07-26.md
+docs/PX4_DXP_vs_Wang2025_Gap_Analysis.pdf
+docs/preline_gap_closure/arc_survey.csv
+docs/preline_gap_closure/arcfit_demo.png
+docs/preline_gap_closure/PRELINE_GAP_CLOSURE_PLAN.md
+docs/preline_gap_closure/PRELINE_GAP_CLOSURE_PLAN.pdf
+docs/preline_gap_closure/PRELINE_ROBUST_METHODS.md
+docs/preline_gap_closure/PRELINE_ROBUST_METHODS.pdf
+docs/preline_gap_closure/prototype_arcfit.py
+docs/preline_gap_closure/robust_fit_demo.png
+docs/preline_gap_closure/robust_fit_demo.py
+docs/preline_gap_closure/square_behaviour.png
+BACKEND_CHANGE_REQUEST_CSV_TRAJECTORY.md

@@ -16,6 +16,7 @@ from config import RPP_STALE, RPP_STATE_NAMES
 from mission_loading import (
     MissionLoadConflict,
     load_path_for_controller,
+    must_hit_for_path,
     pose_origin_or_error,
     spray_flags_for_path,
 )
@@ -59,7 +60,10 @@ async def load_mission(req: MissionLoadRequest):
     except Exception as exc:
         raise HTTPException(400, f"Load failed: {exc}")
     spray_flags = spray_flags_for_path(path_mgr, name, len(pts))
-    offboard_ctrl.load_path(pts, name=name, spray_flags=spray_flags)
+    must_hit = must_hit_for_path(path_mgr, name, len(pts))
+    offboard_ctrl.load_path(
+        pts, name=name, spray_flags=spray_flags, must_hit=must_hit
+    )
     return {"loaded": name, "num_points": len(pts)}
 
 
@@ -71,6 +75,33 @@ async def start_mission(req: MissionStartRequest | None = None):
 
     auto_origin = req.auto_origin if req else False
     name = (req.path_name or req.mission_file) if req else None
+
+    # A caller may name the staged mission it verified. Cross-check it against
+    # what the controller actually holds rather than trusting either side: this
+    # is the guard against starting a mission the client never inspected (e.g.
+    # after a background re-stage, or a second device loading something else).
+    expected_id = (req.mission_id or "").strip() if req else ""
+    if expected_id:
+        if name:
+            raise HTTPException(
+                422,
+                "start: pass mission_id OR path_name, not both — mission_id starts "
+                "the already-loaded staged mission, path_name re-loads from disk "
+                "and would discard its surveyed placement",
+            )
+        loaded_id = (offboard_ctrl.loaded_path_summary(sample=0).get("mission_id") or "")
+        if not loaded_id:
+            raise HTTPException(
+                409,
+                f"start: mission {expected_id} was requested but no staged mission "
+                f"is loaded — load it to the controller first",
+            )
+        if loaded_id != expected_id:
+            raise HTTPException(
+                409,
+                f"start: requested mission {expected_id} but {loaded_id} is loaded "
+                f"— re-load before starting",
+            )
     origin = (0.0, 0.0)
     start_position = None
     origin_pre_applied = False
@@ -151,6 +182,22 @@ async def clear_mission():
         status = await offboard_ctrl.clear_mission_async()
     except MissionClearConflict as exc:
         raise HTTPException(409, str(exc))
+
+    # B0 (plan §3): publish an EXPLICIT cleared spray config, don't just stop
+    # publishing. /spray/session_config is TRANSIENT_LOCAL, so silence would
+    # let a restarted spray node re-latch the last mission's mode (e.g. dash)
+    # over a now-empty path. Best-effort — never fail the clear on this.
+    try:
+        from main import ros_node
+        from spray_session_builder import cleared_config_json
+
+        if ros_node is not None:
+            ros_node.publish_spray_session_config(cleared_config_json())
+    except Exception as exc:  # noqa: BLE001
+        import logging
+        logging.getLogger("server.mission").warning(
+            "cleared spray session_config publish failed: %s", exc
+        )
     return MissionClearResponse(cleared=True, status=LoadedPathResponse(**status))
 
 

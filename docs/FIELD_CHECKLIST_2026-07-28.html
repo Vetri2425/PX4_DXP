@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Field Checklist 2026-07-28 — unverified commits + carried-over items</title>
+<style>
+  :root { --ink:#111; --mut:#666; --line:#d8d8d2; --warn:#8a4b00; --bad:#a32d2d; --ok:#0f6e56; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         max-width: 1000px; margin: 0 auto; padding: 24px 18px 80px; color: var(--ink);
+         line-height: 1.55; font-size: 15px; }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  h2 { font-size: 18px; margin: 32px 0 8px; padding-top: 12px; border-top: 2px solid var(--ink); }
+  h3 { font-size: 15px; margin: 20px 0 6px; }
+  .sub { color: var(--mut); margin: 0 0 18px; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0 18px; font-size: 13.5px; }
+  th, td { border: 1px solid var(--line); padding: 7px 9px; vertical-align: top; text-align: left; }
+  th { background: #f4f3ee; font-weight: 600; }
+  td.n { width: 34px; text-align: center; font-weight: 600; }
+  td.chk { width: 34px; text-align: center; font-size: 17px; }
+  code { background: #f4f3ee; padding: 1px 4px; border-radius: 3px; font-size: 12.5px;
+         font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre { background: #f4f3ee; padding: 10px 12px; border-radius: 5px; overflow-x: auto;
+        font-size: 12.5px; line-height: 1.45; }
+  .box { border: 1px solid var(--line); border-left: 4px solid var(--warn);
+         padding: 10px 14px; margin: 14px 0; background: #fdfaf5; }
+  .box.bad { border-left-color: var(--bad); background: #fdf5f5; }
+  .box.ok  { border-left-color: var(--ok);  background: #f4faf8; }
+  .box p:first-child { margin-top: 0; } .box p:last-child { margin-bottom: 0; }
+  .meta { display: flex; gap: 28px; flex-wrap: wrap; font-size: 13.5px; color: var(--mut);
+          border: 1px solid var(--line); padding: 10px 14px; border-radius: 5px; }
+  .fill { border-bottom: 1px solid var(--ink); display: inline-block; min-width: 130px; }
+  ul { margin: 6px 0 6px 20px; padding: 0; } li { margin: 3px 0; }
+  .ok-t  { color: var(--ok);  font-weight: 600; }
+  .bad-t { color: var(--bad); font-weight: 600; }
+
+  @page { size: A4 portrait; margin: 12mm 10mm; }
+  @media print {
+    body { font-size: 10.5pt; line-height: 1.35; padding: 0; max-width: none; color: #000; }
+    h1 { font-size: 16pt; margin-bottom: 2px; }
+    h2 { font-size: 12.5pt; margin: 14pt 0 5pt; padding-top: 6pt;
+         border-top: 1.5pt solid #000; break-after: avoid; page-break-after: avoid; }
+    h3 { font-size: 10.5pt; margin: 9pt 0 3pt; break-after: avoid; }
+    .sub, .meta { font-size: 9pt; color: #000; }
+    table, pre, .box { break-inside: avoid; page-break-inside: avoid; }
+    tr, td, th { break-inside: avoid; page-break-inside: avoid; }
+    table { font-size: 9pt; width: 100%; }
+    th, td { padding: 4pt 5pt; border: 0.5pt solid #666; }
+    th { background: #eee !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    code, pre { background: transparent !important; border: 0.4pt solid #bbb; font-size: 8.5pt; }
+    pre { padding: 5pt 6pt; }
+    .box { background: transparent !important; border: 0.5pt solid #999;
+           border-left: 3pt solid #000 !important; padding: 6pt 9pt; margin: 8pt 0; }
+    td.chk { font-size: 0; }
+    td.chk::before { content: ""; display: inline-block; width: 11pt; height: 11pt;
+                     border: 0.9pt solid #000; }
+    .fill { min-width: 42mm; border-bottom: 0.6pt solid #000; }
+    h2 { page-break-before: always; break-before: page; }
+    h2:first-of-type { page-break-before: auto; break-before: auto; }
+    a { text-decoration: none; color: #000; }
+  }
+</style>
+</head>
+<body>
+
+<h1>Field Checklist — 2026-07-28</h1>
+<p class="sub">3WD marking rover · branch <code>Upgrade_Spray</code> @ <code>f329a27</code> ·
+covers the week audit 07-22 → 07-27 (85 commits: 67 code + 18 docs) and yesterday's carried-over items</p>
+
+<div class="meta">
+  <span>Date <span class="fill"></span></span>
+  <span>Operator <span class="fill"></span></span>
+  <span>Site <span class="fill"></span></span>
+  <span>Jetson SHA <span class="fill"></span></span>
+</div>
+
+<h2>A · Week audit — verified vs unverified (67 code commits, grouped by feature)</h2>
+
+<h3 class="ok-t">✅ VERIFIED — field evidence or heavy in-use proof (≈41 commits)</h3>
+<table>
+<tr><th>Feature</th><th>Key commits</th><th>Evidence</th></tr>
+<tr><td>B-series frame + controller fixes (B6′ sphere frame, B2 lateral gains, B3/B4/B5 spray + disarm)</td>
+<td><code>2dc7155 3634200 8da931d d0ae176 ab6ee26</code></td>
+<td>Field 07-25: marking RMS 5.1 → 1.0 cm</td></tr>
+<tr><td>Analysis stack: §8 absolute, §9 traversal, geometry fidelity, NavSatFix uint16 fix, GPSRAW parse, geo overlay, analyzer B7/B9/B12</td>
+<td><code>f1c8610 5f820be de943e4 a61118d 4c94899 740b325 22c02de</code></td>
+<td>Used to grade every bag on 07-27 (20+ bundles)</td></tr>
+<tr><td>Placement determinism via declared EKF origin</td><td><code>dd166b3</code></td>
+<td>Field: byte-identical staging all day 07-27</td></tr>
+<tr><td>Preline CSV chain: header fix, station collapse, WYSIWYG preview, control_points, arc fit + curvature segmentation, survey grouping, wet-paint index, waypoint cap</td>
+<td><code>fcb891b 420c40f 99eb3d8 0fc5097 b5ee685 9d9a749 8d2b8b9 0c10fa6 01c68ba</code></td>
+<td>Field 07-27: checklist rows 1.1–1.3, 2.1–2.4 PASS</td></tr>
+<tr><td>Mission identity: /start verifies mission_id; vertex provenance on all load routes; A9 multi-entity corners; terminal MARK→TRANSIT boundary</td>
+<td><code>a686995 21a8b05 e3939e3 75e6012 6aa6426</code></td>
+<td>Field 07-27: app flow end-to-end; square kept 4/4 must-hit</td></tr>
+<tr><td>Dash mode (engine + transport + status exposure)</td><td><code>73c3b3b 0545fa1 0cd284a fc9a025</code></td>
+<td>Field 07-27: row 2.4 PASS, node confirmed <code>mode=dash</code></td></tr>
+<tr><td>Origin trust gate + startup fix; A12 param capture; run-out revert; A14 accuracy honesty + gate; A15 passthrough; A16 CSV extensions</td>
+<td><code>779d9f0 ed358f0 7b57c40 cd3d8ea d0222a0 eb6a040 4a0b3e1 2fa1016</code></td>
+<td>All live-verified on the rover 07-27 (A14 gate <em>trip</em> excepted — see B1)</td></tr>
+<tr><td>GPS status truth (3D_FIX display) + MAVROS GCS heartbeat retype</td><td><code>0e85c64</code> (part)</td>
+<td>Telemetry + journal confirmed on deploy</td></tr>
+</table>
+
+<h3 class="bad-t">❌ UNVERIFIED — built, never field-exercised (≈14 commits)</h3>
+<table>
+<tr><th class="n">#</th><th>Feature</th><th>Key commits</th><th>State</th></tr>
+<tr><td class="n">U1</td><td><strong>RTK-dropout gate TRIP</strong> (Phase B §7.6)</td><td><code>fdf83b0</code></td>
+<td>Ran default-ON all day, never challenged — fix never dropped. <strong>Tomorrow B1.</strong></td></tr>
+<tr><td class="n">U2</td><td><strong>Joystick drive stack</strong>: arm-on-acquire, throttle 0.35, steering axis</td>
+<td><code>0e85c64 212ac9a f2eaaa6</code></td>
+<td>Deployed, heartbeat proven; never driven. <strong>Tomorrow B2.</strong></td></tr>
+<tr><td class="n">U3</td><td><strong>RTK reconnect-anchor grace</strong></td><td><code>0e85c64</code> (part)</td>
+<td>Needs an NTRIP stop/start while watching health. <strong>Tomorrow B3 (pairs with B1).</strong></td></tr>
+<tr><td class="n">U4</td><td>Phase E speed-proportional flow</td><td><code>d2b1b9e</code></td>
+<td>Default OFF; needs 3-speed calibration first. <strong>Tomorrow B4 (optional).</strong></td></tr>
+<tr><td class="n">U5</td><td><code>close_shape</code> (paint the closing side)</td><td><code>a84fcaf</code></td>
+<td>Default OFF, never enabled. <strong>Tomorrow B5 (cheap).</strong></td></tr>
+<tr><td class="n">U6</td><td>Corner fillet for no-arc surveys</td><td><code>3f0008f</code></td>
+<td>Knob never set. Optional; corners already pass at 90°.</td></tr>
+<tr><td class="n">U7</td><td>A3 EKF-reset compensation</td><td><code>8f17e5b</code></td>
+<td>Default OFF; needs its own named A/B — NOT tomorrow.</td></tr>
+<tr><td class="n">U8</td><td>Run-0 pre-align force</td><td><code>19048f0</code></td>
+<td>Param resets on rpp-pipeline restart; unobserved.</td></tr>
+<tr><td class="n">U9</td><td>survey_tolerance_m operator provenance</td><td><code>7d77565</code></td>
+<td>Never set by an operator; analyzer default used instead.</td></tr>
+</table>
+
+<h3>⏸ WAIVED by product scope — point/dot mode (12 commits, do NOT test tomorrow)</h3>
+<p>G0–G5 handshake (<code>87d71b7 40c11d0 4dd454c fa7768f f41fc37 055eb6c</code>),
+Phase D point mode (<code>9218de4 25850c9 67ef615</code>), point-CSV ingest
+(<code>2441614 a4bce1d</code>), handshake bag topics (<code>6026f53</code>).
+Pre-line marking is lines, not dots. Blocked on B1/B15 besides. Recorded in the merge waiver.</p>
+
+<p>Plus 1 revert (<code>d0222a0</code>, counted verified above) and 18 docs/skill commits needing no field time.</p>
+
+<h2>B · TOMORROW — field rows (dry-run first where paint is involved)</h2>
+
+<div class="box">
+<p><strong>Pre-flight = section 0 of <code>PRELINE_ROAD_FIELD_CHECKLIST.html</code>, plus:</strong>
+check <code>/api/rtk/status</code> explicitly — NTRIP never auto-starts after a
+<code>rover-server</code> restart and RTK sits silently at 3D_FIX (bit us twice on 07-27).
+Confirm origin gate OK &lt; 5 cm and note <code>gps_accuracy_known</code>.</p>
+</div>
+
+<table>
+<tr><th class="n">#</th><th>Test</th><th>Set up / do</th><th>PASS if</th><th class="chk">✓</th></tr>
+
+<tr><td class="n">B1</td><td><strong>RTK dropout — gate trip</strong> ★ carried from 07-27 row 2.5</td>
+<td>Any line mission, continuous mode, mid-MARK: <code>POST /api/rtk/stop</code>.
+Monitor <code>/api/spray/status</code> at 1 Hz. Then restart NTRIP from the app.</td>
+<td>Signature <code>desired=true</code> while <code>spraying=false</code> within ~2 s of fix
+falling below 6; <code>safety_reason</code> names GPS; re-enable only after
+<code>gps_recover_hold_s</code>=1.0 s of good fix. <em>Both flags falling together is the
+terminal shutoff, NOT the gate — that is what 07-27 recorded.</em></td><td class="chk">☐</td></tr>
+
+<tr><td class="n">B2</td><td><strong>Joystick drive test</strong> (Monday step 2)</td>
+<td>Open the app joystick page. Drive forward/turn ~30 s. Release deadman. Close page.</td>
+<td>Arm-on-open in one round trip; no jerk on neutral; deadman stops within timeout;
+steering direction correct (axis revert <code>f2eaaa6</code>); 0.35 throttle cap feels right.</td><td class="chk">☐</td></tr>
+
+<tr><td class="n">B3</td><td><strong>RTK reconnect grace</strong></td>
+<td>Rides on B1's NTRIP stop/start: watch health/telemetry through the reconnect.</td>
+<td>No nuisance E-stop or anchor invalidation during the grace window; health recovers
+without a service restart.</td><td class="chk">☐</td></tr>
+
+<tr><td class="n">B4</td><td>Flow calibration → live (optional, needs paint)</td>
+<td>3 lines at 0.15 / 0.35 / 0.60 m/s, flow forced full; then set
+<code>rated_marking_speed_mps</code> + <code>min_flow_value</code>, enable
+<code>flow_modulation_enabled</code>, one slow→fast→slow pass.</td>
+<td>Line density constant across speeds; <code>flow_source=speed_scaled</code>.</td><td class="chk">☐</td></tr>
+
+<tr><td class="n">B5</td><td><code>close_shape</code> (cheap, 1 run)</td>
+<td>Square CSV, stage with <code>"close_shape": true</code>, extensions ON.</td>
+<td>Closing side is PAINTED (4 sides, not 3); no spur; endpoint behaviour unchanged.</td><td class="chk">☐</td></tr>
+
+<tr><td class="n">B6</td><td><strong>Re-survey yesterday's marks</strong> ★ perishable</td>
+<td>RS3 shots along the painted lines from the 07-27 session (12 runs, same site).</td>
+<td>Band width ≤ ~2 cm (confirms the 1.8–1.9 cm claim on paint); band centre vs surveyed
+line = <strong>nozzle offset</strong> (feeds B4/nozzle plan — the one budget no log answers).</td><td class="chk">☐</td></tr>
+</table>
+
+<h2>C · Carried-over DESK items (no rover needed — can run in parallel)</h2>
+<table>
+<tr><th class="n">#</th><th>Item</th><th>Note</th></tr>
+<tr><td class="n">C1</td><td>Grade the 12 session bags per-station</td>
+<td><code>bags/27_07_2026/PRELINE_FIELD/session_bags/</code> — decides <strong>0.3 vs 0.5
+extensions</strong> and quantifies the entry/terminal improvement. One manifest
+(<code>…183723</code>) unreadable — regenerate from the bag.</td></tr>
+<tr><td class="n">C2</td><td>Re-dispatch the frontend extensions agent</td>
+<td>Died mid-run on an API error. Fields page still has no CSV extensions control —
+top frontend gap; backend (A16) is live.</td></tr>
+<tr><td class="n">C3</td><td>Week-audit report (this doc = the grading input) + merge waiver</td>
+<td>Waiver must name: RTK-dropout unproven (until B1 passes), point mode waived by scope,
+frontend CSV-extensions control missing, A14 residue (non-reporting boots fix-type-only).</td></tr>
+<tr><td class="n">C4</td><td>Merge <code>Upgrade_Spray</code> → <code>baseline_master</code>, then bug A11</td>
+<td>After the report. A11 = point-CSV validation swallowed (registered, deferred).</td></tr>
+<tr><td class="n">C5</td><td><code>fit_arcs_max_dev_m</code> sweep (laptop)</td>
+<td>Default 15 cm is 6× tolerance. Find the tightest value that avoids the turning-radius
+warning; candidate for the next curve run. A15 made it reachable.</td></tr>
+</table>
+
+<h3>Notes / anomalies</h3>
+<p style="border:1px solid var(--line); min-height:110px; border-radius:5px;"></p>
+
+</body>
+</html>

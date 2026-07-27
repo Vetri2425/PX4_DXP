@@ -94,6 +94,27 @@ free_port() {
     fi
 }
 
+apply_gcs_heartbeat() {
+    # PX4 with NAV_DLL_ACT>0 refuses to ARM (NavModes::All, RC included) unless
+    # a MAVLink HEARTBEAT typed MAV_TYPE_GCS arrived within COM_DL_LOSS_T.
+    # MAVROS heartbeats as ONBOARD_CONTROLLER by default, which PX4 tracks
+    # separately and which never clears gcs_connection_lost — so arming used to
+    # require QGC to be open. Retype the MAVROS heartbeat so the Jetson link
+    # itself satisfies the GCS prearm check. Param name differs across mavros2
+    # builds (sub-node vs dotted) — try both.
+    local attempt
+    for attempt in 1 2 3; do
+        if ros2 param set /mavros/sys heartbeat_mav_type GCS >/dev/null 2>&1 \
+            || ros2 param set /mavros sys.heartbeat_mav_type GCS >/dev/null 2>&1; then
+            log "MAVROS heartbeat retyped to GCS — arming no longer requires QGC"
+            return 0
+        fi
+        sleep 2
+    done
+    log "WARNING: failed to set MAVROS heartbeat_mav_type=GCS — arming will still require a connected QGC"
+    return 0
+}
+
 mavros_watchdog() {
     local mavros_pid=""
 
@@ -136,6 +157,7 @@ mavros_watchdog() {
 
         if [[ "$ready" -eq 1 ]]; then
             log "Watchdog: MAVROS ready (PID $mavros_pid)"
+            apply_gcs_heartbeat
             touch "$MAVROS_READY_FLAG"
             wait "$mavros_pid" 2>/dev/null || true
             log "Watchdog: MAVROS exited — restarting in ${MAVROS_RESTART_DELAY}s..."

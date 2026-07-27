@@ -52,6 +52,113 @@ POSE_STALE_MS = 300.0       # pose age beyond this is a staleness event
 RTK_MIN_FIX = 6             # GPSRAW fix_type below this during drive = RTK degraded
 EKF_JUMP_M = 0.5            # pose position jump between consecutive samples
 
+# ── geometry fidelity (§9) ───────────────────────────────────────────────────
+# The controller conditions /path before tracking it (rpp_controller_node
+# _simplify_path_for_profile): collinear resample points are dropped so segment
+# mode sees real segments instead of 5 cm crumbs. That is correct for generated
+# geometry — but it also silently deletes surveyed vertices that bend the line
+# only slightly, and nothing in this report could see it, because §1 TRACKING
+# reads /rpp/debug[0], which is the controller's error against its OWN
+# conditioned path. The rover graded its own homework and always passed.
+#
+# 2026-07-18 field case (tes_cross_line.dxf, 4 surveyed points): interior
+# vertices bent the line 1.45° / 2.79° and sat 3.4 / 4.4 cm off the end-to-end
+# chord. Both were dropped, /rpp/conditioned_path came out as TWO points, and
+# the rover drove a straight line past them — while §1 reported RMS 0.73 cm and
+# verdict PASS.
+#
+# This section compares the two recorded paths directly and reports what was
+# removed. It is diagnostic, not a controller change: dropping a vertex is
+# legitimate when the deviation is survey noise. The point is that it must be
+# VISIBLE, with the number attached, so the operator can judge.
+# DEFAULT only — override per mission (operator, staged with the plan) or per
+# run (--survey-tol-cm). It is a property of the SURVEY, not of the analyser:
+# a 1.7 cm single-epoch RS3 shot and a 5 mm averaged one cannot share a
+# threshold. 2.5 cm is empirical, from the 2026-07-22 Emlid export — lateral
+# RMS 1.7 cm at Samples=1 against vertex intent of 3.4/4.4 cm. Because this
+# number decides a FAIL, every report states which source it came from.
+SURVEY_TOL_CM = 2.5         # deviations below this read as survey noise, above = intent
+# S8 ABSOLUTE ACCURACY. Separate budget from S1 (tracking) and S9 (geometry):
+# both of those live entirely inside the local frame, so a wrong ANCHOR shifts the
+# whole shape on the ground while every local metric still reads perfect.
+ABS_MISS_WARN_CM = 5.0      # per-vertex absolute miss above this = WARN
+ABS_MISS_FAIL_CM = 15.0     # ...above this = FAIL
+ABS_BIAS_FAIL_CM = 10.0     # a consistent mean offset this large is a placement error
+VERTEX_BEND_DEG = 0.8       # heading change that marks a /path point as a real vertex
+# S9 TRAVERSAL. manifest.outcome.status is hardcoded "COMPLETE" by the recorder
+# whenever it shuts down in an orderly way — a clean abort at 40% and a full run
+# are indistinguishable there. Runs covering 24/64 and 76/86 waypoints both read
+# COMPLETE, so filtering bags on that field silently mixes partial runs into an
+# error budget. Coverage is the fraction of /path the pose actually reached.
+COVERAGE_RADIUS_M = 0.25    # a path point counts as reached within this distance
+COVERAGE_COMPLETE = 0.98    # at/above this the path was traversed end to end
+COVERAGE_PARTIAL = 0.75     # below this it is not a full run at all
+
+
+_WGS84_A = 6378137.0
+_WGS84_F = 1.0 / 298.257223563
+_WGS84_E2 = _WGS84_F * (2.0 - _WGS84_F)
+
+
+def _metres_per_degree(lat_deg: float) -> tuple[float, float]:
+    """(north, east) metres per degree on the WGS84 ellipsoid.
+
+    North uses the MERIDIONAL radius of curvature, east the prime vertical.
+    Using the semi-major axis for north is a +0.62% scale error at 13 deg — the
+    bug that was fixed in path_engine/parsers/georef.py on 2026-07-22. Kept
+    duplicated here on purpose: this tool must stay a stdlib-only, independent
+    check on the pipeline, not import the code it is auditing.
+    """
+    lat = math.radians(lat_deg)
+    sn = math.sin(lat)
+    w2 = 1.0 - _WGS84_E2 * sn * sn
+    w = math.sqrt(w2)
+    m_merid = _WGS84_A * (1.0 - _WGS84_E2) / (w2 * w)
+    n_prime = _WGS84_A / w
+    per = math.radians(1.0)
+    return (m_merid * per, n_prime * per * math.cos(lat))
+
+
+def _geodesic_ne_m(lat1, lon1, lat2, lon2) -> tuple[float, float]:
+    """(north, east) metres from point 1 to point 2. Local-tangent, exact enough
+    over a marking site (sub-mm below a few hundred metres)."""
+    mn, me = _metres_per_degree((lat1 + lat2) * 0.5)
+    return ((lat2 - lat1) * mn, (lon2 - lon1) * me)
+
+
+def _geodesic_m(lat1, lon1, lat2, lon2) -> float:
+    dn, de = _geodesic_ne_m(lat1, lon1, lat2, lon2)
+    return math.hypot(dn, de)
+
+
+def _perp_from_span(p, a, b) -> float:
+    """Perpendicular distance of p from the infinite line a->b (metres).
+
+    Measured against the SPAN BEING COLLAPSED, deliberately. The controller's
+    own guard measures against the next raw sample ~5 cm away, which reads ~1 mm
+    at a vertex sitting 4 cm off the retained chord — that is why its
+    max_offset_m test never fires on a densified path.
+    """
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    h = math.hypot(dx, dy)
+    if h < 1e-9:
+        return math.hypot(p[0] - a[0], p[1] - a[1])
+    return abs(dx * (a[1] - p[1]) - dy * (a[0] - p[0])) / h
+
+
+def _xtrack_to_polyline(p, poly) -> float:
+    """Shortest distance from p to a polyline (metres)."""
+    best = float("inf")
+    for j in range(len(poly) - 1):
+        a, b = poly[j], poly[j + 1]
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        s2 = dx * dx + dy * dy
+        t = 0.0 if s2 < 1e-12 else max(0.0, min(1.0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / s2))
+        d = math.hypot(p[0] - (a[0] + t * dx), p[1] - (a[1] + t * dy))
+        if d < best:
+            best = d
+    return best
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CDR reader — classic little-endian XCDR1 with proper member alignment.
@@ -178,12 +285,57 @@ def _p_statustext(d):
 
 
 def _p_gpsraw(d):
-    # header + uint8 fix_type is all we need; deeper fields vary by version.
+    """mavros_msgs/GPSRAW — the receiver's OWN lat/lon, upstream of the EKF.
+
+    This is the only position in the bag that is NOT downstream of the EKF:
+    pose-derived geo is the EKF grading its own homework (it IS ekf_origin +
+    local_NED), so run-to-run physical separation must be measured here.
+    Field layout validated against the 2026-07-25 bags
+    (bags/25_07_2026/Analysis/scripts/gpsraw.py): lat/lon land at the site,
+    fix_type 6, h_acc 1.4-2.1 cm — reading anything shifted produces garbage
+    coordinates, which is the sanity check.
+    """
     r = _CDR(d); r.header()
-    return {"fix_type": r.u8()}
+    fix = r.u8()
+    lat = r.i32(); lon = r.i32(); alt = r.i32()          # degE7 / degE7 / mm
+    eph = r.u16(); epv = r.u16(); vel = r.u16(); cog = r.u16()
+    sats = r.u8()
+    r.i32()                                              # alt_ellipsoid (mm)
+    h_acc = r.u32(); v_acc = r.u32()                     # mm
+    return {"fix_type": fix, "lat": lat * 1e-7, "lon": lon * 1e-7,
+            "alt": alt * 1e-3, "eph": eph, "epv": epv, "vel": vel, "cog": cog,
+            "sats": sats, "h_acc": h_acc * 1e-3, "v_acc": v_acc * 1e-3}
+
+
+def _p_navsatfix(d):
+    """sensor_msgs/NavSatFix — the rover's own lat/lon, for absolute accuracy (S8).
+
+    NavSatStatus is `int8 status` + `uint16 service` — service is SIXTEEN bits.
+    Reading it as uint8 shifts every following float64 by one slot, so latitude
+    lands in the longitude field and the whole fix is garbage. Validated against
+    a real bag: the origin must come out near the site, not near (0, lat).
+    """
+    r = _CDR(d); r.header()
+    r.i8()                               # NavSatStatus.status
+    r.u16()                              # NavSatStatus.service  (uint16, not uint8)
+    lat = r.f64(); lon = r.f64(); alt = r.f64()
+    return {"lat": lat, "lon": lon, "alt": alt}
+
+
+def _p_geopoint(d):
+    """geographic_msgs/GeoPointStamped — the EKF local-frame origin (gp_origin).
+
+    header + GeoPoint{float64 latitude, longitude, altitude}. This is the datum
+    the local /path is expressed against; used to render /path back into lat/lon.
+    """
+    r = _CDR(d); r.header()
+    lat = r.f64(); lon = r.f64(); alt = r.f64()
+    return {"lat": lat, "lon": lon, "alt": alt}
 
 
 PARSERS = {
+    "sensor_msgs/msg/NavSatFix": _p_navsatfix,
+    "geographic_msgs/msg/GeoPointStamped": _p_geopoint,
     "geometry_msgs/msg/PoseStamped": _p_pose,
     "geometry_msgs/msg/TwistStamped": _p_twist,
     "geometry_msgs/msg/Vector3Stamped": _p_vec3,
@@ -339,13 +491,20 @@ def _pctl(sorted_vals, q):
 
 
 def _stat_block(vals):
-    """RMS / median / p95 / max / mean over |vals| in cm, plus signed bias."""
+    """RMS / median / p95 / max / mean over |vals| in cm, plus signed bias.
+
+    ``zero_frac`` makes left + right + zero sum to 1: the controller publishes
+    hardcoded cross_track=0.0 while braking/aligning (not tracking), and those
+    placeholder samples used to vanish from the L/R split — the missing 32%
+    in the 2026-07-25 bags (B7).
+    """
     if not vals:
         return None
     absv = sorted(abs(v) for v in vals)
     rms = math.sqrt(sum(v * v for v in vals) / len(vals))
     left = sum(1 for v in vals if v < 0)
     right = sum(1 for v in vals if v > 0)
+    zero = len(vals) - left - right
     return {
         "n": len(vals),
         "rms_cm": round(rms * 100, 2),
@@ -355,6 +514,7 @@ def _stat_block(vals):
         "mean_signed_cm": round((sum(vals) / len(vals)) * 100, 2),
         "left_frac": round(left / len(vals), 3),
         "right_frac": round(right / len(vals), 3),
+        "zero_frac": round(zero / len(vals), 3),
     }
 
 
@@ -390,12 +550,19 @@ class Series:
         self.seg = []        # (t, state, heading_err)
         self.yaw_rate = []   # (t, val)
         self.path = None     # [(n, e)] NED
+        self.paths = []      # (t, [(n, e)]) EVERY /path message — one per run
+        self.cond_paths = [] # (t, [(n, e)]) EVERY /rpp/conditioned_path message
         self.spray_active = []    # (t, bool) desired MARK
         self.spray_desired = []   # (t, bool)
         self.spray_commanded = [] # (t, bool)
         self.spray_state = []     # (t, bool)
         self.statustext = []      # (t, severity, text)
         self.gps = []             # (t, fix_type)
+        self.gps_raw = []         # (t, lat, lon, sats, h_acc) — receiver's own fix (GPSRAW, ~5 Hz, EKF-independent)
+        self.raw_fix = []         # (t, lat, lon, alt) — receiver's own fix (raw/fix NavSatFix, denser, EKF-independent)
+        self.global_fix = []      # (t, lat, lon, alt) — EKF WGS84 position (= ekf_origin + local NED; NOT independent)
+        self.path_z = None        # z bitfield of the kept /path (bit1 = must-hit)
+        self.ekf_origin = None    # (lat, lon) — EKF local-frame datum (gp_origin)
         self.topics_seen = {}     # name -> count
 
 
@@ -423,7 +590,22 @@ def collect(bag_dir: str) -> Series:
             s.yaw_rate.append((t, m["data"]))
         elif topic == "/path":
             if m["poses"]:
-                s.path = [(p[0], p[1]) for p in m["poses"]]   # /path is NED direct (x=N, y=E)
+                # /path is NED direct (x=N, y=E). A staged mission publishes SEVERAL
+                # /path messages — a 2-pt transit hop, the mark run, then a 1-pt
+                # endpoint marker. Taking the LAST one (the old behaviour) left
+                # s.path as that single endpoint point, so analyze_stops ran against
+                # a 1-point path: _stop_vertices returned [0], verts[idx-1] wrapped
+                # to the same point, and every stop metric was meaningless. Keep the
+                # longest — that is the mark run, the geometry actually driven.
+                pts = [(p[0], p[1]) for p in m["poses"]]
+                s.paths.append((t, pts))
+                if s.path is None or len(pts) > len(s.path):
+                    s.path = pts
+                    # position.z is a bitfield: bit0 spray, bit1 must-hit vertex.
+                    s.path_z = [int(round(p[2])) for p in m["poses"]]
+        elif topic == "/rpp/conditioned_path":
+            if m["poses"]:
+                s.cond_paths.append((t, [(p[0], p[1]) for p in m["poses"]]))
         elif topic == "/spray/active":
             s.spray_active.append((t, m["data"]))
         elif topic == "/spray/desired":
@@ -436,9 +618,25 @@ def collect(bag_dir: str) -> Series:
             s.statustext.append((t, m["severity"], m["text"]))
         elif topic == "/mavros/gpsstatus/gps1/raw":
             s.gps.append((t, m["fix_type"]))
+            # receiver's own position — guard the (0,0) no-fix placeholder
+            if abs(m["lat"]) <= 90.0 and not (m["lat"] == 0.0 and m["lon"] == 0.0):
+                s.gps_raw.append((t, m["lat"], m["lon"], m["sats"], m["h_acc"]))
+        elif topic == "/mavros/global_position/raw/fix":
+            if m["lat"] == m["lat"] and abs(m["lat"]) <= 90.0 \
+                    and not (m["lat"] == 0.0 and m["lon"] == 0.0):
+                s.raw_fix.append((t, m["lat"], m["lon"], m["alt"]))
+        elif topic == "/mavros/global_position/global":
+            if m["lat"] == m["lat"] and abs(m["lat"]) <= 90.0:   # skip NaN / unset
+                s.global_fix.append((t, m["lat"], m["lon"], m["alt"]))
+        elif topic == "/mavros/global_position/gp_origin":
+            # Latched EKF datum; one message. Guard NaN / (0,0) placeholder.
+            if (m["lat"] == m["lat"] and abs(m["lat"]) <= 90.0
+                    and not (m["lat"] == 0.0 and m["lon"] == 0.0)):
+                s.ekf_origin = (m["lat"], m["lon"])
     for lst in (s.pose, s.vel_meas, s.vel_cmd, s.setpoint, s.state, s.rpp, s.seg,
                 s.yaw_rate, s.spray_active, s.spray_desired, s.spray_commanded,
-                s.spray_state, s.statustext, s.gps):
+                s.spray_state, s.statustext, s.gps, s.gps_raw, s.raw_fix,
+                s.global_fix):
         lst.sort(key=lambda r: r[0])
     return s
 
@@ -463,13 +661,25 @@ def analyze_tracking(s: Series) -> dict:
             if on:
                 xt_mark.append(d[0])
         out["marking_only"] = _stat_block(xt_mark) if xt_mark else None
-    ov = out["overall"]
-    out["verdict"] = ("PASS" if ov and ov["rms_cm"] <= XTRACK_PROD_CM else "FAIL") if ov else "WARN"
+    # B7: the verdict grades the PAINTED span when a spray signal exists. The
+    # overall block averages in pivot/idle placeholder zeros (32% of samples in
+    # the 2026-07-25 bags) and can dilute a 5 cm marking error below the gate.
+    basis = out.get("marking_only") or out["overall"]
+    out["verdict_basis"] = "marking_only" if out.get("marking_only") else "overall"
+    out["verdict"] = (("PASS" if basis["rms_cm"] <= XTRACK_PROD_CM else "FAIL")
+                      if basis else "WARN")
     return out
 
 
 def _pivot_windows(seg):
-    """Yield (i_stop, i_align, i_rel) index triples for each STOP→ALIGN→TRACK pivot."""
+    """Yield (i_stop, i_align, i_rel) index triples for each STOP→ALIGN→TRACK pivot.
+
+    ``i_rel`` is None when no S_TRACK ever follows the ALIGN (e.g. the topic
+    goes silent because the next run is the smooth profile — B3). B12a: the old
+    fallback to n-1 silently measured ALIGN-start → end-of-bag as a "settle
+    time" and let post-mission DONE samples (heading_err = NaN) leak into the
+    reverse-flip scan.
+    """
     wins = []
     i = 0
     n = len(seg)
@@ -479,9 +689,9 @@ def _pivot_windows(seg):
             i_align = next((j for j in range(i_stop + 1, n) if seg[j][1] == S_ALIGN), None)
             if i_align is None:
                 break
-            i_rel = next((j for j in range(i_align + 1, n) if seg[j][1] == S_TRACK), n - 1)
+            i_rel = next((j for j in range(i_align + 1, n) if seg[j][1] == S_TRACK), None)
             wins.append((i_stop, i_align, i_rel))
-            i = i_rel + 1
+            i = (i_rel if i_rel is not None else i_align) + 1
         else:
             i += 1
     return wins
@@ -495,13 +705,18 @@ def analyze_pivots(s: Series) -> dict:
         return {"available": True, "count": 0, "pivots": [],
                 "note": "no CORNER_STOP→ALIGN→TRACK pivots in this mission"}
     pivots = []
-    worst_settle = 0.0
+    settles: list[float] = []      # finite settle errors only (B12b)
     any_flip = False
+    any_unreleased = False
     for k, (i_stop, i_align, i_rel) in enumerate(wins):
-        t_stop, t_align, t_rel = s.seg[i_stop][0], s.seg[i_align][0], s.seg[i_rel][0]
-        herr0 = math.degrees(abs(s.seg[i_align][2]))
+        released = i_rel is not None
+        i_end = i_rel if released else len(s.seg) - 1
+        t_stop, t_align = s.seg[i_stop][0], s.seg[i_align][0]
+        t_end = s.seg[i_end][0]
+        herr0_raw = s.seg[i_align][2]
+        herr0 = math.degrees(abs(herr0_raw)) if math.isfinite(herr0_raw) else None
         # turn magnitude — pose-yaw swept between stop and release
-        yaws = [y for (t, _n, _e, y) in s.pose if t_stop <= t <= t_rel]
+        yaws = [y for (t, _n, _e, y) in s.pose if t_stop <= t <= t_end]
         swept = 0.0
         for a, b in zip(yaws, yaws[1:]):
             swept += _wrap(b - a)
@@ -510,7 +725,9 @@ def analyze_pivots(s: Series) -> dict:
         min_fwd = math.inf
         vc_series = [(t, (vn, ve)) for (t, vn, ve) in s.vel_cmd]
         yw_series = [(pt, py) for (pt, _n, _e, py) in s.pose]
-        for (t, st, he) in s.seg[i_align:i_rel + 1]:
+        for (t, st, he) in s.seg[i_align:i_end + 1]:
+            if not math.isfinite(he):
+                continue  # B12c: NaN heartbeat (DONE/IDLE) — not a turning sample
             if abs(math.degrees(he)) <= TURNING_BAND_DEG:
                 continue  # align-brake (intentional reverse) — not a flip
             vc = _nearest(vc_series, t)
@@ -521,12 +738,18 @@ def analyze_pivots(s: Series) -> dict:
             min_fwd = min(min_fwd, fwd)
         flip = (min_fwd is not math.inf) and (min_fwd < FWD_EPS)
         any_flip = any_flip or flip
-        # settle — |heading_err| at release
-        settle_deg = math.degrees(abs(s.seg[i_rel][2] if s.seg[i_rel][1] == S_TRACK
-                                       else s.seg[i_rel - 1][2]))
-        worst_settle = max(worst_settle, settle_deg)
-        # oscillation count during ALIGN
-        herr = [abs(s.seg[j][2]) for j in range(i_align, i_rel + 1)]
+        # settle — |heading_err| at release. Only meaningful when the pivot
+        # actually released; a NaN there is "unknown", never 0.0 (B12b).
+        settle_deg = None
+        if released:
+            he_rel = (s.seg[i_rel][2] if s.seg[i_rel][1] == S_TRACK
+                      else s.seg[i_rel - 1][2])
+            if math.isfinite(he_rel):
+                settle_deg = math.degrees(abs(he_rel))
+                settles.append(settle_deg)
+        # oscillation count during ALIGN (finite samples only)
+        herr = [abs(s.seg[j][2]) for j in range(i_align, i_end + 1)
+                if math.isfinite(s.seg[j][2])]
         rises = 0
         if herr:
             run_min = herr[0]
@@ -536,23 +759,26 @@ def analyze_pivots(s: Series) -> dict:
                     run_min = h
                 else:
                     run_min = min(run_min, h)
-        # settle time
-        settle_s = round(t_rel - t_align, 2)
+        any_unreleased = any_unreleased or not released
         pivots.append({
             "index": k,
-            "initial_heading_err_deg": round(herr0, 1),
+            "released": released,
+            "initial_heading_err_deg": (round(herr0, 1) if herr0 is not None else None),
             "turn_magnitude_deg": round(turn_deg, 1),
-            "settle_time_s": settle_s,
-            "settle_err_deg": round(settle_deg, 2),
+            "settle_time_s": (round(t_end - t_align, 2) if released else None),
+            "settle_err_deg": (round(settle_deg, 2) if settle_deg is not None else None),
             "min_fwd_component_m_s": (None if min_fwd is math.inf else round(min_fwd, 3)),
             "reverse_flip": flip,
             "oscillations": rises,
         })
+    worst_settle = max(settles) if settles else None
     verdict = "PASS"
-    if any_flip or worst_settle > SETTLE_TOL_DEG:
+    if any_flip or (worst_settle is not None and worst_settle > SETTLE_TOL_DEG):
         verdict = "FAIL"
     return {"available": True, "count": len(pivots), "pivots": pivots,
-            "any_reverse_flip": any_flip, "worst_settle_deg": round(worst_settle, 2),
+            "any_reverse_flip": any_flip,
+            "worst_settle_deg": (round(worst_settle, 2) if worst_settle is not None else None),
+            "unreleased_pivots": any_unreleased,
             "verdict": verdict}
 
 
@@ -603,10 +829,22 @@ def analyze_stops(s: Series) -> dict:
     for idx in stop_idx:
         bn, be = verts[idx]
         dists = [math.hypot(n - bn, e - be) for (n, e) in rover]
-        i_arrive = next((i for i, d in enumerate(dists) if d <= STOP_APPROACH_CM / 100.0), None)
+        is_endpoint = (idx == last_idx)
+        # Arrival index. For the ENDPOINT this must be the arrival on the FINAL
+        # approach, not the first time the rover was ever near the point: on a
+        # there-and-back shape the rover starts parked beside its own endpoint, so
+        # a first-ever match lands at t≈0 and every window below then spans the
+        # whole mission. Anchor to the last departure beyond DEPART_M first.
+        search_from = 0
+        if is_endpoint:
+            for i in range(len(dists) - 1, -1, -1):
+                if dists[i] > DEPART_M:
+                    search_from = i + 1
+                    break
+        i_arrive = next((i for i in range(search_from, len(dists))
+                         if dists[i] <= STOP_APPROACH_CM / 100.0), None)
         if i_arrive is None:
             continue  # never got close enough to call it a stop
-        is_endpoint = (idx == last_idx)
         # incoming travel direction (unit) into this stop — "past the corner" is
         # the forward projection along it. At a 90° corner the perpendicular
         # departure contributes ~0, so this isolates the true overshoot (unlike a
@@ -635,17 +873,29 @@ def analyze_stops(s: Series) -> dict:
         }
         worst_coast = max(worst_coast, coast)
         if is_endpoint:
-            # euclidean max-distance-after-arrival too (the D3 completion metric):
-            # the endpoint must be a true final stop, so this counts toward verdict.
+            # Where the rover actually came to rest. This is the D3 completion
+            # metric and the trustworthy one — see FINAL_STOP_MAX_CM below.
             entry["resting_cm"] = round(dists[-1] * 100, 1)
-            endpoint_coast = max(dists[i_arrive:])
-            entry["max_dist_after_arrival_cm"] = round(endpoint_coast * 100, 1)
-            worst_coast = max(worst_coast, endpoint_coast)
+            #
+            # `max_dist_after_arrival_cm` used to live here as a second gate and is
+            # GONE on purpose. It was a euclidean max, which cannot tell "still
+            # 10 cm short of the point" from "10 cm past it" — every window you can
+            # anchor it to has its own floor built in (DEPART_M gives ~30 cm,
+            # STOP_APPROACH_CM gives ~10 cm), so it reported a constant artifact and
+            # failed missions that rested 1.1 cm from their endpoint. Overshoot is
+            # already measured correctly above, as the SIGNED forward projection
+            # along the incoming direction (`coast`), which is what a euclidean
+            # distance can never be.
         stops.append(entry)
     saw_done = any(st == S_DONE for (_t, st, _h) in s.seg)
-    verdict = "PASS" if worst_coast <= COAST_MAX_CM / 100.0 else "FAIL"
+    # Endpoint settling is its own criterion. FINAL_STOP_MAX_CM has been declared
+    # since this analyser was written but was never wired to anything.
+    resting_cm = next((e["resting_cm"] for e in stops if e.get("is_endpoint")), None)
+    resting_bad = resting_cm is not None and resting_cm > FINAL_STOP_MAX_CM
+    verdict = ("FAIL" if (worst_coast > COAST_MAX_CM / 100.0 or resting_bad) else "PASS")
     return {"available": True, "count": len(stops), "stops": stops,
             "worst_coast_cm": round(worst_coast * 100, 1),
+            "endpoint_resting_cm": resting_cm,
             "reached_done": saw_done, "verdict": verdict}
 
 
@@ -718,8 +968,12 @@ def analyze_health(s: Series) -> dict:
     for (t1, n1, e1, _), (t2, n2, e2, _) in zip(s.pose, s.pose[1:]):
         if math.hypot(n2 - n1, e2 - e1) > EKF_JUMP_M and (t2 - t1) < 0.5:
             jumps += 1
-    # pose staleness from rpp/debug[6] (pose_age_ms)
-    stale = sum(1 for (_t, d) in s.rpp if d and len(d) > 6 and d[6] > POSE_STALE_MS)
+    # pose staleness from rpp/debug[6] (pose_age_ms). B12: `nan > thresh` is
+    # False, so NaN heartbeats used to count as HEALTHY — count them apart.
+    stale = sum(1 for (_t, d) in s.rpp
+                if d and len(d) > 6 and math.isfinite(d[6]) and d[6] > POSE_STALE_MS)
+    stale_unknown = sum(1 for (_t, d) in s.rpp
+                        if d and len(d) > 6 and not math.isfinite(d[6]))
     # statustext failsafe / reject lines
     st_flags = [{"t": round(t, 2), "severity": sev, "text": txt}
                 for (t, sev, txt) in s.statustext
@@ -735,9 +989,447 @@ def analyze_health(s: Series) -> dict:
             "rtk_degraded_samples": rtk_bad,
             "ekf_position_jumps": jumps,
             "pose_stale_samples": stale,
+            "pose_age_unknown_samples": stale_unknown,
             "statustext_flags": st_flags[:20],
             "events": events[:20],
             "verdict": verdict}
+
+
+def _path_vertices(poly, bend_deg=VERTEX_BEND_DEG):
+    """Interior points of *poly* where the heading turns by more than bend_deg.
+
+    On a densified /path these are exactly the CAD-authored vertices: every
+    other point is a resample sitting dead on its own leg.
+    """
+    out = []
+    for i in range(1, len(poly) - 1):
+        h0 = math.atan2(poly[i][1] - poly[i - 1][1], poly[i][0] - poly[i - 1][0])
+        h1 = math.atan2(poly[i + 1][1] - poly[i][1], poly[i + 1][0] - poly[i][0])
+        d = abs(_wrap(h1 - h0))
+        if math.degrees(d) > bend_deg:
+            out.append((i, poly[i], math.degrees(d)))
+    return out
+
+
+def resolve_survey_tol_cm(manifest, cli_cm: float | None = None) -> tuple[float, str]:
+    """Return (tolerance_cm, where_it_came_from).
+
+    Precedence: explicit --survey-tol-cm, then the value the operator staged
+    with the mission, then the documented default. The provenance string is
+    returned rather than logged because this threshold decides whether §7
+    FAILs — a verdict that turns on an unattributed constant is not a verdict.
+
+    An unusable staged value (non-numeric, zero, negative, absurd) falls back
+    to the default and SAYS SO, instead of silently judging the run by a
+    number nobody chose.
+    """
+    if cli_cm is not None:
+        return float(cli_cm), "--survey-tol-cm"
+
+    # B9: the recorder writes "plan_provenance"; "staged_mission" never existed
+    # in a real manifest (only in test fixtures). Accept both, prefer the real one.
+    staged = ((manifest or {}).get("plan_provenance")
+              or (manifest or {}).get("staged_mission") or {})
+    raw = staged.get("survey_tolerance_m")
+    if raw is not None:
+        try:
+            val_m = float(raw)
+        except (TypeError, ValueError):
+            return SURVEY_TOL_CM, f"default (staged value {raw!r} is not a number)"
+        if 0.0 < val_m <= 1.0:
+            return val_m * 100.0, "staged with the mission (operator-set)"
+        return SURVEY_TOL_CM, f"default (staged value {val_m} m out of range)"
+
+    return SURVEY_TOL_CM, "built-in default — not set for this survey"
+
+
+def analyze_traversal(s: Series, radius_m: float = COVERAGE_RADIUS_M) -> dict:
+    """Did the rover actually GO everywhere it was told to? (report §9)
+
+    Every other section measures how well the rover drove the part of the path
+    it drove. None of them notice that it stopped a third of the way through:
+    an aborted run just yields fewer samples, and its statistics are biased —
+    it never reaches the far corners, so its error budget reads low. That is
+    what makes a partial run dangerous when it is averaged in with full ones.
+
+    Coverage = fraction of /path points that the pose came within radius_m of.
+    Deliberately NOT cross-track: a rover that stops dead on the line has zero
+    xtrack error for the rest of the mission it never drove.
+    """
+    if not s.path:
+        return {"available": False, "reason": "no /path in bag"}
+    if len(s.pose) < 2:
+        return {"available": False, "reason": "no pose samples in bag"}
+
+    # Uniform grid over the poses, cell = radius, so each path point tests only
+    # its own cell and the 8 around it. The naive all-pairs scan is O(path x
+    # pose), which is fine for a 160-point square and minutes of wall-clock for
+    # a 17k-waypoint plan against 10k pose samples.
+    cell = max(radius_m, 1e-6)
+    grid: dict[tuple[int, int], list[tuple[float, float]]] = {}
+    for rec in s.pose:
+        n, e = rec[1], rec[2]
+        grid.setdefault((int(n // cell), int(e // cell)), []).append((n, e))
+
+    r2 = radius_m * radius_m
+    covered: list[bool] = []
+    for (pn, pe) in s.path:
+        gn, ge = int(pn // cell), int(pe // cell)
+        hit = False
+        for dn in (-1, 0, 1):
+            for de in (-1, 0, 1):
+                for (n, e) in grid.get((gn + dn, ge + de), ()):
+                    if (n - pn) ** 2 + (e - pe) ** 2 <= r2:
+                        hit = True
+                        break
+                if hit:
+                    break
+            if hit:
+                break
+        covered.append(hit)
+
+    total = len(covered)
+    num_covered = sum(covered)
+    coverage = num_covered / total if total else 0.0
+
+    # WHERE the misses sit matters more than how many there are, and the 07-22
+    # field bags proved a two-way split (abort vs skip) was too coarse: the
+    # 24/64 run covered the LAST 24 points, not the first — it never drove the
+    # beginning at all. Measure the leading and trailing runs of misses and
+    # classify from those.
+    first_covered = next((i for i, c in enumerate(covered) if c), None)
+    last_covered = max((i for i, c in enumerate(covered) if c), default=-1)
+    lead_missing = first_covered if first_covered is not None else total
+    trail_missing = (total - 1 - last_covered) if last_covered >= 0 else 0
+    interior_missing = (
+        total - num_covered - lead_missing - trail_missing if num_covered else 0
+    )
+
+    if num_covered == 0:
+        shape = "NONE"
+    elif lead_missing == trail_missing == interior_missing == 0:
+        shape = "FULL"
+    elif interior_missing:
+        # Missed geometry with driven path on both sides of it.
+        shape = "INTERIOR_GAP"
+    elif lead_missing and trail_missing:
+        shape = "MIDDLE_ONLY"
+    elif lead_missing:
+        # Drove to the end, but the start was never reached: a late start, a
+        # resumed mission, or a recorder that began after the rover did.
+        shape = "STARTED_LATE"
+    else:
+        shape = "STOPPED_EARLY"
+
+    if coverage >= COVERAGE_COMPLETE:
+        status = "COMPLETE"
+    elif coverage >= COVERAGE_PARTIAL:
+        status = "MOSTLY"
+    else:
+        status = "PARTIAL"
+
+    return {
+        "available": True,
+        "status": status,
+        "shape": shape,
+        "coverage": round(coverage, 4),
+        "points_total": total,
+        "points_covered": num_covered,
+        "radius_cm": round(radius_m * 100, 1),
+        "first_covered_index": first_covered,
+        "last_covered_index": last_covered,
+        "missing_leading": lead_missing,
+        "missing_trailing": trail_missing,
+        "missing_interior": interior_missing,
+        # Kept for the one question most callers ask. NOTE: false on a run that
+        # never started, which is why `shape` exists — do not read this alone.
+        "stopped_early": shape == "STOPPED_EARLY",
+        "verdict": "PASS" if status == "COMPLETE" else "FAIL",
+    }
+
+
+def _write_traversal_to_manifest(root: str, traversal: dict) -> str | None:
+    """Fold the traversal verdict back into the bundle's manifest.
+
+    The whole point is to be machine-detectable WITHOUT opening the bag, so the
+    number has to live next to outcome. Rewrites only this one key, atomically,
+    and never raises — a bundle whose manifest cannot be updated is still a
+    valid bundle with a valid analysis.json.
+    """
+    mpath = os.path.join(root, "manifest.json")
+    if not os.path.isfile(mpath):
+        return None
+    try:
+        with open(mpath) as f:
+            manifest = json.load(f)
+        if not isinstance(manifest, dict):
+            return None
+        manifest["traversal"] = traversal
+        tmp = mpath + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(manifest, f, indent=2)
+        os.replace(tmp, mpath)
+        return mpath
+    except Exception as exc:
+        return f"ERROR: {type(exc).__name__}: {exc}"
+
+
+def analyze_geometry_fidelity(s: Series, survey_tol_cm: float = SURVEY_TOL_CM,
+                              survey_tol_source: str = "caller-supplied") -> dict:
+    """Did the rover track the geometry it was GIVEN? (§9)
+
+    Independent of §1: §1 asks "how well did the controller follow its own
+    conditioned path"; this asks "does that conditioned path still contain the
+    surveyed geometry". A mission can pass §1 perfectly while having driven a
+    different shape — that is the failure mode this exists to catch.
+    """
+    if not s.paths:
+        return {"available": False, "reason": "no /path in bag"}
+    if not s.cond_paths:
+        return {"available": False,
+                "reason": "no /rpp/conditioned_path in bag (recorder predates it, or "
+                          "the controller never conditioned a run)"}
+
+    # Pair each /path run with the conditioned path published for it. Both are
+    # latched and emitted per run in the same order, so index pairing holds; the
+    # endpoint guard keeps a mismatched count from silently mis-pairing.
+    runs = []
+    for k, (t_in, pin) in enumerate(s.paths):
+        if k >= len(s.cond_paths):
+            break
+        pout = s.cond_paths[k][1]
+        if len(pin) < 3:
+            continue                      # transit hop / endpoint marker: nothing to drop
+        if math.dist(pin[0], pout[0]) > 0.5 or math.dist(pin[-1], pout[-1]) > 0.5:
+            continue                      # not the same run — refuse to guess
+
+        dropped = []
+        for idx, v, bend in _path_vertices(pin):
+            # nearest retained node: if the vertex survived it is there exactly
+            near = min((math.dist(v, q), q) for q in pout)
+            if near[0] <= 0.01:
+                continue
+            # How far off the path the controller ACTUALLY tracked did this
+            # vertex end up? That is the whole question, and it is just the
+            # vertex's distance to the conditioned polyline.
+            dev = _xtrack_to_polyline(v, pout)
+            rec = {
+                "path_index": idx,
+                "n": round(v[0], 4), "e": round(v[1], 4),
+                "bend_deg": round(bend, 2),
+                "deviation_cm": round(dev * 100, 2),
+                "nearest_tracked_node_cm": round(near[0] * 100, 1),
+                "intent": "INTENT" if dev * 100 >= survey_tol_cm else "noise",
+            }
+            dropped.append(rec)
+        runs.append({
+            "run": k,
+            "planned_points": len(pin),
+            "tracked_points": len(pout),
+            "vertices_in_plan": len(_path_vertices(pin)),
+            "dropped": dropped,
+        })
+
+    if not runs:
+        return {"available": False, "reason": "no comparable mark run"}
+
+    # rover closest approach to each dropped vertex — the number that matters
+    track = [(n, e) for (_t, n, e, _y) in s.pose]
+    for r in runs:
+        for d in r["dropped"]:
+            v = (d["n"], d["e"])
+            d["rover_closest_cm"] = (round(min(math.dist(v, p) for p in track) * 100, 2)
+                                     if track else None)
+
+    # independent cross-track: driven vs the PLANNED geometry, not the conditioned one
+    xt_true = None
+    mark = max((p for _t, p in s.paths), key=len, default=None)
+    if track and mark and len(mark) >= 2:
+        i0 = min(range(len(track)), key=lambda i: math.dist(track[i], mark[0]))
+        i1 = min(range(len(track)), key=lambda i: math.dist(track[i], mark[-1]))
+        seg = track[min(i0, i1):max(i0, i1) + 1]
+        if len(seg) >= 2:
+            errs = [_xtrack_to_polyline(p, mark) for p in seg]
+            xt_true = {
+                "rms_cm": round(math.sqrt(sum(e * e for e in errs) / len(errs)) * 100, 2),
+                "max_cm": round(max(errs) * 100, 2),
+                "n": len(errs),
+            }
+
+    all_dropped = [d for r in runs for d in r["dropped"]]
+    intent = [d for d in all_dropped if d["intent"] == "INTENT"]
+    worst = max((d["deviation_cm"] for d in all_dropped), default=0.0)
+    return {
+        "available": True,
+        "survey_tol_cm": survey_tol_cm,
+        "survey_tol_source": survey_tol_source,
+        "runs": runs,
+        "dropped_total": len(all_dropped),
+        "dropped_above_tolerance": len(intent),
+        "worst_deviation_cm": worst,
+        "xtrack_vs_planned": xt_true,
+        "verdict": "FAIL" if intent else ("WARN" if all_dropped else "PASS"),
+    }
+
+
+def _surveyed_latlon_from_source(manifest) -> tuple[list, str]:
+    """The INDEPENDENT ground truth: surveyed lat/lon straight from the source file.
+
+    This must NOT come from the mission's own anchor. Placement computes
+    local = T(global) once, from a single pose/global correspondence pair; if T
+    is wrong (a skewed pair — what POSE_GLOBAL_MAX_SKEW_MS guards), converting
+    the driven local position back through T reproduces the intended lat/lon
+    exactly and detects nothing. Re-reading the source file sidesteps T entirely.
+
+    Returns (points, provenance) where points is [(lat, lon), ...].
+    """
+    # B9: the recorder writes "plan_provenance"; accept the legacy fixture key
+    # too so old test bundles keep working.
+    staged = ((manifest or {}).get("plan_provenance")
+              or (manifest or {}).get("staged_mission") or {})
+    src = staged.get("source_file")
+    if not src or not os.path.isfile(src):
+        return [], f"source file unavailable ({src or 'not recorded'})"
+    ext = os.path.splitext(src)[1].lower()
+    try:
+        if ext == ".csv":
+            import csv as _csv
+            with open(src, encoding="utf-8-sig", errors="replace") as f:
+                rows = list(_csv.DictReader(f))
+            hdr = {k.strip().lower(): k for k in (rows[0].keys() if rows else {})}
+            klat = next((hdr[k] for k in ("latitude", "lat") if k in hdr), None)
+            klon = next((hdr[k] for k in ("longitude", "lon", "long") if k in hdr), None)
+            if not (klat and klon):
+                return [], "CSV has no Latitude/Longitude columns"
+            pts = []
+            for r in rows:
+                try:
+                    pts.append((float(r[klat]), float(r[klon])))
+                except (TypeError, ValueError):
+                    continue
+            return pts, f"survey CSV {os.path.basename(src)}"
+        if ext == ".dxf":
+            import ezdxf
+            doc = ezdxf.readfile(src)
+            pts = [(p.dxf.location.y, p.dxf.location.x)
+                   for p in doc.modelspace() if p.dxftype() == "POINT"]
+            # A georeferenced DXF stores lat in y and lon in x (parser maps
+            # DXF y->north, x->east and leaves the values unscaled).
+            pts = [(a, b) for a, b in pts if abs(a) <= 90.0 and abs(b) <= 180.0]
+            return pts, f"DXF POINT layer of {os.path.basename(src)}"
+    except Exception as exc:
+        return [], f"{type(exc).__name__} reading {os.path.basename(src)}: {exc}"
+    return [], f"unsupported source extension {ext!r}"
+
+
+def analyze_absolute(s: Series, manifest) -> dict:
+    """Did the rover reach the real-world coordinates? (S8)
+
+    S1 asks "did the controller follow its own path" and S9 asks "was that path
+    the right shape". Neither can see a PLACEMENT error, because both work in the
+    local frame — if the anchor is off by 40 cm the whole shape moves on the
+    ground and both still report centimetres.
+
+    Method: for each surveyed point, find the rover's closest approach in the
+    LOCAL frame, take the CONCURRENT global fix, and measure the geodesic to the
+    surveyed lat/lon. Local closest-approach is only used to pick the instant;
+    the comparison itself is global-to-global, so the anchor never enters it.
+    """
+    out = {"available": False}
+    if not s.global_fix:
+        out["reason"] = "no /mavros/global_position/global in bag"
+        return out
+    if not s.pose:
+        out["reason"] = "no pose"
+        return out
+
+    truth, provenance = _surveyed_latlon_from_source(manifest)
+    out["provenance"] = provenance
+    if not truth:
+        out["reason"] = f"no independent ground truth ({provenance})"
+        out["fixes"] = len(s.global_fix)
+        return out
+
+    # Local-frame targets to time the closest approach against: prefer the
+    # must-hit vertices the planner declared, else every /path vertex.
+    path = s.path or []
+    if not path:
+        out["reason"] = "no /path"
+        return out
+    if s.path_z and len(s.path_z) == len(path):
+        targets = [p for p, z in zip(path, s.path_z) if z & 2]
+        target_kind = "must-hit vertices"
+    else:
+        targets = []
+        target_kind = ""
+    if not targets:
+        targets = path
+        target_kind = "all /path vertices (no must-hit flags in bag)"
+
+    # Pair each surveyed point with a local target. Counts usually match (both
+    # are the surveyed vertex set); if not, say so rather than guessing.
+    out["n_truth"] = len(truth)
+    out["n_targets"] = len(targets)
+    out["target_kind"] = target_kind
+    if len(truth) != len(targets):
+        out["reason"] = (f"cannot pair {len(truth)} surveyed point(s) with "
+                         f"{len(targets)} local target(s)")
+        return out
+
+    gf = s.global_fix
+    rows = []
+    for i, (tgt_n, tgt_e) in enumerate(targets):
+        best_t, best_d = None, float("inf")
+        for (t, n, e, _yaw) in s.pose:
+            d = math.hypot(n - tgt_n, e - tgt_e)
+            if d < best_d:
+                best_d, best_t = d, t
+        if best_t is None:
+            continue
+        # nearest global fix in time
+        j = min(range(len(gf)), key=lambda k: abs(gf[k][0] - best_t))
+        t_fix, lat_r, lon_r, _alt = gf[j]
+        skew_ms = abs(t_fix - best_t) * 1000.0
+        lat_s, lon_s = truth[i]
+        miss_m = _geodesic_m(lat_s, lon_s, lat_r, lon_r)
+        dn, de = _geodesic_ne_m(lat_s, lon_s, lat_r, lon_r)
+        rows.append({"i": i, "miss_cm": miss_m * 100.0,
+                     "dn_cm": dn * 100.0, "de_cm": de * 100.0,
+                     "local_approach_cm": best_d * 100.0, "skew_ms": skew_ms})
+
+    if not rows:
+        out["reason"] = "no usable closest-approach samples"
+        return out
+
+    misses = [r["miss_cm"] for r in rows]
+    mean_dn = sum(r["dn_cm"] for r in rows) / len(rows)
+    mean_de = sum(r["de_cm"] for r in rows) / len(rows)
+    bias_cm = math.hypot(mean_dn, mean_de)
+    # Scatter about the mean separates a PLACEMENT shift (large bias, small
+    # scatter) from noise/tracking (small bias, large scatter).
+    scatter = math.sqrt(sum((r["dn_cm"] - mean_dn) ** 2 + (r["de_cm"] - mean_de) ** 2
+                            for r in rows) / len(rows))
+    max_skew = max(r["skew_ms"] for r in rows)
+
+    verdict = "PASS"
+    notes = []
+    if max(misses) > ABS_MISS_FAIL_CM:
+        verdict = "FAIL"; notes.append(f"worst miss {max(misses):.1f} cm > {ABS_MISS_FAIL_CM:.0f} cm")
+    elif max(misses) > ABS_MISS_WARN_CM:
+        verdict = "WARN"; notes.append(f"worst miss {max(misses):.1f} cm > {ABS_MISS_WARN_CM:.0f} cm")
+    if bias_cm > ABS_BIAS_FAIL_CM:
+        verdict = "FAIL"
+        notes.append(f"systematic {bias_cm:.1f} cm offset with only {scatter:.1f} cm scatter "
+                     f"— this is PLACEMENT, not tracking")
+    if max_skew > 500.0:
+        notes.append(f"global fix up to {max_skew:.0f} ms from closest approach — "
+                     f"at speed that is itself centimetres; treat as indicative")
+
+    out.update({"available": True, "verdict": verdict, "rows": rows,
+                "max_cm": max(misses), "mean_cm": sum(misses) / len(misses),
+                "bias_cm": bias_cm, "bias_n_cm": mean_dn, "bias_e_cm": mean_de,
+                "scatter_cm": scatter, "max_skew_ms": max_skew, "notes": notes})
+    return out
 
 
 def analyze_config(s: Series, manifest) -> dict:
@@ -759,8 +1451,13 @@ def analyze_config(s: Series, manifest) -> dict:
         38: "mission_speed",
     }
     if s.rpp:
-        d = s.rpp[len(s.rpp) // 2][1]
-        out["rpp_from_bag"] = {lbl: (round(d[i], 4) if i < len(d) else None)
+        # B12: a midpoint frame can be a stop-debug heartbeat whose whole RPP
+        # block is NaN — pick the first frame whose config indices are finite.
+        d = next((d for (_t, d) in s.rpp
+                  if d and len(d) > 38 and all(math.isfinite(d[i]) for i in labels)),
+                 s.rpp[len(s.rpp) // 2][1])
+        out["rpp_from_bag"] = {lbl: (round(d[i], 4) if i < len(d) and math.isfinite(d[i])
+                                     else None)
                                for i, lbl in labels.items()}
     return out
 
@@ -792,11 +1489,14 @@ def _fmt_report(a: dict) -> str:
         line(f"   overall : RMS {o['rms_cm']}  median {o['median_cm']}  "
              f"p95 {o['p95_cm']}  max {o['max_cm']} cm   (n={o['n']})")
         line(f"   bias    : {o['mean_signed_cm']:+} cm  "
-             f"(L {o['left_frac']*100:.0f}% / R {o['right_frac']*100:.0f}%)")
+             f"(L {o['left_frac']*100:.0f}% / R {o['right_frac']*100:.0f}% / "
+             f"zero {o.get('zero_frac', 0)*100:.0f}%)")
         if tr.get("marking_only"):
             mo = tr["marking_only"]
-            line(f"   marking : RMS {mo['rms_cm']}  p95 {mo['p95_cm']}  max {mo['max_cm']} cm")
-        line(f"   verdict : {tr['verdict']}  (production class RMS ≤ {XTRACK_PROD_CM} cm)")
+            line(f"   marking : RMS {mo['rms_cm']}  p95 {mo['p95_cm']}  max {mo['max_cm']} cm"
+                 f"   (n={mo['n']})")
+        line(f"   verdict : {tr['verdict']}  on {tr.get('verdict_basis', 'overall')} "
+             f"(production class RMS ≤ {XTRACK_PROD_CM} cm)")
     else:
         line(f"   WARN — {tr.get('reason', 'unavailable')}")
     line("")
@@ -806,12 +1506,12 @@ def _fmt_report(a: dict) -> str:
     if st.get("available"):
         for e in st["stops"]:
             tag = "ENDPOINT" if e["is_endpoint"] else f"corner@{e['vertex']}"
-            extra = (f"  resting {e['resting_cm']}cm  final-coast {e['max_dist_after_arrival_cm']}cm"
-                     if "resting_cm" in e else "")
+            extra = f"  resting {e['resting_cm']}cm" if "resting_cm" in e else ""
             line(f"   {tag:11s} closest {e['closest_cm']}cm  coast-past {e['coast_past_cm']}cm"
                  f"  dwell {e['dwell_s']}s{extra}")
-        line(f"   worst coast-past {st['worst_coast_cm']}cm  DONE={st['reached_done']}  "
-             f"verdict {st['verdict']}  (coast ≤ {COAST_MAX_CM}cm)")
+        line(f"   worst coast-past {st['worst_coast_cm']}cm  "
+             f"endpoint resting {st.get('endpoint_resting_cm')}cm  DONE={st['reached_done']}  "
+             f"verdict {st['verdict']}  (coast ≤ {COAST_MAX_CM}cm, resting ≤ {FINAL_STOP_MAX_CM}cm)")
     else:
         line(f"   WARN — {st.get('reason', 'unavailable')}")
     line("")
@@ -820,12 +1520,17 @@ def _fmt_report(a: dict) -> str:
     line("3. PIVOTS (per corner / run boundary)")
     if pv.get("available") and pv.get("count"):
         for p in pv["pivots"]:
+            if p.get("released", True):
+                tail = (f"settle {p['settle_err_deg']}° in {p['settle_time_s']}s")
+            else:
+                tail = "NEVER RELEASED (no S_TRACK followed — topic went silent, see B3)"
             line(f"   pivot{p['index']}: turn {p['turn_magnitude_deg']}°  "
-                 f"init-err {p['initial_heading_err_deg']}°  settle {p['settle_err_deg']}° "
-                 f"in {p['settle_time_s']}s  osc {p['oscillations']}  "
+                 f"init-err {p['initial_heading_err_deg']}°  {tail}  "
+                 f"osc {p['oscillations']}  "
                  f"min-fwd {p['min_fwd_component_m_s']}  flip={p['reverse_flip']}")
+        ws = pv.get("worst_settle_deg")
         line(f"   any reverse-flip {pv['any_reverse_flip']}  worst settle "
-             f"{pv['worst_settle_deg']}°  verdict {pv['verdict']}")
+             f"{ws if ws is not None else 'n/a (no released pivot)'}°  verdict {pv['verdict']}")
     elif pv.get("available"):
         line(f"   none — {pv.get('note', 'no pivots')}")
     else:
@@ -867,8 +1572,97 @@ def _fmt_report(a: dict) -> str:
         line(f"   verdict {h['verdict']}")
     line("")
 
+    g = a.get("geometry") or {}
+    line("7. GEOMETRY FIDELITY (planned /path vs tracked /rpp/conditioned_path)")
+    if not g.get("available"):
+        line(f"   unavailable — {g.get('reason')}")
+    else:
+        for r in g["runs"]:
+            line(f"   run {r['run']}: planned {r['planned_points']} pts "
+                 f"({r['vertices_in_plan']} CAD vertices) -> tracked {r['tracked_points']} pts")
+        xt = g.get("xtrack_vs_planned")
+        if xt:
+            line(f"   driven vs PLANNED geometry : RMS {xt['rms_cm']} cm  max {xt['max_cm']} cm  "
+                 f"(n={xt['n']})")
+            line("     ^ independent of §1, which measures against the CONDITIONED path")
+        # State the threshold and where it came from even when nothing was
+        # dropped: a PASS at a tolerance nobody chose is not evidence.
+        line(f"   survey tolerance {g['survey_tol_cm']:.2f} cm  "
+             f"[{g.get('survey_tol_source', '?')}]")
+        if not g["dropped_total"]:
+            line("   no surveyed vertex was dropped — the rover tracked the full geometry")
+        else:
+            line(f"   {g['dropped_total']} vertex/vertices removed by conditioning:")
+            for r in g["runs"]:
+                for d in r["dropped"]:
+                    tag = "INTENT — should have been driven" if d["intent"] == "INTENT" else "within survey noise"
+                    line(f"     - idx {d['path_index']:>3} ({d['n']:+.3f}N,{d['e']:+.3f}E)  "
+                         f"bend {d['bend_deg']:>5.2f}deg  {d['deviation_cm']:>5.2f} cm off the "
+                         f"driven path  [{tag}]")
+                    if d.get("rover_closest_cm") is not None:
+                        line(f"       rover closest approach {d['rover_closest_cm']} cm   "
+                             f"nearest tracked node {d['nearest_tracked_node_cm']} cm away")
+        line(f"   verdict : {g['verdict']}")
+    line("")
+
+    ab = a.get("absolute") or {}
+    line("8. ABSOLUTE ACCURACY (rover's own lat/lon vs the SURVEYED lat/lon)")
+    line("   asks the one question §1 and §7 structurally cannot: is the shape in the")
+    line("   RIGHT PLACE ON EARTH? Both of those live in the local frame, so a wrong")
+    line("   anchor moves the whole mission and they still report centimetres.")
+    if not ab.get("available"):
+        line(f"   unavailable — {ab.get('reason')}")
+        if ab.get("provenance"):
+            line(f"   ground truth : {ab['provenance']}")
+    else:
+        line(f"   ground truth : {ab['provenance']}  ({ab['n_truth']} surveyed point(s))")
+        line(f"   timed against: {ab['target_kind']}")
+        for r in ab["rows"]:
+            line(f"     - pt {r['i'] + 1}: miss {r['miss_cm']:>6.2f} cm "
+                 f"(N {r['dn_cm']:+6.2f}, E {r['de_cm']:+6.2f})   "
+                 f"local approach {r['local_approach_cm']:>5.2f} cm, "
+                 f"fix skew {r['skew_ms']:.0f} ms")
+        line(f"   mean miss {ab['mean_cm']:.2f} cm   max {ab['max_cm']:.2f} cm")
+        line(f"   systematic bias {ab['bias_cm']:.2f} cm "
+             f"(N {ab['bias_n_cm']:+.2f}, E {ab['bias_e_cm']:+.2f})   "
+             f"scatter about it {ab['scatter_cm']:.2f} cm")
+        line("     ^ large bias + small scatter = PLACEMENT (the whole shape is shifted).")
+        line("       small bias + large scatter = tracking/localisation noise.")
+        for n in ab.get("notes", []):
+            line(f"   NOTE: {n}")
+        line(f"   verdict : {ab['verdict']}")
+    line("")
+
+    tv = a.get("traversal") or {}
+    line("9. TRAVERSAL (did the rover reach the whole path, or stop part way?)")
+    line("   every section above describes only the part that WAS driven — an abort")
+    line("   just yields fewer samples, and biases the error budget low.")
+    if not tv.get("available"):
+        line(f"   unavailable — {tv.get('reason')}")
+    else:
+        line(f"   reached {tv['points_covered']}/{tv['points_total']} path points "
+             f"({tv['coverage']:.1%}) within {tv['radius_cm']} cm")
+        if tv["status"] != "COMPLETE":
+            _shape = {
+                "STOPPED_EARLY": f"STOPPED EARLY — drove indices 0..{tv['last_covered_index']} "
+                                 f"of {tv['points_total'] - 1}, then never resumed",
+                "STARTED_LATE": f"NEVER DROVE THE START — first {tv['missing_leading']} "
+                                f"point(s) unreached; ran from index "
+                                f"{tv['first_covered_index']} to the end",
+                "MIDDLE_ONLY": f"drove only the middle — missed {tv['missing_leading']} "
+                               f"at the start and {tv['missing_trailing']} at the end",
+                "INTERIOR_GAP": f"SKIPPED {tv['missing_interior']} point(s) mid-path and "
+                                f"came back — not a clean abort",
+                "NONE": "the rover never came within range of ANY path point",
+            }.get(tv["shape"], tv["shape"])
+            line(f"   {_shape}")
+            line("   ! manifest.outcome.status does NOT encode this: the recorder writes")
+            line("     COMPLETE whenever it shut down cleanly, abort or not.")
+        line(f"   verdict : {tv['verdict']}  ({tv['status']})")
+    line("")
+
     cfg = a["config"]
-    line("7. AS-RUN CONFIG")
+    line("10. AS-RUN CONFIG")
     fm = cfg.get("from_manifest")
     if fm:
         line(f"   git {fm.get('git_sha')}  services {fm.get('services')}")
@@ -881,17 +1675,144 @@ def _fmt_report(a: dict) -> str:
         line("   (no manifest and no /rpp/debug params)")
     line("")
 
-    line("8. VERDICT")
+    line("11. VERDICT")
     line(f"   ===> {a['verdict']} <===")
     if a["worst_offenders"]:
         line("   worst offenders:")
         for w in a["worst_offenders"]:
             line(f"     - {w}")
+    line("")
+
+    geo = a.get("geo") or {}
+    line("12. GEO OVERLAY (surveyed vs commanded /path vs driven — all in lat/lon)")
+    if not geo.get("available"):
+        line(f"   unavailable — {geo.get('reason', 'no geo layers')}")
+    else:
+        o = geo.get("ekf_origin")
+        line(f"   EKF origin : {o[0]:.7f}, {o[1]:.7f}" if o
+             else "   EKF origin : (none — /path could not be geo-referenced)")
+        line(f"   layers     : surveyed {geo['n_surveyed']}, commanded {geo['n_commanded']}, "
+             f"driven {geo['n_driven']}")
+        if geo.get("placement_mean_cm") is not None:
+            line(f"   placement  : commanded-geo vs surveyed-geo   "
+                 f"mean {geo['placement_mean_cm']:.2f} cm   max {geo['placement_max_cm']:.2f} cm")
+            line("     ^ placement + projection only (§8 = surveyed vs DRIVEN = this + tracking).")
+        if geo.get("commanded_error"):
+            line(f"   NOTE: commanded layer skipped — {geo['commanded_error']}")
+        line(f"   files      : {', '.join(geo.get('files', []))}"
+             "   (open in geojson.io / Google Earth / QGIS)")
     line("=" * 72)
     return "\n".join(L) + "\n"
 
 
-def analyze(root: str) -> dict:
+# ── §12 GEO OVERLAY — surveyed vs commanded /path vs driven, all in lat/lon ────
+def _import_ned_to_latlon():
+    import sys as _sys
+    from pathlib import Path as _Path
+    root = _Path(__file__).resolve().parents[1]
+    if str(root) not in _sys.path:
+        _sys.path.insert(0, str(root))
+    from path_engine.ned import ned_to_latlon
+    return ned_to_latlon
+
+
+def _downsample(pts, cap=2000):
+    if len(pts) <= cap:
+        return list(pts)
+    step = len(pts) / cap
+    return [pts[int(i * step)] for i in range(cap)]
+
+
+def _geo_feature(name, pts, geom, color):
+    coords = [[lon, lat] for (lat, lon) in pts]          # GeoJSON is [lon, lat]
+    g = ({"type": "LineString", "coordinates": coords} if geom == "line"
+         else {"type": "MultiPoint", "coordinates": coords})
+    return {"type": "Feature",
+            "properties": {"layer": name, "count": len(pts),
+                           "stroke": color, "marker-color": color},
+            "geometry": g}
+
+
+def analyze_geo(s: Series, manifest, out_dir: str) -> dict:
+    """Render the mission into GEO coordinates and write a map overlay (§12).
+
+    Three lat/lon layers → geo_overlay.geojson + geo_overlay.csv:
+      * surveyed  — the intent, straight from the source file (independent).
+      * commanded — the local /path converted back to lat/lon via the EKF origin.
+      * driven    — the rover's own /mavros/global_position/global trace.
+
+    Also a PLACEMENT-only miss (commanded-geo vs surveyed-geo at the must-hit
+    vertices): isolates placement + projection residual, the half §8 folds into
+    the total (§8 = surveyed vs DRIVEN = placement + tracking).
+    """
+    out = {"available": False}
+    truth, provenance = _surveyed_latlon_from_source(manifest)
+    origin = s.ekf_origin
+    driven = [(lat, lon) for (_t, lat, lon, _a) in s.global_fix]
+
+    commanded, commanded_musthit = [], []
+    if origin and s.path:
+        try:
+            n2ll = _import_ned_to_latlon()
+            commanded = [n2ll(n, e, origin[0], origin[1]) for (n, e) in s.path]
+            if s.path_z and len(s.path_z) == len(s.path):
+                commanded_musthit = [ll for ll, z in zip(commanded, s.path_z) if z & 2]
+        except Exception as exc:                     # geographiclib missing etc.
+            out["commanded_error"] = f"{type(exc).__name__}: {exc}"
+
+    out["ekf_origin"] = list(origin) if origin else None
+    out["provenance"] = provenance
+    out["n_surveyed"], out["n_commanded"], out["n_driven"] = \
+        len(truth), len(commanded), len(driven)
+    if not origin:
+        out["reason"] = ("no EKF origin in bag (gp_origin) — cannot geo-reference "
+                         "/path; driven + surveyed layers still exported")
+    if not (truth or commanded or driven):
+        out["reason"] = "nothing to export (no surveyed truth, /path, or global fix)"
+        return out
+
+    # placement-only miss: commanded must-hit vertices vs surveyed truth
+    tgt = commanded_musthit or commanded
+    if truth and tgt and len(truth) == len(tgt):
+        rows = [{"i": i, "miss_cm": _geodesic_m(a, b, c, d) * 100.0}
+                for i, ((a, b), (c, d)) in enumerate(zip(truth, tgt))]
+        out["placement_rows"] = rows
+        out["placement_mean_cm"] = round(sum(r["miss_cm"] for r in rows) / len(rows), 2)
+        out["placement_max_cm"] = round(max(r["miss_cm"] for r in rows), 2)
+
+    features = []
+    if truth:
+        features.append(_geo_feature("surveyed", truth, "points", "#2ca02c"))
+    if commanded:
+        features.append(_geo_feature("commanded_path", _downsample(commanded), "line", "#1f77b4"))
+    if driven:
+        features.append(_geo_feature("driven", _downsample(driven), "line", "#d62728"))
+
+    files = []
+    try:
+        gj = os.path.join(out_dir, "geo_overlay.geojson")
+        with open(gj, "w") as f:
+            json.dump({"type": "FeatureCollection", "features": features}, f)
+        files.append(os.path.basename(gj))
+        cf = os.path.join(out_dir, "geo_overlay.csv")
+        with open(cf, "w") as f:
+            f.write("layer,index,lat,lon\n")
+            for name, pts in (("surveyed", truth),
+                              ("commanded_path", _downsample(commanded)),
+                              ("driven", _downsample(driven))):
+                for i, (lat, lon) in enumerate(pts):
+                    f.write(f"{name},{i},{lat:.8f},{lon:.8f}\n")
+        files.append(os.path.basename(cf))
+    except OSError as exc:
+        out["write_error"] = str(exc)
+
+    out["available"] = bool(files)
+    out["files"] = files
+    return out
+
+
+def analyze(root: str, survey_tol_cm: float | None = None,
+            out_dir: str | None = None) -> dict:
     bag_dir, manifest = _find_bag_dir(root)
     if bag_dir is None:
         sys.exit(f"ERROR: no rosbag2 (.db3 / metadata.yaml) found under {root}")
@@ -904,25 +1825,74 @@ def analyze(root: str) -> dict:
     speed = analyze_speed(s)
     spray = analyze_spray(s)
     health = analyze_health(s)
+    tol_cm, tol_source = resolve_survey_tol_cm(manifest, survey_tol_cm)
+    geometry = analyze_geometry_fidelity(s, survey_tol_cm=tol_cm,
+                                         survey_tol_source=tol_source)
+    absolute = analyze_absolute(s, manifest)
+    traversal = analyze_traversal(s)
     config = analyze_config(s, manifest)
+    geo = analyze_geo(s, manifest, out_dir or root)
 
     # overall verdict + worst offenders
     offenders = []
     fails = []
-    for name, sec in (("tracking", tracking), ("stops", stops), ("pivots", pivots)):
+    for name, sec in (("tracking", tracking), ("stops", stops), ("pivots", pivots),
+                      ("geometry", geometry), ("absolute", absolute),
+                      ("traversal", traversal)):
         v = sec.get("verdict")
         if v == "FAIL":
             fails.append(name)
-    if tracking.get("overall") and tracking["overall"]["rms_cm"] > XTRACK_PROD_CM:
-        offenders.append(f"tracking RMS {tracking['overall']['rms_cm']}cm > {XTRACK_PROD_CM}cm")
+    if traversal.get("available") and traversal.get("status") != "COMPLETE":
+        _end = {
+            "STOPPED_EARLY": "stopped early and never resumed",
+            "STARTED_LATE": "never drove the start of the path",
+            "MIDDLE_ONLY": "drove only the middle of the path",
+            "INTERIOR_GAP": "skipped geometry mid-path and came back",
+            "NONE": "never came within range of the path at all",
+        }.get(traversal["shape"], traversal["shape"])
+        offenders.append(
+            f"only {traversal['points_covered']}/{traversal['points_total']} path points "
+            f"reached ({traversal['coverage']:.0%}) — {_end}. Every other metric here "
+            f"describes only the part that was driven"
+        )
+    if geometry.get("available") and geometry.get("dropped_above_tolerance"):
+        offenders.append(
+            f"{geometry['dropped_above_tolerance']} surveyed vertex/vertices dropped by path "
+            f"conditioning (worst {geometry['worst_deviation_cm']}cm off the driven path, "
+            f"tolerance {geometry['survey_tol_cm']}cm, {geometry['survey_tol_source']}) — "
+            f"the rover did not drive the "
+            f"surveyed shape"
+        )
+    # B7: grade the painted span when a spray signal exists — the overall block
+    # is diluted by pivot/idle placeholders and can PASS a bad marking run.
+    _xt_block = tracking.get("marking_only") or tracking.get("overall")
+    _xt_label = "marking" if tracking.get("marking_only") else "overall"
+    if _xt_block and _xt_block["rms_cm"] > XTRACK_PROD_CM:
+        offenders.append(
+            f"tracking RMS ({_xt_label}) {_xt_block['rms_cm']}cm > {XTRACK_PROD_CM}cm")
     if stops.get("available") and stops["worst_coast_cm"] > COAST_MAX_CM:
         offenders.append(f"coast-past {stops['worst_coast_cm']}cm > {COAST_MAX_CM}cm")
+    if stops.get("available") and (stops.get("endpoint_resting_cm") or 0) > FINAL_STOP_MAX_CM:
+        offenders.append(
+            f"endpoint resting {stops['endpoint_resting_cm']}cm > {FINAL_STOP_MAX_CM}cm")
     if pivots.get("available") and pivots.get("any_reverse_flip"):
         offenders.append("reverse-flip detected during a pivot")
-    if pivots.get("available") and pivots.get("worst_settle_deg", 0) > SETTLE_TOL_DEG:
+    if pivots.get("available") and (pivots.get("worst_settle_deg") or 0) > SETTLE_TOL_DEG:
         offenders.append(f"pivot settle {pivots['worst_settle_deg']}° > {SETTLE_TOL_DEG}°")
+    if pivots.get("available") and pivots.get("unreleased_pivots"):
+        offenders.append(
+            "pivot never released (no S_TRACK after ALIGN — segment_debug went "
+            "silent; settle unmeasurable)")
     if health.get("offboard_drops"):
         offenders.append(f"{health['offboard_drops']} OFFBOARD drop(s)")
+    if absolute.get("available") and absolute.get("bias_cm", 0) > ABS_BIAS_FAIL_CM:
+        offenders.append(
+            f"the whole mission sits {absolute['bias_cm']:.1f}cm off its surveyed position "
+            f"(scatter only {absolute['scatter_cm']:.1f}cm) — a PLACEMENT error, which no "
+            f"local-frame metric can see")
+    elif absolute.get("available") and absolute.get("max_cm", 0) > ABS_MISS_FAIL_CM:
+        offenders.append(
+            f"worst absolute miss {absolute['max_cm']:.1f}cm vs the surveyed lat/lon")
     verdict = "FAIL" if fails else ("WARN" if (offenders or health.get("verdict") == "WARN") else "PASS")
 
     return {
@@ -941,7 +1911,11 @@ def analyze(root: str) -> dict:
         "speed": speed,
         "spray": spray,
         "health": health,
+        "geometry": geometry,
+        "absolute": absolute,
+        "traversal": traversal,
         "config": config,
+        "geo": geo,
         "worst_offenders": offenders,
         "verdict": verdict,
     }
@@ -954,11 +1928,39 @@ def main() -> int:
                     help="where to write analysis.json + report.txt (default: the bundle dir)")
     ap.add_argument("--json-only", action="store_true", help="skip report.txt")
     ap.add_argument("--quiet", action="store_true", help="do not print the report to stdout")
+    ap.add_argument("--survey-tol-cm", type=float, default=None,
+                    help="vertex deviation above which a dropped point counts as "
+                         "INTENT rather than survey noise. Overrides the value staged "
+                         f"with the mission; default {SURVEY_TOL_CM} cm. Set this from "
+                         "the survey's own lateral RMS, not by taste.")
     args = ap.parse_args()
+    if args.survey_tol_cm is not None and not (0.0 < args.survey_tol_cm <= 100.0):
+        sys.exit(f"ERROR: --survey-tol-cm must be in (0, 100]; got {args.survey_tol_cm}")
     if not os.path.isdir(args.bundle):
         sys.exit(f"ERROR: not a directory: {args.bundle}")
 
-    result = analyze(args.bundle)
+    result = analyze(args.bundle, survey_tol_cm=args.survey_tol_cm,
+                     out_dir=(args.outdir or args.bundle))
+
+    # A4: fold the traversal verdict back next to outcome, so a partial run is
+    # detectable by reading manifest.json alone — no bag, no analysis.json.
+    tv = result.get("traversal") or {}
+    if tv.get("available"):
+        written = _write_traversal_to_manifest(args.bundle, {
+            "status": tv["status"],
+            "shape": tv["shape"],
+            "coverage": tv["coverage"],
+            "points_covered": tv["points_covered"],
+            "points_total": tv["points_total"],
+            "radius_cm": tv["radius_cm"],
+            "first_covered_index": tv["first_covered_index"],
+            "last_covered_index": tv["last_covered_index"],
+            "source": "analyze_mission",
+        })
+        if written and written.startswith("ERROR"):
+            print(f"WARN: could not update manifest traversal: {written}",
+                  file=sys.stderr)
+
     outdir = args.outdir or args.bundle
     try:
         os.makedirs(outdir, exist_ok=True)

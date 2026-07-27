@@ -51,6 +51,14 @@ class MissionStartRequest(BaseModel):
     path_name: Optional[str] = None
     mission_file: Optional[str] = None
     auto_origin: bool = False
+    # The staged mission the caller believes is loaded. Optional, and never used
+    # to LOAD anything — start always drives whatever the controller already
+    # holds. Supplying it turns "start the loaded mission" into "start the
+    # mission I verified", so a stale client cannot start something it never
+    # checked. Previously the mobile app sent this field and Pydantic silently
+    # dropped it (extras are ignored), which happened to be safe only because it
+    # left path_name None; nothing actually validated the two agreed.
+    mission_id: Optional[str] = None
 
 
 class MissionLoadRequest(BaseModel):
@@ -104,6 +112,10 @@ class TelemetryData(BaseModel):
     gps_sat: Optional[int] = None
     hrms: Optional[float] = None
     vrms: Optional[float] = None
+    # A14: null hrms/vrms means "the driver did not report metre-valued
+    # accuracy", NOT "zero error". This flag says which, so a client never has
+    # to infer it from a magnitude.
+    gps_accuracy_known: Optional[bool] = None
     lat: Optional[float] = None
     lon: Optional[float] = None
     alt: Optional[float] = None
@@ -117,6 +129,16 @@ class TelemetryData(BaseModel):
     global_position_age_ms: Optional[float] = None
     gps_fix_age_ms: Optional[float] = None
     pose_global_skew_ms: Optional[float] = None
+    # EKF local-frame origin trust. `origin_trusted` false means a surveyed
+    # mission will REFUSE to place right now — the client should surface this
+    # before the operator walks the rover out, because a stale origin has no
+    # other symptom until the rover drives to the wrong place.
+    # `origin_delta_m` is the measured disagreement between the declared origin
+    # and the one implied by the live pose/global pair (see
+    # GET /api/health/origin for the full breakdown).
+    origin_status: Optional[str] = None
+    origin_trusted: Optional[bool] = None
+    origin_delta_m: Optional[float] = None
 
 
 class PathInfo(BaseModel):
@@ -130,6 +152,32 @@ class PathPreviewPoint(BaseModel):
     north: float
     east: float
     spray: bool = True
+    # True = the point came from the source geometry (CAD/survey vertex), not
+    # from densification. Carried so the non-staged load routes can hand vertex
+    # provenance to the controller — RPP must never simplify a must-hit point
+    # away. Defaults False so a preview built without provenance is treated as
+    # "unknown", never as "every point is a surveyed vertex".
+    must_hit: bool = False
+
+
+class SurveyControlPoint(BaseModel):
+    """One ORIGINAL surveyed shot, before any fitting moved it.
+
+    Emitted so a client can draw the measurements as their own map layer and see
+    them against the reconstructed path. The waypoint list cannot serve this: the
+    arc fit and corner fillet deliberately move geometry off the raw shots (that
+    is the whole point of fitting), so a `must_hit` waypoint is the fitted
+    vertex, not the measurement.
+    """
+
+    north: float
+    east: float
+    # Original WGS84 from the source file — NOT re-projected from north/east.
+    # None when the source carried projected grid coordinates instead.
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    name: Optional[str] = None      # survey point Name (label)
+    code: Optional[str] = None      # survey Code (feature / line id)
 
 
 class PathPreviewBounds(BaseModel):
@@ -145,6 +193,15 @@ class PathPreviewResponse(BaseModel):
     num_points: int
     bounds: Optional[PathPreviewBounds] = None
     waypoints: list[PathPreviewPoint]
+    # WGS84 (lat, lon) the local NED frame is anchored at, when the source is
+    # georeferenced (a survey CSV projected from lat/lon, or a geo DXF). None for
+    # a metric/local source. Lets the map place the preview at its true surveyed
+    # coordinates (WYSIWYG) instead of an arbitrary origin.
+    geo_origin: Optional[list[float]] = None
+    # The original surveyed shots behind this path, in the SAME local NED frame
+    # as `waypoints`, each also carrying its source lat/lon. Empty for a source
+    # with no surveyed provenance (builtin, legacy NED CSV, plain DXF).
+    control_points: list[SurveyControlPoint] = []
 
 
 class MissionStatus(BaseModel):
@@ -282,10 +339,36 @@ class DXFEntitiesResponse(BaseModel):
     name: str
     frame: str = "local_ned"
     num_entities: int
+    # True when the source DXF held raw WGS84 lat/lon and georef projected it to
+    # local ENU metres. geo_origin is the (lat, lon) the local frame is anchored
+    # at — the client uses this to skip manual ref-point alignment: a
+    # georeferenced DXF already knows where it belongs, so it stages with no
+    # alignment fields and the planner auto-places it at geo_origin. None/False
+    # for an ordinary metric DXF, which still needs alignment.
+    is_geographic: bool = False
+    geo_origin: Optional[list[float]] = None  # [lat, lon] or None
     bounds: Optional[PathPreviewBounds] = None
     extension_config: Optional["PathExtensionConfig"] = None
     transit_preview: list["EntityTransitPreview"] = Field(default_factory=list)
+    # Flat list of every PRE/AFT run-up in the preview, so a client can render
+    # "Extensions" as one named layer without walking entities[]. Mirrors the
+    # per-entity extension_preview, which stays populated for hit-testing.
+    extensions: list["EntityExtensionRun"] = Field(default_factory=list)
     entities: list[DXFEntityPreview]
+
+
+class EntityExtensionRun(BaseModel):
+    """One PRE or AFT run-up/run-out, flattened for canvas rendering."""
+
+    entity_id: str
+    role: str  # "pre" | "aft"
+    # Which decomposed edge of the parent entity this run belongs to. A single
+    # closed polyline (a square) is split into its sides in per-line mode, so one
+    # entity_id yields several runs; edge_index disambiguates them. 0 for an
+    # entity that is a single edge (a lone LINE/ARC), matching the planner.
+    edge_index: int = 0
+    length_m: float = 0.0
+    points: list[EntityPreviewPoint]
 
 
 class EntityTransitPreview(BaseModel):
@@ -366,6 +449,34 @@ class PathExtensionConfigResponse(PathExtensionConfig):
     saved: bool = True
 
 
+class SurveyLineConfig(BaseModel):
+    """Per-file survey-LINE reconstruction settings (survey CSV only).
+
+    Read by preview, plan AND load, so what the map draws is what the rover
+    drives.
+    """
+
+    # Radius of the arc inserted at each surveyed corner. 0 = leave corners as
+    # surveyed. This INVENTS geometry — a road survey captures a bend as two
+    # straights meeting at one vertex, so there is no arc to recover and the
+    # radius has to come from the marking spec.
+    fillet_corners_m: float = Field(0.0, ge=0.0, le=200.0)
+    # How far a fitted arc may sit from the surveyed points it replaces. Raise it
+    # to recover a circle from a survey that sampled it as a coarse polygon;
+    # lower it to keep the reconstruction closer to the raw samples.
+    # None on save = leave unchanged.
+    fit_arcs_max_dev_m: Optional[float] = Field(None, gt=0.0, le=1.0)
+
+
+class SurveyLineConfigResponse(BaseModel):
+    """Response from GET/POST /api/path/{name}/line-config."""
+
+    name: str
+    saved: bool = True
+    fillet_corners_m: float
+    fit_arcs_max_dev_m: float
+
+
 class DXFParseResponse(BaseModel):
     """Response from /api/path/parse-dxf."""
 
@@ -374,6 +485,11 @@ class DXFParseResponse(BaseModel):
     entities: list[DXFEntityInfo]
     unit_scale: float  # metres per DXF unit
     layer_names: list[str]  # unique layer names found
+    # See DXFEntitiesResponse.is_geographic — set when the DXF carried lat/lon
+    # and was projected to local metres. Lets the client route a georeferenced
+    # file straight to staging (no manual alignment) at geo_origin.
+    is_geographic: bool = False
+    geo_origin: Optional[list[float]] = None  # [lat, lon] or None
 
 
 class RefPoint(BaseModel):
@@ -383,6 +499,24 @@ class RefPoint(BaseModel):
     dxf_y: float  # DXF y coordinate
     lat: float  # WGS84 latitude
     lon: float  # WGS84 longitude
+
+
+class PointMissionPoint(BaseModel):
+    """One surveyed marking/stop point in a point-mission (mirrors the mobile app
+    and ``src/point_ingest.SprayPoint``).
+
+    Coordinates are anchor-relative NED metres (the GPS parse endpoint projects
+    lat/lon → NED against the first row as anchor). ``mark`` True = spray a dot
+    here; the point-mission bridge maps ``mark`` to BOTH the /path must-hit flag
+    and the spray flag, so only marked points become RPP stop + spray-dwell
+    targets (an unmarked point is a plain transit vertex, never sprayed).
+    """
+
+    north_m: float
+    east_m: float
+    dwell_s: Optional[float] = None
+    source_index: int = 0
+    mark: bool = True
 
 
 class PathPlanRequest(BaseModel):
@@ -424,11 +558,93 @@ class PathPlanRequest(BaseModel):
     aft_extension_m: float = Field(0.5, ge=0.0)
     corner_smooth_radius_m: float = Field(0.0, ge=0.0)  # Planner-side corner radius; 0 disables
     corner_smooth_arc_pts: int = Field(6, ge=2)  # Points per smoothed corner arc
+    # Arc fit for surveyed LINE_CHAINs (survey CSV). Default OFF → straight
+    # chords, so DXF/builtin/line-CSV plans are byte-for-byte unchanged. On, a
+    # surveyed curve is split at corners and each curved run fit to one circle.
+    # These are None-by-default ON PURPOSE. A survey CSV arc-fits automatically
+    # (preview and load both do), so a request model that defaulted fit_arcs to
+    # False sent an EXPLICIT "off" on every call — /api/path/plan then staged
+    # straight chords for the very file preview was drawing as arcs, silently
+    # breaking the WYSIWYG contract. None = "not specified, use the auto/per-file
+    # value"; only an explicit value from the caller overrides it.
+    fit_arcs: Optional[bool] = None
+    fit_arcs_rms_m: Optional[float] = Field(None, gt=0.0, le=1.0)  # straight-vs-arc threshold (~survey RMS)
+    fit_arcs_corner_deg: Optional[float] = Field(None, gt=0.0, le=180.0)  # turn that splits runs at a corner
+    # How far a fitted arc may sit from the surveyed points it replaces. Raise it
+    # to recover a circle from a survey that sampled it as a coarse polygon;
+    # lower it to keep the reconstruction closer to the raw samples. None = use
+    # the per-file .linecfg.json sidecar (which is what preview and load read).
+    fit_arcs_max_dev_m: Optional[float] = Field(None, gt=0.0, le=1.0)
+    # Paint the closing side of an open MARK shape (distinct from close_loop,
+    # which closes with spray OFF). Default OFF → existing plans unchanged.
+    close_shape: bool = False
     use_two_opt: bool = True  # Improve greedy segment order with 2-opt
     max_two_opt_segments: int = Field(80, ge=0, le=1000)  # Skip 2-opt above this MARK count
-    max_waypoints: int = Field(10000, ge=100, le=500000)  # Hard publication guard
+    max_waypoints: int = Field(100000, ge=100, le=500000)  # Hard publication guard
     max_segments: int = Field(2000, ge=1, le=100000)  # Hard segment-count guard
     include_waypoints: bool = True  # If False, return summary only (no waypoint arrays)
+    # How far a surveyed vertex may sit off the driven chord before that counts
+    # as INTENT rather than survey noise. Decides whether analyze_mission §7
+    # FAILs a run, so it belongs to the survey, not to the analyser: a 1.7 cm
+    # single-epoch RS3 shot and a 5 mm averaged one do not deserve the same
+    # threshold. None = the analyser's documented default (2.5 cm, from the
+    # 2026-07-22 Emlid export). Staged with the mission so the number that
+    # judges a run is the one the operator set when planning it.
+    survey_tolerance_m: Optional[float] = Field(None, gt=0.0, le=1.0)
+
+    # Spray mode selection (Spray V2 B0/Phase C). Staged with the mission so it
+    # rides to the controller at load and reaches the spray node on
+    # /spray/session_config. "continuous" (default) preserves pre-B0 behaviour.
+    # Geometry (MARK/transit) still comes from /path — dash only adds the
+    # on/off metering distances. "point" is reserved for Phase D (not emitted).
+    spray_mode: str = Field("continuous", pattern="^(continuous|dash|point)$")
+    dash_on_distance_m: Optional[float] = Field(None, gt=0.0, le=1000.0)
+    dash_off_distance_m: Optional[float] = Field(None, gt=0.0, le=1000.0)
+    dash_start_state: str = Field("on", pattern="^(on|off)$")
+    # Point-mode dwell params. Coordinates are NOT set here — the dwell targets
+    # are the mission's must-hit vertices, which reach the spray node on /path
+    # (placed into the live EKF frame at start). These only carry how the node
+    # should behave AT each point: how long to dwell and how close counts as
+    # "arrived". Defaults are field-reasonable (1 s dwell, 10 cm tolerance).
+    point_dwell_s: float = Field(1.0, gt=0.0, le=60.0)
+    point_arrival_tolerance_m: float = Field(0.10, gt=0.0, le=5.0)
+    # Point-mission ingest (mobile CSV flow). When present with
+    # point_source_frame=="GPS_SURVEYED" + origin_gps, /plan-and-stage skips the
+    # line planner and stages these points directly as must-hit /path vertices
+    # (see server/routes/path.py plan_and_stage). None ⇒ ordinary DXF/line plan,
+    # byte-for-byte unchanged.
+    point_source_frame: Optional[str] = None  # "GPS_SURVEYED" | "LOCAL_NED"
+    point_mission_points: Optional[list[PointMissionPoint]] = None
+
+
+class SprayModeDashRequest(BaseModel):
+    """Body for PUT /api/path/{name}/spray-mode/dash — mirrors the mobile app.
+
+    The app sends ``dash_phase_reset`` ("per_mark_region"). The shipped
+    DashMeter runs continuous-across-mission and does NOT yet reset the pattern
+    per mark region, so the field is accepted and echoed but not honored — the
+    endpoint reports that in ``warnings`` rather than silently pretending.
+    """
+
+    dash_on_distance_m: float = Field(..., gt=0.0, le=1000.0)
+    dash_off_distance_m: float = Field(..., gt=0.0, le=1000.0)
+    dash_phase_reset: str = Field(
+        "per_mark_region", pattern="^(per_mark_region|continuous)$"
+    )
+
+
+class SprayModePointRequest(BaseModel):
+    """Body for PUT /api/path/{name}/spray-mode/point — mirrors the mobile app.
+
+    The app sends only ``point_execution_mode``; it does NOT carry marking-point
+    coordinates. Physical stop-and-dwell at each must-hit point is the RPP
+    point-hold A/B (``point_hold_enabled``, default OFF). Per-point spray
+    metering in the node needs a coordinate list this contract does not provide,
+    so this route acknowledges the selection without demoting a loaded point
+    mission — see ``warnings``.
+    """
+
+    point_execution_mode: str = Field("auto", pattern="^(auto|manual)$")
 
 
 class PathPlanResponse(BaseModel):
@@ -443,6 +659,7 @@ class PathPlanResponse(BaseModel):
     segments: list[dict]  # [{type, points, speed, source}]
     merged_waypoints: list[list[float]]  # [[north, east], ...]
     spray_flags: list[bool]  # True = MARK
+    must_hit: list[bool] = Field(default_factory=list)  # True = source vertex
     alignment_metadata: Optional[dict] = None  # alignment stats/residuals
     planning_metadata: Optional[dict] = None  # counts/timings/bbox/unit metadata
     warnings: Optional[list[str]] = None  # geometry/safety warnings
@@ -555,6 +772,7 @@ class StagedMissionResponse(BaseModel):
     num_waypoints: int = 0
     waypoints: list[list[float]] = Field(default_factory=list)
     spray_flags: list[bool] = Field(default_factory=list)
+    must_hit: list[bool] = Field(default_factory=list)
     segment_runs: list[dict] = Field(default_factory=list)  # derived spray on/off runs
     alignment_metadata: Optional[dict] = None
     metadata: Optional[dict] = None

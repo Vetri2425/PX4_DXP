@@ -24,13 +24,25 @@ class EmergencyHandler:
         ros_node,
         offboard_controller,
         activity_log: deque,
+        joystick_controller=None,
     ) -> None:
         self._node       = ros_node
         self._controller = offboard_controller
         self._log        = activity_log
+        self._joystick    = joystick_controller
 
     async def estop_async(self) -> dict:
         """Execute emergency stop. Returns {success, message}."""
+        # 0. Neutralize the joystick lease first (if any). Cheap, synchronous,
+        # and must happen regardless of ROS-node availability below — a
+        # stranded ACTIVE lease would otherwise keep streaming manual-control
+        # frames after the "no ROS node" short-circuit returns.
+        if self._joystick is not None:
+            try:
+                self._joystick.emergency_neutralize(reason="estop")
+            except Exception:
+                log.exception("joystick emergency_neutralize raised during e-stop")
+
         # Guard: if ROS node is unavailable, short-circuit cleanly
         if self._node is None:
             msg = "ROS node not available — e-stop cannot reach FCU"

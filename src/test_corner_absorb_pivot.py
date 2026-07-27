@@ -255,6 +255,74 @@ def test_5_release_safety_gate(node):
     print("PASS test 5: holds at 28°, releases at 1°, hard 10° cap survives a mis-set relaxed band")
 
 
+def test_7_musthit_points_preserved(cls):
+    # Segment-mode simplification must KEEP near-straight must-hit points.
+    # tes_cross_line.dxf: 4 points, middle two bend the line only ~3° but sit
+    # 3-4cm off the straight ends. Angle-only simplification dropped them, so
+    # the rover tracked a straight line and missed the points by ~4cm.
+    V = [(-0.860, -1.217), (-0.286, -0.442), (0.266, 0.344), (0.880, 1.315)]
+
+    # Old behaviour (angle only) collapses to the two endpoints.
+    old, _ = cls._simplify_path_for_profile(V, max_offset_m=0.0)
+    assert len(old) == 2, f"angle-only should drop the middle points, got {len(old)}"
+
+    # With a 1cm distance keep, every drawn point survives.
+    new, _ = cls._simplify_path_for_profile(V, max_offset_m=0.01)
+    assert len(new) == 4, f"must-hit points must be kept, got {len(new)}"
+    for p in V:
+        assert min(math.hypot(p[0]-q[0], p[1]-q[1]) for q in new) < 1e-6, \
+            f"point {p} missing from simplified path"
+
+    # ── The case the bare-vertex assertions above CANNOT catch ──────────────
+    # The planner never hands the controller bare vertices: every MARK segment
+    # is densified at mark_spacing (5 cm) first. Feeding V directly made this
+    # test pass while the deployed path still collapsed to 2 points, because
+    # the old guard measured each candidate against the next raw sample ~5 cm
+    # away (~2.4 mm at a vertex 3-4 cm off the chord) instead of against the
+    # span being collapsed. Densify first, or the test proves nothing.
+    def densify(vs, spacing=0.05):
+        out = [vs[0]]
+        for a, b in zip(vs, vs[1:]):
+            n = max(1, int(math.ceil(math.hypot(b[0]-a[0], b[1]-a[1]) / spacing - 1e-9)))
+            out.extend((a[0] + (b[0]-a[0]) * i / n, a[1] + (b[1]-a[1]) * i / n)
+                       for i in range(1, n + 1))
+        return out
+
+    dense = densify(V)
+    assert len(dense) > 50, "densify helper did not densify"
+
+    # Geometry alone (Layer 1): proper Douglas-Peucker measures against the
+    # collapsing span, so the interior vertices now survive densification.
+    dp_only, _ = cls._simplify_path_for_profile(dense, max_offset_m=0.01)
+    for p in V[1:-1]:
+        assert min(math.hypot(p[0]-q[0], p[1]-q[1]) for q in dp_only) < 0.011, \
+            f"densified: vertex {p} lost with a 1cm tolerance"
+
+    # Provenance (Layer 2): flagged source vertices survive even when the
+    # tolerance is far too loose to catch them geometrically.
+    keys = frozenset(cls._pt_key(p) for p in V)
+    prov, _ = cls._simplify_path_for_profile(
+        dense, max_offset_m=0.50, must_hit_keys=keys
+    )
+    for p in V:
+        assert min(math.hypot(p[0]-q[0], p[1]-q[1]) for q in prov) < 1e-6, \
+            f"densified: must-hit vertex {p} dropped despite provenance flag"
+
+    # ...and without the flag, a 50 cm tolerance legitimately drops them.
+    loose, _ = cls._simplify_path_for_profile(dense, max_offset_m=0.50)
+    assert len(loose) == 2, f"loose tolerance should collapse, got {len(loose)}"
+
+    # Regressions: an exactly-straight densified line still collapses to 2, and
+    # a square's corners still survive.
+    line = [(0.0, i * 0.05) for i in range(60)]
+    assert len(cls._simplify_path_for_profile(line, max_offset_m=0.01)[0]) == 2
+    square = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0)]
+    assert len(cls._simplify_path_for_profile(square, max_offset_m=0.01)[0]) == 5
+    # Densified square: corners survive, sides collapse to their endpoints.
+    assert len(cls._simplify_path_for_profile(densify(square), max_offset_m=0.01)[0]) == 5
+    print("PASS test 7: must-hit points kept on DENSIFIED input (DP + provenance)")
+
+
 def main():
     rclpy.init(args=["--ros-args", "-p", "require_rtk_fix:=false"])
     try:
@@ -265,6 +333,7 @@ def main():
         test_2_absorption_gating(cls)
         test_3_tangent_regression(cls)
         test_6_angle_wrapping(cls)
+        test_7_musthit_points_preserved(cls)
 
         node = RPPControllerNode()
         for name in ("_vel_pub", "_yaw_rate_pub", "_dbg_pub",

@@ -25,6 +25,8 @@ from .core import (
 from .parsers import load_mission_file, load_mission_segments, parse_dxf, entities_to_segments
 from .parsers.csv_parser import read_ned_csv_enhanced
 from .parsers.waypoints_parser import read_qgc_waypoints_as_segment
+from .planners.arc_chain import MAX_ARC_DEVIATION_M, fit_line_chain
+from .planners.corner_fillet import fillet_corners
 from .planners.straight_line import densify_segment
 from .planners.extensions import (
     decompose_line_chain_to_edges,
@@ -192,6 +194,32 @@ class PathEngine:
         per_line_extensions: bool = False,
         corner_smooth_radius_m: float = 0.0,
         corner_smooth_arc_pts: int = 6,
+        # Arc fit for surveyed LINE_CHAINs (survey CSV). Default OFF: with the
+        # flag off a surveyed chain densifies to straight chords exactly as
+        # before, so DXF and line missions are byte-for-byte unchanged. On, a
+        # surveyed curve is split at corners and each curved run is fit to one
+        # circle (see planners/arc_chain.py). rms is the straight-vs-arc
+        # threshold (~ survey lateral RMS); corner_deg the turn that splits runs.
+        fit_arcs: bool = False,
+        fit_arcs_rms_m: float = 0.025,
+        fit_arcs_corner_deg: float = 35.0,
+        # How far a fitted arc may sit from the surveyed points it replaces.
+        # The binding case is a survey that samples a curve as a coarse polygon
+        # (the Egmore roundabout CSV is a ~20-gon whose facets sit 13 cm inside
+        # the true circle) — tighten this and such a circle stays a polygon.
+        fit_arcs_max_dev_m: float = MAX_ARC_DEVIATION_M,
+        # Round every surveyed corner in a LINE_CHAIN into a tangent arc of this
+        # radius. 0 = off. UNLIKE fit_arcs this INVENTS geometry — the radius is
+        # a marking-spec value, not something the surveyor measured — so it is
+        # never enabled implicitly; the operator has to ask for it and choose the
+        # radius. Needed because a road survey captures a bend as two straights
+        # meeting at one vertex, leaving no arc for fit_arcs to recover.
+        fillet_corners_m: float = 0.0,
+        # Paint the closing side of an open MARK shape. Distinct from close_loop
+        # (which closes with spray OFF, a deadhead). Default OFF. On, a MARK
+        # segment whose first and last points differ gets a copy of its first
+        # point appended, so the closing edge is a genuine sprayed MARK edge.
+        close_shape: bool = False,
         use_two_opt: bool = True,
         max_two_opt_segments: int = 80,
         group_shapes: bool = True,
@@ -254,6 +282,16 @@ class PathEngine:
         self.per_line_extensions = per_line_extensions
         self.corner_smooth_radius_m = corner_smooth_radius_m
         self.corner_smooth_arc_pts = corner_smooth_arc_pts
+        self.fit_arcs = fit_arcs
+        self.fit_arcs_rms_m = fit_arcs_rms_m
+        self.fit_arcs_corner_deg = fit_arcs_corner_deg
+        self.fit_arcs_max_dev_m = fit_arcs_max_dev_m
+        if fillet_corners_m < 0.0:
+            raise ValueError(
+                f"fillet_corners_m must be >= 0.0, got {fillet_corners_m}"
+            )
+        self.fillet_corners_m = fillet_corners_m
+        self.close_shape = close_shape
         self.use_two_opt = use_two_opt
         self.max_two_opt_segments = max_two_opt_segments
         self.group_shapes = group_shapes
@@ -264,6 +302,29 @@ class PathEngine:
         self.extension_min_useful_m = extension_min_useful_m
         self.avoid_wet_paint = avoid_wet_paint
         self.wet_paint_penalty_m = wet_paint_penalty_m
+
+    @staticmethod
+    def _geo_origin_gps(entities, origin_gps, ref_points_gps):
+        """Default GPS placement to the DXF's own geo_origin.
+
+        A georeferenced DXF (lat/lon coords, projected to local ENU metres by
+        georef with the WGS84 origin stamped on each entity) already knows where
+        it belongs on the ground. When the caller gives no explicit GPS
+        placement, use that origin so the mission drives at the EXACT lat/lon it
+        was drawn at — GPS_SURVEYED placement with no alignment survey. Because
+        georef centres the local frame on this same origin, local (0,0) maps
+        back to it and every waypoint round-trips to its original lat/lon.
+
+        Explicit origin_gps / ref_points always win. A metric DXF has no
+        geo_origin, so this is a no-op and LOCAL_NED placement stands.
+        """
+        if origin_gps is not None or ref_points_gps is not None:
+            return origin_gps
+        for ent in entities:
+            geo = getattr(ent, "geo_origin", None)
+            if geo is not None:
+                return (float(geo[0]), float(geo[1]))
+        return origin_gps
 
     def plan_file(
         self,
@@ -310,6 +371,7 @@ class PathEngine:
         if ext == ".dxf":
             entities = parse_dxf(filepath, unit_scale=unit_scale)
             detected_unit_scale = entities[0].unit_scale if entities else unit_scale
+            origin_gps = self._geo_origin_gps(entities, origin_gps, ref_points_gps)
             segments = entities_to_segments(
                 entities, layer_mapping=layer_mapping,
                 mark_speed=self.marking_speed, transit_speed=self.transit_speed,
@@ -318,6 +380,15 @@ class PathEngine:
             # CSV and .waypoints: use the parser dispatcher
             detected_unit_scale = None
             segments = load_mission_segments(filepath)
+            # A survey CSV carries its own WGS84 origin (it was projected from
+            # lat/lon), so surveyed placement can auto-anchor exactly as a
+            # georeferenced DXF does.
+            if origin_gps is None:
+                for seg in segments:
+                    geo = seg.metadata.get("geo_origin")
+                    if geo:
+                        origin_gps = (float(geo[0]), float(geo[1]))
+                        break
 
         plan = self._plan_from_segments(
             segments,
@@ -371,6 +442,7 @@ class PathEngine:
         Returns:
             PlannedPath with merged waypoints and spray flags.
         """
+        origin_gps = self._geo_origin_gps(entities, origin_gps, ref_points_gps)
         segments = entities_to_segments(
             entities, layer_mapping=layer_mapping,
             mark_speed=self.marking_speed, transit_speed=self.transit_speed,
@@ -518,6 +590,60 @@ class PathEngine:
             )
             for seg in segments
         ]
+
+        # Arc fit (opt-in): replace a surveyed LINE_CHAIN's straight-chord
+        # geometry with fitted straight-runs + circular arcs BEFORE anything
+        # else touches the points. A rigid transform preserves circles, so
+        # running this ahead of alignment is equivalent and keeps the fit in the
+        # raw survey frame. Off by default and only ever LINE_CHAIN MARKs (DXF
+        # never has that geometry_type), so all other missions are untouched.
+        if self.fit_arcs:
+            for seg in segments:
+                if (seg.segment_type == SegmentType.MARK
+                        and str(seg.metadata.get("geometry_type", "")).upper() == "LINE_CHAIN"
+                        and len(seg.points) >= 3):
+                    new_pts, ctrl = fit_line_chain(
+                        seg.points,
+                        rms_m=self.fit_arcs_rms_m,
+                        corner_angle_deg=self.fit_arcs_corner_deg,
+                        max_spacing_m=self.mark_spacing,
+                        max_dev_m=self.fit_arcs_max_dev_m,
+                    )
+                    seg.points = new_pts
+                    seg.metadata["control_indices"] = ctrl
+
+        # Corner fillet (opt-in, radius from the operator). Runs AFTER the arc
+        # fit so a genuinely surveyed arc is recovered first and only what is
+        # still a corner gets rounded. Same LINE_CHAIN-only gate, so DXF and
+        # legacy missions cannot be touched.
+        if self.fillet_corners_m > 0.0:
+            for seg in segments:
+                if (seg.segment_type == SegmentType.MARK
+                        and str(seg.metadata.get("geometry_type", "")).upper() == "LINE_CHAIN"
+                        and len(seg.points) >= 3):
+                    new_pts, ctrl = fillet_corners(
+                        seg.points,
+                        seg.metadata.get("control_indices"),
+                        radius_m=self.fillet_corners_m,
+                        max_spacing_m=self.mark_spacing,
+                    )
+                    seg.points = new_pts
+                    seg.metadata["control_indices"] = ctrl
+
+        # Close the shape (opt-in): append a copy of the first point to any open
+        # MARK shape so its closing side is a genuine sprayed MARK edge — unlike
+        # close_loop, which closes with spray OFF. Runs after arc fit so the
+        # closing edge is a straight chord back to the start. A shape already
+        # closed (ends within one waypoint spacing) is left untouched.
+        if self.close_shape:
+            for seg in segments:
+                if seg.segment_type == SegmentType.MARK and len(seg.points) >= 3:
+                    first = seg.points[0]
+                    if math.dist(first, seg.points[-1]) > self.mark_spacing:
+                        seg.points = list(seg.points) + [first]
+                        ctrl = list(seg.metadata.get("control_indices", []))
+                        ctrl.append(len(seg.points) - 1)
+                        seg.metadata["control_indices"] = sorted(set(ctrl))
 
         alignment_meta = {}
         has_alignment = False
@@ -998,6 +1124,11 @@ class PathEngine:
         # Step 6: Merge into single polyline with spray flags (and de-duplicate junctions)
         merged_waypoints: list[tuple[float, float]] = []
         spray_flags: list[bool] = []
+        # Parallel to merged_waypoints: True = this point came from the source
+        # geometry (CAD/survey vertex), not from densification. Consumers must
+        # never simplify a must-hit point away — see densify_segment's
+        # "vertex_indices" and RPP `_simplify_path_for_profile`.
+        must_hit: list[bool] = []
         total_mark = 0.0
         total_transit = 0.0
 
@@ -1023,7 +1154,25 @@ class PathEngine:
 
         for seg in ordered:
             is_mark = seg.segment_type == SegmentType.MARK
+            # A segment that never went through densify_segment carries no
+            # provenance, which means every one of its points IS source
+            # geometry (e.g. a parser-tessellated arc). Treat it as all-vertex
+            # rather than all-fill: over-preserving is safe, under-preserving
+            # silently deletes surveyed intent.
+            # Precedence: an explicit POINT-layer declaration NARROWS must-hit
+            # to just those vertices; absent one, every source vertex counts.
+            # That is what keeps a long exported road tangent tractable — 200
+            # vertices, 6 declared, 194 free to simplify.
+            raw_ctrl = seg.metadata.get("control_indices")
+            raw_vidx = seg.metadata.get("vertex_indices")
+            if raw_ctrl:
+                vertex_set = set(raw_ctrl)
+            elif raw_vidx is not None:
+                vertex_set = set(raw_vidx)
+            else:
+                vertex_set = None
             for i, pt in enumerate(seg.points):
+                is_vertex = True if vertex_set is None else (i in vertex_set)
                 # Apply origin offset (only if not already aligned using GPS/affine)
                 if has_alignment:
                     offset_pt = pt
@@ -1034,10 +1183,14 @@ class PathEngine:
                 if merged_waypoints:
                     d = math.hypot(offset_pt[0] - merged_waypoints[-1][0], offset_pt[1] - merged_waypoints[-1][1])
                     if d < 0.01 and spray_flags[-1] == is_mark:
+                        # The retained coincident point inherits must-hit, or a
+                        # junction vertex would lose its provenance to dedup.
+                        must_hit[-1] = must_hit[-1] or is_vertex
                         continue
 
                 merged_waypoints.append(offset_pt)
                 spray_flags.append(is_mark)
+                must_hit.append(is_vertex)
 
                 # Compute segment length
                 if i > 0:
@@ -1059,8 +1212,81 @@ class PathEngine:
                 # which would paint the closing leg. Always close with spray OFF.
                 merged_waypoints.append(merged_waypoints[0])
                 spray_flags.append(False)
+                # Closing leg lands back on the path start — a real vertex.
+                must_hit.append(True)
                 # Account for the closing leg in the totals (transit)
                 total_transit += d_start_end
+
+        # Guarantee a terminal MARK->TRANSIT boundary when the mission ends on a
+        # MARK point. With extensions ON, the AFT run-out already appends a
+        # trailing TRANSIT point; with extensions OFF the mission ends on MARK
+        # (spray_flags[-1] is True), so the spray node never sees a terminal
+        # boundary: _next_boundary returns None, off_early can never fire, and
+        # _project_onto_path's global-closest snap can leave the nozzle latched
+        # ON at the endpoint. Append one short TRANSIT run-out so the extensions
+        # OFF tail is structurally identical to the extensions ON tail.
+        #
+        # Placed AFTER the close_loop block on purpose: a closed loop already
+        # ends on a TRANSIT (spray_flags[-1] is False), so this is a no-op there
+        # and cannot spur off the closing leg. This is purely additive — it only
+        # ever extends the deadhead tail by ~0.05 m and never alters a leg the
+        # rover actually marks.
+        #
+        # ONLY for an OPEN mission: a geometrically closed shape (last point
+        # coincides with the path start, e.g. a square outline marked as one
+        # MARK chain) must NOT get a linear run-out — that would drive a spur
+        # out past the closed corner and change the CAD topology (see
+        # test_extensions.py square-topology contracts). Closed shapes have a
+        # separate, pre-existing endpoint ambiguity: the nozzle projection at
+        # the coincident start/end point cannot distinguish "at the start" from
+        # "at the end" without a monotonic-progress window, which is deliberately
+        # deferred. This fix targets the reported case — OPEN extensions-off
+        # missions (lines, point-lines) that end on a MARK.
+        ends_at_start = (
+            len(merged_waypoints) >= 2
+            and math.hypot(
+                merged_waypoints[-1][0] - merged_waypoints[0][0],
+                merged_waypoints[-1][1] - merged_waypoints[0][1],
+            )
+            < 0.01
+        )
+        if merged_waypoints and spray_flags and spray_flags[-1] and not ends_at_start:
+            tail_n, tail_e = merged_waypoints[-1]
+            if len(merged_waypoints) >= 2:
+                p0n, p0e = merged_waypoints[-2]
+                dn, de = tail_n - p0n, tail_e - p0e
+                norm = math.hypot(dn, de)
+                if norm > 1e-9:
+                    dn, de = dn / norm, de / norm
+                else:
+                    dn, de = 1.0, 0.0
+            else:
+                dn, de = 1.0, 0.0
+            # Tail length: the floor is coupled to the spray node's B4 terminal
+            # shutoff (`terminal_off_epsilon_m`, 0.05 m in
+            # src/spray_controller_node.py). B4 closes the valve within epsilon
+            # of the PATH END at creep speed — with a tail shorter than epsilon
+            # that region crosses INTO the marked line and cuts the mark short
+            # of the final station. So 0.05 is the FLOOR, not the target.
+            #
+            # It was briefly set to 0.05 (2026-07-27) to cut the ~10 cm overrun
+            # past the final surveyed station. That was the wrong term: the
+            # overrun is the rover's own braking distance, so it did not move
+            # (8.4-12.6 cm before, 9.1-12.5 cm after, bags/27_07_2026) — the
+            # edit only deleted the leg that used to absorb it. The rover then
+            # finished 5-7 cm BEYOND the last path point, the terminal target
+            # heading flipped ~150 deg to point back at the station it had
+            # passed, and the controller sat in CORNER_STOP for 10+ s commanding
+            # 0.02-0.055 m/s reverse — under RO_SPEED_TH=0.1, the firmware speed
+            # dead-band, so it barely crawled (2 of 3 runs; 13.3 s and 12.6 s).
+            # Restored to 0.10 so the tail again covers the coast. Shrinking the
+            # overrun needs terminal deceleration, not a shorter tail.
+            runout = self.aft_extension_m if self.enable_path_extensions else 0.1
+            runout = max(0.1, runout)
+            merged_waypoints.append((tail_n + dn * runout, tail_e + de * runout))
+            spray_flags.append(False)
+            must_hit.append(False)
+            total_transit += runout
 
         bbox = None
         if merged_waypoints:
@@ -1159,6 +1385,7 @@ class PathEngine:
             segments=ordered,
             merged_waypoints=merged_waypoints,
             spray_flags=spray_flags,
+            must_hit=must_hit,
             total_mark_length=total_mark,
             total_transit_length=total_transit,
             origin=origin if not has_alignment else (0.0, 0.0),

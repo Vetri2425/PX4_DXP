@@ -2,13 +2,49 @@
 
 import math
 
+import pytest
+
 from path_engine.ned import (
     latlon_to_ned,
+    ned_to_latlon,
     dxf_to_ned_affine,
     apply_affine_transform,
     estimate_fit_scale,
     _HAS_GEOGRAPHICLIB,
 )
+
+
+# ── ned_to_latlon (inverse) tests ──────────────────────────────────────────────
+
+@pytest.mark.skipif(not _HAS_GEOGRAPHICLIB, reason="geographiclib not installed")
+def test_ned_to_latlon_roundtrip_is_exact():
+    """latlon → ned → latlon recovers the original to sub-millimetre."""
+    origin = (13.07202700, 80.26195130)          # Chennai test site
+    for lat, lon in [(13.07206386, 80.26194119),
+                     (13.07208200, 80.26194256),
+                     (13.07206256, 80.26196002)]:
+        n, e = latlon_to_ned(lat, lon, *origin)
+        la, lo = ned_to_latlon(n, e, *origin)
+        # residual as a ground distance back to the true point
+        rn, re = latlon_to_ned(la, lo, lat, lon)
+        assert math.hypot(rn, re) < 1e-3          # < 1 mm
+
+
+@pytest.mark.skipif(not _HAS_GEOGRAPHICLIB, reason="geographiclib not installed")
+def test_ned_to_latlon_origin_maps_to_origin():
+    origin = (13.0, 80.0)
+    la, lo = ned_to_latlon(0.0, 0.0, *origin)
+    assert abs(la - 13.0) < 1e-9 and abs(lo - 80.0) < 1e-9
+
+
+@pytest.mark.skipif(not _HAS_GEOGRAPHICLIB, reason="geographiclib not installed")
+def test_ned_to_latlon_cardinal_directions():
+    """+north raises latitude; +east raises longitude."""
+    origin = (13.0, 80.0)
+    north_lat, _ = ned_to_latlon(10.0, 0.0, *origin)
+    _, east_lon = ned_to_latlon(0.0, 10.0, *origin)
+    assert north_lat > 13.0
+    assert east_lon > 80.0
 
 
 # ── latlon_to_ned tests ────────────────────────────────────────────────────────

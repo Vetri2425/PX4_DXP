@@ -18,6 +18,7 @@ shim if ever needed) but **must not** be called from the asyncio loop.
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import threading
 import time
@@ -36,9 +37,13 @@ from rclpy.qos import (
 
 from geometry_msgs.msg import PoseStamped, Vector3Stamped
 from nav_msgs.msg import Path
-from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, String
 
 from config import (
+    ORIGIN_CONSISTENCY_MAX_M,
+    ORIGIN_LINK_GAP_S,
+    ORIGIN_REQUEST_MAX_TRIES,
+    ORIGIN_REQUEST_PERIOD_S,
     SRV_RPP_GET_PARAMS,
     SRV_RPP_LIST_PARAMS,
     SRV_RPP_SET_PARAMS,
@@ -46,6 +51,7 @@ from config import (
     SRV_SPRAY_SET_PARAMS,
 )
 from logging_setup import get_logger
+from origin_health import INCONSISTENT, OK, UNVERIFIABLE, evaluate_origin_health
 from rpp_status import RppStatusMonitor
 
 log = get_logger("server.ros")
@@ -54,12 +60,21 @@ log = get_logger("server.ros")
 try:
     from mavros_msgs.msg import State
     from sensor_msgs.msg import BatteryState, NavSatFix
-    from mavros_msgs.srv import CommandBool, SetMode
+    from mavros_msgs.srv import CommandBool, CommandLong, SetMode
 
     _HAS_MAVROS = True
 except ImportError:
     _HAS_MAVROS = False
     State = BatteryState = NavSatFix = CommandBool = SetMode = None  # type: ignore
+    CommandLong = None  # type: ignore
+
+try:
+    from geographic_msgs.msg import GeoPointStamped
+
+    _HAS_GEOPOINT = True
+except ImportError:
+    _HAS_GEOPOINT = False
+    GeoPointStamped = None  # type: ignore
 
 try:
     from mavros_msgs.msg import GPSRAW
@@ -157,6 +172,19 @@ class RosBridgeNode(Node):
         "pos_e": 0.0,
         "pose_received": False,
         "global_position_received": False,
+        # EKF-declared local-frame origin (GPS_GLOBAL_ORIGIN -> gp_origin). Fixed
+        # for the EKF session, so using it makes mission placement deterministic.
+        "ekf_origin_lat": 0.0,
+        "ekf_origin_lon": 0.0,
+        "ekf_origin_received": False,
+        "ekf_origin_stamp": None,
+        # Why the cached origin was last dropped (FCU reboot / MAVROS restart /
+        # measured inconsistency) and when — surfaced verbatim in the placement
+        # refusal and on GET /api/health/origin so the operator sees the cause,
+        # not just the symptom. None => never invalidated in this process.
+        "ekf_origin_invalid_reason": None,
+        "ekf_origin_invalidated_at": None,
+        "ekf_origin_invalidations": 0,
         "gps_fix_received": False,
         "heading_ned_deg": 0.0,
         "battery_v": 0.0,
@@ -166,8 +194,12 @@ class RosBridgeNode(Node):
         "alt": 0.0,
         "gps_fix": 0,
         "gps_sat": 0,
-        "hrms": 0.0,
-        "vrms": 0.0,
+        # A14: None = "not reported yet / not trustworthy", never 0.0. A zero
+        # here is indistinguishable from a perfect fix.
+        "hrms": None,
+        "vrms": None,
+        "gps_accuracy_known": False,
+        "position_covariance_type": 0,
         "xtrack_m": 0.0,
         "heading_err_deg": 0.0,
         "lookahead_m": 0.0,
@@ -184,6 +216,11 @@ class RosBridgeNode(Node):
         "spraying": False,
         "spray_active": False,
         "spray_manual": False,
+        # Current spray MODE + mode_state, mirrored from the node's rich
+        # /spray/status (String JSON). None until the spray node is first heard
+        # from, so callers can distinguish "continuous" from "node not reporting".
+        "spray_mode": None,
+        "spray_mode_state": None,
     }
 
     def __init__(self) -> None:
@@ -207,8 +244,14 @@ class RosBridgeNode(Node):
         self._rpp_debug_recv_time: float | None = None
         self._MAVROS_STATE_TIMEOUT_S = 2.0  # MAVROS publishes /state ~10 Hz
 
-        # Callback groups: subs mutually exclusive, services reentrant
+        # Callback groups: subs mutually exclusive, services reentrant.
+        # /mavros/state gets its OWN group: it is the liveness + mode signal
+        # (get_state() flips connected=False after 2 s without it, and the
+        # joystick MANUAL-mode check reads it). In the shared group a burst of
+        # pose/GPS/rpp callbacks can starve it, which cascades into joystick
+        # transport/mode rejections → gateway deadman neutral → jerky drive.
         self._sub_group = MutuallyExclusiveCallbackGroup()
+        self._state_sub_group = MutuallyExclusiveCallbackGroup()
         self._svc_group = ReentrantCallbackGroup()
 
         if not _HAS_MAVROS:
@@ -221,7 +264,7 @@ class RosBridgeNode(Node):
                 "/mavros/state",
                 self._cb_state,
                 _qos_reliable_tl(),
-                callback_group=self._sub_group,
+                callback_group=self._state_sub_group,
             )
             self.create_subscription(
                 PoseStamped,
@@ -244,6 +287,17 @@ class RosBridgeNode(Node):
                 _qos_best_effort(),
                 callback_group=self._sub_group,
             )
+            # EKF local-frame origin. mavros publishes this with LatchedStateQoS
+            # (RELIABLE + TRANSIENT_LOCAL, depth 1), so we MUST match durability
+            # or we silently never receive the one latched message.
+            if _HAS_GEOPOINT:
+                self.create_subscription(
+                    GeoPointStamped,
+                    "/mavros/global_position/gp_origin",
+                    self._cb_gp_origin,
+                    _qos_reliable_tl(),
+                    callback_group=self._sub_group,
+                )
             if _HAS_GPSRAW:
                 self.create_subscription(
                     GPSRAW,
@@ -281,12 +335,35 @@ class RosBridgeNode(Node):
             _qos_best_effort(),
             callback_group=self._sub_group,
         )
+        # Rich spray status (mode + mode_state) — the node's own /spray/status
+        # (std_msgs/String JSON, best-effort). Mirrored so /api/spray/status can
+        # report the live mode and its config without a second ROS hop.
+        self.create_subscription(
+            String,
+            "/spray/status",
+            self._cb_spray_status,
+            _qos_best_effort(),
+            callback_group=self._sub_group,
+        )
 
         # ── Publishers ────────────────────────────────────────────────────────
         self._path_pub = self.create_publisher(Path, "/path", _qos_reliable_tl())
+        # B0 (plan §3): spray mode + mode params, published once per mission
+        # load. RELIABLE + TRANSIENT_LOCAL (same class as /path) so a restarted
+        # spray node re-latches the current mission's mode. The spray node is
+        # the sole parser; we send it a JSON String and never validate on its
+        # behalf.
+        self._spray_session_config_pub = self.create_publisher(
+            String, "/spray/session_config", _qos_reliable_tl()
+        )
         # Manual spray override command — reliable VOLATILE (depth 1): must
         # arrive, but a stale override must never replay to a restarted node.
         self._spray_manual_pub = self.create_publisher(Bool, "/spray/manual", 1)
+        # G5 — manual point advance (server → RPP). Default QoS is RELIABLE
+        # VOLATILE (depth 1), same class as /spray/manual: the operator "next
+        # point" command must arrive, but a restart must never replay a stale
+        # advance (never TRANSIENT_LOCAL).
+        self._point_advance_pub = self.create_publisher(String, "/point/advance", 1)
 
         # ── Service clients (reentrant group, can be called from any thread) ──
         self._arming_cli = None
@@ -296,6 +373,24 @@ class RosBridgeNode(Node):
         if _HAS_MAVROS:
             self._arming_cli = self.create_client(
                 CommandBool, "/mavros/cmd/arming", callback_group=self._svc_group
+            )
+            # Used only to ask PX4 to (re)send GPS_GLOBAL_ORIGIN — see
+            # _request_ekf_origin_tick. Read-only telemetry request.
+            self._command_cli = self.create_client(
+                CommandLong, "/mavros/cmd/command", callback_group=self._svc_group
+            )
+            # PX4 force-sends GPS_GLOBAL_ORIGIN once when its MAVLink stream
+            # starts, then only on change. If MAVROS connects after that (a
+            # rover-server restart, a MAVROS restart) the latched topic stays
+            # EMPTY FOREVER and mission placement silently falls back to the
+            # non-deterministic live pose/global pair. Verified on the rig:
+            # echo returned nothing until MAV_CMD_REQUEST_MESSAGE was sent, and
+            # the value latched immediately afterwards. So ask for it.
+            self._origin_req_count = 0
+            self.create_timer(
+                ORIGIN_REQUEST_PERIOD_S,
+                self._request_ekf_origin_tick,
+                callback_group=self._svc_group,
             )
             self._set_mode_cli = self.create_client(
                 SetMode, "/mavros/set_mode", callback_group=self._svc_group
@@ -359,11 +454,55 @@ class RosBridgeNode(Node):
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
     def _cb_state(self, msg) -> None:
-        self._state_recv_time = time.monotonic()
+        now = time.monotonic()
+        prev_recv = self._state_recv_time
+        self._state_recv_time = now
         with self._lock:
+            prev_connected = bool(self._state.get("connected", False))
             self._state["armed"] = msg.armed
             self._state["mode"] = msg.mode
             self._state["connected"] = msg.connected
+
+        # ── Cached-origin invalidation on link re-establishment ──────────────
+        # The EKF local-frame origin is per-EKF-session, but it lives in THIS
+        # process's state — which survives an FCU reboot and a MAVROS restart.
+        # Field bug 2026-07-27: the server kept serving a dead session's origin
+        # and placed two missions 2.15 m / 2.25 m off the surveyed line.
+        #
+        # Two independent signals, OR'd, because either alone can miss:
+        #   * connected False->True — MAVROS itself declaring the FCU link came
+        #     back (heartbeat timeout), the normal FCU-reboot signature.
+        #   * a long gap in /mavros/state — MAVROS restarted or the topic
+        #     stalled, which connected cannot report because a TRANSIENT_LOCAL
+        #     State message keeps reading connected=True while the process dies.
+        # Neither is trusted to be complete: the consistency gate in
+        # origin_health is the mechanism-independent backstop. This half is
+        # about RECOVERY (re-arm the request path), not detection.
+        # The FIRST /mavros/state message of this process is the INITIAL
+        # connection, not a re-establishment: `connected` starts False in
+        # _DEFAULT_STATE, so every startup produced a spurious False->True and
+        # invalidated a perfectly good origin ~50 ms after it arrived (observed
+        # live 2026-07-27 16:55:18). It self-healed in ~10 s via the re-request
+        # path, but it burned a request attempt and cried wolf on every restart,
+        # which trains the operator to ignore the one warning that matters.
+        #
+        # Skipping it is safe because this half is only RECOVERY. A fresh
+        # process holds no cached origin to invalidate; the one real hazard —
+        # MAVROS handing us a STALE latched gp_origin from a dead EKF session —
+        # is caught by the consistency gate in origin_health, which measures the
+        # declared origin against the frame PX4 is actually publishing and does
+        # not care how the value got there.
+        gap_s = (now - prev_recv) if prev_recv is not None else None
+        first_state_msg = prev_recv is None
+        if first_state_msg:
+            pass
+        elif bool(msg.connected) and not prev_connected:
+            self._invalidate_ekf_origin("FCU link re-established (connected False->True)")
+        elif gap_s is not None and gap_s > ORIGIN_LINK_GAP_S:
+            self._invalidate_ekf_origin(
+                f"/mavros/state gap of {gap_s:.1f} s (> {ORIGIN_LINK_GAP_S:.1f} s) "
+                "— MAVROS restarted or the link stalled"
+            )
 
     def _cb_pose(self, msg) -> None:
         """ENU (MAVROS REP-103) → NED conversion."""
@@ -389,24 +528,188 @@ class RosBridgeNode(Node):
             self._state["battery_pct"] = pct if pct is not None else 0.0
 
     def _cb_global_pos(self, msg) -> None:
-        hrms = 0.0
-        vrms = 0.0
+        lat = float(msg.latitude)
+        lon = float(msg.longitude)
+        alt = float(msg.altitude)
+        # NaN lat/lon is the driver's "no fix yet" sentinel (same convention
+        # _cb_gp_origin and tools/analyze_mission.py already guard against).
+        # Never let it into state: Socket.IO nulls NaN via _sanitize, but the
+        # REST /telemetry/latest path would serialize it as a bare NaN token —
+        # invalid JSON that throws in the client's JSON.parse.
+        if not (math.isfinite(lat) and math.isfinite(lon)):
+            return
+        # A14 (2026-07-27): the covariance is only in METRES when the driver
+        # says so. NavSatFix.position_covariance_type is
+        #   0 UNKNOWN · 1 APPROXIMATED · 2 DIAGONAL_KNOWN · 3 KNOWN
+        # and only 2/3 carry metre-valued variances. Type 1 is filled from DOP —
+        # a DIMENSIONLESS quality score — so taking sqrt() unconditionally
+        # reported an HDOP of 0.50 as "0.707 m" of horizontal error, and a
+        # zeroed vertical term as a hard "0.000 m", which reads as PERFECT
+        # accuracy when it actually means NO INFORMATION. Observed live on this
+        # rover: type 2 sessions give hrms 0.025 / vrms 0.033, type 1 sessions
+        # give 0.707 / 0.000 while `gps_fix_name` still says RTK_FIXED.
+        #
+        # Unknown is now reported as None, never as a number. `hrms`/`vrms` are
+        # already Optional[float] in models.TelemetryData, and Socket.IO/REST
+        # serialise None as null.
+        cov_type = 0
         try:
-            cov = msg.position_covariance
-            hrms = round(math.sqrt(abs(cov[0]) + abs(cov[4])), 3)
-            vrms = round(math.sqrt(abs(cov[8])), 3)
-        except (ValueError, IndexError, TypeError):
+            cov_type = int(msg.position_covariance_type)
+        except (AttributeError, TypeError, ValueError):
             pass
+        accuracy_known = cov_type >= 2  # DIAGONAL_KNOWN or KNOWN
+        hrms = None
+        vrms = None
+        if accuracy_known:
+            try:
+                cov = msg.position_covariance
+                hrms = round(math.sqrt(abs(cov[0]) + abs(cov[4])), 3)
+                vrms = round(math.sqrt(abs(cov[8])), 3)
+            except (ValueError, IndexError, TypeError):
+                hrms = vrms = None
+            if hrms is not None and not math.isfinite(hrms):
+                hrms = None
+            if vrms is not None and not math.isfinite(vrms):
+                vrms = None
 
         with self._lock:
             self._global_pos_recv_time = time.monotonic()
-            self._state["lat"] = msg.latitude
-            self._state["lon"] = msg.longitude
-            self._state["alt"] = msg.altitude
+            self._state["lat"] = lat
+            self._state["lon"] = lon
+            if math.isfinite(alt):
+                self._state["alt"] = alt
             self._state["hrms"] = hrms
             self._state["vrms"] = vrms
+            self._state["gps_accuracy_known"] = accuracy_known
+            self._state["position_covariance_type"] = cov_type
             self._state["global_position_received"] = True
 
+
+    def _cb_gp_origin(self, msg) -> None:
+        """EKF-declared local-frame origin (mavros ~/gp_origin, latched).
+
+        This is the datum PX4 itself projects every global coordinate against
+        (`vehicle_local_position.ref_lat/ref_lon`). It is set once at first GPS
+        fix and then fixed for the EKF session, so using it for mission
+        placement makes the published path identical on every load — which a
+        live pose/global pair cannot be, because GLOBAL_POSITION_INT quantises
+        lat/lon to 1e-7 deg (~1.1 cm here) and the two samples are never
+        simultaneous.
+        """
+        lat = float(msg.position.latitude)
+        lon = float(msg.position.longitude)
+        if not (math.isfinite(lat) and math.isfinite(lon)):
+            return
+        if abs(lat) > 90.0 or abs(lon) > 180.0 or (lat == 0.0 and lon == 0.0):
+            return
+        stamp = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+        with self._lock:
+            prev_lat = self._state.get("ekf_origin_lat")
+            prev_lon = self._state.get("ekf_origin_lon")
+            prev_recv = self._state.get("ekf_origin_received")
+            self._state["ekf_origin_lat"] = lat
+            self._state["ekf_origin_lon"] = lon
+            self._state["ekf_origin_stamp"] = stamp
+            self._state["ekf_origin_received"] = True
+            # A value has arrived, so whatever caused the last drop is answered.
+            # Keep the counter (how many times this process has been through it)
+            # as a field-diagnostic breadcrumb.
+            self._state["ekf_origin_invalid_reason"] = None
+        # Fresh datum in hand: give the request path its full budget back for
+        # the NEXT fault episode, instead of burning the process-lifetime cap on
+        # the first one. Bounded per episode, not per process.
+        self._origin_req_count = 0
+        if not prev_recv:
+            log.info("EKF local-frame origin received: %.8f, %.8f", lat, lon)
+        elif prev_lat != lat or prev_lon != lon:
+            # A moved origin invalidates any already-placed mission.
+            log.warning(
+                "EKF local-frame origin CHANGED from %.8f, %.8f to %.8f, %.8f — "
+                "previously placed missions are no longer valid, re-place before "
+                "driving", prev_lat, prev_lon, lat, lon)
+
+    def _invalidate_ekf_origin(self, reason: str) -> None:
+        """Drop the cached EKF origin and re-arm the GPS_GLOBAL_ORIGIN request.
+
+        Called when something happened that could have started a NEW EKF session
+        (FCU reboot, MAVROS restart) or when the cached origin has been measured
+        to disagree with the live frame. The coordinates are cleared, not merely
+        flagged, so no consumer can read a dead session's datum by forgetting to
+        check `ekf_origin_received`.
+        """
+        with self._lock:
+            had = bool(self._state.get("ekf_origin_received"))
+            prev = (self._state.get("ekf_origin_lat"),
+                    self._state.get("ekf_origin_lon"))
+            self._state["ekf_origin_received"] = False
+            self._state["ekf_origin_lat"] = 0.0
+            self._state["ekf_origin_lon"] = 0.0
+            self._state["ekf_origin_stamp"] = None
+            self._state["ekf_origin_invalid_reason"] = reason
+            self._state["ekf_origin_invalidated_at"] = time.time()
+            if had:
+                self._state["ekf_origin_invalidations"] = (
+                    int(self._state.get("ekf_origin_invalidations", 0)) + 1
+                )
+        # Re-arm the bounded request path: without this reset the tick would
+        # never ask again once the process-lifetime cap had been reached.
+        self._origin_req_count = 0
+        if had:
+            log.warning(
+                "EKF local-frame origin INVALIDATED (was %.8f, %.8f): %s — surveyed "
+                "placement will REFUSE until a fresh GPS_GLOBAL_ORIGIN arrives; "
+                "re-place any staged mission before driving", prev[0], prev[1], reason)
+
+    def _request_ekf_origin_tick(self) -> None:
+        """Ask PX4 for GPS_GLOBAL_ORIGIN while we do not have a trustworthy one.
+
+        MAV_CMD_REQUEST_MESSAGE (512) with param1 = 49. This is a pure telemetry
+        request — it cannot move the vehicle — but it is still a command to the
+        FCU, so it is bounded.
+
+        Two changes from the original "ask until we have any value at all":
+          * A measured-INCONSISTENT origin also re-requests. That is the case
+            where MAVROS is latching a value from a dead EKF session; asking
+            makes PX4 re-send the live one. (If PX4 itself is the one reporting
+            the wrong datum, re-asking cannot fix it — placement still refuses,
+            which is the point.)
+          * The budget resets whenever a trustworthy origin is in hand, so the
+            cap is per fault episode rather than per process lifetime. A rover
+            left running across several FCU reboots used to exhaust it once and
+            then never ask again.
+        """
+        state = self.get_state()
+        if not state.get("connected"):
+            return
+        health = evaluate_origin_health(state, ORIGIN_CONSISTENCY_MAX_M)
+        if health.status == OK:
+            self._origin_req_count = 0
+            return
+        if health.status == UNVERIFIABLE and state.get("ekf_origin_received"):
+            # We hold an origin but cannot currently check it (no RTK fix yet,
+            # stale pose). Do not spam the FCU on the strength of a maybe.
+            return
+        if self._origin_req_count >= ORIGIN_REQUEST_MAX_TRIES:
+            return
+        if self._command_cli is None or not self._command_cli.service_is_ready():
+            return
+        self._origin_req_count += 1
+        req = CommandLong.Request()
+        req.broadcast = False
+        req.command = 512               # MAV_CMD_REQUEST_MESSAGE
+        req.confirmation = 0
+        req.param1 = 49.0               # GPS_GLOBAL_ORIGIN
+        try:
+            fut = self._command_cli.call_async(req)
+            fut.add_done_callback(lambda _f: None)
+            log.info(
+                "requested GPS_GLOBAL_ORIGIN from PX4 (attempt %d/%d) — origin "
+                "status is %s", self._origin_req_count, ORIGIN_REQUEST_MAX_TRIES,
+                health.status)
+        except Exception:
+            log.exception("GPS_GLOBAL_ORIGIN request failed")
+        if health.status == INCONSISTENT:
+            log.warning("origin re-request reason: %s", health.detail)
     def _cb_gps_raw(self, msg) -> None:
         with self._lock:
             self._gps_fix_recv_time = time.monotonic()
@@ -451,6 +754,24 @@ class RosBridgeNode(Node):
         with self._lock:
             self._state["spray_manual"] = bool(msg.data)
 
+    def _cb_spray_status(self, msg: String) -> None:
+        """Mirror the node's mode + mode_state from /spray/status (JSON String).
+
+        The node is the sole author; we only read `mode` and `mode_state`. A
+        malformed payload is ignored (keep last-known-good) — never crash the
+        subscription over one bad frame.
+        """
+        try:
+            data = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(data, dict):
+            return
+        with self._lock:
+            self._state["spray_mode"] = data.get("mode")
+            ms = data.get("mode_state")
+            self._state["spray_mode_state"] = ms if isinstance(ms, dict) else {}
+
     # ── Public API: spray manual override ────────────────────────────────────
 
     def publish_spray_manual(self, on: bool) -> None:
@@ -459,6 +780,33 @@ class RosBridgeNode(Node):
         msg.data = bool(on)
         self._spray_manual_pub.publish(msg)
         log.info("published /spray/manual: %s", "ON" if on else "OFF")
+
+    def publish_point_advance(self, expect_index: int) -> None:
+        """G5: command the RPP to advance past the point it is holding (manual).
+
+        `expect_index` is the point the frontend saw as WAIT_OPERATOR; the RPP
+        rejects the advance if it is holding a different point (stale double-tap
+        guard). JSON matches mission_progress.AdvanceMsg.
+        """
+        msg = String()
+        msg.data = json.dumps({"advance": True, "expect_index": int(expect_index)})
+        self._point_advance_pub.publish(msg)
+        log.info("published /point/advance: expect_index=%d", int(expect_index))
+
+    def publish_spray_session_config(self, config_json: str) -> None:
+        """Publish the spray mode/config JSON string on /spray/session_config (B0).
+
+        `config_json` must already be a valid SpraySessionConfig dict serialized
+        to JSON (built by the caller). The spray node is the only parser and
+        fails static on anything it does not accept, so we do not validate here.
+        Published on every mission load AND on mission clear (a cleared config,
+        not silence) — because the topic is TRANSIENT_LOCAL, simply stopping
+        would let a restarted node re-latch stale mission geometry (plan §3).
+        """
+        msg = String()
+        msg.data = str(config_json)
+        self._spray_session_config_pub.publish(msg)
+        log.info("published /spray/session_config (%d bytes)", len(msg.data))
 
     # ── Public API: state ─────────────────────────────────────────────────────
 
@@ -553,6 +901,21 @@ class RosBridgeNode(Node):
             "armed": armed,
             "mode": mode,
         }
+
+    def get_origin_health(self) -> dict[str, Any]:
+        """Is the cached EKF local-frame origin the frame PX4 is publishing?
+
+        The SAME evaluation surveyed placement enforces, so the operator answer
+        and the machine decision can never disagree. Read-only; commands nothing.
+        """
+        state = self.get_state()
+        health = evaluate_origin_health(state, ORIGIN_CONSISTENCY_MAX_M)
+        out = health.as_dict()
+        out["invalidated_at"] = state.get("ekf_origin_invalidated_at")
+        out["invalidations"] = state.get("ekf_origin_invalidations", 0)
+        out["origin_stamp"] = state.get("ekf_origin_stamp")
+        out["fcu_connected"] = bool(state.get("connected", False))
+        return out
 
     def get_rpp_monitor(self) -> RppStatusMonitor:
         return self._rpp_monitor
@@ -954,8 +1317,16 @@ class RosBridgeNode(Node):
         points: list[tuple[float, float]],
         frame_id: str = "local_ned",
         spray_flags: list[bool] | None = None,
+        must_hit_flags: list[bool] | None = None,
     ) -> None:
-        """Publish nav_msgs/Path. Empty list → see publish_stop_path()."""
+        """Publish nav_msgs/Path. Empty list → see publish_stop_path().
+
+        `pose.position.z` is a BITFIELD, not a boolean:
+            bit 0 (1) = spray ON
+            bit 1 (2) = must-hit (source geometry vertex, never simplify away)
+        Legacy readers that tested `z > 0.5` will misread a spray-OFF must-hit
+        point (z=2) as spray ON — every reader must bit-test `int(round(z)) & 1`.
+        """
         if spray_flags is None:
             flags = [False] * len(points)
         elif len(spray_flags) != len(points):
@@ -968,23 +1339,37 @@ class RosBridgeNode(Node):
         else:
             flags = [bool(f) for f in spray_flags]
 
+        if must_hit_flags is None:
+            mh = [False] * len(points)
+        elif len(must_hit_flags) != len(points):
+            log.warning(
+                "publish_path: must_hit_flags length %d != points length %d — "
+                "dropping provenance (simplification falls back to geometry only)",
+                len(must_hit_flags),
+                len(points),
+            )
+            mh = [False] * len(points)
+        else:
+            mh = [bool(f) for f in must_hit_flags]
+
         path = Path()
         path.header.stamp = self.get_clock().now().to_msg()
         path.header.frame_id = frame_id
-        for (n, e), spray in zip(points, flags):
+        for (n, e), spray, must in zip(points, flags, mh):
             ps = PoseStamped()
             ps.header = path.header
             ps.pose.position.x = float(n)
             ps.pose.position.y = float(e)
-            ps.pose.position.z = 1.0 if spray else 0.0
+            ps.pose.position.z = float((1 if spray else 0) | (2 if must else 0))
             ps.pose.orientation.w = 1.0
             path.poses.append(ps)
         self._path_pub.publish(path)
         log.info(
-            "published path: %d points → %s (spray_on=%d)",
+            "published path: %d points → %s (spray_on=%d, must_hit=%d)",
             len(points),
             frame_id,
             sum(1 for f in flags if f),
+            sum(1 for f in mh if f),
         )
 
     def publish_stop_path(

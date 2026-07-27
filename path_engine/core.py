@@ -131,6 +131,10 @@ class DXFEntity:
     geometry: dict = field(default_factory=dict)
     unit_scale: float = 0.01  # default: DXF units are centimetres
     is_mark_override: Optional[bool] = None
+    # (lat0, lon0) WGS84 origin of the local ENU frame, set only when the DXF
+    # held geographic coordinates and georef projected them to metres. None for
+    # an ordinary metric DXF. Lets GPS_SURVEYED placement recover the geo frame.
+    geo_origin: Optional[tuple[float, float]] = None
 
     def classify(self, layer_mapping: dict[str, str] | None = None) -> str:
         """Classify this entity as 'mark', 'transit', or 'ignore'."""
@@ -169,6 +173,19 @@ class DXFEntity:
 
         # Default rules
         upper = self.layer.upper()
+        # A bare CAD POINT is a reference/survey marker (drawing start/end refs,
+        # georeference anchors), not a drivable spray path — it has no line to
+        # spray along. Default to ignore so points are shown in the preview but
+        # never planned. Without this, survey points that sit on a shape's
+        # vertices were planned as their own MARK targets and the rover drove
+        # AND painted the whole shape a SECOND time (field bag 2026-07-18
+        # stg_98398053: a georeferenced square driven twice — once with
+        # extensions from the polyline, once bare from its 5 corner points).
+        # An explicit layer_mapping above still overrides this if a design ever
+        # means its points as dwell targets (point missions normally come via
+        # the point-CSV flow, not DXF POINT entities).
+        if self.entity_type == "POINT":
+            return "ignore"
         # Non-printing / annotation layers by CAD convention → never sprayed.
         # Dimension callouts (DIM*), AutoCAD definition points (DEFPOINTS),
         # annotations (ANNOT*) and hatch fills are design aids, not field
@@ -238,6 +255,11 @@ class PlannedPath:
         segments: Ordered list of PathSegments (MARK + TRANSIT).
         merged_waypoints: Single polyline for the /path topic.
         spray_flags: Parallel to merged_waypoints; True = spray ON.
+        must_hit: Parallel to merged_waypoints; True = the point came from the
+            source geometry (CAD/survey vertex) rather than densification.
+            Consumers MUST NOT simplify a must-hit point away — it is operator
+            intent, not machine-generated fill. Empty list = provenance unknown
+            (legacy plans); consumers should then fall back to geometric tests.
         total_mark_length: Total metres of spray-on path.
         total_transit_length: Total metres of dead-heading.
         origin: (north_m, east_m) NED origin used for lat/lon conversion.
@@ -247,6 +269,7 @@ class PlannedPath:
     segments: list[PathSegment] = field(default_factory=list)
     merged_waypoints: list[tuple[float, float]] = field(default_factory=list)
     spray_flags: list[bool] = field(default_factory=list)
+    must_hit: list[bool] = field(default_factory=list)
     total_mark_length: float = 0.0
     total_transit_length: float = 0.0
     origin: tuple[float, float] = (0.0, 0.0)

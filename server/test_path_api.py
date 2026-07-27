@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 
@@ -15,6 +16,7 @@ from routes.path import (
     preview_path,
     save_path_entity_overrides,
     save_path_extensions,
+    update_entity_order,
 )
 import main
 from path_manager import PathManager
@@ -38,6 +40,89 @@ def test_path_manager_preview_returns_bounds_and_local_ned_points(tmp_path):
     assert preview.waypoints[1].north == 1.5
     assert preview.waypoints[1].east == -0.25
     assert all(pt.spray is True for pt in preview.waypoints)
+
+
+def test_path_manager_preview_survey_csv_real_must_hit_and_geo_origin(tmp_path):
+    """A named-header survey CSV previews via the planner: only surveyed vertices
+    are must-hit (not every densified point), and the WGS84 origin is exposed."""
+    mission_file = tmp_path / "survey.csv"
+    lat0, lon0, mn, me = 13.0721, 80.2620, 110900.0, 108400.0
+    rows = ["Name,Code,Latitude,Longitude"]
+    for i, (n, e) in enumerate([(0, 0), (1, 0), (2, 0), (2, 2)]):
+        rows.append(f"{i + 1},L_1,{lat0 + n / mn:.8f},{lon0 + e / me:.8f}")
+    mission_file.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    preview = PathManager(str(tmp_path)).preview_path("survey.csv")
+
+    must_hit = [pt.must_hit for pt in preview.waypoints]
+    assert sum(must_hit) == 4, "exactly the four surveyed vertices"
+    assert not all(must_hit), "densified fill is not must-hit"
+    assert preview.num_points > 4, "the chain was densified"
+    assert preview.geo_origin is not None
+    assert abs(preview.geo_origin[0] - lat0) < 0.01
+
+
+def _count_big_kinks(pts, deg=5.0):
+    import math
+    big = 0
+    for i in range(1, len(pts) - 1):
+        v1 = (pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
+        v2 = (pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+        m1 = math.hypot(*v1); m2 = math.hypot(*v2)
+        if m1 < 1e-9 or m2 < 1e-9:
+            continue
+        d = (v1[0] * v2[0] + v1[1] * v2[1]) / (m1 * m2)
+        if math.degrees(math.acos(max(-1.0, min(1.0, d)))) > deg:
+            big += 1
+    return big
+
+
+def test_survey_csv_arc_previews_as_a_true_arc_not_chords(tmp_path):
+    """A surveyed curve auto-arc-fits in the preview (was straight chords)."""
+    import math
+    from path_engine.parsers.georef import metres_per_degree
+    lat0, lon0 = 13.0721, 80.2620
+    mn, me = metres_per_degree(lat0)
+    rows = ["Name,Code,Latitude,Longitude"]
+    for i in range(7):  # 90° arc, radius 5 m, 7 surveyed points
+        a = math.radians(90 * i / 6)
+        n, e = 5.0 * math.sin(a), 5.0 * math.cos(a)
+        rows.append(f"{i + 1},L_1,{lat0 + n / mn:.8f},{lon0 + e / me:.8f}")
+    (tmp_path / "arc.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    pts = [(w.north, w.east)
+           for w in PathManager(str(tmp_path)).preview_path("arc.csv").waypoints]
+    # A true arc bends by a fraction of a degree per densified step: no big kinks.
+    # Straight chords between the 7 vertices would show ~5 big (>5°) kinks.
+    assert _count_big_kinks(pts) == 0
+
+
+def test_survey_csv_square_stays_square_in_preview(tmp_path):
+    """Auto arc-fit must NOT round a square — corner-split keeps sharp corners."""
+    import math
+    from path_engine.parsers.georef import metres_per_degree
+    lat0, lon0 = 13.0721, 80.2620
+    mn, me = metres_per_degree(lat0)
+    rows = ["Name,Code,Latitude,Longitude"]
+    for i, (n, e) in enumerate([(0, 0), (2, 0), (2, 2), (0, 2), (0, 0)], start=1):
+        rows.append(f"{i},L_1,{lat0 + n / mn:.8f},{lon0 + e / me:.8f}")
+    (tmp_path / "square.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    pts = [(w.north, w.east)
+           for w in PathManager(str(tmp_path)).preview_path("square.csv").waypoints]
+    # A closed square keeps its three interior 90° corners as sharp kinks.
+    assert _count_big_kinks(pts) == 3
+
+
+def test_path_manager_preview_legacy_ned_csv_has_no_geo_origin(tmp_path):
+    """A headerless NED CSV is an explicit point list — no geo origin, all vertices."""
+    mission_file = tmp_path / "line.csv"
+    mission_file.write_text("0,0\n1.5,-0.25\n2.0,0.75\n", encoding="utf-8")
+
+    preview = PathManager(str(tmp_path)).preview_path("line.csv")
+
+    assert preview.geo_origin is None
+    assert all(pt.must_hit for pt in preview.waypoints)
 
 
 def test_path_manager_preview_preserves_dxf_spray_flags(tmp_path, monkeypatch):
@@ -379,10 +464,13 @@ async def test_entities_api_uses_dense_spline_points_for_extension_preview(tmp_p
 
 @pytest.mark.anyio
 async def test_entities_api_suppresses_extension_preview_on_closed_chain(tmp_path, monkeypatch):
-    """Connectivity-aware preview: a closed square (4 edges meeting corner-to-
-    corner) has no free end, so NO entity may show a run-up — matching the
-    vertex-anchored planner, which suppresses extensions on closed chains.
-    Internal corners are junctions, not open ends."""
+    """per_line=False only. A closed square (4 edges meeting corner-to-corner)
+    has no free end, so NO entity may show a run-up — matching the planner's
+    vertex-anchored chain-ends policy (suppress_closed_loops=True). Internal
+    corners are junctions, not open ends.
+
+    per_line=True is the opposite contract and is covered by
+    test_entities_api_per_line_extends_every_side_of_closed_square."""
     mission_file = tmp_path / "square.dxf"
     mission_file.write_text("0\nEOF\n", encoding="utf-8")
 
@@ -406,7 +494,9 @@ async def test_entities_api_suppresses_extension_preview_on_closed_chain(tmp_pat
             return {}
 
         def load_extension_config(self, filename):
-            return {"enabled": True, "pre_extension_m": 0.5, "aft_extension_m": 0.5}
+            # Explicit: this test pins the per_line=False chain-ends policy.
+            return {"enabled": True, "pre_extension_m": 0.5, "aft_extension_m": 0.5,
+                    "per_line": False}
 
         def load_entity_order(self, filename):
             return []
@@ -451,7 +541,9 @@ async def test_entities_api_extension_preview_only_at_open_ends_of_chain(tmp_pat
             return {}
 
         def load_extension_config(self, filename):
-            return {"enabled": True, "pre_extension_m": 0.5, "aft_extension_m": 0.5}
+            # Explicit: this test pins the per_line=False chain-ends policy.
+            return {"enabled": True, "pre_extension_m": 0.5, "aft_extension_m": 0.5,
+                    "per_line": False}
 
         def load_entity_order(self, filename):
             return []
@@ -468,6 +560,534 @@ async def test_entities_api_extension_preview_only_at_open_ends_of_chain(tmp_pat
     assert by_id["L0"].pre_points != [] and by_id["L0"].aft_points == []
     # L1: shared start at corner -> no PRE; free end at (2,2) -> AFT only.
     assert by_id["L1"].pre_points == [] and by_id["L1"].aft_points != []
+
+
+def _fake_square_mgr(per_line: bool, corners=None):
+    """4 LINE entities drawn corner-to-corner as a closed square."""
+    corners = corners or [(0.0, 0.0), (0.0, 2.0), (2.0, 2.0), (2.0, 0.0), (0.0, 0.0)]
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            return [
+                SimpleNamespace(
+                    entity_id=f"E{i}", entity_type="LINE", layer="M", color=7,
+                    geometry={"start": corners[i], "end": corners[i + 1]},
+                    is_mark=lambda: True,
+                )
+                for i in range(4)
+            ]
+
+        def load_entity_overrides(self, filename):
+            return {}
+
+        def load_extension_config(self, filename):
+            return {"enabled": True, "pre_extension_m": 0.5, "aft_extension_m": 0.5,
+                    "per_line": per_line}
+
+        def load_entity_order(self, filename):
+            return []
+
+    return FakePathManager()
+
+
+@pytest.mark.anyio
+async def test_entities_api_per_line_extends_every_side_of_closed_square(tmp_path, monkeypatch):
+    """per_line=True: every side of a CLOSED square gets its own PRE and AFT.
+
+    Regression for the preview<->plan divergence: the preview applied the
+    chain-ends freeness gate unconditionally and reported enabled=False on all
+    four sides, while the planner (decompose_line_chain_to_edges +
+    suppress_closed_loops=False) really does emit 4 PRE + 4 AFT here — see
+    path_engine test_engine_per_line_square_gives_four_passes. A square's
+    corners are perpendicular, so none of them is a collinear retrace.
+    """
+    (tmp_path / "square.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_square_mgr(per_line=True))
+
+    data = await path_entities("square.dxf")
+
+    assert data.extension_config.per_line is True
+    for ent in data.entities:
+        assert ent.extension_preview.enabled is True, ent.entity_id
+        assert ent.extension_preview.pre_points != [], ent.entity_id
+        assert ent.extension_preview.aft_points != [], ent.entity_id
+        assert ent.extension_preview.pre_length_m == 0.5
+        assert ent.extension_preview.aft_length_m == 0.5
+
+    # Matches the planner's (pre, aft) == (4, 4) on this same shape.
+    assert sum(1 for x in data.extensions if x.role == "pre") == 4
+    assert sum(1 for x in data.extensions if x.role == "aft") == 4
+
+
+def _fake_closed_polyline_mgr(per_line: bool, closed: bool = True):
+    """ONE closed LWPOLYLINE square — the test_1.dxf shape (a single polyline,
+    not 4 separate LINEs). Previously the preview treated this as one self-closed
+    run and produced 0 extensions, while the plan splits it into 4 sides."""
+    verts = [(0.0, 0.0), (0.0, 2.0), (2.0, 2.0), (2.0, 0.0)]
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            return [SimpleNamespace(
+                entity_id="PL0", entity_type="LWPOLYLINE", layer="Lines", color=7,
+                geometry={"vertices": verts, "bulges": [0.0] * len(verts),
+                          "closed": closed},
+                is_mark=lambda: True,
+            )]
+
+        def load_entity_overrides(self, filename):
+            return {}
+
+        def load_extension_config(self, filename):
+            return {"enabled": True, "pre_extension_m": 0.5, "aft_extension_m": 0.5,
+                    "per_line": per_line}
+
+        def load_entity_order(self, filename):
+            return []
+
+    return FakePathManager()
+
+
+@pytest.mark.anyio
+async def test_entity_order_excludes_survey_points(tmp_path, monkeypatch):
+    """A DXF that is one LWPOLYLINE + survey POINTs must accept an order of just
+    the polyline — POINTs are not drivable and the client never orders them.
+
+    Regression for the georeferenced-square load failure: the order contract
+    required EVERY parsed entity id (incl. 5 POINTs), so a valid order of the
+    single polyline was rejected as 'Missing entity IDs'.
+    """
+    from path_engine.core import DXFEntity
+    from models import EntityOrderUpdateRequest
+    import routes.path as path_route
+
+    (tmp_path / "geo.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+
+    saved = {}
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            return [
+                DXFEntity(entity_type="LWPOLYLINE", layer="Lines", entity_id="PL0",
+                          geometry={"vertices": [(0.0, 0.0), (2.0, 0.0)]}),
+                DXFEntity(entity_type="POINT", layer="Points", entity_id="P1",
+                          geometry={"position": (0.0, 0.0)}),
+                DXFEntity(entity_type="POINT", layer="Points", entity_id="P2",
+                          geometry={"position": (2.0, 0.0)}),
+            ]
+
+        def save_entity_order(self, filename, order):
+            saved["order"] = list(order)
+
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    # Ordering just the polyline must succeed — the two POINTs are excluded.
+    resp = await update_entity_order("geo.dxf", EntityOrderUpdateRequest(entity_order=["PL0"]))
+    assert resp.entity_order == ["PL0"]
+    assert saved["order"] == ["PL0"]
+
+
+@pytest.mark.anyio
+async def test_entity_order_rejects_point_id(tmp_path, monkeypatch):
+    """A POINT id is not orderable, so posting it is 'unknown', not accepted."""
+    from path_engine.core import DXFEntity
+    from models import EntityOrderUpdateRequest
+    import routes.path as path_route
+
+    (tmp_path / "geo.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            return [
+                DXFEntity(entity_type="LWPOLYLINE", layer="Lines", entity_id="PL0",
+                          geometry={"vertices": [(0.0, 0.0), (2.0, 0.0)]}),
+                DXFEntity(entity_type="POINT", layer="Points", entity_id="P1",
+                          geometry={"position": (0.0, 0.0)}),
+            ]
+
+        def save_entity_order(self, filename, order):
+            pass
+
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    with pytest.raises(HTTPException) as exc:
+        await update_entity_order("geo.dxf", EntityOrderUpdateRequest(entity_order=["PL0", "P1"]))
+    assert exc.value.status_code == 422
+    assert "Unknown" in str(exc.value.detail)
+
+
+def _fake_geographic_mgr():
+    """One polyline whose entities carry a geo_origin — i.e. parse_dxf detected
+    lat/lon and georef projected + stamped the WGS84 origin (as it does for a
+    real georeferenced DXF)."""
+    verts = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)]
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            ent = SimpleNamespace(
+                entity_id="PL0", entity_type="LWPOLYLINE", layer="Lines", color=7,
+                geometry={"vertices": verts, "bulges": [0.0] * 4, "closed": True},
+                is_mark=lambda: True, geo_origin=(13.072071, 80.261949))
+            return [ent]
+
+        def load_entity_overrides(self, filename):
+            return {}
+
+        def load_extension_config(self, filename):
+            return {"enabled": False, "pre_extension_m": 0.5, "aft_extension_m": 0.5,
+                    "per_line": True}
+
+        def load_entity_order(self, filename):
+            return []
+
+    return FakePathManager()
+
+
+@pytest.mark.anyio
+async def test_entities_api_exposes_geographic_signal(tmp_path, monkeypatch):
+    """A georeferenced DXF reports is_geographic + geo_origin so the client can
+    skip manual alignment and stage straight to geo_origin."""
+    (tmp_path / "geo.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_geographic_mgr())
+
+    data = await path_entities("geo.dxf")
+    assert data.is_geographic is True
+    assert data.geo_origin == [13.072071, 80.261949]
+
+
+@pytest.mark.anyio
+async def test_entities_api_metric_dxf_not_geographic(tmp_path, monkeypatch):
+    """A plain metric DXF (no geo_origin) reports is_geographic False / None."""
+    (tmp_path / "sq.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_closed_polyline_mgr(per_line=True))
+
+    data = await path_entities("sq.dxf")
+    assert data.is_geographic is False
+    assert data.geo_origin is None
+
+
+@pytest.mark.anyio
+async def test_entities_api_per_line_closed_polyline_matches_plan(tmp_path, monkeypatch):
+    """A single CLOSED LWPOLYLINE square must preview the same 4 PRE + 4 AFT the
+    plan drives — not 0.
+
+    This is the preview<->plan divergence the earlier per_line fix did NOT cover:
+    it handled a square drawn as 4 separate LINEs, but a square drawn as ONE
+    closed polyline hit the self-closed 'no free end' branch and got nothing,
+    while engine.py (decompose_line_chain_to_edges, gated on per_line) really
+    splits it into 4 sides and extends each. Cross-checked against the planner
+    functions directly below.
+    """
+    (tmp_path / "poly.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_closed_polyline_mgr(per_line=True))
+
+    data = await path_entities("poly.dxf")
+
+    n_pre = sum(1 for x in data.extensions if x.role == "pre")
+    n_aft = sum(1 for x in data.extensions if x.role == "aft")
+    assert (n_pre, n_aft) == (4, 4), f"preview gave {(n_pre, n_aft)}, plan drives (4, 4)"
+    # All four runs belong to the one polyline, disambiguated by edge_index.
+    assert {x.entity_id for x in data.extensions} == {"PL0"}
+    assert {x.edge_index for x in data.extensions if x.role == "pre"} == {0, 1, 2, 3}
+
+
+@pytest.mark.anyio
+async def test_entities_api_per_line_closed_polyline_equals_planner(tmp_path, monkeypatch):
+    """Definitive: preview extension count == what the real planner emits.
+
+    Runs decompose_line_chain_to_edges + split_mark_segment_with_extensions on
+    the identical geometry and asserts the preview produced the same number of
+    PRE/AFT runs. If the planner's edge-splitting ever changes, this fails.
+    """
+    from path_engine.core import PathSegment, SegmentType
+    from path_engine.planners.extensions import (
+        decompose_line_chain_to_edges, split_mark_segment_with_extensions,
+    )
+    verts = [(0.0, 0.0), (0.0, 2.0), (2.0, 2.0), (2.0, 0.0), (0.0, 0.0)]
+    seg = PathSegment(segment_type=SegmentType.MARK, points=verts, speed=0.35,
+                      source_entity="PL0", metadata={"geometry_type": "LWPOLYLINE"})
+    plan_pre = plan_aft = 0
+    for edge in decompose_line_chain_to_edges(seg):
+        parts = split_mark_segment_with_extensions(
+            edge, pre_extension_m=0.5, aft_extension_m=0.5, transit_speed=0.2,
+            suppress_closed_loops=False)
+        plan_pre += sum(1 for p in parts if p.metadata.get("extension_role") == "pre")
+        plan_aft += sum(1 for p in parts if p.metadata.get("extension_role") == "aft")
+
+    (tmp_path / "poly.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_closed_polyline_mgr(per_line=True))
+    data = await path_entities("poly.dxf")
+
+    prev_pre = sum(1 for x in data.extensions if x.role == "pre")
+    prev_aft = sum(1 for x in data.extensions if x.role == "aft")
+    assert (prev_pre, prev_aft) == (plan_pre, plan_aft), \
+        f"preview {(prev_pre, prev_aft)} != plan {(plan_pre, plan_aft)}"
+
+
+@pytest.mark.anyio
+async def test_entities_api_per_line_closed_polyline_grows_corner_connectors(tmp_path, monkeypatch):
+    """The sides of a split polyline get their between-side connectors.
+
+    Regression for 'the connector is missing': a single polyline was one
+    connector-endpoint and produced none. Per-edge endpoints give one connector
+    per corner traversed (3 for a 4-side square painted in sequence), each
+    spanning AFT-tip -> next PRE-start = sqrt(0.5^2 + 0.5^2) = 0.707 m.
+    """
+    (tmp_path / "poly.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_closed_polyline_mgr(per_line=True))
+
+    data = await path_entities("poly.dxf")
+
+    assert len(data.transit_preview) == 3, [t.length_m for t in data.transit_preview]
+    for t in data.transit_preview:
+        assert t.from_entity_id == "PL0" and t.to_entity_id == "PL0"
+        assert abs(t.length_m - 0.707) < 0.01, t.length_m
+
+
+@pytest.mark.anyio
+async def test_entities_api_chain_ends_closed_polyline_gets_no_extension(tmp_path, monkeypatch):
+    """per_line=False (chain-ends): a closed polyline still gets NO extension —
+    a closed loop has no true open end, and the planner does not decompose in
+    this mode. Guards against the fix leaking into chain-ends behaviour."""
+    (tmp_path / "poly.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_closed_polyline_mgr(per_line=False))
+
+    data = await path_entities("poly.dxf")
+    assert data.extensions == []
+    assert all(not e.extension_preview.enabled for e in data.entities)
+
+
+@pytest.mark.anyio
+async def test_entities_api_per_line_run_up_geometry_is_outward_and_collinear(tmp_path, monkeypatch):
+    """A PRE run-up must approach ALONG the line from outside it, not sideways.
+
+    E0 runs (0,0)->(0,2) (north const, east +). Its PRE therefore starts 0.5 m
+    BEFORE (0,0) on the same line — i.e. at east=-0.5 — and ends at the vertex.
+    """
+    (tmp_path / "square.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_square_mgr(per_line=True))
+
+    data = await path_entities("square.dxf")
+    pre = next(x for x in data.extensions if x.entity_id == "E0" and x.role == "pre")
+
+    assert (pre.points[0].north, round(pre.points[0].east, 6)) == (0.0, -0.5)
+    assert (pre.points[-1].north, pre.points[-1].east) == (0.0, 0.0)
+    assert pre.length_m == 0.5
+
+
+@pytest.mark.anyio
+async def test_entities_api_per_line_suppresses_collinear_retrace_junction(tmp_path, monkeypatch):
+    """per_line=True still drops a run-up at a COLLINEAR junction.
+
+    Two edges continuing straight through a shared point are a retrace: the AFT
+    would run out along the very line the next PRE runs back in on, so the
+    connector doubles back over both (the d82317d field failure). The planner's
+    _touches() is a direction test, so the preview must be one too — a shared
+    point alone is not enough to block, but a straight-through one is.
+    """
+    (tmp_path / "split.dxf").write_text("0\nEOF\n", encoding="utf-8")
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            return [  # one 4 m line drawn as two collinear 2 m halves
+                SimpleNamespace(
+                    entity_id="C0", entity_type="LINE", layer="M", color=7,
+                    geometry={"start": (0.0, 0.0), "end": (0.0, 2.0)},
+                    is_mark=lambda: True,
+                ),
+                SimpleNamespace(
+                    entity_id="C1", entity_type="LINE", layer="M", color=7,
+                    geometry={"start": (0.0, 2.0), "end": (0.0, 4.0)},
+                    is_mark=lambda: True,
+                ),
+            ]
+
+        def load_entity_overrides(self, filename):
+            return {}
+
+        def load_extension_config(self, filename):
+            return {"enabled": True, "pre_extension_m": 0.5, "aft_extension_m": 0.5,
+                    "per_line": True}
+
+        def load_entity_order(self, filename):
+            return []
+
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    data = await path_entities("split.dxf")
+    by_id = {e.entity_id: e.extension_preview for e in data.entities}
+
+    # Outer ends stay free; the collinear seam at (0,2) is suppressed both sides.
+    assert by_id["C0"].pre_points != [] and by_id["C0"].aft_points == []
+    assert by_id["C1"].pre_points == [] and by_id["C1"].aft_points != []
+
+
+@pytest.mark.anyio
+async def test_entities_api_extensions_layer_mirrors_per_entity_preview(tmp_path, monkeypatch):
+    """The named `extensions` layer is a flattening, never a second source of truth."""
+    (tmp_path / "square.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_square_mgr(per_line=True))
+
+    data = await path_entities("square.dxf")
+
+    flat = {(x.entity_id, x.role): [(p.north, p.east) for p in x.points]
+            for x in data.extensions}
+    expected = {}
+    for ent in data.entities:
+        ep = ent.extension_preview
+        if ep.pre_points:
+            expected[(ent.entity_id, "pre")] = [(p.north, p.east) for p in ep.pre_points]
+        if ep.aft_points:
+            expected[(ent.entity_id, "aft")] = [(p.north, p.east) for p in ep.aft_points]
+    assert flat == expected
+
+
+@pytest.mark.anyio
+async def test_entities_api_extensions_layer_empty_when_chain_ends_suppress(tmp_path, monkeypatch):
+    """per_line=False on a closed square: no previews, so no `extensions` layer."""
+    (tmp_path / "square.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_square_mgr(per_line=False))
+
+    data = await path_entities("square.dxf")
+    assert data.extensions == []
+
+
+@pytest.mark.anyio
+async def test_entities_api_connectors_span_aft_tip_to_next_pre_start(tmp_path, monkeypatch):
+    """With per-line extensions on, travel runs AFT-tip -> next PRE-start.
+
+    The planner routes connectors only AFTER extension, so a connector pinned to
+    the mark vertex would overlap the run-up it should start from and
+    under-report the distance driven. Square in DXF order 0..3:
+      E0 (0,0)->(0,2) exits its AFT at (0,2.5)
+      E1 (0,2)->(2,2) enters its PRE at (-0.5,2)
+    so the connector is (0,2.5) -> (-0.5,2), NOT the vertex (0,2) -> (0,2).
+    """
+    (tmp_path / "square.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_square_mgr(per_line=True))
+
+    data = await path_entities("square.dxf")
+    t0 = data.transit_preview[0]
+
+    assert (t0.from_entity_id, t0.to_entity_id) == ("E0", "E1")
+    assert (t0.points[0].north, t0.points[0].east) == (0.0, 2.5)   # E0 AFT tip
+    assert (t0.points[-1].north, round(t0.points[-1].east, 6)) == (-0.5, 2.0)  # E1 PRE start
+    assert t0.length_m == round(math.hypot(0.5, 0.5), 3) == 0.707
+
+
+@pytest.mark.anyio
+async def test_entities_api_per_line_corners_are_not_dropped_as_zero_length(tmp_path, monkeypatch):
+    """Every corner of a per-line square has a REAL connector.
+
+    Pre-fix the preview measured vertex->vertex, got 0, and silently skipped it —
+    hiding travel the rover genuinely drives. Once each edge runs off its own
+    end the edges no longer touch, so all 3 in-order junctions are ~0.707 m.
+    """
+    (tmp_path / "square.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_square_mgr(per_line=True))
+
+    data = await path_entities("square.dxf")
+
+    assert len(data.transit_preview) == 3
+    for t in data.transit_preview:
+        assert t.length_m == 0.707, (t.from_entity_id, t.to_entity_id, t.length_m)
+
+
+@pytest.mark.anyio
+async def test_entities_api_connectors_use_mark_endpoints_when_no_extensions(tmp_path, monkeypatch):
+    """No extensions -> connectors are unchanged: vertex to vertex, touching
+    corners still collapse to nothing. Guards the fallback path."""
+    (tmp_path / "square.dxf").write_text("0\nEOF\n", encoding="utf-8")
+
+    class FakePathManager:
+        def parse_dxf(self, filepath):
+            corners = [(0.0, 0.0), (0.0, 2.0), (2.0, 2.0), (2.0, 0.0), (0.0, 0.0)]
+            return [
+                SimpleNamespace(
+                    entity_id=f"E{i}", entity_type="LINE", layer="M", color=7,
+                    geometry={"start": corners[i], "end": corners[i + 1]},
+                    is_mark=lambda: True,
+                )
+                for i in range(4)
+            ]
+
+        def load_entity_overrides(self, filename):
+            return {}
+
+        def load_extension_config(self, filename):
+            return {"enabled": False, "pre_extension_m": 0.5, "aft_extension_m": 0.5,
+                    "per_line": True}
+
+        def load_entity_order(self, filename):
+            return []
+
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", FakePathManager())
+
+    data = await path_entities("square.dxf")
+
+    assert data.extensions == []
+    # Consecutive edges share their vertices, so every connector is zero-length
+    # and correctly dropped.
+    assert data.transit_preview == []
+
+
+@pytest.mark.anyio
+async def test_entities_api_extension_bounds_include_run_ups(tmp_path, monkeypatch):
+    """Bounds must cover the run-ups, or a client clips them off-canvas.
+
+    per_line square 0..2 with 0.5 m extensions -> -0.5..2.5 on both axes.
+    """
+    (tmp_path / "square.dxf").write_text("0\nEOF\n", encoding="utf-8")
+    import routes.path as path_route
+
+    monkeypatch.setattr(path_route, "MISSION_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "path_mgr", _fake_square_mgr(per_line=True))
+
+    data = await path_entities("square.dxf")
+    assert data.bounds.north_min == -0.5 and data.bounds.north_max == 2.5
+    assert data.bounds.east_min == -0.5 and data.bounds.east_max == 2.5
 
 
 @pytest.mark.anyio
@@ -663,12 +1283,17 @@ def test_plan_preflight_rejects_oversized_mission(tmp_path):
     doc.saveas(str(tmp_path / "long.dxf"))
 
     mgr = PathManager(str(tmp_path))
-    # Default 5 cm spacing → ~12000 waypoints > 10000 cap → reject fast.
+    # 5 cm spacing → ~12000 waypoints. The cap is 100k (raised so a 2.4 km road
+    # survey can load at all), so pin an explicit lower cap here — the point of
+    # this test is the preflight guard, not the value of the default.
     with pytest.raises(ValueError, match="Too many waypoints"):
-        mgr.plan_path("long.dxf", summary_only=True)
+        mgr.plan_path("long.dxf", summary_only=True, max_waypoints=10000)
     # Coarser 20 cm spacing → ~3000 waypoints → the guard does not fire.
-    result = mgr.plan_path("long.dxf", summary_only=True, line_spacing=0.20)
+    result = mgr.plan_path("long.dxf", summary_only=True, line_spacing=0.20,
+                           max_waypoints=10000)
     assert result["num_waypoints"] > 0
+    # And the raised default lets the 12000-waypoint mission through.
+    assert mgr.plan_path("long.dxf", summary_only=True)["num_waypoints"] > 10000
 
 
 @pytest.mark.anyio
@@ -1284,9 +1909,19 @@ async def test_plan_then_load_to_controller_round_trip(monkeypatch, tmp_path):
         def load_path(self, points, name=None, spray_flags=None, **kwargs):
             self.loaded = (list(points), name, spray_flags, kwargs)
 
+    class _OriginNode:
+        """Healthy EKF-origin verdict. /load-to-controller fails closed on a
+        surveyed mission without one, so the test has to declare which world
+        it is in rather than inherit whatever main.ros_node happens to be."""
+
+        def get_origin_health(self):
+            return {"status": "OK", "trusted": True, "delta_m": 0.019,
+                    "detail": "origin agrees", "threshold_m": 0.30}
+
     fake_ctrl = FakeController()
     monkeypatch.setattr(main, "path_mgr", FakePathManager())
     monkeypatch.setattr(main, "offboard_ctrl", fake_ctrl)
+    monkeypatch.setattr(main, "ros_node", _OriginNode(), raising=False)
 
     req = PathPlanRequest(source="soccer_field_penalty_area.dxf")
     data = await plan_path(req)
@@ -1438,6 +2073,7 @@ def _make_line_entity(entity_id: str, is_mark_callable=None):
         color=7,
         geometry={"start": (0.0, 0.0), "end": (1.0, 0.0)},
         is_mark=is_mark_callable,
+        classify=lambda: "mark",
     )
 
 
@@ -1863,3 +2499,267 @@ def test_preview_spray_flags_match_executed_path_with_extensions(tmp_path):
     # PRE/AFT extensions are TRANSIT → spray OFF at the ends.
     assert preview.waypoints[0].spray is False
     assert preview.waypoints[-1].spray is False
+
+
+# ── Survey control points in the preview ──────────────────────────────────────
+# The pipeline works in local NED and previously emitted ONLY that, so a client
+# could not draw the raw surveyed shots: the arc fit and corner fillet
+# deliberately move geometry off the measurements, and re-projecting NED back to
+# lat/lon goes through the client's own projection rather than the source data.
+
+_SURVEY_HDR = ("Name,Code,Code description,Easting,Northing,Elevation,Longitude,"
+               "Latitude,Lateral RMS,Solution status,Samples,PDOP,CS name")
+
+
+def _survey_row(name, code, lon, lat):
+    return (f"{name},{code},Point,1204636.0,1243756.0,9.9,{lon:.8f},{lat:.8f},"
+            f"0.017,FIX,1,1.8,WGS 84 / Tamil Nadu + EGM96 height")
+
+
+def _write_survey(tmp_path, n=6, name="curve.csv"):
+    """A gently curving chain of n surveyed shots ~0.6 m apart."""
+    import math as _m
+    lat0, lon0 = 13.07206142, 80.26193876
+    deg = 1.0 / 111320.0
+    rows = []
+    for i in range(n):
+        a = _m.radians(i * 12.0)
+        rows.append(_survey_row(i + 1, "P",
+                                lon0 + (0.6 * i) * deg * 0.9,
+                                lat0 + (0.6 * (1 - _m.cos(a))) * deg))
+    (tmp_path / name).write_text("\n".join([_SURVEY_HDR, *rows]) + "\n")
+    return name
+
+
+def test_preview_emits_control_points_with_source_latlon(tmp_path):
+    name = _write_survey(tmp_path)
+    mgr = PathManager(str(tmp_path))
+    res = mgr.preview_path(name)
+
+    assert len(res.control_points) == 6
+    assert all(c.lat is not None and c.lon is not None for c in res.control_points)
+    # Exactly the values in the file, not re-projected from NED.
+    import csv as _csv
+    with open(tmp_path / name) as f:
+        src = list(_csv.DictReader(f))
+    assert [c.lat for c in res.control_points] == [float(r["Latitude"]) for r in src]
+    assert [c.lon for c in res.control_points] == [float(r["Longitude"]) for r in src]
+    assert [c.name for c in res.control_points] == [r["Name"] for r in src]
+    assert all(c.code == "P" for c in res.control_points)
+
+
+def test_control_points_share_the_waypoint_ned_frame(tmp_path):
+    """north/east must be directly overlayable on the waypoints — i.e. the same
+    projection about the same geo_origin the preview reports."""
+    from path_engine.parsers.georef import metres_per_degree
+
+    name = _write_survey(tmp_path)
+    res = PathManager(str(tmp_path)).preview_path(name)
+    lat0, lon0 = res.geo_origin
+    mdeg_n, mdeg_e = metres_per_degree(lat0)
+    for c in res.control_points:
+        assert abs((c.lat - lat0) * mdeg_n - c.north) < 1e-6
+        assert abs((c.lon - lon0) * mdeg_e - c.east) < 1e-6
+
+
+def test_control_points_are_the_raw_shots_not_the_fitted_path(tmp_path):
+    """They must NOT move when the fitted geometry does — that is what makes
+    them useful as a separate map layer."""
+    name = _write_survey(tmp_path)
+    mgr = PathManager(str(tmp_path))
+    before = mgr.preview_path(name).control_points
+
+    mgr.save_line_config(name, 5.0)          # fillet on: waypoints change
+    mgr._preview_cache.clear()
+    after = mgr.preview_path(name)
+    assert [(c.north, c.east, c.lat, c.lon) for c in after.control_points] == \
+           [(c.north, c.east, c.lat, c.lon) for c in before]
+
+
+def test_non_survey_sources_emit_no_control_points(tmp_path):
+    mgr = PathManager(str(tmp_path))
+    assert mgr.preview_path("builtin:square_2x2").control_points == []
+    # Legacy headerless NED CSV has no surveyed provenance either.
+    (tmp_path / "legacy.csv").write_text("0,0\n1,0\n2,0\n")
+    assert mgr.preview_path("legacy.csv").control_points == []
+
+
+def test_grid_only_survey_csv_emits_control_points_without_latlon(tmp_path):
+    """A Northing/Easting export has no geographic anchor; the points still come
+    through so they can be drawn, but lat/lon is null rather than invented."""
+    hdr = "Name,Code,Northing,Easting"
+    rows = [f"{i+1},L_1,{1243756.0 + i * 0.6:.3f},{1204636.0 + i * 0.2:.3f}"
+            for i in range(4)]
+    (tmp_path / "grid.csv").write_text("\n".join([hdr, *rows]) + "\n")
+    res = PathManager(str(tmp_path)).preview_path("grid.csv")
+    assert len(res.control_points) == 4
+    assert res.geo_origin is None
+    assert all(c.lat is None and c.lon is None for c in res.control_points)
+    assert all(c.name is not None for c in res.control_points)
+
+
+# ── preview / plan / load must produce the SAME geometry for a survey CSV ─────
+# The arc fit is automatic for a survey CSV, and preview and load both apply it.
+# PathPlanRequest.fit_arcs used to default to False, and /api/path/plan forwards
+# it unconditionally — so an ordinary plan call sent an EXPLICIT "off" and staged
+# straight chords for the very file the map was drawing as arcs. None now means
+# "not specified"; only a caller who asks gets an override.
+
+def _curving_survey(tmp_path, name="sweep.csv"):
+    """A survey CSV whose points lie on a real arc, so fitting is observable."""
+    import math as _m
+    hdr = ("Name,Code,Code description,Easting,Northing,Elevation,Longitude,"
+           "Latitude,Lateral RMS,Solution status,Samples,PDOP,CS name")
+    lat0, lon0, deg = 13.07206142, 80.26193876, 1.0 / 111320.0
+    rows = []
+    for i in range(12):
+        a = _m.radians(i * 8.0)
+        rows.append(
+            f"{i+1},P,Point,1204636.0,1243756.0,9.9,"
+            f"{lon0 + 6.0 * _m.sin(a) * deg:.8f},"
+            f"{lat0 + 6.0 * (1 - _m.cos(a)) * deg:.8f},"
+            f"0.017,FIX,1,1.8,WGS 84 / Tamil Nadu + EGM96 height"
+        )
+    (tmp_path / name).write_text("\n".join([hdr, *rows]) + "\n")
+    return name
+
+
+def test_plan_matches_preview_for_a_survey_csv(tmp_path):
+    """The WYSIWYG contract: what the map draws is what gets planned."""
+    name = _curving_survey(tmp_path)
+    mgr = PathManager(str(tmp_path))
+    preview = [(w.north, w.east) for w in mgr.preview_path(name).waypoints]
+    planned = mgr.plan_path(name, summary_only=False)["merged_waypoints"]
+    assert planned == preview
+
+
+def test_plan_defaults_do_not_disable_the_survey_arc_fit(tmp_path):
+    """Regression: forwarding the request model's unset arc-fit fields (all None)
+    must be identical to not passing them at all."""
+    name = _curving_survey(tmp_path)
+    mgr = PathManager(str(tmp_path))
+    bare = mgr.plan_path(name, summary_only=False)["merged_waypoints"]
+    forwarded = mgr.plan_path(
+        name, summary_only=False,
+        fit_arcs=None, fit_arcs_rms_m=None,
+        fit_arcs_corner_deg=None, fit_arcs_max_dev_m=None,
+    )["merged_waypoints"]
+    assert forwarded == bare
+    # And the fit really is doing something, or the assertion above is vacuous.
+    chords = mgr.plan_path(name, summary_only=False, fit_arcs=False)["merged_waypoints"]
+    assert chords != bare
+
+
+def test_explicit_fit_arcs_false_still_wins(tmp_path):
+    """None means 'unset', but a caller who genuinely wants chords still gets them."""
+    name = _curving_survey(tmp_path)
+    mgr = PathManager(str(tmp_path))
+    off = mgr.plan_path(name, summary_only=False, fit_arcs=False)["merged_waypoints"]
+    on = mgr.plan_path(name, summary_only=False, fit_arcs=True)["merged_waypoints"]
+    assert off != on
+
+
+def test_plan_honours_the_line_config_sidecar_like_preview_does(tmp_path):
+    """fit_arcs_max_dev_m defaulted to 0.15 in the request model and was always
+    forwarded, overriding the per-file sidecar that preview and load read."""
+    name = _curving_survey(tmp_path)
+    mgr = PathManager(str(tmp_path))
+    mgr.save_line_config(name, 0.0, fit_arcs_max_dev_m=0.002)   # too tight to fit
+    mgr._preview_cache.clear()
+    preview = [(w.north, w.east) for w in mgr.preview_path(name).waypoints]
+    planned = mgr.plan_path(name, summary_only=False)["merged_waypoints"]
+    assert planned == preview
+
+
+# ── A16: extensions must be configurable for survey CSVs, not DXF only ────────
+
+_SURVEY_CSV = (
+    "Name,Code,Longitude,Latitude,Ellipsoidal height\n"
+    "1,L_1,80.26194110,13.07206390,-82.323\n"
+    "2,L_1,80.26195200,13.07207100,-82.330\n"
+    "3,L_1,80.26196445,13.07207953,-82.337\n"
+)
+
+
+def test_extensions_are_configurable_for_a_survey_csv(tmp_path):
+    """A16 regression. Extensions were gated to DXF, which locked the pre-line
+    CSV product out of the one feature that moves the entry transient and the
+    terminal shutoff OFF the painted line.
+
+    Both were measured on the 2026-07-27 curve run: station 1 missed by 4.05 cm
+    (entry) and the LAST surveyed station by 5.03 cm (terminal shutoff) — and
+    engine.py takes `runout = aft_extension_m` only when extensions are on.
+
+    Fails if the fix is wrong: on pre-fix source `_require_extendable` does not
+    exist and `save_extension_config` raises ValueError("...only available for
+    DXF files"), so the save below raises instead of returning a config.
+    """
+    (tmp_path / "curve.csv").write_text(_SURVEY_CSV)
+    mgr = PathManager(str(tmp_path))
+
+    saved = mgr.save_extension_config("curve.csv", True, 0.5, 0.5, per_line=False)
+    assert saved["enabled"] is True
+    assert saved["pre_extension_m"] == 0.5
+    assert saved["aft_extension_m"] == 0.5
+
+    loaded = mgr.load_extension_config("curve.csv")
+    assert loaded["enabled"] is True, "a saved CSV config must survive a reload"
+
+
+def test_extensions_still_refuse_a_legacy_headerless_ned_csv(tmp_path):
+    """Scope guard. The widened rule must admit SURVEY CSVs only — a legacy
+    headerless north,east CSV has no surveyed stations and its planning
+    behaviour is deliberately frozen. If this fails, the guard was widened to
+    'any .csv' and legacy missions can silently acquire run-ups.
+    """
+    (tmp_path / "legacy.csv").write_text("0.0,0.0\n1.0,0.0\n2.0,0.0\n")
+    mgr = PathManager(str(tmp_path))
+
+    with pytest.raises(ValueError):
+        mgr.save_extension_config("legacy.csv", True, 0.5, 0.5, per_line=False)
+
+
+def test_extensions_still_refuse_a_missing_file(tmp_path):
+    mgr = PathManager(str(tmp_path))
+    with pytest.raises(FileNotFoundError):
+        mgr.save_extension_config("nope.csv", True, 0.5, 0.5, per_line=False)
+
+
+def test_survey_csv_preview_matches_plan_and_load_with_extensions(tmp_path):
+    """A16 follow-up: preview_path / load_path must honor the CSV extension
+    sidecar the same way plan_path does.
+
+    Before this, save_extension_config succeeded for a survey CSV (A16) but
+    preview still built a bare PathEngine — so the map showed no PRE/AFT while
+    plan-and-stage drove them. Mirror the DXF parity test
+    test_preview_spray_flags_match_executed_path_with_extensions.
+
+    per_line=False = chain-ends mode (open-run PRE/AFT only). Closed loops with
+    per_line=True are an operator choice via the sidecar; not asserted here.
+    """
+    (tmp_path / "curve.csv").write_text(_SURVEY_CSV)
+    mgr = PathManager(str(tmp_path))
+
+    off = mgr.plan_path("curve.csv", summary_only=False)
+    mark_off = off["mark_length_m"]
+    wp_off = off["num_waypoints"]
+
+    mgr.save_extension_config("curve.csv", True, 0.5, 0.5, per_line=False)
+
+    planned = mgr.plan_path("curve.csv", summary_only=False)
+    preview = mgr.preview_path("curve.csv")
+    executed = mgr.load_path("curve.csv")
+
+    assert preview.num_points == planned["num_waypoints"]
+    assert preview.num_points == len(executed)
+    assert [(w.north, w.east) for w in preview.waypoints] == planned["merged_waypoints"]
+    assert executed == planned["merged_waypoints"]
+
+    # PRE/AFT are TRANSIT → spray OFF at the ends.
+    assert preview.waypoints[0].spray is False
+    assert preview.waypoints[-1].spray is False
+
+    # MARK length byte-for-byte unchanged; only deadhead transit grows.
+    assert planned["mark_length_m"] == pytest.approx(mark_off, abs=1e-9)
+    assert planned["num_waypoints"] > wp_off
+    assert planned["transit_length_m"] > off["transit_length_m"]

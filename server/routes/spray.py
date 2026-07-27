@@ -26,6 +26,7 @@ import math
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 
 from auth import require_token
 from logging_setup import get_logger
@@ -245,6 +246,37 @@ async def spray_test(req: SprayTestRequest):
     return {"manual": True, "duration_s": duration}
 
 
+class PointAdvanceRequest(BaseModel):
+    """G5 manual gate: advance past the point the RPP is holding.
+
+    `expect_index` is the point index the frontend saw reported as
+    WAIT_OPERATOR (from /api/spray/status.point.rpp_point_index). The RPP
+    rejects the advance unless it matches the point it is actually holding, so a
+    stale double-tap for an already-advanced point is a no-op.
+    """
+
+    expect_index: int
+
+
+@router.post("/point/advance")
+async def spray_point_advance(req: PointAdvanceRequest):
+    """G5: operator "Next point" — release the RPP's manual WAIT_OPERATOR hold.
+
+    Publishes /point/advance {advance:true, expect_index}. Fire-and-forget: the
+    RPP acts on it only while it is holding `expect_index` in WAIT_OPERATOR
+    (manual point_execution_mode); otherwise it is safely ignored. Returns the
+    published command so the caller can confirm the target.
+    """
+    from main import ros_node
+
+    if ros_node is None:
+        raise HTTPException(503, "ROS bridge not ready")
+    if req.expect_index < 0:
+        raise HTTPException(422, "expect_index must be >= 0")
+    ros_node.publish_point_advance(req.expect_index)
+    return {"advance": True, "expect_index": req.expect_index}
+
+
 @router.get("/status")
 async def spray_status():
     """Enabled gate, actual commanded state, RPP MARK desire, manual-override, hold state."""
@@ -257,12 +289,46 @@ async def spray_status():
             "spray_active_desired": False,
             "manual_override": False,
             "hold_active": hold_active,
+            # No ROS graph → the spray node is not reporting a mode.
+            "mode": None,
         }
     s = ros_node.get_state()
-    return {
+    resp = {
         "enabled": _spray_enabled,
         "spraying": bool(s.get("spraying", False)),
         "spray_active_desired": bool(s.get("spray_active", False)),
         "manual_override": bool(s.get("spray_manual", False)),
         "hold_active": hold_active,
+        # Live spray mode mirrored from the node's /spray/status. None means the
+        # spray node has not been heard from (not "continuous").
+        "mode": s.get("spray_mode"),
     }
+    # Attach the mode-specific config the node is actually running, so the app
+    # can show it without a separate call. Sourced from the node's mode_state
+    # (single source of truth), not from what the server last published.
+    mode = resp["mode"]
+    mode_state = s.get("spray_mode_state") or {}
+    if mode == "dash":
+        resp["dash"] = {
+            "on_distance_m": mode_state.get("on_distance_m"),
+            "off_distance_m": mode_state.get("off_distance_m"),
+            "phase": mode_state.get("phase"),
+            "armed": mode_state.get("armed"),
+        }
+    elif mode == "point":
+        resp["point"] = {
+            "dwell_s": mode_state.get("dwell_s"),
+            "arrival_tolerance_m": mode_state.get("arrival_tolerance_m"),
+            "num_points": mode_state.get("num_points"),
+            "target_index": mode_state.get("target_index"),
+            "phase": mode_state.get("phase"),
+            # G5 — RPP mission phase mirrored via the spray node's /spray/status.
+            # wait_operator=True ⇒ the RPP is holding in WAIT_OPERATOR (manual
+            # gate); show the "Next point" button and POST /api/spray/point/advance
+            # with rpp_point_index as expect_index. None until the RPP publishes
+            # progress (progress_publish_enabled) — the frontend hides the button.
+            "rpp_phase_name": mode_state.get("rpp_phase_name"),
+            "rpp_point_index": mode_state.get("rpp_point_index"),
+            "wait_operator": bool(mode_state.get("wait_operator", False)),
+        }
+    return resp

@@ -29,7 +29,12 @@ def test_engine_plan_segments_single_mark():
     plan = engine.plan_segments([seg])
     assert plan.num_waypoints > 2  # Densified
     assert plan.total_mark_length > 0
-    assert all(plan.spray_flags)  # All MARK
+    # Every marked waypoint is MARK, but the engine now appends one short
+    # TRANSIT run-out so a mission that ends on MARK still has a terminal
+    # MARK->TRANSIT boundary — without it the spray node latches ON forever at
+    # the endpoint (no boundary => off_early can never fire).
+    assert all(plan.spray_flags[:-1])  # all marked points are MARK
+    assert plan.spray_flags[-1] is False  # terminal run-out is TRANSIT
     assert plan.origin == (0.0, 0.0)
 
 
@@ -481,8 +486,13 @@ def test_spray_toggle_mark_transit_alternation_via_pose():
     assert mark_on_count >= 2, f"Expected spray ON at least 2 times, got {mark_on_count}"
 
 
-def test_spray_toggle_single_segment_no_transitions():
-    """Single MARK segment — spray stays ON, no transitions."""
+def test_spray_toggle_single_segment_terminal_off():
+    """Single MARK segment — spray comes ON, then OFF at the terminal run-out.
+
+    The engine appends a short TRANSIT run-out when a mission ends on MARK so
+    there is a terminal MARK->TRANSIT boundary; otherwise the spray node has no
+    boundary to react to and the nozzle stays latched ON at the endpoint.
+    """
     engine = PathEngine(optimize_order=False, compensate_spray=False)
     seg = PathSegment(segment_type=SegmentType.MARK, points=[(0, 0), (5, 0)], speed=0.35)
     plan = engine.plan_segments([seg])
@@ -494,8 +504,7 @@ def test_spray_toggle_single_segment_no_transitions():
             transitions.append(flag)
             last_state = flag
 
-    assert len(transitions) == 1, "Single MARK should have exactly 1 transition (OFF→ON)"
-    assert transitions[0] is True
+    assert transitions == [True, False], "Single MARK: OFF->ON at start, ON->OFF at terminal run-out"
 
 
 def test_spray_toggle_progress_increments_with_pose():

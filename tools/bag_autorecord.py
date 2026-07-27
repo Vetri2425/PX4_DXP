@@ -59,10 +59,17 @@ IST = timezone(timedelta(hours=5, minutes=30), name="IST")
 CAPTURE_FCU_PARAMS = os.environ.get("BAG_FCU_PARAMS", "1") == "1"
 FCU_PARAM_NAMES = [
     "COM_OF_LOSS_T", "RO_YAW_P", "RO_YAW_RATE_LIM", "RO_MAX_THR_SPEED",
-    "RD_TRANS_TRN_ARM", "RD_TRANS_ARM_TRN",
+    # Correct names (2026-07-27): the old RD_TRANS_TRN_ARM/RD_TRANS_ARM_TRN do
+    # not exist on this firmware — every manifest flagged them `missing`.
+    "RD_TRANS_DRV_TRN", "RD_TRANS_TRN_DRV",
     "EKF2_WENC_CTRL", "RBCLW_COUNTS_REV",
     "NAV_ACC_RAD",
     "PWM_AUX_FUNC1", "PWM_AUX_MIN1", "PWM_AUX_MAX1", "PWM_AUX_DIS1",
+    # WENC A/B provenance (2026-07-27): the fusion-trust knobs under test and
+    # the heading offset they interact with — without these a param A/B's
+    # manifest cannot prove which tuning actually ran.
+    "EKF2_GPS_P_NOISE", "EKF2_WENC_NOISE", "EKF2_WENC_LAT_N", "EKF2_WENC_GATE",
+    "EKF2_GPS_YAW_OFF",
 ]
 # The RPP tuning block lives in /rpp/debug[11..38] (see rpp_controller_node.py).
 # index -> readable label, so the manifest names each number.
@@ -126,6 +133,31 @@ TOPICS = [
     "/spray/commanded",                   # what the controller commanded to PX4 AUX
     "/spray/state",                       # actual sprayer state (controller)
     "/spray/debug",                       # spray timing / boundary metrics
+    # ── added 2026-07-22: verified present on Upgrade_Spray (grep create_publisher)
+    "/spray/status",                      # Spray V2 Phase A typed status (std_msgs/String JSON)
+    "/spray/manual_state",                # manual-override state (POST /api/spray/test)
+    "/dyx/mission/progress",              # 0.0→1.0 completion @1Hz (path_publisher)
+    # ── added 2026-07-24: RPP↔spray progress handshake (G1–G5), needed to
+    # validate the point-mode A/B from the bag. VOLATILE (not latched); progress
+    # is BEST_EFFORT (see the QoS override), the rest RELIABLE. All silent unless
+    # progress_publish_enabled / point_handshake_enabled are set at the rover.
+    "/rpp/progress",                      # mission phase + dist-to-boundary @50Hz (BEST_EFFORT)
+    "/rpp/milestone",                     # discrete edges: MARK_START/AT_POINT/… (RELIABLE)
+    "/spray/point_done",                  # spray→RPP dwell-complete proof (RELIABLE)
+    "/point/advance",                     # operator "next point" (G5 manual, RELIABLE)
+    # ── added 2026-07-24: EKF local-frame origin (LATCHED — see QoS override).
+    # The datum the local /path is expressed against; analyze_mission uses it to
+    # render /path back into lat/lon for the geo overlay (surveyed vs commanded
+    # vs driven). Published once early (after the server's MAV_CMD_REQUEST_MESSAGE).
+    "/mavros/global_position/gp_origin",  # geographic_msgs/GeoPointStamped (TRANSIENT_LOCAL)
+    # ── added 2026-07-26: the receiver's OWN lat/lon (NavSatFix from GPS_RAW_INT,
+    # global_position plugin — not denylisted, so present). This is the only
+    # dense position stream UPSTREAM of the EKF: /mavros/global_position/global
+    # is ekf_origin + local NED (the EKF grading itself), and GPSRAW is only
+    # ~5 Hz. Needed as the independent ruler for the WENC A/B drift analysis.
+    # VOLATILE sensor topic — captured via the recorder's QoS adaptation, same
+    # as /mavros/global_position/global; no override entry required.
+    "/mavros/global_position/raw/fix",    # sensor_msgs/NavSatFix (EKF-independent)
 ]
 
 # QoS profile overrides so the LATCHED (TRANSIENT_LOCAL) topics above are actually
@@ -292,33 +324,71 @@ def _environment() -> dict:
     }
 
 
-def _fcu_params() -> dict:
-    """Best-effort MAVROS ParamGet snapshot of the curated FCU knobs.
+def _parse_ros2_param_value(out: str | None):
+    """Parse `ros2 param get --hide-type` output → int | float | None."""
+    if not out:
+        return None
+    token = out.strip().splitlines()[-1].strip()
+    if not token or "not set" in out.lower() or "error" in out.lower():
+        return None
+    try:
+        return int(token)
+    except ValueError:
+        try:
+            return float(token)
+        except ValueError:
+            return None
 
-    Off the mission critical path (runs at finalise), bounded per-param, and
-    tolerant: a param that can't be read is recorded as null, never an error.
+
+def _fcu_params() -> dict:
+    """Best-effort snapshot of the curated FCU knobs (bug A12).
+
+    mavros2 (ROS2/Humble) does NOT provide the mavros1 `/mavros/param/get`
+    ParamGet service — FCU params are exposed as native ROS2 parameters on the
+    `/mavros/param` node. The old service call failed silently for every param,
+    which is why every manifest to date has `values: {pid: null}` (A12). Try
+    the native interface first, fall back to the legacy service, and record
+    failures EXPLICITLY (`missing` list) so an unprovable A/B label is visible
+    instead of silently null.
+
+    Off the mission critical path (runs at finalise), bounded per-param.
     """
     if not CAPTURE_FCU_PARAMS:
-        return {"captured": False, "reason": "disabled", "values": {}}
+        return {"captured": False, "reason": "disabled", "values": {}, "missing": []}
     values: dict = {}
-    any_ok = False
+    missing: list = []
+    method = None
     for pid in FCU_PARAM_NAMES:
-        out = _run(
-            ["ros2", "service", "call", "/mavros/param/get",
-             "mavros_msgs/srv/ParamGet", f"{{param_id: '{pid}'}}"],
+        # mavros2: native ROS2 parameter on the param plugin node
+        val = _parse_ros2_param_value(_run(
+            ["ros2", "param", "get", "--hide-type", "/mavros/param", pid],
             timeout=4.0,
-        )
-        val = None
-        if out and "success=True" in out.replace(" ", ""):
-            # response embeds mavros_msgs/ParamValue{integer, real}
-            m_int = re.search(r"integer=(-?\d+)", out)
-            m_real = re.search(r"real=(-?\d+\.?\d*(?:e-?\d+)?)", out)
-            iv = int(m_int.group(1)) if m_int else 0
-            rv = float(m_real.group(1)) if m_real else 0.0
-            val = rv if rv != 0.0 else iv
-            any_ok = True
+        ))
+        if val is not None:
+            method = method or "ros2_param"
+        else:
+            # mavros1 compat: ParamGet service
+            out = _run(
+                ["ros2", "service", "call", "/mavros/param/get",
+                 "mavros_msgs/srv/ParamGet", f"{{param_id: '{pid}'}}"],
+                timeout=4.0,
+            )
+            if out and "success=True" in out.replace(" ", ""):
+                m_int = re.search(r"integer=(-?\d+)", out)
+                m_real = re.search(r"real=(-?\d+\.?\d*(?:e-?\d+)?)", out)
+                iv = int(m_int.group(1)) if m_int else 0
+                rv = float(m_real.group(1)) if m_real else 0.0
+                val = rv if rv != 0.0 else iv
+                method = method or "param_get_service"
+        if val is None:
+            missing.append(pid)
         values[pid] = val
-    return {"captured": any_ok, "values": values}
+    return {
+        "captured": bool(values) and len(missing) < len(FCU_PARAM_NAMES),
+        "method": method,
+        "missing": missing,
+        "values": values,
+    }
 
 
 def _rpp_param_block() -> dict:
@@ -364,6 +434,121 @@ def _loaded_path_identity() -> dict:
     ident = {k: data.get(k) for k in keep if k in data}
     ident["available"] = True
     return ident
+
+
+# ── staged-mission provenance ────────────────────────────────────────────────
+# Without this the bundle cannot answer "what file produced this drive, and was
+# it georeferenced?". manifest.identity only carries counts and origin_gps —
+# nothing about the SOURCE. The 2026-07-18 georef investigation had to guess the
+# DXF from a hand-copied ref_dxf/ folder someone happened to create.
+#
+# The staged mission JSON holds the global anchor (lat/lon/rotation/scale) and
+# the alignment fit (method, rmse, fitted_scale, residuals). The bundle name IS
+# the mission_id, so it is a direct lookup.
+#
+# It did NOT hold the file provenance: this reader was written against an assumed
+# metadata.source dict, but the server wrote a bare filename STRING there, so
+# source_file was empty in every bundle recorded before 2026-07-22 and §8
+# absolute accuracy reported "unavailable". The server now also writes
+# metadata.source_detail (a dict); _source_block below reads either shape and
+# resolves a legacy bare filename against server/missions/.
+STAGING_DIR = os.path.join(_REPO_ROOT, "server", "missions", "staging")
+
+
+MISSIONS_DIR = os.path.join(_REPO_ROOT, "server", "missions")
+
+
+def _source_block(metadata: dict) -> dict:
+    """Normalise the staged artifact's source provenance to a dict.
+
+    Three shapes exist on disk and all three must work, because staged files
+    written by an older server outlive the deploy that fixed them:
+
+      * ``source_detail`` — a dict (current server).
+      * ``source`` — a dict (never shipped, but the schema allows it).
+      * ``source`` — a bare filename string (every file staged before this fix).
+        Resolve it against server/missions/ so §8 still gets a real path.
+
+    Returns {} when nothing resolves. Must not raise: the caller's contract is
+    that provenance is best-effort and never blocks a recording.
+    """
+    detail = metadata.get("source_detail")
+    if isinstance(detail, dict) and detail:
+        return detail
+
+    source = metadata.get("source")
+    if isinstance(source, dict):
+        return source
+    if isinstance(source, str) and source and not source.startswith("builtin:"):
+        out = {"name": source, "extension": os.path.splitext(source)[1].lower() or None}
+        candidate = os.path.join(MISSIONS_DIR, os.path.basename(source))
+        if os.path.isfile(candidate):
+            out["filepath"] = candidate
+        return out
+    return {}
+
+
+def _staged_mission(mission_id: str | None) -> dict:
+    """Read the staged mission artifact for *mission_id*. Never raises.
+
+    Returns the provenance block for the manifest. The full artifact is written
+    to the bundle separately (see BagSession.start) so the exact commanded
+    geometry survives even after STAGING_TTL_S prunes the original.
+    """
+    if not mission_id:
+        return {"available": False, "reason": "no mission_id in identity"}
+    path = os.path.join(STAGING_DIR, f"{mission_id}.json")
+    try:
+        with open(path) as f:
+            d = json.load(f)
+    except Exception as exc:
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+    anchor = d.get("anchor") or {}
+    align = d.get("alignment_metadata") or {}
+    source = _source_block(d.get("metadata") or {})
+    # A georeferenced DXF is one the parser projected from lat/lon: georef.py
+    # stamps geo_origin, the planner promotes it to origin_gps, and the plan is
+    # staged GPS_SURVEYED with alignment method "gps_origin" and no ref points.
+    return {
+        "available": True,
+        "staged_file": path,
+        "source_file": source.get("filepath"),
+        "source_extension": source.get("extension"),
+        "unit_scale_m_per_unit": source.get("unit_scale_m_per_unit"),
+        # Operator's per-survey vertex tolerance; None = analyser default.
+        "survey_tolerance_m": (d.get("metadata") or {}).get("survey_tolerance_m"),
+        "placement_mode": d.get("placement_mode"),
+        "anchor": anchor or None,
+        "alignment": {
+            "method": align.get("method"),
+            "rotation_deg": align.get("rotation_deg"),
+            "scale": align.get("scale"),
+            "fitted_scale": align.get("fitted_scale"),
+            "rmse": align.get("rmse"),
+            "residuals": align.get("residuals"),
+        },
+        "is_georeferenced": bool(d.get("origin_gps")) and align.get("method") == "gps_origin",
+        "num_waypoints": len(d.get("waypoints") or []),
+        "num_mark": sum(1 for f in (d.get("spray_flags") or []) if f),
+        "mark_length_m": (d.get("metadata") or {}).get("mark_length_m"),
+        "transit_length_m": (d.get("metadata") or {}).get("transit_length_m"),
+    }
+
+
+def _snapshot_staged_artifact(bundle_dir: str, mission_id: str | None) -> None:
+    """Copy the full staged mission JSON into the bundle. Best-effort, never raises."""
+    if not mission_id:
+        return
+    src = os.path.join(STAGING_DIR, f"{mission_id}.json")
+    try:
+        with open(src) as f:
+            data = f.read()
+        with open(os.path.join(bundle_dir, "staged_mission.json"), "w") as f:
+            f.write(data)
+        log(f"staged mission artifact snapshotted ({len(data)} bytes)")
+    except Exception as exc:
+        log(f"staged mission snapshot skipped: {type(exc).__name__}: {exc}")
 
 
 # ── manifest read/write (G2) ─────────────────────────────────────────────────
@@ -558,10 +743,14 @@ class Recorder:
 
         # Build the initial manifest AFTER the bag is already recording, so none
         # of this best-effort capture can lose data or block the mission (R1).
+        identity = _loaded_path_identity()
+        mission_id = identity.get("mission_id")
+        _snapshot_staged_artifact(self.bundle_dir, mission_id)
         self.manifest = {
             "schema": "bag_autorecord/manifest@1",
             "bundle": name,
-            "identity": _loaded_path_identity(),
+            "identity": identity,
+            "plan_provenance": _staged_mission(mission_id),
             "timestamps": {
                 "recorder_start": _stamp(started),
                 "mission_start_observed": _stamp(started),
@@ -609,12 +798,27 @@ class Recorder:
                 self.manifest["timestamps"]["recorder_end"] = _stamp(ended)
                 self.manifest["timestamps"]["mission_end_observed"] = _stamp(ended)
                 self.manifest["outcome"] = {
+                    # RECORDER status only: the bag was closed in an orderly way.
+                    # It is NOT a statement about the mission — a clean abort at
+                    # 40% and a full traversal both land here, which is why runs
+                    # covering 24/64 and 76/86 waypoints both read COMPLETE.
+                    # mission_end_reason distinguishes WHY it ended; the traversal
+                    # block below says how much of the path was actually driven.
                     "status": "COMPLETE",
+                    "means": "recorder finalised cleanly; see traversal for mission coverage",
                     "mission_end_reason": reason,
                     "recorder_end": _stamp(ended),
                     "integrity": _bundle_integrity(
                         bundle, exclude={MANIFEST_NAME, MANIFEST_NAME + ".tmp"}
                     ),
+                }
+                # Coverage needs the closed bag, so the analyser fills this in
+                # (it is spawned just below). PENDING is written now so that a
+                # missing verdict reads as "not analysed yet" rather than as a
+                # silent pass — absence must never look like success.
+                self.manifest["traversal"] = {
+                    "status": "PENDING",
+                    "source": "awaiting analyze_mission",
                 }
                 _write_manifest(bundle, self.manifest)
                 log(f"  saved: {bundle}  (manifest + integrity written)")

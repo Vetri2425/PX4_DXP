@@ -1,8 +1,26 @@
 """Coordinate transforms — lat/lon to NED metres.
 
-Uses GeographicLib Karney geodesic (WGS84) for accurate lat/lon conversion.
-Centralized here so both the ROS2 path_publisher and the FastAPI server
-use the same implementation.
+FRAME CONTRACT (B6', 2026-07-25)
+--------------------------------
+``latlon_to_ned`` / ``ned_to_latlon`` implement **PX4's own map projection**:
+a spherical azimuthal-equidistant projection with R = 6 371 000 m, the exact
+math of PX4-Autopilot ``src/lib/geo/geo.cpp`` (``CONSTANTS_RADIUS_OF_EARTH``).
+
+PX4's EKF defines the local NED frame by projecting every GPS fix through that
+model, so any companion conversion crossing into or out of PX4 local NED MUST
+use the same model. Using a WGS84 geodesic here instead (as this module did
+until 2026-07-25) puts a pure scale error on every metre of distance from the
+origin: at 13 °N the two models diverge by −0.51 cm per metre north and
++0.13 cm per metre east — measured as a north-walking placement residual in
+the 2026-07-25 field bags (docs/FIELD_BUG_REPORT_2026-07-25.md, B6').
+
+The WGS84 Karney geodesic remains available ONLY for true ground distance
+between two lat/lon pairs (``geodesic_ground_distance_m``) — e.g. grading a
+painted line against surveyed truth. Never use it for anything that produces
+or consumes PX4 local-frame coordinates.
+
+Centralized here so the ROS2 nodes, the FastAPI server and the analysis tools
+all share one implementation of each model.
 """
 
 from __future__ import annotations
@@ -18,6 +36,11 @@ try:
 except ImportError:
     _HAS_GEOGRAPHICLIB = False
 
+# PX4 geo.h:55 CONSTANTS_RADIUS_OF_EARTH — the sphere the EKF's local frame
+# lives on. Not a physical Earth radius; a frame definition. Do not "improve"
+# it to a WGS84 radius: matching PX4 exactly is the whole point.
+PX4_EARTH_RADIUS_M = 6371000.0
+
 
 def latlon_to_ned(
     lat: float,
@@ -25,7 +48,12 @@ def latlon_to_ned(
     origin_lat: float,
     origin_lon: float,
 ) -> tuple[float, float]:
-    """Convert lat/lon to NED metres relative to an origin using Karney geodesic.
+    """Convert lat/lon to PX4 local NED metres relative to an origin.
+
+    Exact port of PX4 ``MapProjection::project()`` (geo.cpp): spherical
+    azimuthal-equidistant projection at R = 6 371 000 m. This is the frame the
+    EKF navigates in — see the module docstring for why WGS84 must not be used
+    here.
 
     Args:
         lat: Target latitude (degrees).
@@ -34,24 +62,94 @@ def latlon_to_ned(
         origin_lon: Origin longitude (degrees).
 
     Returns:
-        (north_m, east_m) relative to origin.
+        (north_m, east_m) relative to origin, in PX4 local-frame metres.
+    """
+    lat_rad = math.radians(lat)
+    lon_rad = math.radians(lon)
+    ref_lat = math.radians(origin_lat)
+    ref_lon = math.radians(origin_lon)
+
+    sin_lat = math.sin(lat_rad)
+    cos_lat = math.cos(lat_rad)
+    sin_ref = math.sin(ref_lat)
+    cos_ref = math.cos(ref_lat)
+    cos_d_lon = math.cos(lon_rad - ref_lon)
+
+    arg = sin_ref * sin_lat + cos_ref * cos_lat * cos_d_lon
+    arg = max(-1.0, min(1.0, arg))
+    c = math.acos(arg)
+    k = c / math.sin(c) if abs(c) > 1e-12 else 1.0
+
+    north = k * (cos_ref * sin_lat - sin_ref * cos_lat * cos_d_lon) * PX4_EARTH_RADIUS_M
+    east = k * cos_lat * math.sin(lon_rad - ref_lon) * PX4_EARTH_RADIUS_M
+    return (north, east)
+
+
+def ned_to_latlon(
+    north: float,
+    east: float,
+    origin_lat: float,
+    origin_lon: float,
+) -> tuple[float, float]:
+    """Inverse of latlon_to_ned: PX4 local NED metres → lat/lon.
+
+    Exact port of PX4 ``MapProjection::reproject()`` (geo.cpp), so it is the
+    true inverse of ``latlon_to_ned`` and of the projection the EKF applied to
+    build the local frame in the first place. Used to render a local-frame
+    /path back into geo coordinates for the post-mission geo overlay
+    (tools/analyze_mission.py §12).
+
+    Args:
+        north: PX4 local-frame metres north of the origin.
+        east: PX4 local-frame metres east of the origin.
+        origin_lat: Origin latitude (degrees).
+        origin_lon: Origin longitude (degrees).
+
+    Returns:
+        (lat, lon) in degrees.
+    """
+    x_rad = float(north) / PX4_EARTH_RADIUS_M
+    y_rad = float(east) / PX4_EARTH_RADIUS_M
+    c = math.hypot(x_rad, y_rad)
+
+    ref_lat = math.radians(origin_lat)
+    ref_lon = math.radians(origin_lon)
+
+    if c > 1e-12:
+        sin_c = math.sin(c)
+        cos_c = math.cos(c)
+        lat_rad = math.asin(
+            cos_c * math.sin(ref_lat) + (x_rad * sin_c * math.cos(ref_lat)) / c
+        )
+        lon_rad = ref_lon + math.atan2(
+            y_rad * sin_c,
+            c * math.cos(ref_lat) * cos_c - x_rad * math.sin(ref_lat) * sin_c,
+        )
+        return (math.degrees(lat_rad), math.degrees(lon_rad))
+    return (float(origin_lat), float(origin_lon))
+
+
+def geodesic_ground_distance_m(
+    lat1: float,
+    lon1: float,
+    lat2: float,
+    lon2: float,
+) -> float:
+    """True ground distance between two lat/lon pairs (WGS84 Karney geodesic).
+
+    This is the ONLY sanctioned use of the WGS84 model in this module: grading
+    real-world separation (e.g. §8 miss distance, survey QA). It must never be
+    used to build PX4 local-frame coordinates — that is ``latlon_to_ned``.
 
     Raises:
         ImportError: If geographiclib is not installed.
     """
     if not _HAS_GEOGRAPHICLIB:
         raise ImportError(
-            "geographiclib is required for lat/lon conversion. "
+            "geographiclib is required for ground-distance measurement. "
             "Install: pip install geographiclib"
         )
-
-    geod = Geodesic.WGS84
-    result = geod.Inverse(origin_lat, origin_lon, lat, lon)
-    dist = result["s12"]
-    bearing_rad = math.radians(result["azi1"])
-    north = dist * math.cos(bearing_rad)
-    east = dist * math.sin(bearing_rad)
-    return (north, east)
+    return float(Geodesic.WGS84.Inverse(lat1, lon1, lat2, lon2)["s12"])
 
 
 def _fit_similarity_coeffs(

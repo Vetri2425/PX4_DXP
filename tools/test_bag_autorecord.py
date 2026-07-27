@@ -193,5 +193,72 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(m["outcome"]["status"], "COMPLETE")
 
 
+class TestSourceProvenance(unittest.TestCase):
+    """metadata.source arrives in three shapes on disk; all must yield a path.
+
+    The original reader assumed a dict and got a string, which is why
+    staged_mission.source_file was empty in every bundle recorded before
+    2026-07-22 and §8 absolute accuracy never ran.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.missions = os.path.join(self.tmp, "missions")
+        os.makedirs(self.missions)
+        self.dxf = os.path.join(self.missions, "tes_cross_line.dxf")
+        with open(self.dxf, "w") as f:
+            f.write("0\nEOF\n")
+        self._orig = bar.MISSIONS_DIR
+        bar.MISSIONS_DIR = self.missions
+
+    def tearDown(self):
+        bar.MISSIONS_DIR = self._orig
+
+    def test_source_detail_dict_preferred(self):
+        out = bar._source_block({
+            "source": "tes_cross_line.dxf",
+            "source_detail": {"filepath": "/srv/a.dxf", "extension": ".dxf",
+                              "unit_scale_m_per_unit": 0.001},
+        })
+        self.assertEqual(out["filepath"], "/srv/a.dxf")
+        self.assertEqual(out["unit_scale_m_per_unit"], 0.001)
+
+    def test_legacy_string_source_resolves_against_missions_dir(self):
+        # This is every bundle recorded before the fix.
+        out = bar._source_block({"source": "tes_cross_line.dxf"})
+        self.assertEqual(out["filepath"], self.dxf)
+        self.assertEqual(out["extension"], ".dxf")
+
+    def test_legacy_string_source_without_file_has_no_filepath(self):
+        out = bar._source_block({"source": "vanished.dxf"})
+        self.assertIsNone(out.get("filepath"))
+        self.assertEqual(out["name"], "vanished.dxf")
+
+    def test_dict_under_source_also_accepted(self):
+        out = bar._source_block({"source": {"filepath": "/srv/b.dxf"}})
+        self.assertEqual(out["filepath"], "/srv/b.dxf")
+
+    def test_builtin_and_empty_yield_nothing(self):
+        for meta in ({}, {"source": ""}, {"source": "builtin:square"}):
+            self.assertEqual(bar._source_block(meta), {}, msg=repr(meta))
+
+    def test_staged_mission_never_raises_on_a_string_source(self):
+        """The docstring promises "never raises" — a string source used to
+        raise AttributeError on source.get(), inside no try block."""
+        staging = os.path.join(self.tmp, "staging")
+        os.makedirs(staging)
+        with open(os.path.join(staging, "stg_x.json"), "w") as f:
+            json.dump({"mission_id": "stg_x",
+                       "metadata": {"source": "tes_cross_line.dxf"}}, f)
+        orig = bar.STAGING_DIR
+        bar.STAGING_DIR = staging
+        try:
+            out = bar._staged_mission("stg_x")
+        finally:
+            bar.STAGING_DIR = orig
+        self.assertTrue(out["available"])
+        self.assertEqual(out["source_file"], self.dxf)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

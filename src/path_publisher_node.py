@@ -308,19 +308,12 @@ PATH_GENERATORS = {
 def read_qgc_waypoints(filepath: str) -> list[tuple[float, float]]:
     """Read QGC WPL 110 .waypoints file and convert lat/lon to NED metres.
 
-    Uses the home waypoint (current=1) as the NED origin.
-    All mission waypoints converted to metres North/East from home
-    using Karney geodesic on WGS84 ellipsoid.
+    Uses the home waypoint (current=1) as the NED origin. All mission
+    waypoints converted to PX4 local-frame metres North/East of home via the
+    PX4-spherical projection (path_engine.ned, B6').
     """
-    try:
-        from geographiclib.geodesic import Geodesic
-    except ImportError:
-        raise ImportError(
-            "geographiclib is required for QGC .waypoints files. "
-            "Install: pip install geographiclib"
-        )
+    from path_engine.ned import latlon_to_ned
 
-    geod = Geodesic.WGS84
     wps = []  # (lat, lon) pairs, skipping home
     home_lat = home_lon = None
 
@@ -354,16 +347,10 @@ def read_qgc_waypoints(filepath: str) -> list[tuple[float, float]]:
         else:
             raise ValueError(f"No waypoints found in {filepath}")
 
-    # Convert each lat/lon to NED metres from home using Karney geodesic
+    # Convert each lat/lon to PX4 local NED metres from home
     pts = []
     for lat, lon in wps:
-        # Bearing from home to waypoint
-        result = geod.Inverse(home_lat, home_lon, lat, lon)
-        dist = result["s12"]  # metres
-        bearing_rad = math.radians(result["azi1"])
-        north = dist * math.cos(bearing_rad)
-        east = dist * math.sin(bearing_rad)
-        pts.append((north, east))
+        pts.append(latlon_to_ned(lat, lon, home_lat, home_lon))
 
     return pts
 

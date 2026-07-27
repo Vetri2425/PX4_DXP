@@ -18,12 +18,14 @@ import math
 from collections import deque
 from typing import Any, Optional
 
+import config
 from config import (
     RPP_IDLE,
     RPP_STALE,
     RPP_UNHEALTHY_CODES,
     SETPOINT_STREAM_GRACE_S,
 )
+from control_arbiter import ControlArbiter, ControlArbiterError, get_control_arbiter
 from logging_setup import get_logger
 from mission_loading import pose_origin_or_error
 from mission_placement import (
@@ -67,12 +69,25 @@ class MissionClearConflict(Exception):
 
 
 class OffboardController:
-    def __init__(self, ros_node, activity_log: deque) -> None:
+    def __init__(
+        self,
+        ros_node,
+        activity_log: deque,
+        *,
+        arbiter: ControlArbiter | None = None,
+    ) -> None:
         self._node       = ros_node
         self._log        = activity_log
+        # Mission↔joystick mutual-exclusion. Wired into start_async so a mission
+        # cannot begin while the joystick owns manual control; the reverse guard
+        # (joystick cannot acquire mid-mission) lives in the joystick controller
+        # and reads self.state. See docs/Architecture/JOYSTICK_CONTROLLER_PLAN.md
+        # §7.4 and control_arbiter.mission_start().
+        self._arbiter    = arbiter or get_control_arbiter()
         self._state      = MissionState.IDLE
         self._loaded_pts: list[tuple[float, float]] | None = None
         self._loaded_spray_flags: list[bool] | None = None
+        self._loaded_must_hit: list[bool] | None = None
         self._path_name: str | None = None
         self._placement_mode = LOCAL_NED
         self._origin_gps: tuple[float, float] | None = None
@@ -82,6 +97,7 @@ class OffboardController:
         # advance_entry_to_marking() once the entry stop is confirmed (RPP DONE).
         self._entry_marking_pts: list[tuple[float, float]] | None = None
         self._entry_marking_flags: list[bool] | None = None
+        self._entry_marking_must_hit: list[bool] | None = None
         # Serialises lifecycle calls. Created lazily on first use: on
         # Python 3.9 asyncio.Lock() binds an event loop at construction,
         # and the controller is built at server startup outside any loop.
@@ -172,12 +188,14 @@ class OffboardController:
             cleared_name = self._path_name
             self._loaded_pts = None
             self._loaded_spray_flags = None
+            self._loaded_must_hit = None
             self._path_name = None
             self._placement_mode = LOCAL_NED
             self._origin_gps = None
             self._is_staged_mission = False
             self._entry_marking_pts = None
             self._entry_marking_flags = None
+            self._entry_marking_must_hit = None
             self._state = MissionState.IDLE
             # Optional path-topic clear if this branch's node grows the hook;
             # baseline has publish_stop_path only, so this self-skips (clear is
@@ -196,6 +214,7 @@ class OffboardController:
         points: list[tuple[float, float]],
         name: Optional[str] = None,
         spray_flags: Optional[list[bool]] = None,
+        must_hit: Optional[list[bool]] = None,
         *,
         placement_mode: str = LOCAL_NED,
         origin_gps: tuple[float, float] | None = None,
@@ -212,6 +231,19 @@ class OffboardController:
         self._loaded_pts = points
         self._entry_marking_pts = None       # D1: wipe any stale entry stash
         self._entry_marking_flags = None
+        self._entry_marking_must_hit = None
+        # Provenance is advisory: a length mismatch degrades to "no provenance"
+        # (geometry-only simplification), never to a wrong flag alignment.
+        if must_hit is not None and len(must_hit) == len(points):
+            self._loaded_must_hit = [bool(f) for f in must_hit]
+        else:
+            if must_hit:
+                self._log_entry(
+                    "warning",
+                    f"must_hit length mismatch for {name or 'unknown'} — "
+                    "publishing without vertex provenance",
+                )
+            self._loaded_must_hit = None
         if spray_flags is not None and len(spray_flags) == len(points):
             self._loaded_spray_flags = [bool(f) for f in spray_flags]
         elif spray_flags is not None:
@@ -266,6 +298,23 @@ class OffboardController:
         return f"start: RPP unhealthy (code={rpp_code})"
 
     async def start_async(self, auto_origin: bool = False) -> tuple[bool, str]:
+        """Begin a mission, bracketed by the mission↔joystick arbiter.
+
+        The arbiter claim happens before any FCU I/O: if the joystick owns
+        manual control, the mission is refused here (typed 409-style reject)
+        rather than racing the vehicle. On any exit — success, early guard
+        return, PlacementError, or unexpected failure — the bracket relinquishes
+        MISSION ownership (see control_arbiter.mission_start()); the running
+        mission is thereafter guarded by self.state, not by a sticky owner.
+        """
+        try:
+            async with self._arbiter.mission_start(self):
+                return await self._start_locked(auto_origin)
+        except ControlArbiterError as exc:
+            self._log_entry("warning", f"start rejected: {exc.message}")
+            return False, exc.message
+
+    async def _start_locked(self, auto_origin: bool = False) -> tuple[bool, str]:
         async with self._lifecycle_lock():
             if self._node is None:
                 return False, "ROS node not available"
@@ -308,6 +357,7 @@ class OffboardController:
 
             pts_to_publish = list(self._loaded_pts)
             spray_flags_to_publish = self._loaded_spray_flags
+            must_hit_to_publish = self._loaded_must_hit
 
             # Surveyed placement first so RTK/pose/skew failures keep a typed
             # PlacementError (HTTP 422) instead of being masked by RPP STALE.
@@ -368,8 +418,10 @@ class OffboardController:
             entry_two_phase = False
             publish_pts = pts_to_publish
             publish_flags = spray_flags_to_publish
+            publish_must_hit = must_hit_to_publish
             self._entry_marking_pts = None
             self._entry_marking_flags = None
+            self._entry_marking_must_hit = None
             if self._placement_mode == GPS_SURVEYED and len(pts_to_publish) >= 2:
                 live_n, live_e = fcu.get("pos_n"), fcu.get("pos_e")
                 tgt_n, tgt_e = pts_to_publish[0]
@@ -383,11 +435,16 @@ class OffboardController:
                     self._entry_marking_flags = (
                         list(spray_flags_to_publish) if spray_flags_to_publish else None
                     )
+                    self._entry_marking_must_hit = (
+                        list(must_hit_to_publish) if must_hit_to_publish else None
+                    )
                     publish_pts = [
                         (float(live_n), float(live_e)),
                         (float(tgt_n), float(tgt_e)),
                     ]
                     publish_flags = [False, False]   # entry leg is spray-OFF
+                    # Both entry-leg points are live geometry, not survey intent.
+                    publish_must_hit = [False, False]
                     self._log_entry(
                         "info",
                         f"entry leg: ({live_n:+.3f}N,{live_e:+.3f}E) → first point "
@@ -403,6 +460,7 @@ class OffboardController:
                 self._node.publish_path(
                     publish_pts,
                     spray_flags=publish_flags,
+                    must_hit_flags=publish_must_hit,
                 )
 
                 # ── Arm ───────────────────────────────────────────────────────
@@ -654,10 +712,55 @@ class OffboardController:
             return ok
 
     # Called from telemetry loop — no async lock to avoid blocking the loop.
-    def mark_completed(self) -> None:
+    # Returns True iff it actually transitioned RUNNING→COMPLETED (so the caller
+    # runs the completion sequence exactly once, on the edge).
+    def mark_completed(self) -> bool:
         if self._state == MissionState.RUNNING:
             self._state = MissionState.COMPLETED
             self._log_entry("info", f"mission completed: {self._path_name}")
+            return True
+        return False
+
+    # Called from the telemetry loop immediately after mark_completed() reports
+    # the RUNNING→COMPLETED edge. Ends the mission spray-OFF and DISARMED without
+    # an operator E-stop (field bug B4, 2026-07-25). The RPP has already settled
+    # DONE (the mission-complete gate upstream), so the rover is stationary
+    # before this runs. Self-gates on config.DISARM_ON_COMPLETE — when OFF the
+    # rover is left armed (old behaviour). No lifecycle lock (mirrors
+    # mark_completed): it only sends a spray-OFF command and a single disarm and
+    # must not block the telemetry loop. Never raises.
+    async def disarm_on_complete_async(self) -> dict[str, Any]:
+        result = {"attempted": False, "spray_off_sent": False, "disarmed": False}
+        if not config.DISARM_ON_COMPLETE:
+            return result
+        result["attempted"] = True
+        if self._node is None:
+            self._log_entry("warning", "complete: ROS node unavailable — cannot disarm")
+            return result
+        # 1. Command spray OFF — the same primitive /api/spray/off and the
+        #    emergency disable path use. The disarm below also forces the spray
+        #    node's actuator OFF via its disarm fail-safe, so this is belt-and-
+        #    suspenders that closes any lingering manual hold immediately.
+        try:
+            self._node.publish_spray_manual(False)
+            result["spray_off_sent"] = True
+        except Exception as exc:
+            self._log_entry("warning", f"complete spray-off raised: {exc}")
+            log.exception("completion spray-off raised")
+        # 2. Disarm. arm_async(False) (not disarm_async) so the mission stays in
+        #    COMPLETED rather than being reset to IDLE. The spray node's disarm
+        #    fail-safe drives the AUX output OFF as the hard guarantee.
+        try:
+            ok, why = await self._node.arm_async(False)
+            result["disarmed"] = bool(ok)
+            self._log_entry(
+                "info" if ok else "error",
+                f"completion disarm {'ok' if ok else f'failed: {why}'}",
+            )
+        except Exception as exc:
+            self._log_entry("error", f"completion disarm raised: {exc}")
+            log.exception("completion disarm raised")
+        return result
 
     # Called from telemetry loop when state==ENTRY and RPP has settled DONE at
     # the entry point (D1 phase 2). Publishes the stashed marking path and
@@ -674,10 +777,12 @@ class OffboardController:
             self._log_entry("warning", "entry complete but no marking path stashed")
             return False
         flags = self._entry_marking_flags
+        must = self._entry_marking_must_hit
         self._entry_marking_pts = None
         self._entry_marking_flags = None
+        self._entry_marking_must_hit = None
         if self._node is not None:
-            self._node.publish_path(pts, spray_flags=flags)
+            self._node.publish_path(pts, spray_flags=flags, must_hit_flags=must)
             # Clear the entry-leg DONE so RUNNING does not instantly auto-complete
             # on the stale settle before RPP re-latches on the marking path.
             try:

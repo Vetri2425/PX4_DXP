@@ -1,7 +1,7 @@
 """QGC WPL 110 .waypoints file reader.
 
-Converts lat/lon waypoints to NED metres using Karney geodesic
-(GeographicLib, same method as arc generators).
+Converts lat/lon waypoints to PX4 local NED metres via path_engine.ned
+(PX4-spherical projection — B6', see that module's frame contract).
 
 The home waypoint (current=1) is used as the NED origin.
 All other waypoints are converted to metres North/East from home.
@@ -10,36 +10,23 @@ All other waypoints are converted to metres North/East from home.
 from __future__ import annotations
 
 import logging
-import math
 
 log = logging.getLogger("path_engine.waypoints_parser")
 
-try:
-    from geographiclib.geodesic import Geodesic
-    _HAS_GEOGRAPHICLIB = True
-except ImportError:
-    _HAS_GEOGRAPHICLIB = False
-
 from ..core import PathSegment, SegmentType
+from ..ned import latlon_to_ned
 
 
 def read_qgc_waypoints(filepath: str) -> list[tuple[float, float]]:
     """Read QGC WPL 110 .waypoints file and convert lat/lon to NED metres.
 
     Uses the home waypoint (current=1) as the NED origin.
-    All mission waypoints converted to metres North/East from home
-    using Karney geodesic on WGS84 ellipsoid.
+    All mission waypoints converted to PX4 local-frame metres North/East of
+    home via the PX4-spherical projection (path_engine.ned, B6').
 
     Returns:
         List of (north_m, east_m) tuples relative to home.
     """
-    if not _HAS_GEOGRAPHICLIB:
-        raise ImportError(
-            "geographiclib is required for QGC .waypoints files. "
-            "Install: pip install geographiclib"
-        )
-
-    geod = Geodesic.WGS84
     wps: list[tuple[float, float]] = []
     home_lat: float | None = None
     home_lon: float | None = None
@@ -77,12 +64,7 @@ def read_qgc_waypoints(filepath: str) -> list[tuple[float, float]]:
 
     pts: list[tuple[float, float]] = []
     for lat, lon in wps:
-        result = geod.Inverse(home_lat, home_lon, lat, lon)
-        dist = result["s12"]
-        bearing_rad = math.radians(result["azi1"])
-        north = dist * math.cos(bearing_rad)
-        east = dist * math.sin(bearing_rad)
-        pts.append((north, east))
+        pts.append(latlon_to_ned(lat, lon, home_lat, home_lon))
 
     return pts
 

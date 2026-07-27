@@ -32,8 +32,12 @@ class FakeNode:
     def get_rpp_monitor(self):
         return FakeRppMonitor()
 
-    def publish_path(self, points, frame_id="local_ned", spray_flags=None):
+    def publish_path(self, points, frame_id="local_ned", spray_flags=None,
+                     must_hit_flags=None):
         self.calls.append(("publish_path", list(points), spray_flags))
+
+    def publish_spray_manual(self, on):
+        self.calls.append(("spray_manual", bool(on)))
 
     async def arm_async(self, arm):
         self.calls.append(("arm", arm))
@@ -98,6 +102,13 @@ def test_start_disarms_if_rpp_stays_idle_after_path_publish():
         offboard_module.SETPOINT_STREAM_GRACE_S = old_grace
 
 
+# The EKF local-frame origin this field sample actually implies. Placement
+# refuses outright without a declared origin that agrees with the live
+# pose/global pair (origin_health), so a fixture that omits it is not a
+# telemetry state the rover can ever be in.
+_SURVEY_EKF_ORIGIN = (13.072019284527872, 80.26196407384334)
+
+
 def _healthy_survey_state(rpp_state=RPP_TRACKING):
     return {
         "connected": True,
@@ -114,6 +125,9 @@ def _healthy_survey_state(rpp_state=RPP_TRACKING):
         "pos_e": -0.9070,
         "lat": 13.0720864,
         "lon": 80.2619557,
+        "ekf_origin_received": True,
+        "ekf_origin_lat": _SURVEY_EKF_ORIGIN[0],
+        "ekf_origin_lon": _SURVEY_EKF_ORIGIN[1],
     }
 
 
@@ -182,7 +196,12 @@ def test_surveyed_start_skips_entry_when_on_first_point():
     try:
         anchor = (13.072066, 80.261956)
         state = _healthy_survey_state()
-        state["lat"], state["lon"] = anchor      # rover AT the survey anchor → R_anchor ≈ 0
+        # Rover parked AT the survey anchor → R_anchor ≈ 0. Both halves of the
+        # sample move together: lat/lon AND the local pose the EKF would report
+        # for that lat/lon (computed independently of path_engine.ned, small-angle
+        # equirectangular on PX4's sphere, agrees to 0.02 mm).
+        state["lat"], state["lon"] = anchor
+        state["pos_n"], state["pos_e"] = 5.194523496337718, -0.8745059958907082
         node = FakeNode([state, dict(state)])
         ctrl = OffboardController(node, deque())
         # source[0] is 3.5 cm from the anchor origin — inside ENTRY_SKIP_DIST_M.
@@ -200,7 +219,7 @@ def test_surveyed_start_skips_entry_when_on_first_point():
         assert name == "publish_path"
         # First publish is the placed MARKING path (wp0 = live pose + source[0]),
         # not a [live_pose, target] entry leg.
-        assert pts[0] == pytest.approx((7.4629, -0.9420), abs=0.02)
+        assert pts[0] == pytest.approx((5.1945, -0.9095), abs=0.02)
     finally:
         offboard_module.SETPOINT_STREAM_GRACE_S = old_grace
 
@@ -256,3 +275,120 @@ def test_loaded_path_summary_exposes_staged_identity():
     s2 = ctrl2.loaded_path_summary()
     assert s2["mission_id"] is None
     assert s2["protected"] is False
+
+
+# ── Mission↔joystick arbiter wiring (plan §7.4) ────────────────────────────────
+
+from control_arbiter import ControlArbiter, ControlOwner
+
+
+class _FakeStateHolder:
+    def __init__(self, state=MissionState.IDLE):
+        self.state = state
+
+
+def _joystick_owned_arbiter():
+    arb = ControlArbiter()
+    run(arb.begin_joystick_acquire(_FakeStateHolder(MissionState.IDLE)))
+    arb.mark_joystick_active("sess-1", "lease-1")
+    assert arb.joystick_owned
+    return arb
+
+
+def test_start_rejected_while_joystick_owns_arbiter():
+    """A mission must not begin while the joystick owns manual control, and it
+    must be refused BEFORE any FCU I/O (no arm, no mode switch)."""
+    arb = _joystick_owned_arbiter()
+    node = FakeNode([{"connected": True, "rpp_state": RPP_TRACKING}])
+    ctrl = OffboardController(node, deque(), arbiter=arb)
+    ctrl.load_path([(1.0, 2.0), (3.0, 4.0)], name="test")
+
+    ok, msg = run(ctrl.start_async())
+
+    assert ok is False
+    assert "joystick" in msg.lower()
+    assert ctrl.state != MissionState.RUNNING
+    assert ("arm", True) not in node.calls  # refused before touching the FCU
+
+
+def test_start_relinquishes_arbiter_on_success():
+    """owner==MISSION is in-flight-only: a successful start leaves the arbiter
+    back at IDLE (the running mission is guarded by state, not a sticky owner)."""
+    old_grace = offboard_module.SETPOINT_STREAM_GRACE_S
+    offboard_module.SETPOINT_STREAM_GRACE_S = 0.0
+    try:
+        arb = ControlArbiter()
+        node = FakeNode([
+            {"connected": True, "rpp_state": RPP_TRACKING},
+            {"connected": True, "rpp_state": RPP_TRACKING},
+        ])
+        ctrl = OffboardController(node, deque(), arbiter=arb)
+        ctrl.load_path([(1.0, 2.0), (3.0, 4.0)], name="test")
+
+        ok, _ = run(ctrl.start_async())
+
+        assert ok is True
+        assert ctrl.state == MissionState.RUNNING
+        assert arb.owner == ControlOwner.IDLE  # bracket relinquished on exit
+    finally:
+        offboard_module.SETPOINT_STREAM_GRACE_S = old_grace
+
+
+def test_start_relinquishes_arbiter_on_failure():
+    """An early-guard failure (no path loaded) must also relinquish the bracket
+    so a stranded owner can never block a later joystick acquire."""
+    arb = ControlArbiter()
+    node = FakeNode([{"connected": True, "rpp_state": RPP_IDLE}])
+    ctrl = OffboardController(node, deque(), arbiter=arb)
+
+    ok, _ = run(ctrl.start_async())  # no load_path → early return
+
+    assert ok is False
+    assert arb.owner == ControlOwner.IDLE
+
+
+# ── B4: spray-OFF + disarm on natural completion ────────────────────────────
+
+def _running_ctrl(node=None):
+    node = node or FakeNode([{"connected": True, "rpp_state": RPP_TRACKING}])
+    ctrl = OffboardController(node, deque())
+    ctrl._state = MissionState.RUNNING
+    return ctrl, node
+
+
+def test_mark_completed_reports_transition_edge():
+    ctrl, _ = _running_ctrl()
+    assert ctrl.mark_completed() is True          # RUNNING → COMPLETED
+    assert ctrl.state == MissionState.COMPLETED
+    assert ctrl.mark_completed() is False         # already COMPLETED — no edge
+
+
+def test_completion_commands_spray_off_then_disarm():
+    old = offboard_module.config.DISARM_ON_COMPLETE
+    offboard_module.config.DISARM_ON_COMPLETE = True
+    try:
+        ctrl, node = _running_ctrl()
+        assert ctrl.mark_completed() is True
+        result = run(ctrl.disarm_on_complete_async())
+        assert result["spray_off_sent"] is True
+        assert result["disarmed"] is True
+        # Spray commanded OFF BEFORE the disarm, and disarm actually called.
+        assert node.calls == [("spray_manual", False), ("arm", False)]
+        # Mission stays COMPLETED (arm_async, not disarm_async → not IDLE).
+        assert ctrl.state == MissionState.COMPLETED
+    finally:
+        offboard_module.config.DISARM_ON_COMPLETE = old
+
+
+def test_completion_flag_off_leaves_rover_armed():
+    old = offboard_module.config.DISARM_ON_COMPLETE
+    offboard_module.config.DISARM_ON_COMPLETE = False
+    try:
+        ctrl, node = _running_ctrl()
+        assert ctrl.mark_completed() is True
+        result = run(ctrl.disarm_on_complete_async())
+        assert result == {"attempted": False, "spray_off_sent": False,
+                          "disarmed": False}
+        assert node.calls == []                    # old behaviour: no commands
+    finally:
+        offboard_module.config.DISARM_ON_COMPLETE = old

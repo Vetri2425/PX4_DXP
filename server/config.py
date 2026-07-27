@@ -14,6 +14,7 @@ TOPIC_MAVROS_SETPOINT = "/mavros/setpoint_raw/local"
 TOPIC_MAVROS_BATTERY = "/mavros/battery"
 TOPIC_MAVROS_GLOBAL_POS = "/mavros/global_position/global"
 TOPIC_MAVROS_GPS_RAW = "/mavros/gpsstatus/gps1/raw"
+TOPIC_MAVROS_MANUAL_CONTROL = "/mavros/manual_control/send"
 
 # ── ROS2 Service Names ────────────────────────────────────────────────────────
 SRV_ARMING = "/mavros/cmd/arming"
@@ -51,20 +52,42 @@ RPP_STATE_NAMES = {
     RPP_JUMP_SKIP: "JUMP_SKIP",
 }
 
-# GPS Fix Type Names (from MAVROS sensor_msgs/NavSatStatus.msg fix_type)
+# GPS Fix Type Names — MAVLink GPS_FIX_TYPE enum, fed by mavros_msgs/GPSRAW
+# .fix_type (/mavros/gpsstatus/gps1/raw). NOT the ROS NavSatStatus.status enum
+# (-1..2), which is what the old table here was written against: it had no
+# key 3, so a plain 3D fix (the receiver's state whenever RTK corrections are
+# absent) fell through to "UNKNOWN" on every telemetry frame. Keep in sync
+# with the copies in src/spray_controller_node.py and src/rpp_controller_node.py.
 GPS_FIX_NAMES = {
-    0: "NO_FIX",
-    1: "GPS",
-    2: "DGPS",
-    4: "DGPS",  # duplicate for compatibility
+    0: "NO_GPS",
+    1: "NO_FIX",
+    2: "2D_FIX",
+    3: "3D_FIX",
+    4: "DGPS",
     5: "RTK_FLOAT",
     6: "RTK_FIXED",
+    7: "STATIC",
+    8: "PPP",
 }
 
 # B2: codes that mean "controller is not driving safely". Treat the same as
 # STALE for safety-abort and OFFBOARD-start guard purposes. Centralised here
 # so server/main.py and server/offboard_controller.py stay in sync.
 RPP_UNHEALTHY_CODES = {RPP_STALE, RPP_RTK_WAIT, RPP_JUMP_SKIP}
+
+# Decimal places for lat/lon/alt in outbound telemetry (WS + REST) only.
+# 8 decimal degrees is sub-millimetre resolution — finer than RTK's real
+# ~1-2 cm — so nothing is lost; this just replaces the variable 6-17 digit
+# count of Python's shortest-round-trip float repr with a consistent wire
+# format at both client-facing boundaries. Internal state (ros_node.py) and
+# mission placement (resolve_surveyed_points) keep full float64 for
+# anchor/EKF math.
+GPS_TELEMETRY_DECIMALS = 8
+
+
+def format_gps_coord(value: float | None) -> float | None:
+    """Round a lat/lon/alt value to GPS_TELEMETRY_DECIMALS for client emit."""
+    return None if value is None else round(value, GPS_TELEMETRY_DECIMALS)
 
 # ── Server Defaults ───────────────────────────────────────────────────────────
 DEFAULT_HOST = "0.0.0.0"  # overridden below when ROVER_DISABLE_AUTH is set
@@ -94,6 +117,11 @@ STAGING_TTL_S = float(os.environ.get("ROVER_STAGING_TTL_S", "3600"))
 SPRAY_LITERS_PER_METER = float(os.environ.get("ROVER_SPRAY_L_PER_M", "0.012"))
 # Default MARK flags for built-in / legacy non-DXF paths that carry no spray metadata.
 SPRAY_DEFAULT_ON = os.environ.get("ROVER_SPRAY_DEFAULT_ON", "1") == "1"
+# On natural mission completion (RPP DONE settled), command spray OFF and disarm
+# the rover so it ends the mission safe without an operator E-stop (field bug
+# B4, 2026-07-25). Default ON. Set ROVER_DISARM_ON_COMPLETE=0 to keep the rover
+# armed at completion (old behaviour: mark COMPLETED only).
+DISARM_ON_COMPLETE = os.environ.get("ROVER_DISARM_ON_COMPLETE", "1") == "1"
 
 # ── Safety / watchdog thresholds ──────────────────────────────────────────────
 POSE_STALE_MS = 500.0  # consider pose stale above this
@@ -101,6 +129,42 @@ POSE_STALE_MS = 500.0  # consider pose stale above this
 # unless overridden — keep global/GPS slightly looser than local pose.
 GLOBAL_POSITION_STALE_MS = float(os.environ.get("ROVER_GLOBAL_POS_STALE_MS", "500"))
 GPS_FIX_STALE_MS = float(os.environ.get("ROVER_GPS_FIX_STALE_MS", "500"))
+# PX4 only force-sends GPS_GLOBAL_ORIGIN at MAVLink stream start; if MAVROS
+# connects later the latched gp_origin topic stays empty and placement loses its
+# fixed datum. Ask for it, bounded.
+ORIGIN_REQUEST_PERIOD_S = float(os.environ.get("ROVER_ORIGIN_REQ_PERIOD_S", "10.0"))
+ORIGIN_REQUEST_MAX_TRIES = int(os.environ.get("ROVER_ORIGIN_REQ_MAX_TRIES", "30"))
+
+# ── EKF local-frame origin trust (2026-07-27 stale-origin field bug) ──────────
+# Max allowed disagreement (metres) between the DECLARED origin (gp_origin) and
+# the origin IMPLIED by a simultaneous (lat, lon, pos_n, pos_e) sample. Beyond
+# this, placement refuses — see server/origin_health.py for the full derivation.
+#
+# Budget for a HEALTHY sample:
+#   GLOBAL_POSITION_INT degE7 quantisation .......... ~1.1 cm N, ~1.1 cm E
+#   pose/global receive skew (<=POSE_GLOBAL_MAX_SKEW_MS
+#     = 100 ms) at up to 1.0 m/s (SPD-T1 ceiling) ... <=10 cm
+#   RTK_FIXED solution noise ......................... ~1-2 cm
+#   => worst-case healthy ~12 cm; measured on the rig 2026-07-27: 1.9-2.0 cm.
+# Smallest observed FAULT: 0.91 m (declared-but-wrong), 2.15/2.25 m (stale).
+# 0.30 m sits 2.5x above the worst healthy case and 3x below the smallest
+# observed fault — the widest gap available between the two populations.
+ORIGIN_CONSISTENCY_MAX_M = float(os.environ.get("ROVER_ORIGIN_MAX_DELTA_M", "0.30"))
+# Fail closed when NO declared origin is available at all. With this set the
+# non-deterministic live pose/global fallback in resolve_surveyed_points is
+# unreachable and surveyed missions refuse to place until gp_origin arrives
+# (the bounded MAV_CMD_REQUEST_MESSAGE retry normally fetches it within
+# ORIGIN_REQUEST_PERIOD_S). Set ROVER_ORIGIN_REQUIRE_DECLARED=0 to re-enable
+# the fallback — it places accurately but varies ~1 cm run to run, so a mission
+# placed that way is NOT bit-reproducible.
+ORIGIN_REQUIRE_DECLARED = os.environ.get("ROVER_ORIGIN_REQUIRE_DECLARED", "1") == "1"
+# A gap this long in /mavros/state means the FCU link or MAVROS itself went
+# away and came back — a new EKF session is possible, so the cached origin is
+# dropped and re-requested. Deliberately far above BRIDGE_STATE_STALE_MS
+# (2.5 s): a spurious invalidation costs a real refusal window, so it must take
+# several consecutive missed /mavros/state publishes, not one scheduling hiccup.
+ORIGIN_LINK_GAP_S = float(os.environ.get("ROVER_ORIGIN_LINK_GAP_S", "5.0"))
+
 POSE_GLOBAL_MAX_SKEW_MS = float(os.environ.get("ROVER_POSE_GLOBAL_SKEW_MS", "100"))
 # Liveness of the RPP controller itself, measured on receipt of /rpp/debug (which it
 # publishes every control tick). Distinct from the controller's own self-reported
@@ -150,6 +214,79 @@ TOKEN_FILE_DEFAULT = os.environ.get(
 # ── File upload limits ────────────────────────────────────────────────────────
 ALLOWED_UPLOAD_EXTENSIONS = {".waypoints", ".csv", ".dxf"}
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MiB (DXF files can be large)
+
+# ── Joystick / manual control (docs/Architecture/JOYSTICK_CONTROLLER_PLAN.md) ──
+# Master switch. MUST stay "0" until the firmware gates in the plan (§7.1 axis
+# mapping, §7.2 COM_RC_IN_MODE) are bench-verified — see plan §8 phase J3.
+JOYSTICK_MANUAL_ENABLED = os.environ.get("ROVER_JOYSTICK_MANUAL_ENABLED", "0") == "1"
+JOYSTICK_MANUAL_TRANSPORT = os.environ.get("ROVER_JOYSTICK_TRANSPORT", "mavros")
+JOYSTICK_COMMAND_RATE_HZ = float(os.environ.get("ROVER_JOYSTICK_COMMAND_RATE_HZ", "20.0"))
+JOYSTICK_GATEWAY_RATE_HZ = float(os.environ.get("ROVER_JOYSTICK_GATEWAY_RATE_HZ", "50.0"))
+# Timeout-ordering safety chain (plan §4.5) — validated below at import time.
+JOYSTICK_SERVER_STOP_TIMEOUT_S = float(
+    os.environ.get("ROVER_JOYSTICK_SERVER_STOP_TIMEOUT_S", "0.30")
+)
+JOYSTICK_GATEWAY_STALE_TIMEOUT_S = float(
+    os.environ.get("ROVER_JOYSTICK_GATEWAY_STALE_TIMEOUT_S", "0.40")
+)
+JOYSTICK_PX4_RC_LOSS_S = float(os.environ.get("ROVER_JOYSTICK_PX4_RC_LOSS_S", "0.50"))
+JOYSTICK_LEASE_REVOKE_TIMEOUT_S = float(
+    os.environ.get("ROVER_JOYSTICK_LEASE_REVOKE_TIMEOUT_S", "2.0")
+)
+JOYSTICK_LEASE_EXPIRY_S = float(os.environ.get("ROVER_JOYSTICK_LEASE_EXPIRY_S", "30.0"))
+JOYSTICK_NEUTRAL_PRESTREAM_S = float(
+    os.environ.get("ROVER_JOYSTICK_NEUTRAL_PRESTREAM_S", "0.20")
+)
+JOYSTICK_MODE_CONFIRM_TIMEOUT_S = float(
+    os.environ.get("ROVER_JOYSTICK_MODE_CONFIRM_TIMEOUT_S", "3.0")
+)
+# Arm-on-acquire: acquire() arms the vehicle itself after MANUAL is confirmed
+# and neutral MANUAL_CONTROL is already streaming (so PX4's manual-control-loss
+# arming check is satisfied). Gives open→drive without a separate arm
+# round-trip from the client. Still master-gated by JOYSTICK_MANUAL_ENABLED.
+JOYSTICK_AUTO_ARM_ENABLED = os.environ.get("ROVER_JOYSTICK_AUTO_ARM", "1") == "1"
+JOYSTICK_ARM_CONFIRM_TIMEOUT_S = float(
+    os.environ.get("ROVER_JOYSTICK_ARM_CONFIRM_TIMEOUT_S", "5.0")
+)
+# Pinned conservative first-field-run defaults (plan §4.5/§7.8/§7.9) — do not
+# inherit whichever default happens to drift between reference sources.
+JOYSTICK_MAX_ABS_THROTTLE = float(os.environ.get("ROVER_JOYSTICK_MAX_ABS_THROTTLE", "0.35"))
+JOYSTICK_MAX_ABS_STEERING = float(os.environ.get("ROVER_JOYSTICK_MAX_ABS_STEERING", "0.20"))
+JOYSTICK_MAVROS_REQUIRE_SUBSCRIBER = (
+    os.environ.get("ROVER_JOYSTICK_MAVROS_REQUIRE_SUBSCRIBER", "1") == "1"
+)
+JOYSTICK_MAVROS_PUBLISH_ERROR_LIMIT = int(
+    os.environ.get("ROVER_JOYSTICK_MAVROS_PUBLISH_ERROR_LIMIT", "10")
+)
+JOYSTICK_PYMAVLINK_ENDPOINT = os.environ.get(
+    "ROVER_JOYSTICK_PYMAVLINK_ENDPOINT", "udpout:127.0.0.1:14540"
+)
+
+
+def _validate_joystick_timeout_ordering() -> None:
+    """Refuse to start if the joystick timeout safety chain is out of order.
+
+    Meaning (plan §4.5): server zeros the command first, the gateway
+    independently goes neutral next, PX4's own RC-loss failsafe is the
+    backstop, and only after that is the lease revoked. Any other ordering
+    lets a later, coarser layer misfire before an earlier, finer one has had
+    a chance to act.
+    """
+    chain = [
+        ("JOYSTICK_SERVER_STOP_TIMEOUT_S", JOYSTICK_SERVER_STOP_TIMEOUT_S),
+        ("JOYSTICK_GATEWAY_STALE_TIMEOUT_S", JOYSTICK_GATEWAY_STALE_TIMEOUT_S),
+        ("JOYSTICK_PX4_RC_LOSS_S", JOYSTICK_PX4_RC_LOSS_S),
+        ("JOYSTICK_LEASE_REVOKE_TIMEOUT_S", JOYSTICK_LEASE_REVOKE_TIMEOUT_S),
+    ]
+    for (name_a, val_a), (name_b, val_b) in zip(chain, chain[1:]):
+        if not val_a < val_b:
+            raise RuntimeError(
+                f"joystick timeout-ordering invariant violated: "
+                f"{name_a}={val_a} must be < {name_b}={val_b}"
+            )
+
+
+_validate_joystick_timeout_ordering()
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 if AUTH_DISABLED:

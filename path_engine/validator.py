@@ -22,7 +22,7 @@ class PathValidator:
         min_turn_radius_m: float = 0.3,
         max_gap_m: float = 0.5,
         max_bbox_size_m: float = 1000.0,
-        max_waypoints: int = 10000,
+        max_waypoints: int = 100000,
         max_segments: int = 2000,
     ):
         self.min_turn_radius_m = min_turn_radius_m
@@ -112,12 +112,54 @@ class PathValidator:
         if len(wp) < 4 or len(fl) != len(wp):
             return
 
+        # Spatially indexed instead of all-pairs. The naive double loop is
+        # O(n^2): on a 2.4 km road survey (48560 waypoints) it ran 67.7 MILLION
+        # segment tests and took 35 s on a laptop, 100 s on the Jetson — the
+        # single dominant cost of planning that mission. Painted segments are
+        # bucketed into a uniform grid and each spray-OFF move is tested only
+        # against the buckets it actually overlaps.
+        #
+        # The grid is filled INCREMENTALLY as i advances, so a segment is only
+        # ever tested against paint laid EARLIER — identical semantics to the
+        # `for j in range(i)` it replaces. Which j matches first can differ, but
+        # the recorded crossing is wp[i], so the result is unchanged either way.
+        cell = 5.0
+        grid: dict[tuple[int, int], list[int]] = {}
+        oversized: list[int] = []             # segments spanning too many cells
+
+        def _cells(a, b):
+            n0, n1 = (a[0], b[0]) if a[0] <= b[0] else (b[0], a[0])
+            e0, e1 = (a[1], b[1]) if a[1] <= b[1] else (b[1], a[1])
+            return (int(n0 // cell), int(n1 // cell),
+                    int(e0 // cell), int(e1 // cell))
+
         crossings: list[tuple[float, float]] = []
         for i in range(len(wp) - 1):
+            # Publish segment i-1 before testing i: only earlier paint is wet.
+            if i > 0 and fl[i - 1]:
+                cn0, cn1, ce0, ce1 = _cells(wp[i - 1], wp[i])
+                if (cn1 - cn0 + 1) * (ce1 - ce0 + 1) > 64:
+                    oversized.append(i - 1)
+                else:
+                    for cn in range(cn0, cn1 + 1):
+                        for ce in range(ce0, ce1 + 1):
+                            grid.setdefault((cn, ce), []).append(i - 1)
+
             if fl[i]:
                 continue                      # only spray-OFF moves
-            for j in range(i):
-                if not fl[j]:
+
+            cn0, cn1, ce0, ce1 = _cells(wp[i], wp[i + 1])
+            if (cn1 - cn0 + 1) * (ce1 - ce0 + 1) > 64:
+                candidates = range(i)         # huge transit: fall back to all
+            else:
+                seen: set[int] = set(oversized)
+                for cn in range(cn0, cn1 + 1):
+                    for ce in range(ce0, ce1 + 1):
+                        seen.update(grid.get((cn, ce), ()))
+                candidates = seen
+
+            for j in candidates:
+                if j >= i or not fl[j]:
                     continue                  # only against paint already laid
                 if self._seg_cross(wp[i], wp[i + 1], wp[j], wp[j + 1]):
                     crossings.append(wp[i])

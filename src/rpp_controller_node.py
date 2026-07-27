@@ -183,7 +183,19 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 from geometry_msgs.msg import PoseStamped, Vector3Stamped
 from mavros_msgs.msg import GPSRAW          # P0.3 RTK fix gate
 from nav_msgs.msg import Path
-from std_msgs.msg import Bool, Float32MultiArray, MultiArrayDimension, Float32
+from std_msgs.msg import Bool, Float32MultiArray, MultiArrayDimension, Float32, String
+
+import mission_progress as mp
+import precise_stop as pstop
+import progress_classifier as pc
+from mission_progress import (
+    AdvanceMsg,
+    MilestoneMsg,
+    MissionPhase,
+    PointDoneMsg,
+    ProgressMsg,
+)
+from mission_progress_ros import qos_profile
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +301,26 @@ class RPPControllerNode(Node):
         # acquisition cause false triggers.
         self.declare_parameter("ekf_jump_threshold_m",                0.05)
 
+        # A3 — EKF reset compensation (default OFF; named A/B switch)
+        # When an EKF position reset fires (GNSS re-lock, RTK FLOAT→FIXED),
+        # PX4 teleports its own estimate and shifts its internal setpoints by
+        # `delta_xy` so tracking is continuous. That `delta_xy`/`xy_reset_counter`
+        # is NOT reachable over our MAVROS config (the `odometry` plugin — the
+        # only MAVLink carrier of `reset_counter` — is denylisted). So the jump
+        # itself, already flagged by the P0.2 guard, is used as the reset delta:
+        # it is absorbed into a running offset and subtracted from the tracking
+        # pose, holding the path relationship continuous instead of commanding a
+        # lurch back onto the line (which paints a kink at every RTK re-lock).
+        #   FALSE → exact frozen P0.2 behavior (skip one cycle, no compensation).
+        #   TRUE  → absorb the jump, drive through, keep net cross-track ≈ 0.
+        # This is the A3 opt-in; leave FALSE until a named A/B run validates it.
+        self.declare_parameter("ekf_reset_compensation",              False)
+        # Guard: only absorb jumps up to this magnitude. A larger single jump is
+        # more likely a bad-estimate glitch than a clean RTK reset; absorbing it
+        # would bake a bogus offset into the whole mission frame, so we fall back
+        # to the baseline skip-one-cycle behavior above this cap.
+        self.declare_parameter("ekf_reset_max_absorb_m",             0.30)
+
         # P0.3 — RTK FIX gate
         # fix_type = 6 → RTK_FIXED.  Set false for SITL or non-RTK testing.
         self.declare_parameter("require_rtk_fix",                     True)
@@ -306,6 +338,30 @@ class RPPControllerNode(Node):
         # Set 0.0 to disable the cross-track term (pure velocity-scaled).
         # 1.0 means a 10 cm cross-track adds 10 cm of lookahead.
         self.declare_parameter("xtrack_lookahead_gain",               0.05)
+
+        # B2 (2026-07-25) — smooth-profile lateral correction. The smooth RPP
+        # had NO signed lateral term anywhere in the control law (the only use
+        # of signed_xtrack was abs()'d into the lookahead length), so with
+        # PX4's pure-P yaw loop a steady offset on an arc was structurally
+        # permanent: measured 5.1-5.4 cm INSIDE the R=2.4 m curve in all three
+        # 2026-07-25 field runs. smooth_lateral_gain rotates the commanded
+        # velocity bearing by −gain·signed_xtrack (xtrack + = right of path,
+        # NED bearing + = clockwise, so a rover right of path steers left),
+        # clamped to ±smooth_lateral_max_deg. Steady-state model: the offset
+        # shrinks by 1/(1 + L·gain). 0.0 restores the pre-B2 frozen behaviour.
+        # Default 1.5 FIELD-VALIDATED 2026-07-25 (runs 182055 + 190115 —
+        # marking RMS 5.13 → 1.00/1.41 cm; crossover k·v ≈ 0.5 rad/s at
+        # 0.35 m/s, 3× inside RO_YAW_P=1.5).
+        self.declare_parameter("smooth_lateral_gain",                 1.5)
+        self.declare_parameter("smooth_lateral_max_deg",              8.0)
+        # B2 root cause 2 — the curvature lookahead floor l_d ≥ coeff/κ
+        # (= coeff·R) was hardcoded 0.35 and BINDS on gentle arcs (R=2.43 m →
+        # 0.85 m lookahead vs 0.56 m velocity-scaled), and the inside-cut
+        # scales ~L². 0.35 restores the pre-B2 frozen behaviour. Default 0.20
+        # FIELD-VALIDATED with the gain above (floor 0.49 m < raw 0.56 m, so
+        # the velocity-scaled lookahead wins; the IDLE-fallback retry at
+        # l_min still protects the lookahead walk).
+        self.declare_parameter("smooth_curvature_ld_coeff",           0.20)
 
         # P1.3 — Path conditioning on receipt
         # path_resample_spacing_m: if > 0, linearly resample the path to this
@@ -329,6 +385,14 @@ class RPPControllerNode(Node):
         # `sharp` is accepted as a runtime alias for `segment`.
         self.declare_parameter("tracking_profile",                    "auto")
         self.declare_parameter("segment_corner_threshold_deg",         45.0)
+        # Segment-mode simplification keeps a "collinear" vertex anyway if it
+        # sits more than this far off the straight run (metric Douglas-Peucker
+        # test). Stops near-straight must-hit points (a few cm off, only ~3 deg)
+        # from being dropped so the rover actually tracks through them. 1 cm is
+        # below the sub-2 cm tracking floor, so real drawn points survive while
+        # exactly-collinear densification samples (0 cm off) are still removed.
+        # 0 = old angle-only behaviour.
+        self.declare_parameter("segment_simplify_max_offset_m",        0.01)
         # D2 (runtime entry): when true, run 0 pivots in place to its first
         # heading before tracking (spray OFF via _run_alignment_hold) instead of
         # the emergent forward-cone arc at tracking speed. Default OFF — enabling
@@ -364,6 +428,42 @@ class RPPControllerNode(Node):
         self.declare_parameter("segment_stop_speed_threshold",         0.02)   # m/s
         self.declare_parameter("segment_stop_yaw_rate_threshold",      0.05)   # rad/s (~2.9 deg/s)
         self.declare_parameter("segment_stop_dwell_s",                 0.30)   # s
+        # ── Phase D point-hold A/B (FROZEN CONTROLLER — default OFF) ─────────
+        # When enabled, the rover brakes to a confirmed stop at each must-hit
+        # waypoint and HOLDS for point_hold_s (long enough for the spray node's
+        # arrival-settle + dwell + OFF-confirm), then continues — so point-mode
+        # dots are actually painted. Reuses the corner-brake/stop primitives.
+        # OFF = byte-for-byte the frozen baseline (the overlay early-returns).
+        # This is a named A/B: enable only for a point-mission run at the rover.
+        self.declare_parameter("point_hold_enabled",                   False)
+        self.declare_parameter("point_hold_s",                         2.0)    # s
+        self.declare_parameter("point_hold_acceptance_m",              0.10)   # m
+        # ── RPP progress + spray handshake (design RPP_PROGRESS_HANDSHAKE) ───
+        # G0: declared now, defaults = frozen behavior, NOTHING reads them yet.
+        # Each is wired + A/B'd in a later phase (G1/G3/G4/G5). See
+        # docs/Architecture/RPP_PROGRESS_HANDSHAKE_TASKS.md.
+        # G1 — publish /rpp/progress + /rpp/milestone (pure observability):
+        self.declare_parameter("progress_publish_enabled",            False)
+        self.declare_parameter("progress_approach_dist_m",            0.30)   # m — APPROACH_/MARK_END band width
+        # G3 — precise 2 cm stop at must-hit points (point mode only):
+        self.declare_parameter("point_precise_stop_enabled",          False)
+        self.declare_parameter("point_arrival_tolerance_m",           0.02)   # m
+        self.declare_parameter("precise_stop_mode",                   "feedforward")  # feedforward|servo
+        self.declare_parameter("precise_stop_decel_m_s2",             0.30)   # m/s² (feedforward profile)
+        self.declare_parameter("precise_stop_creep_speed",            0.05)   # m/s (servo)
+        self.declare_parameter("precise_stop_max_s",                  8.0)    # s
+        # G4/G5 — point handshake + auto/manual advance:
+        # point_handshake_enabled (default OFF) swaps the Phase-D fixed point_hold_s
+        # timer for the RPP↔spray handshake: RPP holds the dwell until the spray
+        # node confirms /spray/point_done (auto), or — in manual mode — until the
+        # operator's /point/advance. point_hold_max_s is the never-wedge backstop.
+        # OFF ⇒ the frozen fixed-timer point-hold runs byte-for-byte. The handshake
+        # also needs progress_publish_enabled (for the AT_POINT milestone spray
+        # reacts to); the backstop makes any misconfig safe.
+        self.declare_parameter("point_handshake_enabled",           False)
+        self.declare_parameter("point_execution_mode",               "auto")  # auto|manual
+        self.declare_parameter("manual_wait_timeout_s",              0.0)     # s (0 = wait forever)
+        self.declare_parameter("point_hold_max_s",                   10.0)    # s backstop cap
         # Active braking at a corner stop. PX4 velocity-OFFBOARD does not brake
         # on a zero setpoint — it coasts — so a rover that reaches the corner
         # still at ~0.1-0.16 m/s drifts 2-3 cm before the dwell confirms, and
@@ -468,6 +568,47 @@ class RPPControllerNode(Node):
         self._active_tracking_profile: str = "smooth"
         # Per-entity run queue (see _split_runs_by_flag / _apply_run)
         self._runs: list[dict] = []
+        # Quantised (n,e) keys of points the planner flagged as source geometry.
+        # Empty = no provenance on this path (legacy publisher) → simplification
+        # falls back to the geometric tests alone.
+        self._must_hit_keys: frozenset[tuple[int, int]] = frozenset()
+        # Phase D point-hold A/B (default OFF). Which must-hit points have had
+        # their dwell, the one currently being dwelled, and its dwell start.
+        # Byte-for-byte inert unless point_hold_enabled is set.
+        self._point_hold_done_keys: set = set()
+        self._point_hold_active_key = None
+        self._point_hold_start_ns = None
+        # G3 precise-stop servo (default OFF; only under point_precise_stop_enabled
+        # + precise_stop_mode=servo). Wall-clock start of the creep phase for the
+        # timeout backstop; None while not servoing. _point_approach_speed is the
+        # speed captured when the hold engaged — the kinematic cap for the
+        # feed-forward decel profile.
+        self._point_servo_start_ns = None
+        self._point_approach_speed = 0.0
+        # G4/G5 — point handshake (default OFF; only under point_handshake_enabled).
+        # Latest /spray/point_done seen (index + monotonic seq); the seq snapshot
+        # taken when the current hold armed, so only a point_done that arrived
+        # AFTER arming can release it. _point_spray_done_this_hold latches the
+        # dwell-complete proof so a later point_done for another point cannot
+        # un-latch it mid-wait. _point_wait_start_ns marks the manual WAIT_OPERATOR
+        # phase; the /point/advance index + monotonic count gate the release.
+        self._point_done_index: int = -1
+        self._point_done_seq: int = -1
+        self._point_done_seq_at_arm: int = -1
+        self._point_spray_done_this_hold: bool = False
+        self._point_wait_start_ns = None
+        self._advance_index: int = -1
+        self._advance_count: int = 0
+        self._advance_count_at_wait: int = 0
+        # G1 — mission-progress publication (default OFF, observability only).
+        # must-hit vertices of the active run in path order + a key→rank map, so
+        # the progress classifier can name the point currently held. Rebuilt in
+        # _apply_run. All read only under progress_publish_enabled.
+        self._musthit_vertices: list[int] = []
+        self._musthit_rank_by_key: dict = {}
+        self._progress_seq: int = 0
+        self._progress_last_phase: MissionPhase = MissionPhase.IDLE
+        self._progress_last_point: int = -1
         self._run_idx: int = 0
         self._run_align_pending: bool = False
         # Latched while a completed run is physically stopping before the
@@ -534,6 +675,13 @@ class RPPControllerNode(Node):
         # P0.2 — EKF jump detection: last accepted NED position
         self._last_pos: tuple[float, float] | None = None
 
+        # A3 — EKF reset compensation: cumulative offset (NED, m) absorbed from
+        # position jumps this mission, and a count for post-hoc correlation.
+        # Both stay zero unless `ekf_reset_compensation` is enabled. Subtracted
+        # from the tracking pose so absorbed resets do not appear as cross-track.
+        self._ekf_reset_offset: tuple[float, float] = (0.0, 0.0)
+        self._ekf_reset_count: int = 0
+
         # P0.3 — RTK fix tracking
         self._gps_fix_type: int = 0  # 0 = no fix; 6 = RTK_FIXED
 
@@ -575,6 +723,15 @@ class RPPControllerNode(Node):
         self._spray_active_pub = self.create_publisher(
             Bool, "/spray/active", be_qos
         )
+        # G1 — mission-progress channel (design §4.1/§4.2). Separate topics +
+        # separate enum from /rpp/segment_debug, whose frozen contract is left
+        # untouched. Nothing publishes here unless progress_publish_enabled.
+        self._progress_pub = self.create_publisher(
+            String, mp.TOPIC_PROGRESS, qos_profile(mp.PROGRESS_QOS)
+        )
+        self._milestone_pub = self.create_publisher(
+            String, mp.TOPIC_MILESTONE, qos_profile(mp.MILESTONE_QOS)
+        )
 
         # ------------------------------------------------------------------
         # Subscribers
@@ -597,6 +754,19 @@ class RPPControllerNode(Node):
         self.create_subscription(
             TwistStamped, "/mavros/local_position/velocity_local",
             self._vel_cb, be_qos,
+        )
+        # G4/G5 — point handshake command channels (design §4.3/§4.4). RELIABLE
+        # VOLATILE (never TRANSIENT_LOCAL, so a restart cannot replay a stale
+        # "done"/"advance"). Read-only unless point_handshake_enabled; the
+        # callbacks only cache the latest message, so the frozen controller is
+        # untouched when the flag is OFF.
+        self.create_subscription(
+            String, mp.TOPIC_POINT_DONE, self._point_done_cb,
+            qos_profile(mp.POINT_DONE_QOS),
+        )
+        self.create_subscription(
+            String, mp.TOPIC_ADVANCE, self._advance_cb,
+            qos_profile(mp.ADVANCE_QOS),
         )
 
         # ------------------------------------------------------------------
@@ -640,7 +810,28 @@ class RPPControllerNode(Node):
         # Operates on (north, east) tuples to keep the geometry code simple,
         # then converts back to PoseStamped at the end.
         raw_pts = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
-        raw_flags = [p.pose.position.z > 0.5 for p in msg.poses]
+        # position.z is a bitfield: bit0 = spray ON, bit1 = must-hit vertex
+        # (source geometry, not densification fill). MUST bit-test, not `> 0.5`
+        # — a spray-OFF must-hit point encodes as 2.0.
+        _z = [int(round(p.pose.position.z)) for p in msg.poses]
+        raw_flags = [bool(z & 1) for z in _z]
+        # Provenance travels by coordinate, not by index: run splitting reorders
+        # and re-groups points but never MOVES them, so a quantised (n,e) key
+        # survives the whole conditioning pipeline intact.
+        self._must_hit_keys = frozenset(
+            self._pt_key(p) for p, z in zip(raw_pts, _z) if z & 2
+        )
+        # A fresh mission re-arms every point-hold dwell (Phase D A/B).
+        self._point_hold_done_keys = set()
+        self._point_hold_active_key = None
+        self._point_hold_start_ns = None
+        self._point_servo_start_ns = None
+        self._point_approach_speed = 0.0
+        # G4/G5 — re-arm the point handshake for the new mission.
+        self._point_spray_done_this_hold = False
+        self._point_wait_start_ns = None
+        self._point_done_seq_at_arm = self._point_done_seq
+        self._advance_count_at_wait = self._advance_count
         n_raw = len(raw_pts)
 
         resample_dx = float(self.get_parameter("path_resample_spacing_m").value)
@@ -691,7 +882,11 @@ class RPPControllerNode(Node):
             )
             if profile == "segment":
                 c_pts, c_flags = self._simplify_path_for_profile(
-                    run_pts, run_flags
+                    run_pts, run_flags,
+                    max_offset_m=float(
+                        self.get_parameter("segment_simplify_max_offset_m").value
+                    ),
+                    must_hit_keys=self._must_hit_keys,
                 )
             else:
                 c_pts, c_flags = run_pts, run_flags
@@ -704,7 +899,9 @@ class RPPControllerNode(Node):
                         c_pts, resample_dx, c_flags
                     )
             runs.append({
-                "poses": self._build_poses(c_pts, c_flags, stamp, expected),
+                "poses": self._build_poses(
+                    c_pts, c_flags, stamp, expected, self._must_hit_keys
+                ),
                 "flags": list(c_flags),
                 "profile": profile,
                 "length": self._pts_length(c_pts),
@@ -730,6 +927,11 @@ class RPPControllerNode(Node):
         self._last_speed_cmd = 0.0
         # P0.2 — reset jump guard; first pose on new path is always "valid"
         self._last_pos = None
+        # A3 — start each mission with a clean reset-offset frame. The path is
+        # re-anchored to the origin on every load, so any offset accumulated on
+        # a prior mission must not carry over.
+        self._ekf_reset_offset = (0.0, 0.0)
+        self._ekf_reset_count = 0
         self._apply_run(0)
         self._publish_conditioned_path(stamp, expected)
 
@@ -910,12 +1112,66 @@ class RPPControllerNode(Node):
     def _heading_delta(cls, h0: float, h1: float) -> float:
         return abs(cls._angle_wrap(h1 - h0))
 
+    @staticmethod
+    def _perp_dist(
+        p: tuple[float, float],
+        a: tuple[float, float],
+        b: tuple[float, float],
+    ) -> float:
+        """Perpendicular distance of point p from the infinite line a->b."""
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        h = math.hypot(dx, dy)
+        if h < 1e-9:
+            return math.hypot(p[0] - a[0], p[1] - a[1])
+        return abs(dx * (a[1] - p[1]) - dy * (a[0] - p[0])) / h
+
+    @staticmethod
+    def _pt_key(p: tuple[float, float]) -> tuple[int, int]:
+        """Quantise a point to a 1 mm grid for identity lookups.
+
+        Conditioning reorders and regroups points but never moves them, so a
+        millimetre-quantised key is a stable identity across the pipeline.
+        """
+        return (int(round(p[0] * 1000.0)), int(round(p[1] * 1000.0)))
+
+    @classmethod
+    def _dp_mark_keep(
+        cls,
+        pts: list[tuple[float, float]],
+        eps: float,
+        lo: int,
+        hi: int,
+        keep: list[bool],
+    ) -> None:
+        """Douglas-Peucker: mark indices in (lo, hi) needed to stay within eps.
+
+        Iterative (explicit stack) rather than recursive — a road alignment can
+        carry thousands of points and Python's recursion limit is 1000.
+        """
+        stack = [(lo, hi)]
+        while stack:
+            a_i, b_i = stack.pop()
+            if b_i <= a_i + 1:
+                continue
+            a, b = pts[a_i], pts[b_i]
+            d_max, i_max = 0.0, -1
+            for i in range(a_i + 1, b_i):
+                d = cls._perp_dist(pts[i], a, b)
+                if d > d_max:
+                    d_max, i_max = d, i
+            if i_max >= 0 and d_max > eps:
+                keep[i_max] = True
+                stack.append((a_i, i_max))
+                stack.append((i_max, b_i))
+
     @classmethod
     def _simplify_path_for_profile(
         cls,
         pts: list[tuple[float, float]],
         flags: list[bool] | None = None,
         collinear_tol_deg: float = 5.0,
+        max_offset_m: float = 0.0,
+        must_hit_keys: frozenset[tuple[int, int]] | None = None,
     ) -> tuple[list[tuple[float, float]], list[bool]]:
         """Remove duplicate and same-heading vertices while preserving corners.
 
@@ -923,6 +1179,36 @@ class RPPControllerNode(Node):
         squares/rectangles often arrive as many collinear samples per side;
         segment mode needs the side endpoints, not every resampled point.
         Flag changes are preserved so mark/transit boundaries are not erased.
+
+        A point is retained when ANY of these hold:
+
+        1. it is an endpoint, or a spray-flag boundary;
+        2. `must_hit_keys` marks it as source geometry (a CAD/survey vertex
+           rather than densification fill) — the authoritative test;
+        3. its heading change from the last retained point exceeds
+           `collinear_tol_deg` — the corner test;
+        4. `max_offset_m > 0` and dropping it would push the retained polyline
+           further than that from the original — a true Douglas-Peucker test.
+
+        Rule 4 replaces a guard that measured each candidate against the NEXT
+        RAW SAMPLE instead of the span being collapsed. On a path densified at
+        `mark_spacing` (5 cm) that measured ~2.4 mm at a vertex sitting 3-4 cm
+        off the retained chord, so it never fired and surveyed vertices were
+        silently deleted — the rover then drove a straight chord and missed
+        them by that offset. Measuring against the collapsing span is what
+        `tools/analyze_mission.py:_perp_from_span` already does.
+
+        Rule 2 is what actually settles it. A tolerance alone cannot separate
+        survey noise from intent — a 3.4 cm real bend and 3.4 cm of RTK noise
+        are numerically identical. Provenance can: densification fill carries no
+        intent and may be dropped freely, a source vertex is operator intent and
+        is never dropped. If a survey is noisy the resulting shape is noisy, and
+        that is a survey-quality problem to surface, not one for the controller
+        to silently smooth away.
+
+        When `max_offset_m <= 0` and `must_hit_keys` is empty this reduces
+        exactly to the original angle-only behaviour, which the classification
+        and run-merge call sites depend on.
         """
         if flags is None or len(flags) != len(pts):
             flags = [False] * len(pts)
@@ -938,27 +1224,44 @@ class RPPControllerNode(Node):
             clean_pts.append(pt)
             clean_flags.append(bool(flag))
 
-        if len(clean_pts) < 3:
+        n = len(clean_pts)
+        if n < 3:
             return clean_pts, clean_flags
 
         tol = math.radians(collinear_tol_deg)
-        out_pts: list[tuple[float, float]] = [clean_pts[0]]
-        out_flags: list[bool] = [clean_flags[0]]
-        for i in range(1, len(clean_pts) - 1):
-            prev_pt = out_pts[-1]
-            this_pt = clean_pts[i]
-            next_pt = clean_pts[i + 1]
-            h0 = cls._segment_heading(prev_pt, this_pt)
-            h1 = cls._segment_heading(this_pt, next_pt)
-            heading_change = cls._heading_delta(h0, h1)
-            flag_boundary = clean_flags[i - 1] != clean_flags[i] or clean_flags[i] != clean_flags[i + 1]
-            if heading_change <= tol and not flag_boundary:
-                continue
-            out_pts.append(this_pt)
-            out_flags.append(clean_flags[i])
+        mh = must_hit_keys or frozenset()
 
-        out_pts.append(clean_pts[-1])
-        out_flags.append(clean_flags[-1])
+        # Pass 1 — angle / flag / must-hit anchors. The heading test measures
+        # from the last RETAINED point (not the previous raw one) so gradual
+        # curvature accumulates; classification relies on that exact behaviour.
+        keep = [False] * n
+        keep[0] = True
+        keep[n - 1] = True
+        last_kept = 0
+        for i in range(1, n - 1):
+            this_pt = clean_pts[i]
+            h0 = cls._segment_heading(clean_pts[last_kept], this_pt)
+            h1 = cls._segment_heading(this_pt, clean_pts[i + 1])
+            heading_change = cls._heading_delta(h0, h1)
+            flag_boundary = (
+                clean_flags[i - 1] != clean_flags[i]
+                or clean_flags[i] != clean_flags[i + 1]
+            )
+            must = cls._pt_key(this_pt) in mh
+            if heading_change <= tol and not flag_boundary and not must:
+                continue
+            keep[i] = True
+            last_kept = i
+
+        # Pass 2 — geometric fidelity between anchors. Only runs when a
+        # tolerance is set, so angle-only callers are bit-for-bit unchanged.
+        if max_offset_m > 0.0:
+            anchors = [i for i, k in enumerate(keep) if k]
+            for a_i, b_i in zip(anchors, anchors[1:]):
+                cls._dp_mark_keep(clean_pts, max_offset_m, a_i, b_i, keep)
+
+        out_pts = [clean_pts[i] for i in range(n) if keep[i]]
+        out_flags = [clean_flags[i] for i in range(n) if keep[i]]
         return out_pts, out_flags
 
     @classmethod
@@ -1332,7 +1635,15 @@ class RPPControllerNode(Node):
         flags: list[bool],
         stamp,
         frame_id: str,
+        must_hit_keys: frozenset[tuple[int, int]] | None = None,
     ) -> list[PoseStamped]:
+        """Build conditioned poses, re-emitting the position.z bitfield.
+
+        bit0 = spray ON, bit1 = must-hit. Carrying provenance through to
+        /rpp/conditioned_path is what lets analyze_mission's geometry-fidelity
+        report tell "this vertex was dropped" from "this was only fill".
+        """
+        mh = must_hit_keys or frozenset()
         poses: list[PoseStamped] = []
         for (n, e), flag in zip(pts, flags):
             ps = PoseStamped()
@@ -1340,7 +1651,8 @@ class RPPControllerNode(Node):
             ps.header.frame_id = frame_id
             ps.pose.position.x = float(n)
             ps.pose.position.y = float(e)
-            ps.pose.position.z = 1.0 if flag else 0.0
+            must = (int(round(n * 1000.0)), int(round(e * 1000.0))) in mh
+            ps.pose.position.z = float((1 if flag else 0) | (2 if must else 0))
             ps.pose.orientation.w = 1.0
             poses.append(ps)
         return poses
@@ -1367,8 +1679,12 @@ class RPPControllerNode(Node):
             if turn >= threshold:
                 self._run_align_pending = True
                 self._run_align_turn_rad = turn   # angle-aware pivot budget
-        elif idx == 0 and len(run["poses"]) > 1 and bool(
-            self.get_parameter("entry_prealign_enabled").value
+        elif idx == 0 and len(run["poses"]) > 1 and (
+            bool(self.get_parameter("entry_prealign_enabled").value)
+            # Run 0 starts on a MARK: the rover MUST be on the first-segment
+            # heading before spray is allowed on, or it paints while arcing onto
+            # line. Force the pre-align regardless of the param in that case.
+            or bool(run.get("flags") and run["flags"][0])
         ):
             # D2 — runtime-entry pre-align. Run 0 has no prev_run, so the block
             # above is skipped and the rover would ARC onto the first heading at
@@ -1390,6 +1706,18 @@ class RPPControllerNode(Node):
         self._path = run["poses"]
         self._path_s = list(run.get("cum_s", []))
         self._spray_flags = list(run["flags"])
+        # G1 — cache this run's must-hit vertices (path order) + key→rank map for
+        # the progress classifier. Behaviour-neutral: only read when
+        # progress_publish_enabled. No-op cost is a single pass at run switch.
+        self._musthit_vertices = []
+        self._musthit_rank_by_key = {}
+        if self._must_hit_keys:
+            for i, ps in enumerate(self._path):
+                p = ps.pose.position
+                key = self._pt_key((p.x, p.y))
+                if key in self._must_hit_keys:
+                    self._musthit_rank_by_key[key] = len(self._musthit_vertices)
+                    self._musthit_vertices.append(i)
         self._active_tracking_profile = run["profile"]
         self._segment_idx = 0
         self._segment_state = (
@@ -1447,6 +1775,326 @@ class RPPControllerNode(Node):
             float(self.get_parameter("segment_corner_threshold_deg").value)
         )
         return self._next_run_turn() >= threshold
+
+    def _point_done_cb(self, msg: String) -> None:
+        """G4: cache the spray node's /spray/point_done (lenient parse)."""
+        pd = PointDoneMsg.from_json(msg.data)
+        if pd.done and pd.point_index >= 0:
+            self._point_done_index = pd.point_index
+            self._point_done_seq = pd.seq
+
+    def _advance_cb(self, msg: String) -> None:
+        """G5: cache the operator's /point/advance (lenient parse).
+
+        A monotonic receive-count (not a wire seq — AdvanceMsg carries none) lets
+        the WAIT_OPERATOR gate accept only a command that arrived AFTER the wait
+        began, so a stale double-tap for an already-advanced point is ignored.
+        """
+        adv = AdvanceMsg.from_json(msg.data)
+        if adv.advance:
+            self._advance_index = adv.expect_index
+            self._advance_count += 1
+
+    def _point_handshake_ready(self, target_key, dwell_start_ns: int) -> bool:
+        """G4/G5: decide when a handshake point-dwell may release. Default OFF.
+
+        Phase 1 (both modes) — wait for the spray node's dwell-complete proof
+        (`/spray/point_done` for this point's rank), or the point_hold_max_s
+        backstop (advance anyway, warn — never wedge the mission).
+        Phase 2 (manual only) — after the proof, hold in WAIT_OPERATOR until the
+        operator's `/point/advance` with a matching expect_index, or the optional
+        manual_wait_timeout_s.
+
+        Only ever called under point_handshake_enabled, so the frozen fixed-timer
+        point-hold path is untouched.
+        """
+        rank = self._musthit_rank_by_key.get(target_key, -1)
+        now_ns = self.get_clock().now().nanoseconds
+
+        # Phase 1 — the spray node's dwell-complete proof (or the backstop).
+        if not self._point_spray_done_this_hold:
+            fresh = (
+                self._point_done_index == rank
+                and self._point_done_seq > self._point_done_seq_at_arm
+            )
+            if fresh:
+                self._point_spray_done_this_hold = True
+            else:
+                max_s = float(self.get_parameter("point_hold_max_s").value)
+                if max_s > 0.0 and (now_ns - dwell_start_ns) * 1e-9 >= max_s:
+                    self.get_logger().warn(
+                        f"point handshake: no /spray/point_done for point {rank} "
+                        f"within {max_s:.1f}s — proceeding (backstop)",
+                        throttle_duration_sec=5.0,
+                    )
+                    self._point_spray_done_this_hold = True  # don't wedge
+                else:
+                    return False   # keep holding (phase DWELL_HOLD)
+
+        # Proof in hand. Auto advances immediately.
+        if str(self.get_parameter("point_execution_mode").value) != "manual":
+            return True
+
+        # Phase 2 (manual) — WAIT_OPERATOR until /point/advance for this point.
+        if self._point_wait_start_ns is None:
+            self._point_wait_start_ns = now_ns
+            self._advance_count_at_wait = self._advance_count
+            self.get_logger().info(
+                f"point {rank}: dwell complete — waiting for operator advance"
+            )
+        if (self._advance_count > self._advance_count_at_wait
+                and self._advance_index == rank):
+            return True
+        timeout = float(self.get_parameter("manual_wait_timeout_s").value)
+        if timeout > 0.0 and (now_ns - self._point_wait_start_ns) * 1e-9 >= timeout:
+            self.get_logger().warn(
+                f"point {rank}: manual wait timeout ({timeout:.1f}s) — advancing",
+                throttle_duration_sec=5.0,
+            )
+            return True
+        return False   # keep holding (phase WAIT_OPERATOR)
+
+    def _point_hold_tick(
+        self,
+        pos_n: float,
+        pos_e: float,
+        yaw_ned: float,
+        pose_age_s: float,
+        dist_to_goal: float,
+    ) -> bool:
+        """Phase D A/B: brake+hold at each must-hit point for its mark dwell.
+
+        Returns True when this control cycle was fully handled (braking or
+        dwelling at a point); False to let normal tracking run. Entirely gated
+        by point_hold_enabled — when off it returns False on the first line, so
+        the control loop is the byte-for-byte frozen baseline.
+
+        Reuses the proven corner-brake / corner-stop-confirm primitives, so a
+        point hold decelerates and confirms a physical stop exactly the way a
+        run-boundary corner stop does, then holds zero for point_hold_s. The
+        hold is sized (by the operator) to cover the spray node's
+        arrival-settle + dwell + OFF-confirm, so the dot is painted while the
+        rover is stopped here. Points already dwelled are remembered per
+        mission (_point_hold_done_keys), so each is held exactly once.
+        """
+        if not bool(self.get_parameter("point_hold_enabled").value):
+            return False
+        if not self._must_hit_keys:
+            return False
+
+        acceptance = float(self.get_parameter("point_hold_acceptance_m").value)
+        # G3 precise stop (default OFF → trigger == acceptance, byte-for-byte).
+        # When enabled, engage the hold earlier so the feed-forward decel can
+        # bring v→0 exactly at the point: trigger = max(acceptance, v²/2a).
+        precise = bool(self.get_parameter("point_precise_stop_enabled").value)
+        approach_speed = (
+            math.hypot(self._latest_vel_ned[0], self._latest_vel_ned[1])
+            if self._vel_is_fresh()
+            else 0.0
+        )
+        trigger = acceptance
+        if precise:
+            trigger = pstop.feedforward_trigger_distance(
+                approach_speed,
+                float(self.get_parameter("precise_stop_decel_m_s2").value),
+                acceptance,
+            )
+        target_key = None
+        target_pos = None
+        best = trigger
+        for ps in self._path:
+            p = ps.pose.position
+            key = self._pt_key((p.x, p.y))
+            if key not in self._must_hit_keys or key in self._point_hold_done_keys:
+                continue
+            d = self._dist(pos_n, pos_e, p.x, p.y)
+            if d <= best:
+                best = d
+                target_key = key
+                target_pos = (p.x, p.y)
+        if target_key is None:
+            # Not near any un-dwelled must-hit point → normal tracking.
+            self._point_hold_active_key = None
+            self._point_hold_start_ns = None
+            return False
+
+        # Entering a hold at a new point: re-arm the stop-confirm primitive once.
+        if self._point_hold_active_key != target_key:
+            self._point_hold_active_key = target_key
+            self._point_hold_start_ns = None
+            self._reset_corner_pivot_state()
+            # G4/G5 — re-arm the handshake for this point (behaviour-neutral when
+            # point_handshake_enabled is OFF; only read by _point_handshake_ready).
+            self._point_done_seq_at_arm = self._point_done_seq
+            self._point_spray_done_this_hold = False
+            self._point_wait_start_ns = None
+            if precise:
+                # Capture the engagement speed as the feed-forward decel cap and
+                # re-arm the servo timeout. Floor at creep so a slow entry still
+                # crawls the last few cm in (G3).
+                self._point_servo_start_ns = None
+                self._point_approach_speed = max(
+                    approach_speed,
+                    float(self.get_parameter("precise_stop_creep_speed").value),
+                )
+
+        # Approach gate. Precise mode (G3, default OFF) decelerates onto the
+        # coordinate and requires BOTH a confirmed physical stop AND the
+        # along-track residual within tolerance before dwelling; the frozen path
+        # requires only the corner stop-confirm. _precise_stop_ready publishes
+        # its own approach setpoint while returning False.
+        if precise:
+            if not self._precise_stop_ready(
+                target_pos, pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
+            ):
+                return True
+        elif not self._corner_stop_satisfied():
+            # Not stopped yet — brake toward zero (same primitive as a corner).
+            self._segment_state = SegmentStateCode.CORNER_STOP
+            self._last_speed_cmd = 0.0
+            brake_n, brake_e = self._corner_brake_velocity(yaw_ned)
+            self._publish_velocity(brake_n, brake_e)
+            self._publish_yaw_rate(0.0)
+            self._publish_debug(
+                cross_track=0.0, heading_err=0.0, lookahead=dist_to_goal,
+                speed=math.hypot(brake_n, brake_e), kappa=0.0,
+                dist_goal=dist_to_goal, pose_age_ms=pose_age_s * 1000.0,
+                state=StateCode.TRACKING, l_d_raw=float("nan"),
+                kappa_speed=0.0, yaw_rate=0.0, spray_active=False,
+            )
+            return True
+
+        # Confirmed stopped — dwell.
+        now_ns = self.get_clock().now().nanoseconds
+        if self._point_hold_start_ns is None:
+            self._point_hold_start_ns = now_ns
+            self.get_logger().info(f"point hold: dwelling at must-hit {target_key}")
+
+        # G4/G5 point handshake (default OFF). When enabled, the dwell releases on
+        # the spray node's /spray/point_done (auto) — or, in manual mode, after the
+        # operator's /point/advance — instead of the fixed point_hold_s timer, with
+        # point_hold_max_s as a never-wedge backstop. Default OFF ⇒ the frozen
+        # fixed-timer block in the `else` below runs byte-for-byte.
+        if bool(self.get_parameter("point_handshake_enabled").value):
+            if not self._point_handshake_ready(target_key, self._point_hold_start_ns):
+                self._segment_state = SegmentStateCode.CORNER_STOP
+                self._last_speed_cmd = 0.0
+                self._publish_velocity(0.0, 0.0)
+                self._publish_yaw_rate(0.0)
+                self._publish_debug(
+                    cross_track=0.0, heading_err=0.0, lookahead=dist_to_goal,
+                    speed=0.0, kappa=0.0, dist_goal=dist_to_goal,
+                    pose_age_ms=pose_age_s * 1000.0, state=StateCode.TRACKING,
+                    l_d_raw=float("nan"), kappa_speed=0.0, yaw_rate=0.0,
+                    spray_active=False,
+                )
+                return True
+            elapsed_s = (now_ns - self._point_hold_start_ns) * 1e-9
+        else:
+            hold_s = float(self.get_parameter("point_hold_s").value)
+            elapsed_s = (now_ns - self._point_hold_start_ns) * 1e-9
+            if elapsed_s < hold_s:
+                self._segment_state = SegmentStateCode.CORNER_STOP
+                self._last_speed_cmd = 0.0
+                self._publish_velocity(0.0, 0.0)
+                self._publish_yaw_rate(0.0)
+                self._publish_debug(
+                    cross_track=0.0, heading_err=0.0, lookahead=dist_to_goal,
+                    speed=0.0, kappa=0.0, dist_goal=dist_to_goal,
+                    pose_age_ms=pose_age_s * 1000.0, state=StateCode.TRACKING,
+                    l_d_raw=float("nan"), kappa_speed=0.0, yaw_rate=0.0,
+                    spray_active=False,
+                )
+                return True
+
+        # Dwell complete — mark done and release to normal tracking this cycle.
+        self._point_hold_done_keys.add(target_key)
+        self._point_hold_active_key = None
+        self._point_hold_start_ns = None
+        self._point_servo_start_ns = None
+        self._point_wait_start_ns = None
+        self._reset_corner_pivot_state()
+        self.get_logger().info(
+            f"point hold: released {target_key} after {elapsed_s:.1f}s "
+            f"({len(self._point_hold_done_keys)}/{len(self._must_hit_keys)} done)"
+        )
+        return False
+
+    def _precise_stop_ready(
+        self,
+        target_pos: tuple[float, float],
+        pos_n: float,
+        pos_e: float,
+        yaw_ned: float,
+        pose_age_s: float,
+        dist_to_goal: float,
+    ) -> bool:
+        """G3 precise 2 cm stop onto a must-hit point (design §7). Default OFF.
+
+        Returns True when the rover is confirmed stopped AND within
+        point_arrival_tolerance_m of the point along-track (→ the caller
+        dwells). While False it has already published this tick's approach
+        setpoint:
+
+          * feedforward (default): the kinematic decel profile v = √(2·a·d)
+            toward the coordinate — open-loop, no new closed loop.
+          * servo: after a coarse stop, creep at precise_stop_creep_speed until
+            within tolerance, bounded by precise_stop_max_s (timeout → accept the
+            best position and dwell; never wedge).
+
+        Pure math lives in precise_stop.py; this method is the ROS glue. Called
+        only under point_precise_stop_enabled, so the frozen brake-when-near path
+        is untouched.
+        """
+        tn, te = target_pos
+        residual = pstop.along_track_residual(pos_n, pos_e, tn, te, yaw_ned)
+        tol = float(self.get_parameter("point_arrival_tolerance_m").value)
+        stopped = self._corner_stop_satisfied()
+        mode = str(self.get_parameter("precise_stop_mode").value)
+
+        if pstop.reached(residual, tol) and stopped:
+            self._point_servo_start_ns = None
+            return True
+
+        self._segment_state = SegmentStateCode.CORNER_STOP
+        self._last_speed_cmd = 0.0
+
+        if mode == "servo" and stopped:
+            # Coarse stop reached but off the mark → creep, bounded by a timeout.
+            now_ns = self.get_clock().now().nanoseconds
+            if self._point_servo_start_ns is None:
+                self._point_servo_start_ns = now_ns
+            max_s = float(self.get_parameter("precise_stop_max_s").value)
+            if (now_ns - self._point_servo_start_ns) * 1e-9 >= max_s:
+                self.get_logger().warn(
+                    f"precise stop: servo timeout ({residual * 100.0:.1f} cm "
+                    f"residual) — dwelling at best position",
+                    throttle_duration_sec=5.0,
+                )
+                self._point_servo_start_ns = None
+                return True
+            creep = float(self.get_parameter("precise_stop_creep_speed").value)
+            v_cmd = pstop.servo_speed(residual, creep, tol)
+        else:
+            # Feed-forward decel profile (feedforward mode, or servo's coarse
+            # phase before the physical stop is confirmed).
+            decel = float(self.get_parameter("precise_stop_decel_m_s2").value)
+            profile = pstop.feedforward_brake_speed(
+                abs(residual), decel, self._point_approach_speed
+            )
+            v_cmd = math.copysign(profile, residual) if residual != 0.0 else 0.0
+
+        vel_n, vel_e = v_cmd * math.cos(yaw_ned), v_cmd * math.sin(yaw_ned)
+        self._publish_velocity(vel_n, vel_e)
+        self._publish_yaw_rate(0.0)
+        self._publish_debug(
+            cross_track=0.0, heading_err=0.0, lookahead=dist_to_goal,
+            speed=abs(v_cmd), kappa=0.0, dist_goal=dist_to_goal,
+            pose_age_ms=pose_age_s * 1000.0, state=StateCode.TRACKING,
+            l_d_raw=float("nan"), kappa_speed=0.0, yaw_rate=0.0,
+            spray_active=False,
+        )
+        return False
 
     def _hold_before_run_advance(
         self,
@@ -2741,6 +3389,129 @@ class RPPControllerNode(Node):
     # Main control loop (50 Hz)
     # ==================================================================
     def _control_loop(self):
+        """Timer entry: run the frozen control tick, then (gated) publish
+        mission progress.
+
+        The control tick is byte-for-byte `_control_loop_impl`. Progress
+        publication is fully behind `progress_publish_enabled` AND wrapped so a
+        bug in the observability path can never take down the controller — if
+        it raises, the drive command for this tick has already been published
+        by the impl, and we only lose one progress sample.
+        """
+        self._control_loop_impl()
+        if bool(self.get_parameter("progress_publish_enabled").value):
+            try:
+                self._publish_progress_tick()
+            except Exception as exc:  # never let observability crash control
+                self.get_logger().warn(
+                    f"progress publish failed: {exc}", throttle_duration_sec=2.0
+                )
+
+    # ------------------------------------------------------------------
+    # G1 — mission-progress publication (design §3/§4). Gated, additive.
+    # ------------------------------------------------------------------
+    def _measured_speed(self) -> float:
+        """Latest measured ground speed (m/s), 0 if no fresh velocity sample."""
+        if self._latest_vel_time is None:
+            return 0.0
+        age = (self.get_clock().now() - self._latest_vel_time).nanoseconds * 1e-9
+        if age >= 0.5:
+            return 0.0
+        v_n, v_e = self._latest_vel_ned
+        return math.hypot(v_n, v_e)
+
+    def _point_progress_inputs(self) -> dict:
+        """Point-mode phase inputs for the classifier, from the point-hold state.
+
+        Reuses the SAME point-hold state the Phase-D overlay maintains
+        (_point_hold_active_key/_start_ns/_done_keys) — G1 only *reports* it.
+        """
+        point_mode = (
+            bool(self.get_parameter("point_hold_enabled").value)
+            and bool(self._must_hit_keys)
+        )
+        if not point_mode:
+            return {"point_mode": False}
+        active_key = self._point_hold_active_key
+        done = self._point_hold_done_keys
+        all_done = len(done) >= len(self._must_hit_keys)
+        if active_key is not None:
+            rank = self._musthit_rank_by_key.get(active_key, -1)
+        else:
+            # closing on the next un-dwelled must-hit point, in path order
+            rank = -1
+            for r, vtx in enumerate(self._musthit_vertices):
+                p = self._path[vtx].pose.position
+                if self._pt_key((p.x, p.y)) not in done:
+                    rank = r
+                    break
+        vertex = self._musthit_vertices[rank] if 0 <= rank < len(self._musthit_vertices) else -1
+        return {
+            "point_mode": True,
+            "point_active": active_key is not None,
+            "point_dwelling": self._point_hold_start_ns is not None,
+            # G5 — manual gate: the RPP is holding after dwell for the operator's
+            # /point/advance. Reported so /rpp/progress (→ /spray/status → the app)
+            # can surface WAIT_OPERATOR for the "Next point" button. None unless a
+            # manual handshake is actually waiting.
+            "point_wait_operator": self._point_wait_start_ns is not None,
+            "point_target_rank": rank,
+            "point_target_vertex": vertex,
+            "all_points_done": all_done,
+        }
+
+    def _publish_progress_tick(self) -> None:
+        """Classify this tick and publish /rpp/progress (+ milestone edges)."""
+        if not self._path or self._last_pos is None:
+            self._emit_progress(ProgressMsg(
+                phase=MissionPhase.REACHED_END if self._path_done else MissionPhase.IDLE
+            ))
+            return
+
+        # Tracking pose = raw last pose minus any absorbed EKF-reset offset —
+        # exactly what the control tick projected with this cycle.
+        pos_n = self._last_pos[0] - self._ekf_reset_offset[0]
+        pos_e = self._last_pos[1] - self._ekf_reset_offset[1]
+        seg_idx = max(0, min(self._segment_idx, max(0, len(self._path) - 2)))
+        t, _fn, _fe, signed_xtrack, _de = self._project_onto_segment(pos_n, pos_e, seg_idx)
+        along_s = self._path_progress_at(seg_idx, t)
+        speed = self._measured_speed()
+        stop_thr = float(self.get_parameter("segment_stop_speed_threshold").value)
+
+        pt = self._point_progress_inputs()
+        msg = pc.classify(
+            has_path=True, path_done=self._path_done,
+            spray_flags=self._spray_flags, cum_s=self._path_s,
+            seg_idx=seg_idx, proj_t=t, along_s=along_s,
+            signed_xtrack=signed_xtrack, speed=speed, stopped=speed < stop_thr,
+            approach_dist_m=float(self.get_parameter("progress_approach_dist_m").value),
+            **pt,
+        )
+        self._emit_progress(msg)
+
+    def _emit_progress(self, msg: ProgressMsg) -> None:
+        """Publish a ProgressMsg + any milestone events on the phase/point edge."""
+        s = String()
+        s.data = msg.to_json()
+        self._progress_pub.publish(s)
+
+        events = pc.milestones_for(
+            self._progress_last_phase, msg.phase,
+            self._progress_last_point, msg.point_index,
+        )
+        for event in events:
+            self._progress_seq += 1
+            idx = msg.point_index if msg.point_index >= 0 else msg.segment_index
+            m = String()
+            m.data = MilestoneMsg(
+                event=event, seq=self._progress_seq, index=idx,
+                stamp_ns=self.get_clock().now().nanoseconds,
+            ).to_json()
+            self._milestone_pub.publish(m)
+        self._progress_last_phase = msg.phase
+        self._progress_last_point = msg.point_index
+
+    def _control_loop_impl(self):
         """Compute and publish NED velocity vector."""
         # ---- Read parameters (allows runtime tuning) ----
         hw_max_v    = self.get_parameter("max_linear_vel").value           # hardware ceiling
@@ -2864,34 +3635,81 @@ class RPPControllerNode(Node):
         # _enu_pose_to_ned twice per cycle; that's now consolidated.
         pos_n, pos_e, yaw_ned = self._enu_pose_to_ned(pose_for_projection)
 
-        # ---- P0.2: EKF / position-jump detection ----
+        # ---- P0.2 / A3: EKF / position-jump detection ----
         # If the pose jumps further than is physically possible in one control
         # cycle (max_v * dt + 3σ_pos), it's an EKF reset or RTK acquisition
-        # artefact. Skip this cycle and do NOT update the controller.
-        # We still update _last_pos so the next cycle compares against the
-        # new (post-jump) position — only one cycle is skipped per event.
+        # artefact — the rover did not physically move, only its estimate did.
+        #
+        # Two responses, selected by `ekf_reset_compensation`:
+        #   • OFF (frozen P0.2 baseline): skip this cycle, do NOT update the
+        #     controller. _last_pos still advances to the post-jump position so
+        #     only one cycle is skipped per event — but the path reference does
+        #     NOT move, so subsequent cycles see the reset as cross-track error
+        #     and steer to close it (A3: paints a kink at the reset).
+        #   • ON (A3): absorb the jump vector into `_ekf_reset_offset` and drive
+        #     through. The offset is subtracted from the tracking pose below, so
+        #     the path relationship stays continuous and net cross-track ≈ 0 —
+        #     PX4's own setpoint-shift convention, done companion-side because
+        #     MAVROS does not expose delta_xy/xy_reset_counter here.
+        comp_enabled = self.get_parameter("ekf_reset_compensation").value
+        max_absorb = float(self.get_parameter("ekf_reset_max_absorb_m").value)
         if self._last_pos is not None:
-            jump_m = math.hypot(pos_n - self._last_pos[0],
-                                pos_e - self._last_pos[1])
+            d_n = pos_n - self._last_pos[0]
+            d_e = pos_e - self._last_pos[1]
+            jump_m = math.hypot(d_n, d_e)
             if jump_m > jump_thr:
-                self.get_logger().warn(
-                    f"Position jump {jump_m * 100:.1f} cm > threshold "
-                    f"{jump_thr * 100:.1f} cm — skipping cycle (EKF reset?)",
-                    throttle_duration_sec=0.5,
-                )
-                self._last_pos = (pos_n, pos_e)
-                # Reset segment hint: after a jump we can't trust the old index
-                self._closest_seg_hint = 0
-                # P1.4 fixup — force full scan next cycle so we relocate the
-                # rover's true segment instead of crawling a window forward
-                # from a stale hint.
-                self._hint_valid = False
-                # B2: emit JUMP_SKIP (5) so observers see the cause-of-pause.
-                # Server watchdog and offboard controller treat it the same
-                # as STALE (RPP_UNHEALTHY_CODES) — same response, more info.
-                self._publish_zero(StateCode.JUMP_SKIP, pose_age_ms=pose_age_s * 1000)
-                return
+                # A3 compensation: only for jumps within the absorb cap. A
+                # larger jump is treated as a suspect estimate, not a clean
+                # reset, and falls through to the baseline skip below.
+                if comp_enabled and jump_m <= max_absorb:
+                    self._ekf_reset_offset = (
+                        self._ekf_reset_offset[0] + d_n,
+                        self._ekf_reset_offset[1] + d_e,
+                    )
+                    self._ekf_reset_count += 1
+                    # A3 post-hoc flag: this WARN is the only in-log marker that
+                    # a reset landed here, so a later kink/offset in the painted
+                    # line can be correlated to it. delta_xy is unavailable over
+                    # MAVROS, so the absorbed jump vector is logged in its place.
+                    self.get_logger().warn(
+                        f"A3 EKF reset absorbed: jump {jump_m * 100:.1f} cm "
+                        f"(Δ={d_n * 100:+.1f},{d_e * 100:+.1f} cm) → cumulative "
+                        f"offset ({self._ekf_reset_offset[0] * 100:+.1f},"
+                        f"{self._ekf_reset_offset[1] * 100:+.1f}) cm "
+                        f"[n={self._ekf_reset_count}] — tracking frame held",
+                        throttle_duration_sec=0.5,
+                    )
+                    # Frame is continuous (offset applied below), so the segment
+                    # hint stays valid and we drive on — no skip, no kink.
+                    # _last_pos advances at the shared assignment just below.
+                else:
+                    self.get_logger().warn(
+                        f"Position jump {jump_m * 100:.1f} cm > threshold "
+                        f"{jump_thr * 100:.1f} cm — skipping cycle (EKF reset?)",
+                        throttle_duration_sec=0.5,
+                    )
+                    self._last_pos = (pos_n, pos_e)
+                    # Reset segment hint: after a jump we can't trust the old index
+                    self._closest_seg_hint = 0
+                    # P1.4 fixup — force full scan next cycle so we relocate the
+                    # rover's true segment instead of crawling a window forward
+                    # from a stale hint.
+                    self._hint_valid = False
+                    # B2: emit JUMP_SKIP (5) so observers see the cause-of-pause.
+                    # Server watchdog and offboard controller treat it the same
+                    # as STALE (RPP_UNHEALTHY_CODES) — same response, more info.
+                    self._publish_zero(StateCode.JUMP_SKIP, pose_age_ms=pose_age_s * 1000)
+                    return
         self._last_pos = (pos_n, pos_e)
+
+        # ---- A3: apply the accumulated EKF-reset offset to the tracking pose ----
+        # No-op when compensation is off (offset stays (0,0)). When on, every
+        # absorbed reset shifts the pose we track with, so the path reference
+        # effectively moves with the estimate and the painted line stays smooth.
+        # _last_pos above intentionally holds the RAW pose so jump detection
+        # keeps working in the estimator's own frame.
+        pos_n -= self._ekf_reset_offset[0]
+        pos_e -= self._ekf_reset_offset[1]
 
         # ---- Run-transition alignment (per-entity profile switching) ----
         # After advancing to a new run, pivot toward its initial heading
@@ -2911,6 +3729,12 @@ class RPPControllerNode(Node):
         min_travel = self._run_min_travel()
         final = self._path[-1].pose.position
         dist_to_goal = self._dist(pos_n, pos_e, final.x, final.y)
+        # Phase D point-hold overlay (default OFF — frozen until enabled). Dwell
+        # at each undone must-hit waypoint before the run-boundary/goal logic so
+        # every surveyed point (incl. corners and the final point) gets its mark
+        # dwell. Byte-for-byte no-op when point_hold_enabled is False.
+        if self._point_hold_tick(pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal):
+            return
         if self._run_boundary_stop_pending:
             self._hold_before_run_advance(
                 pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
@@ -2976,12 +3800,16 @@ class RPPControllerNode(Node):
         l_d = self._clamp(l_d_raw, l_min, l_max)
 
         # Fix 1: curvature-aware minimum lookahead — on arcs, ensure l_d
-        # spans at least 1/3 of the radius so the lookahead walk reliably
+        # spans a fraction of the radius so the lookahead walk reliably
         # reaches past the foot. Without this, short lookaheads on tight
         # arcs can land at the rover position, triggering the IDLE path.
+        # B2: coefficient is a parameter (0.35 = frozen); this floor is
+        # applied after the [l_min, l_max] clamp and can exceed
+        # max_lookahead_dist — the inside-cut on arcs scales ~L².
         kappa_path = self._path_curvature_at(seg_idx)
-        if kappa_path > 1e-6:
-            l_d = max(l_d, 0.35 / kappa_path)
+        ld_coeff = float(self.get_parameter("smooth_curvature_ld_coeff").value)
+        if kappa_path > 1e-6 and ld_coeff > 0.0:
+            l_d = max(l_d, ld_coeff / kappa_path)
 
         # ---- Step 3: Lookahead point (NED), then body-frame for κ ----
         lh_n, lh_e, hit_end = self._get_lookahead_point(seg_idx, foot_n, foot_e, l_d)
@@ -3123,6 +3951,22 @@ class RPPControllerNode(Node):
         unit_e = de / l_actual if l_actual > 1e-9 else 0.0
         v_n = speed * unit_n
         v_e = speed * unit_e
+
+        # B2 — signed lateral correction (default OFF: gain 0.0 keeps the
+        # frozen controller byte-for-byte). Rotate the commanded bearing
+        # toward the path: signed_xtrack + = right of path and NED bearing +
+        # = clockwise (rightward), so the correction is −gain·xtrack. Without
+        # this the smooth profile has no lateral feedback at all and PX4's
+        # pure-P yaw loop parks the rover at a permanent offset on arcs.
+        lat_gain = float(self.get_parameter("smooth_lateral_gain").value)
+        if lat_gain > 0.0 and speed > 1e-6:
+            max_corr = math.radians(
+                float(self.get_parameter("smooth_lateral_max_deg").value))
+            delta = self._clamp(-lat_gain * signed_xtrack, -max_corr, max_corr)
+            bearing = math.atan2(v_e, v_n) + delta
+            v_n = speed * math.cos(bearing)
+            v_e = speed * math.sin(bearing)
+
         # BUG-T3 fix: clamp velocity bearing into forward cone so PX4
         # reverse-detection never flips the turn, even on the first run
         # (idx==0) where _run_alignment_hold is skipped.
@@ -3156,6 +4000,29 @@ class RPPControllerNode(Node):
             kappa_speed=kappa_speed,           # B1
             yaw_rate=yaw_rate_body,            # P3.1
             spray_active=spray_active,
+        )
+
+        # B3(a): the smooth profile must ALSO publish /rpp/segment_debug with a
+        # TRACK_SEGMENT edge. Without this the smooth branch only ever emits
+        # segment_debug via the SEGMENT profile / pivot paths, so the LAST state
+        # on the wire before a smooth MARK run is the run-boundary pivot's
+        # CORNER_ALIGN — which the spray node's pivot gate then latches for the
+        # full segment_state_timeout_s, holding spray OFF for ~1 s (9.5-9.9 cm of
+        # unpainted line at the start of every smooth run — field bug B3). It
+        # also gives the spray B5 tracking-seen gate a real "run has started"
+        # edge for BOTH profiles. Diagnostics ONLY: it publishes after the
+        # velocity/yaw commands and does not mutate _segment_state (which the
+        # SEGMENT profile owns), so no control path is affected. Corner-specific
+        # fields carry NaN-free placeholders (this is a straight-tracking edge).
+        self._publish_segment_debug(
+            SegmentStateCode.TRACK_SEGMENT,
+            seg_idx,
+            dist_to_goal,       # [3] dist_to_segment_end (goal-relative here)
+            dist_to_goal,       # [4] dist_to_corner (no corner in smooth)
+            0.0,                # [5] corner angle — none
+            yaw_target_ned,     # [6] target heading NED
+            theta_e,            # [7] heading error
+            yaw_rate_body,      # [8] yaw-rate command
         )
 
         r_eff = (1.0 / kappa_speed) if kappa_speed > 1e-9 else float("inf")

@@ -41,6 +41,7 @@ from config import (
     CORS_ALLOW_ORIGINS,
     DEFAULT_PORT,
     GPS_FIX_NAMES,
+    format_gps_coord,
     MAX_ACTIVITY_LOG,
     MISSION_DIR,
     POSE_STALE_MS,
@@ -53,6 +54,7 @@ from config import (
 )
 from logging_setup import configure_logging, get_logger
 from models import MissionState
+from origin_health import evaluate_origin_health
 
 # ── sd_notify for systemd watchdog ────────────────────────────────────────────
 _sd_notifier = None
@@ -74,6 +76,7 @@ _listener: Optional["object"] = None
 _telemetry_task: Optional[asyncio.Task] = None
 bridge_health: Optional["object"] = None
 rtk_manager: Optional["object"] = None
+joystick_ctrl: Optional["object"] = None
 
 # Bounded, thread-safe ring buffer (deque maxlen). All log appends are atomic
 # under the GIL; bounded eviction is built in. Replaces the racy list+trim.
@@ -99,6 +102,7 @@ socket_app = socketio.ASGIApp(sio)
 async def lifespan(app: FastAPI):
     global ros_node, offboard_ctrl, path_mgr, emergency_handler
     global _executor, _beacon, _listener, _telemetry_task, bridge_health, rtk_manager
+    global joystick_ctrl
 
     configure_logging()
     init_auth()
@@ -128,7 +132,33 @@ async def lifespan(app: FastAPI):
 
     path_mgr = PathManager(MISSION_DIR)
     offboard_ctrl = OffboardController(ros_node, activity_log)
-    emergency_handler = EmergencyHandler(ros_node, offboard_ctrl, activity_log)
+
+    # Joystick / manual control (docs/Architecture/JOYSTICK_CONTROLLER_PLAN.md).
+    # Enablement is deployment-controlled via ROVER_JOYSTICK_MANUAL_ENABLED
+    # (config.JOYSTICK_MANUAL_ENABLED); when False, acquire() rejects with
+    # manual_control_disabled and the subsystem only streams neutral frames.
+    try:
+        from config import JOYSTICK_MANUAL_ENABLED
+        from joystick_controller import JoystickController
+        from manual_control_gateway import ManualControlGateway, build_manual_transport
+
+        _manual_transport = build_manual_transport(ros_node)
+        _manual_gateway = ManualControlGateway(_manual_transport)
+        _manual_gateway.start()
+        joystick_ctrl = JoystickController(ros_node, offboard_ctrl, _manual_gateway)
+        _record(
+            "info",
+            "Joystick subsystem initialised (manual control "
+            + ("ENABLED" if JOYSTICK_MANUAL_ENABLED else "disabled")
+            + f", transport={_manual_transport.name})",
+        )
+    except Exception as exc:
+        log.exception("joystick subsystem failed to initialise")
+        _record("warning", f"joystick subsystem unavailable: {exc}")
+
+    emergency_handler = EmergencyHandler(
+        ros_node, offboard_ctrl, activity_log, joystick_controller=joystick_ctrl
+    )
     rtk_manager = AsyncRTKManager()
 
     # ── Register Socket.IO handlers ───────────────────────────────────────────
@@ -174,6 +204,12 @@ async def lifespan(app: FastAPI):
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
     log.info("shutting down…")
+
+    if joystick_ctrl is not None:
+        try:
+            await joystick_ctrl.shutdown()
+        except Exception:
+            log.exception("joystick controller shutdown raised")
 
     if rtk_manager is not None:
         try:
@@ -316,6 +352,7 @@ async def _telemetry_loop() -> None:
                     continue
 
                 s = ros_node.get_state()
+                origin_health = evaluate_origin_health(s)
                 code = s.get("rpp_state", 0)
                 now = time.time()
                 spraying = bool(s.get("spraying", False))
@@ -353,13 +390,16 @@ async def _telemetry_loop() -> None:
                     "battery_v": s.get("battery_v"),
                     "battery_pct": s.get("battery_pct"),
                     "gps_fix": s.get("gps_fix"),
-                    "gps_fix_name": GPS_FIX_NAMES.get(s.get("gps_fix", 0), "UNKNOWN"),
+                    "gps_fix_name": GPS_FIX_NAMES.get(
+                        s.get("gps_fix", 0), f"FIX_{s.get('gps_fix', 0)}"
+                    ),
                     "gps_sat": s.get("gps_sat"),
                     "hrms": s.get("hrms"),
                     "vrms": s.get("vrms"),
-                    "lat": s.get("lat"),
-                    "lon": s.get("lon"),
-                    "alt": s.get("alt"),
+                    "gps_accuracy_known": s.get("gps_accuracy_known"),
+                    "lat": format_gps_coord(s.get("lat")),
+                    "lon": format_gps_coord(s.get("lon")),
+                    "alt": format_gps_coord(s.get("alt")),
                     # Freshness. These were already computed but never streamed, so
                     # the client had no way to tell "RTK_FIXED now" from "was
                     # RTK_FIXED five minutes ago" — local pose keeps updating from
@@ -371,7 +411,22 @@ async def _telemetry_loop() -> None:
                     "global_position_age_ms": s.get("global_position_age_ms"),
                     "gps_fix_age_ms": s.get("gps_fix_age_ms"),
                     "pose_global_skew_ms": s.get("pose_global_skew_ms"),
+                    # EKF origin trust — the only warning the operator gets
+                    # before a stale origin displaces the whole mission. Same
+                    # evaluation the placement gate enforces.
+                    "origin_status": origin_health.status,
+                    "origin_trusted": origin_health.trusted,
+                    "origin_delta_m": origin_health.delta_m,
                 }
+                # Joystick/arbiter snapshot (plan §5) — load-bearing for client
+                # safety: the client detects lease loss / mission takeover only
+                # through these fields. Merged in raw (not pydantic-validated;
+                # this emit is a plain dict, unlike the REST TelemetryData model).
+                if joystick_ctrl is not None:
+                    try:
+                        telem.update(joystick_ctrl.snapshot())
+                    except Exception:
+                        log.exception("joystick snapshot failed")
                 await _emit_authenticated("telemetry", _sanitize(telem))
 
                 mission_status = {
@@ -408,14 +463,24 @@ async def _telemetry_loop() -> None:
                     and offboard_ctrl.state == MissionState.RUNNING
                     and ros_node.get_rpp_monitor().is_done()
                 ):
-                    offboard_ctrl.mark_completed()
-                    await _emit_authenticated(
-                        "mission_completed",
-                        {
-                            "state": offboard_ctrl.state.value,
-                            "name": offboard_ctrl.loaded_path_name,
-                        },
-                    )
+                    if offboard_ctrl.mark_completed():
+                        await _emit_authenticated(
+                            "mission_completed",
+                            {
+                                "state": offboard_ctrl.state.value,
+                                "name": offboard_ctrl.loaded_path_name,
+                            },
+                        )
+                        # B4: end the mission spray-OFF + DISARMED without an
+                        # operator E-stop. Self-gated on DISARM_ON_COMPLETE; runs
+                        # strictly AFTER the COMPLETED transition (never keyed on
+                        # a raw DONE — B16: /rpp/debug can flash DONE mid-mission,
+                        # but the RPP monitor's settle logic gates the transition
+                        # above). Never raises.
+                        try:
+                            await offboard_ctrl.disarm_on_complete_async()
+                        except Exception:
+                            log.exception("disarm-on-complete failed")
 
                 # ── 3. Watchdog: RUNNING + unhealthy/disconnected → estop ──────
                 # B2: RPP_UNHEALTHY_CODES covers STALE (-1), RTK_WAIT (4),

@@ -802,8 +802,13 @@ class TestDisabledMode:
             compensate_spray=False,
         )
         plan = engine.plan_segments([self._seg()])
-        # All spray flags must be True (pure MARK, no TRANSIT extensions)
-        assert all(f is True for f in plan.spray_flags)
+        # No per-line PRE/AFT extension segments are injected, but the engine
+        # appends one short terminal TRANSIT run-out so a mission that ends on
+        # MARK still has a MARK->TRANSIT boundary for the spray node (otherwise
+        # spray latches ON at the endpoint). So every flag is True except the
+        # final run-out point.
+        assert all(f is True for f in plan.spray_flags[:-1])
+        assert plan.spray_flags[-1] is False
 
     def test_disabled_same_waypoint_count_as_legacy(self):
         """Disabled mode must produce exactly the same output as a vanilla engine."""
