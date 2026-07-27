@@ -396,6 +396,7 @@ async def _telemetry_loop() -> None:
                     "gps_sat": s.get("gps_sat"),
                     "hrms": s.get("hrms"),
                     "vrms": s.get("vrms"),
+                    "gps_accuracy_known": s.get("gps_accuracy_known"),
                     "lat": format_gps_coord(s.get("lat")),
                     "lon": format_gps_coord(s.get("lon")),
                     "alt": format_gps_coord(s.get("alt")),

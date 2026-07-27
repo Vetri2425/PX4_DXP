@@ -194,8 +194,12 @@ class RosBridgeNode(Node):
         "alt": 0.0,
         "gps_fix": 0,
         "gps_sat": 0,
-        "hrms": 0.0,
-        "vrms": 0.0,
+        # A14: None = "not reported yet / not trustworthy", never 0.0. A zero
+        # here is indistinguishable from a perfect fix.
+        "hrms": None,
+        "vrms": None,
+        "gps_accuracy_known": False,
+        "position_covariance_type": 0,
         "xtrack_m": 0.0,
         "heading_err_deg": 0.0,
         "lookahead_m": 0.0,
@@ -534,18 +538,39 @@ class RosBridgeNode(Node):
         # invalid JSON that throws in the client's JSON.parse.
         if not (math.isfinite(lat) and math.isfinite(lon)):
             return
-        hrms = 0.0
-        vrms = 0.0
+        # A14 (2026-07-27): the covariance is only in METRES when the driver
+        # says so. NavSatFix.position_covariance_type is
+        #   0 UNKNOWN · 1 APPROXIMATED · 2 DIAGONAL_KNOWN · 3 KNOWN
+        # and only 2/3 carry metre-valued variances. Type 1 is filled from DOP —
+        # a DIMENSIONLESS quality score — so taking sqrt() unconditionally
+        # reported an HDOP of 0.50 as "0.707 m" of horizontal error, and a
+        # zeroed vertical term as a hard "0.000 m", which reads as PERFECT
+        # accuracy when it actually means NO INFORMATION. Observed live on this
+        # rover: type 2 sessions give hrms 0.025 / vrms 0.033, type 1 sessions
+        # give 0.707 / 0.000 while `gps_fix_name` still says RTK_FIXED.
+        #
+        # Unknown is now reported as None, never as a number. `hrms`/`vrms` are
+        # already Optional[float] in models.TelemetryData, and Socket.IO/REST
+        # serialise None as null.
+        cov_type = 0
         try:
-            cov = msg.position_covariance
-            hrms = round(math.sqrt(abs(cov[0]) + abs(cov[4])), 3)
-            vrms = round(math.sqrt(abs(cov[8])), 3)
-        except (ValueError, IndexError, TypeError):
+            cov_type = int(msg.position_covariance_type)
+        except (AttributeError, TypeError, ValueError):
             pass
-        if not math.isfinite(hrms):
-            hrms = 0.0
-        if not math.isfinite(vrms):
-            vrms = 0.0
+        accuracy_known = cov_type >= 2  # DIAGONAL_KNOWN or KNOWN
+        hrms = None
+        vrms = None
+        if accuracy_known:
+            try:
+                cov = msg.position_covariance
+                hrms = round(math.sqrt(abs(cov[0]) + abs(cov[4])), 3)
+                vrms = round(math.sqrt(abs(cov[8])), 3)
+            except (ValueError, IndexError, TypeError):
+                hrms = vrms = None
+            if hrms is not None and not math.isfinite(hrms):
+                hrms = None
+            if vrms is not None and not math.isfinite(vrms):
+                vrms = None
 
         with self._lock:
             self._global_pos_recv_time = time.monotonic()
@@ -555,6 +580,8 @@ class RosBridgeNode(Node):
                 self._state["alt"] = alt
             self._state["hrms"] = hrms
             self._state["vrms"] = vrms
+            self._state["gps_accuracy_known"] = accuracy_known
+            self._state["position_covariance_type"] = cov_type
             self._state["global_position_received"] = True
 
 

@@ -659,6 +659,22 @@ class SprayControllerNode(Node):
         # Asymmetric hysteresis: drop is instant (unsafe edge, no debounce);
         # re-enable only after fix has been continuously good this long.
         self.declare_parameter("gps_recover_hold_s", 1.0)
+        # A14 (2026-07-27): fix_type alone is NOT accuracy. GPSRAW carries
+        # h_acc on the very same message the gate already reads, and until now
+        # it was discarded — so an RTK_FIXED claim opened the valve regardless
+        # of the reported error. This is the accuracy half of the gate.
+        #
+        # FALLBACK BY DESIGN, which is why it ships ON: h_acc == 0 is the
+        # driver's "unknown" sentinel (~half of boots on this hardware report
+        # it, latched per boot — see A14), and refusing on unknown would ground
+        # the rover for reasons unrelated to safety. So: when accuracy IS
+        # reported, enforce it; when it is NOT, behave exactly as before. That
+        # is strictly safer than today on every boot that reports, and
+        # byte-identical on every boot that does not.
+        # Default 0.10 m ≈ 6x the 1.4–1.6 cm an RTK_FIXED solution measures on
+        # this rig, so it only trips on a genuinely degraded fix that is still
+        # claiming fix_type 6. Set 0 to disable the accuracy half entirely.
+        self.declare_parameter("spray_max_hrms_m", 0.10)
         # ── Phase D: point/dwell mode (plan §7.3) ────────────────────────────
         # A dot counts as "arrived" only at/below this speed (a dwell sprays at
         # a standstill). Per-point tolerances/settle/dwell come from the
@@ -752,6 +768,8 @@ class SprayControllerNode(Node):
         # until the first GPSRAW; recover_since is set the moment fix goes good
         # and reset to None on any bad/stale sample (asymmetric hysteresis).
         self._gps_fix_type: int = 0
+        # None = the receiver did not report accuracy this boot (A14 sentinel).
+        self._gps_h_acc_m: Optional[float] = None
         self._gps_recv_time = None
         self._gps_recover_since = None
         self._last_decision: Optional[SprayDecision] = None
@@ -1638,6 +1656,14 @@ class SprayControllerNode(Node):
         prev = self._gps_fix_type
         self._gps_fix_type = int(msg.fix_type)
         self._gps_recv_time = self.get_clock().now()
+        # GPSRAW.h_acc is uint32 MILLIMETRES (MAVLink GPS_RAW_INT). 0 is the
+        # "not supplied" sentinel, not a perfect fix — keep it as None so the
+        # gate can tell "good" from "unknown" (A14).
+        try:
+            h_acc_mm = int(msg.h_acc)
+            self._gps_h_acc_m = (h_acc_mm * 1e-3) if h_acc_mm > 0 else None
+        except (AttributeError, TypeError, ValueError):
+            self._gps_h_acc_m = None
         if prev != self._gps_fix_type:
             self.get_logger().info(
                 f"spray GPS fix: {_GPS_FIX_NAMES.get(prev, '?')} -> "
@@ -1660,7 +1686,15 @@ class SprayControllerNode(Node):
         if age_s > timeout_s:
             return False, False, name
         min_fix = int(self.get_parameter("spray_min_fix_type").value)
-        return True, self._gps_fix_type >= min_fix, name
+        if self._gps_fix_type < min_fix:
+            return True, False, name
+        # A14 accuracy half. Only enforced when the receiver actually reported
+        # an accuracy; an unreported one leaves the pre-A14 behaviour intact.
+        max_hrms = float(self.get_parameter("spray_max_hrms_m").value)
+        h_acc = self._gps_h_acc_m
+        if max_hrms > 0.0 and h_acc is not None and h_acc > max_hrms:
+            return True, False, f"{name}_hacc_{h_acc:.3f}m"
+        return True, True, name
 
     def _gps_gate(self) -> tuple[bool, str]:
         """RTK gate with asymmetric hysteresis (§7.6). Mutates the recover timer.

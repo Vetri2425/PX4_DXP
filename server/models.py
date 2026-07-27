@@ -112,6 +112,10 @@ class TelemetryData(BaseModel):
     gps_sat: Optional[int] = None
     hrms: Optional[float] = None
     vrms: Optional[float] = None
+    # A14: null hrms/vrms means "the driver did not report metre-valued
+    # accuracy", NOT "zero error". This flag says which, so a client never has
+    # to infer it from a magnitude.
+    gps_accuracy_known: Optional[bool] = None
     lat: Optional[float] = None
     lon: Optional[float] = None
     alt: Optional[float] = None

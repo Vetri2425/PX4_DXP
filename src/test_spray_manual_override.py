@@ -52,6 +52,8 @@ def _install_ros_stubs() -> None:
     class _GPSRAW:
         def __init__(self):
             self.fix_type = 0
+            # uint32 MILLIMETRES on the real message; 0 = "not supplied" (A14).
+            self.h_acc = 0
 
     mavros_msg.State = _State
     mavros_msg.GPSRAW = _GPSRAW
@@ -297,6 +299,7 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "progress_timeout_s": _Param(0.3),
         "spray_require_rtk_fix": _Param(False),
         "spray_min_fix_type": _Param(6),
+        "spray_max_hrms_m": _Param(0.10),
         "gps_fix_timeout_s": _Param(2.0),
         "gps_recover_hold_s": _Param(1.0),
         "point_arrival_max_speed_mps": _Param(0.05),

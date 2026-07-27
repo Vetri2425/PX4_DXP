@@ -139,3 +139,82 @@ if __name__ == "__main__":
             fn()
             print(f"PASS: {name}")
     print("ALL RTK GATE TESTS PASSED")
+
+
+# ── A14: the accuracy half of the gate (2026-07-27) ──────────────────────────
+#
+# Until A14, `_gps_health` compared fix_type and nothing else — GPSRAW.h_acc
+# arrived on the same message and was discarded. An RTK_FIXED claim opened the
+# valve at any reported error. These tests pin the FALLBACK contract:
+#   accuracy reported  -> enforce it
+#   accuracy missing   -> behave exactly as before (h_acc == 0 is the driver's
+#                         "unknown" sentinel, latched per boot on ~half of
+#                         boots on this hardware; refusing on it would ground
+#                         the rover for a reason unrelated to safety)
+
+def _set_fix_acc(node, fix_type, h_acc_mm):
+    msg = GPSRAW()
+    msg.fix_type = fix_type
+    msg.h_acc = h_acc_mm
+    node._gps_cb(msg)
+
+
+def test_good_fix_with_bad_accuracy_is_refused():
+    """The bug A14 names: fix_type 6 while the receiver reports 0.85 m of
+    horizontal error. Pre-A14 this returned fix_ok True and the valve opened.
+
+    Fails if the fix is wrong: with the accuracy half removed, `ok` is True
+    because fix_type 6 >= 6, so the assertion breaks. It cannot pass by
+    accident — 850 mm is 8.5x the 0.10 m default.
+    """
+    node = make_node()
+    _enable_gate(node)
+    _set_fix_acc(node, 6, 850)
+    fresh, ok, name = node._gps_health()
+    assert fresh is True
+    assert ok is False, "RTK_FIXED with 0.85 m of reported error must not spray"
+    assert "hacc" in name, "the operator must be told WHY, not just that it failed"
+
+
+def test_good_fix_with_good_accuracy_sprays():
+    """Scope guard: a genuinely good fix must still pass, or the gate is just
+    an outage. 15 mm is what this rig measures at RTK_FIXED."""
+    node = make_node()
+    _enable_gate(node)
+    _set_fix_acc(node, 6, 15)
+    assert node._gps_health()[1] is True
+
+
+def test_unreported_accuracy_falls_back_to_pre_a14_behaviour():
+    """h_acc == 0 is 'unknown', NOT 'perfect' — but it must not block either.
+
+    This is the whole reason the gate ships enabled: on boots where the driver
+    supplies no accuracy (about half of them, latched per boot) the rover keeps
+    working exactly as it did before A14. If this test fails, the fix has
+    grounded the rover on the sentinel and must not be deployed.
+    """
+    node = make_node()
+    _enable_gate(node)
+    _set_fix_acc(node, 6, 0)
+    assert node._gps_h_acc_m is None, "0 mm must be read as unknown, never 0.0 m"
+    assert node._gps_health()[1] is True
+
+
+def test_a_bad_fix_still_fails_regardless_of_accuracy():
+    """Ordering guard: the fix-type test must run FIRST. A receiver reporting
+    a tight h_acc on an RTK_FLOAT solution must not be promoted by the new
+    accuracy branch."""
+    node = make_node()
+    _enable_gate(node)
+    _set_fix_acc(node, 5, 12)
+    assert node._gps_health()[1] is False
+
+
+def test_accuracy_half_can_be_disabled_with_zero():
+    """Escape hatch: spray_max_hrms_m = 0 restores pre-A14 behaviour exactly,
+    for a site where the receiver's accuracy is known to be unreliable."""
+    node = make_node()
+    _enable_gate(node)
+    node._params["spray_max_hrms_m"] = _Param(0.0)
+    _set_fix_acc(node, 6, 850)
+    assert node._gps_health()[1] is True
