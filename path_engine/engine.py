@@ -1267,12 +1267,22 @@ class PathEngine:
             # src/spray_controller_node.py). B4 closes the valve within epsilon
             # of the PATH END at creep speed — with a tail shorter than epsilon
             # that region crosses INTO the marked line and cuts the mark short
-            # of the final station. 0.05 keeps the valve open to the station
-            # while the rover overruns it by only ~5 cm (was 10 cm — the
-            # 2026-07-27 field session flagged the overrun past the surveyed
-            # endpoint).
-            runout = self.aft_extension_m if self.enable_path_extensions else 0.05
-            runout = max(0.05, runout)
+            # of the final station. So 0.05 is the FLOOR, not the target.
+            #
+            # It was briefly set to 0.05 (2026-07-27) to cut the ~10 cm overrun
+            # past the final surveyed station. That was the wrong term: the
+            # overrun is the rover's own braking distance, so it did not move
+            # (8.4-12.6 cm before, 9.1-12.5 cm after, bags/27_07_2026) — the
+            # edit only deleted the leg that used to absorb it. The rover then
+            # finished 5-7 cm BEYOND the last path point, the terminal target
+            # heading flipped ~150 deg to point back at the station it had
+            # passed, and the controller sat in CORNER_STOP for 10+ s commanding
+            # 0.02-0.055 m/s reverse — under RO_SPEED_TH=0.1, the firmware speed
+            # dead-band, so it barely crawled (2 of 3 runs; 13.3 s and 12.6 s).
+            # Restored to 0.10 so the tail again covers the coast. Shrinking the
+            # overrun needs terminal deceleration, not a shorter tail.
+            runout = self.aft_extension_m if self.enable_path_extensions else 0.1
+            runout = max(0.1, runout)
             merged_waypoints.append((tail_n + dn * runout, tail_e + de * runout))
             spray_flags.append(False)
             must_hit.append(False)
