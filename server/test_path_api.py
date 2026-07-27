@@ -2669,3 +2669,57 @@ def test_plan_honours_the_line_config_sidecar_like_preview_does(tmp_path):
     preview = [(w.north, w.east) for w in mgr.preview_path(name).waypoints]
     planned = mgr.plan_path(name, summary_only=False)["merged_waypoints"]
     assert planned == preview
+
+
+# ── A16: extensions must be configurable for survey CSVs, not DXF only ────────
+
+_SURVEY_CSV = (
+    "Name,Code,Longitude,Latitude,Ellipsoidal height\n"
+    "1,L_1,80.26194110,13.07206390,-82.323\n"
+    "2,L_1,80.26195200,13.07207100,-82.330\n"
+    "3,L_1,80.26196445,13.07207953,-82.337\n"
+)
+
+
+def test_extensions_are_configurable_for_a_survey_csv(tmp_path):
+    """A16 regression. Extensions were gated to DXF, which locked the pre-line
+    CSV product out of the one feature that moves the entry transient and the
+    terminal shutoff OFF the painted line.
+
+    Both were measured on the 2026-07-27 curve run: station 1 missed by 4.05 cm
+    (entry) and the LAST surveyed station by 5.03 cm (terminal shutoff) — and
+    engine.py takes `runout = aft_extension_m` only when extensions are on.
+
+    Fails if the fix is wrong: on pre-fix source `_require_extendable` does not
+    exist and `save_extension_config` raises ValueError("...only available for
+    DXF files"), so the save below raises instead of returning a config.
+    """
+    (tmp_path / "curve.csv").write_text(_SURVEY_CSV)
+    mgr = PathManager(str(tmp_path))
+
+    saved = mgr.save_extension_config("curve.csv", True, 0.5, 0.5, per_line=False)
+    assert saved["enabled"] is True
+    assert saved["pre_extension_m"] == 0.5
+    assert saved["aft_extension_m"] == 0.5
+
+    loaded = mgr.load_extension_config("curve.csv")
+    assert loaded["enabled"] is True, "a saved CSV config must survive a reload"
+
+
+def test_extensions_still_refuse_a_legacy_headerless_ned_csv(tmp_path):
+    """Scope guard. The widened rule must admit SURVEY CSVs only — a legacy
+    headerless north,east CSV has no surveyed stations and its planning
+    behaviour is deliberately frozen. If this fails, the guard was widened to
+    'any .csv' and legacy missions can silently acquire run-ups.
+    """
+    (tmp_path / "legacy.csv").write_text("0.0,0.0\n1.0,0.0\n2.0,0.0\n")
+    mgr = PathManager(str(tmp_path))
+
+    with pytest.raises(ValueError):
+        mgr.save_extension_config("legacy.csv", True, 0.5, 0.5, per_line=False)
+
+
+def test_extensions_still_refuse_a_missing_file(tmp_path):
+    mgr = PathManager(str(tmp_path))
+    with pytest.raises(FileNotFoundError):
+        mgr.save_extension_config("nope.csv", True, 0.5, 0.5, per_line=False)

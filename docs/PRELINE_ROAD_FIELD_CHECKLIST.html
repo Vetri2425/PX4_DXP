@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pre-line Road Marking — Field Validation Checklist</title>
+<style>
+  :root { --ink:#111; --mut:#666; --line:#d8d8d2; --warn:#8a4b00; --bad:#a32d2d; --ok:#0f6e56; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         max-width: 1000px; margin: 0 auto; padding: 24px 18px 80px; color: var(--ink);
+         line-height: 1.55; font-size: 15px; }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  h2 { font-size: 18px; margin: 32px 0 8px; padding-top: 12px; border-top: 2px solid var(--ink); }
+  h3 { font-size: 15px; margin: 20px 0 6px; }
+  .sub { color: var(--mut); margin: 0 0 18px; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0 18px; font-size: 13.5px; }
+  th, td { border: 1px solid var(--line); padding: 7px 9px; vertical-align: top; text-align: left; }
+  th { background: #f4f3ee; font-weight: 600; }
+  td.n { width: 34px; text-align: center; font-weight: 600; }
+  td.chk { width: 34px; text-align: center; font-size: 17px; }
+  code { background: #f4f3ee; padding: 1px 4px; border-radius: 3px; font-size: 12.5px;
+         font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre { background: #f4f3ee; padding: 10px 12px; border-radius: 5px; overflow-x: auto;
+        font-size: 12.5px; line-height: 1.45; }
+  .box { border: 1px solid var(--line); border-left: 4px solid var(--warn);
+         padding: 10px 14px; margin: 14px 0; background: #fdfaf5; }
+  .box.bad { border-left-color: var(--bad); background: #fdf5f5; }
+  .box.ok  { border-left-color: var(--ok);  background: #f4faf8; }
+  .box p:first-child { margin-top: 0; } .box p:last-child { margin-bottom: 0; }
+  .meta { display: flex; gap: 28px; flex-wrap: wrap; font-size: 13.5px; color: var(--mut);
+          border: 1px solid var(--line); padding: 10px 14px; border-radius: 5px; }
+  .fill { border-bottom: 1px solid var(--ink); display: inline-block; min-width: 130px; }
+  ul { margin: 6px 0 6px 20px; padding: 0; } li { margin: 3px 0; }
+
+  /* ── PRINT ─────────────────────────────────────────────────────────────
+     This sheet is meant to be carried into the field and written on, so the
+     print rules prioritise legibility and pen-space over screen fidelity:
+       · tick boxes become real, ink-visible squares big enough for a pen
+       · the record sheet and notes get generous writing room
+       · nothing splits across a page mid-row
+       · coloured status boxes keep their left rule but drop the fill, so a
+         mono printer still shows PASS/WARN/STOP and no ink is wasted
+     Tested against A4 portrait. */
+  @page { size: A4 portrait; margin: 12mm 10mm; }
+
+  @media print {
+    body { font-size: 10.5pt; line-height: 1.35; padding: 0; max-width: none;
+           color: #000; }
+    h1 { font-size: 16pt; margin-bottom: 2px; }
+    h2 { font-size: 12.5pt; margin: 14pt 0 5pt; padding-top: 6pt;
+         border-top: 1.5pt solid #000; break-after: avoid; page-break-after: avoid; }
+    h3 { font-size: 10.5pt; margin: 9pt 0 3pt; break-after: avoid; }
+    .sub, .meta { font-size: 9pt; color: #000; }
+
+    /* Never split a check row, a warning box or a code block across pages. */
+    table, pre, .box { break-inside: avoid; page-break-inside: avoid; }
+    tr, td, th { break-inside: avoid; page-break-inside: avoid; }
+    table { font-size: 9pt; width: 100%; }
+    th, td { padding: 4pt 5pt; border: 0.5pt solid #666; }
+    th { background: #eee !important; -webkit-print-color-adjust: exact;
+         print-color-adjust: exact; }
+    code, pre { background: transparent !important; border: 0.4pt solid #bbb;
+                font-size: 8.5pt; }
+    pre { padding: 5pt 6pt; }
+
+    /* Status boxes: keep the semantic left rule, drop the fill. */
+    .box { background: transparent !important; border: 0.5pt solid #999;
+           border-left: 3pt solid #000 !important; padding: 6pt 9pt; margin: 8pt 0; }
+
+    /* A tick box you can actually tick. */
+    td.chk { font-size: 0; }
+    td.chk::before { content: ""; display: inline-block; width: 11pt; height: 11pt;
+                     border: 0.9pt solid #000; }
+
+    /* Writing room. */
+    .fill { min-width: 42mm; border-bottom: 0.6pt solid #000; }
+    h3 + p[style] { min-height: 34mm !important; border: 0.5pt solid #999 !important; }
+
+    /* Each numbered part starts a fresh page — 0 · Pre-flight is the exception,
+       it should sit under the header on page 1. */
+    h2 { page-break-before: always; break-before: page; }
+    h1 + .sub + .meta + .box + h2,
+    h2:first-of-type { page-break-before: auto; break-before: auto; }
+
+    a { text-decoration: none; color: #000; }
+  }
+</style>
+</head>
+<body>
+
+<h1>Pre-line Road Marking — Field Validation Checklist</h1>
+<p class="sub">3WD marking rover · branch <code>Upgrade_Spray</code> · written 2026-07-27</p>
+
+<div class="meta">
+  <span>Date <span class="fill"></span></span>
+  <span>Operator <span class="fill"></span></span>
+  <span>Site <span class="fill"></span></span>
+  <span>Jetson SHA <span class="fill"></span></span>
+</div>
+
+<div class="box">
+<p><strong>Scope — this is NOT the Phase F checklist.</strong>
+<code>PHASE_F_FIELD_CHECKLIST.html</code> validates <em>spray modes</em> and remains the
+baseline document; do not edit it. This one validates the <strong>pre-line road marking
+product</strong>: the chain <strong>CSV → path → curve fit → placement → tracking → mark</strong>,
+which Phase F does not test at any point.</p>
+<p><strong>Deliberately excluded:</strong> point/dot mode, point flow, and the whole G6
+RPP↔spray handshake. Pre-line marking is about lines. Point mode needs three compound flags,
+is blocked on bugs B1 and B15, its in-env tests have never run, and its frontend control does
+not exist. Those live in Phase F §1 row 3, row 7 and §2 — run them there when point mode
+becomes a product requirement.</p>
+</div>
+
+<h2>RESULTS — session 2026-07-27 (first run of this checklist)</h2>
+
+<div class="box ok">
+<p><strong>Operator verdict: rows 2.1–2.4 PASS in the field.</strong> 12 bags recorded,
+11 readable, every one <code>COMPLETE</code> with full traversal. Jetson, origin and Mac
+all at <code>2fa1016</code>; 873 tests green (334 server + 475 path_engine + 64 tools).
+Bags: <code>bags/27_07_2026/PRELINE_FIELD/session_bags/</code>.</p>
+</div>
+
+<table>
+<tr><th class="n">#</th><th>Row</th><th>Result</th><th>Evidence</th></tr>
+<tr><td class="n">1.1</td><td>Preview = mission</td><td><strong>PASS</strong></td>
+    <td>identical wp count and endpoints on both files</td></tr>
+<tr><td class="n">1.2</td><td>Surveyed stations preserved</td><td><strong>PASS / bug found</strong></td>
+    <td>square 4/4; curve 2 of 8 — <strong>B1 reproduced and localised to the arc fitter</strong>
+    (with fitting off, 8/8 survive)</td></tr>
+<tr><td class="n">1.3</td><td>Placement anchored to survey</td><td><strong>PASS</strong></td>
+    <td><code>GPS_SURVEYED</code>, origin = the CSV's own geo origin, every run</td></tr>
+<tr><td class="n">2.1</td><td>Straight, multi-leg</td><td><strong>PASS</strong> (with extensions)</td>
+    <td>operator-confirmed in the field</td></tr>
+<tr><td class="n">2.2</td><td>Surveyed curve ★</td><td><strong>PASS</strong> (with extensions)</td>
+    <td>arc-fit vs chords A/B measured: plan 1.95 vs 0.00 cm, physical 2.73 vs 3.59 cm
+    → <strong>arc fit stays ON</strong>; extensions then cleared it</td></tr>
+<tr><td class="n">2.3</td><td>Road corner ★★</td><td><strong>PASS</strong></td>
+    <td>2×2 square, corners 89.8° / 88.9°, cut <strong>2.83 and 1.44 cm</strong> —
+    the feared 5.5–6.5 cm did NOT reproduce</td></tr>
+<tr><td class="n">2.4</td><td>Dash</td><td><strong>PASS</strong></td>
+    <td>0.5 on / 0.5 off over 3.069 m; node confirmed <code>mode=dash, phase=on, armed</code></td></tr>
+<tr><td class="n">2.5</td><td>RTK dropout</td><td class="chk">⚠ <strong>NOT VERIFIED</strong></td>
+    <td>see below</td></tr>
+</table>
+
+<div class="box bad">
+<p><strong>Row 2.5 has no evidence and must not be recorded as a pass.</strong> The gate was
+never challenged: the spray node logs every <code>fix_type</code> change and there were
+<strong>zero transitions</strong> — GPS held <code>RTK_FIXED</code> at 29 sats for the whole
+run. Holding the antenna by hand did not degrade a dual-antenna UM982 enough, and the mark
+window is only ~9 s at 0.35 m/s over 3.07 m.</p>
+<p>A gate trip has a distinct signature that was never seen:
+<code>spray_active_desired=true</code> while <code>spraying=false</code>. What was observed
+instead was both going false together, which is the normal terminal shutoff.</p>
+<p><strong>To close it:</strong> use <code>POST /api/rtk/stop</code> mid-mark — deterministic,
+precisely timable, and the same failure as driving behind a building. Corrections stop, the
+fix drops below <code>spray_min_fix_type=6</code>, and the gate must fire. Restart NTRIP to
+watch the <code>gps_recover_hold_s=1.0</code> re-enable. Gate params verified live:
+<code>spray_require_rtk_fix=True</code>, <code>min_fix_type=6</code>,
+<code>gps_fix_timeout_s=2.0</code>, <code>gps_recover_hold_s=1.0</code>,
+<code>spray_max_hrms_m=0.10</code>.</p>
+</div>
+
+<div class="box">
+<p><strong>Open items from this session.</strong>
+(1) <strong>Frontend does not expose extensions for the CSV flow</strong> — the backend half
+landed (A16) and works, but the Fields page has no control, so extensions can only be set by
+API. (2) Bag <code>…183723</code> has an unreadable <code>manifest.json</code>.
+(3) The 0.3 vs 0.5 extension comparison and the per-station grading of these 12 bags have not
+been run yet — the numbers above for 2.2/2.3 come from the earlier no-extension runs.</p>
+</div>
+
+<h2>0 · Pre-flight — before any drive</h2>
+
+<table>
+<tr><th class="n">#</th><th>Check</th><th>How</th><th>Pass criterion</th><th class="chk">✓</th></tr>
+
+<tr><td class="n">0.1</td><td>Services up</td>
+<td><code>systemctl is-active px4-dxp rpp-pipeline rover-server bag-autorecord</code></td>
+<td>all four <code>active</code></td><td class="chk">☐</td></tr>
+
+<tr><td class="n">0.2</td><td>Code in sync</td>
+<td><code>cd ~/PX4_DXP &amp;&amp; git status --porcelain &amp;&amp; git rev-parse --short HEAD</code></td>
+<td>tree <strong>clean</strong>, SHA matches origin — a dirty tree makes every bag's
+manifest SHA a lie</td><td class="chk">☐</td></tr>
+
+<tr><td class="n">0.3</td><td>RTK fixed</td>
+<td><code>python3 tools/capture_telemetry.py -n 5 --host localhost</code></td>
+<td><code>gps_fix_name = RTK_FIXED</code> on every sample. Allow ~2 min after a boot to
+converge from RTK_FLOAT</td><td class="chk">☐</td></tr>
+
+<tr><td class="n">0.4</td><td><strong>Origin gate</strong> <em>(new 2026-07-27)</em></td>
+<td><code>curl -s localhost:5001/api/health/origin</code></td>
+<td><code>"status":"OK"</code>, <code>"trusted":true</code>, <code>delta_m &lt; 0.05</code>.
+<strong>If this fails, do not stage</strong> — the mission will be placed metres off with no
+other symptom</td><td class="chk">☐</td></tr>
+
+<tr><td class="n">0.5</td><td>GPS accuracy honesty <em>(new 2026-07-27)</em></td>
+<td>same telemetry sample — read <code>gps_accuracy_known</code></td>
+<td>Record it. <code>true</code> → <code>hrms</code> is real metres and the spray accuracy
+gate is live. <code>false</code> → accuracy is unreported this boot; the gate falls back to
+fix-type only (bug A14). <strong>Not a stopper — but note which boot you got</strong></td>
+<td class="chk">☐</td></tr>
+
+<tr><td class="n">0.6</td><td>Recorder ready</td>
+<td>bag-autorecord active; confirm a bundle appears in <code>~/bags_jet/</code> after run 1</td>
+<td>one bundle per run, <code>manifest.json</code> carries real FCU params (not null)</td>
+<td class="chk">☐</td></tr>
+
+<tr><td class="n">0.7</td><td><strong>Dry run first</strong></td>
+<td>cap or disconnect the nozzle for the first pass of each new row</td>
+<td>no paint on the first pass of any row</td><td class="chk">☐</td></tr>
+</table>
+
+<h2>1 · CSV → mission integrity — before the rover moves</h2>
+
+<p>These three catch the failures that put paint in the wrong place. They cost minutes at a
+laptop and save a re-survey.</p>
+
+<h3>The load sequence (verified 2026-07-25 — do not improvise)</h3>
+<pre>1. POST /api/path/upload                      (multipart "file")        -> saved
+2. GET  /api/path/{name}/preview                                        -> control_points
+3. POST /api/path/{name}/plan-and-stage   body: {"source": "{name}"}    -> mission_id
+      ^ OMIT origin_gps — the engine adopts the CSV's own geo_origin
+4. POST /api/path/load-to-controller      body: {"mission_id": "stg_…"}
+5. POST /api/mission/start                body: {"mission_id": "stg_…", "auto_origin": false}</pre>
+
+<div class="box bad">
+<p><strong>Never send <code>path_name</code> to <code>/start</code> after step 4.</strong>
+It re-loads from disk as <code>LOCAL_NED</code> and silently discards the surveyed placement.
+A failed start leaves the mission loaded — wait for RTK and retry, do not re-stage.</p>
+</div>
+
+<table>
+<tr><th class="n">#</th><th>Target</th><th>Do</th><th>PASS if</th><th class="chk">✓</th></tr>
+
+<tr><td class="n">1.1</td><td><strong>Preview = mission (WYSIWYG)</strong></td>
+<td>Compare the step-2 preview against the step-3 staged waypoints — count, first/last
+coordinate, and total length.</td>
+<td>They match. <em>Watch bug B14: preview can render arcs the mission does not carry.
+For this product a preview that isn't what gets driven is a product failure, not a test
+nuisance.</em></td><td class="chk">☐</td></tr>
+
+<tr><td class="n">1.2</td><td><strong>Surveyed stations preserved</strong></td>
+<td>Count must-hit vertices in the staged mission against rows in the source CSV.</td>
+<td>Every surveyed station survives. <em>Watch bug B1: the arc fitter drops interior
+must-hits (kept 2 of 8 on the known case). This does not bend the driven curve — but it
+destroys your ability to grade station-by-station, which is how the product is proven.</em></td>
+<td class="chk">☐</td></tr>
+
+<tr><td class="n">1.3</td><td>Placement anchored to the survey</td>
+<td>Read the staged artifact: <code>placement_mode</code>, <code>origin_gps</code>.</td>
+<td><code>GPS_SURVEYED</code>, and <code>origin_gps</code> equals the CSV's own geo origin —
+not the rover's position</td><td class="chk">☐</td></tr>
+</table>
+
+<h2>2 · Drive and mark — one bag per run, dry run then live</h2>
+
+<table>
+<tr><th class="n">#</th><th>Target</th><th>Set up</th><th>Do</th><th>PASS if</th><th class="chk">✓</th></tr>
+
+<tr><td class="n">2.1</td><td><strong>Straight, multi-leg</strong></td>
+<td>Default continuous. A <code>MARK → TRANSIT → MARK</code> route.</td>
+<td>Drive at 0.35 m/s. Dry run, then live.</td>
+<td>Paint on both MARK legs, valve <strong>lifts fully</strong> over the transit, no drag-on
+at either boundary. <em>Single-MARK continuous is already proven — this row is only about the
+lift.</em></td><td class="chk">☐</td></tr>
+
+<tr><td class="n">2.2</td><td><strong>Surveyed curve</strong> ★</td>
+<td>A real surveyed curve CSV (e.g. <code>curve_6_points</code>), arc fit ON.</td>
+<td>One full pass. Record the bag. Re-survey the painted arc afterwards if you can.</td>
+<td><strong>Raw GNSS within 2.5 cm of the surveyed shots along the whole arc</strong>, and no
+growth in error from entry to exit.</td><td class="chk">☐</td></tr>
+
+<tr><td class="n">2.3</td><td><strong>Road corner</strong> ★★</td>
+<td>Real road geometry with a sharp corner (~40°).</td>
+<td>Drive the corner at mission speed. Compare inside-of-corner paint to the surveyed vertex.</td>
+<td>Corner cut <strong>≤ 2.5 cm</strong>. <em>Prior measurement on roads' 42° corners was
+5.5–6.5 cm — over twice tolerance. Expect this row to FAIL; the point is to measure it
+properly.</em></td><td class="chk">☐</td></tr>
+
+<tr><td class="n">2.4</td><td><strong>Dash</strong></td>
+<td>Plan with <code>spray_mode=dash</code>, on/off metres (e.g. 6 / 3).</td>
+<td>Straight run of at least 3 dash periods, through one corner. Measure the first dash.</td>
+<td>On/off lengths match the set metres; the pattern <strong>flows through the corner</strong>
+and does not reset.</td><td class="chk">☐</td></tr>
+
+<tr><td class="n">2.5</td><td><strong>RTK dropout</strong> (safety)</td>
+<td>No change — <code>spray_require_rtk_fix</code> is already true.</td>
+<td>Mid-MARK, force a dropout (shade the antenna / stop the base a few seconds).</td>
+<td>Spray stops <strong>instantly</strong>; re-enables only ~1 s after fix returns;
+<code>safety_reason</code> names the GPS cause.</td><td class="chk">☐</td></tr>
+</table>
+
+<p>★ = the product's biggest unproven claim &nbsp;·&nbsp; ★★ = suspected existing defect</p>
+
+<div class="box">
+<p><strong>Why 2.2 matters most.</strong> The "1–2 cm on arcs" figure is <em>extrapolated</em>,
+not measured for a CSV curve. The validated 1.46 cm RMS comes from the R=1.5 m built-in arc,
+and it is <strong>budget B</strong> — driven versus its own path. Measured against the surveyed
+shots, the same curve sat <strong>mean 1.96 / max 3.40 cm</strong>. For a product whose entire
+value is "the line is where the survey says it is", that is the number that has never been
+proven in the field.</p>
+</div>
+
+<h2>3 · How to grade — the honest rulers</h2>
+
+<p>Run <code>python3 tools/analyze_mission.py &lt;bundle&gt;</code> per bag, then judge on the
+budgets below. They are separate questions and one number must never stand for another.</p>
+
+<table>
+<tr><th class="n">#</th><th>Question</th><th>Measure</th><th>Target</th></tr>
+<tr><td class="n">A</td><td>Was the plan the right shape, in the right place?</td>
+<td>planned <code>/path</code> vs the <strong>surveyed lat/lon</strong></td><td>≤ 2 cm</td></tr>
+<tr><td class="n">B</td><td>Did the controller follow its own plan?</td>
+<td>pose vs raw <code>/path</code> (report §7)</td><td>≤ 2 cm RMS</td></tr>
+<tr><td class="n">C</td><td><strong>Where did the rover physically go?</strong></td>
+<td><strong>raw GNSS vs the surveyed lat/lon</strong> — this is the verdict</td>
+<td>≤ 2.5 cm, no drift along the line</td></tr>
+<tr><td class="n">D</td><td>Did the <em>paint</em> land there?</td>
+<td><strong>physical re-survey of the mark</strong></td>
+<td>no log can answer this — only a tape or a rover shot</td></tr>
+</table>
+
+<div class="box bad">
+<p><strong>Never quote <code>/rpp/debug[0]</code> as accuracy.</strong> It is cross-track
+against the <em>conditioned</em> path — the controller grading its own homework — and it
+structurally hides dropped vertices. <code>/spray/debug[5]</code> is nozzle cross-track
+carrying an uncalibrated offset; also not tracking error.</p>
+</div>
+
+<div class="box ok">
+<p><strong>Budget D is the one to grab while you are on site.</strong> Paint is perishable —
+it gets walked over, weathered, and driven on. A re-survey of today's marks closes the only
+error budget no log will ever answer, and it also yields the nozzle offset (band centre vs
+the surveyed line) that bug B4 is waiting on.</p>
+</div>
+
+<h2>4 · Record sheet</h2>
+
+<table>
+<tr><th>Row</th><th>Bag / mission id</th><th>Budget A</th><th>Budget B</th><th>Budget C</th>
+<th>Re-survey (D)</th><th>Verdict</th></tr>
+<tr><td>2.1 multi-leg</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td>2.2 curve ★</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td>2.3 corner ★★</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td>2.4 dash</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td>2.5 RTK dropout</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+</table>
+
+<h3>Notes / anomalies</h3>
+<p style="border:1px solid var(--line); min-height:110px; border-radius:5px;"></p>
+
+<h2>5 · Known issues live during this session</h2>
+<ul>
+  <li><strong>A14</strong> — on boots reporting no GPS accuracy, the spray gate is fix-type
+      only. Record 0.5 so you know which boot you had.</li>
+  <li><strong>B1</strong> — arc fitter drops interior surveyed must-hits (grading, not driving).</li>
+  <li><strong>B14</strong> — preview can disagree with the staged mission.</li>
+  <li><strong>B15</strong> — pivot release band collides with firmware <code>RD_TRANS_TRN_DRV</code>;
+      affects stop-and-hold, deferred with point mode.</li>
+  <li><strong>A13</strong> — <code>mark_length_m</code> is frame metres reported as ground
+      metres. Only bites metric-specified geometry; surveyed endpoints are exact.</li>
+</ul>
+
+</body>
+</html>

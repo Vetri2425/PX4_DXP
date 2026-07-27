@@ -854,8 +854,13 @@ def _load_extension_config_checked(path_mgr, name: str) -> dict:
     fpath = os.path.join(MISSION_DIR, safe)
     if not os.path.isfile(fpath):
         raise FileNotFoundError(f"Path not found: {name!r}")
-    if os.path.splitext(fpath)[1].lower() != ".dxf":
-        raise ValueError("Path extensions are only configurable for DXF files")
+    # A16: the pre-line CSV product needs extensions too — they are what move
+    # the entry transient and the terminal shutoff OFF the painted line. Mirror
+    # PathManager._require_extendable rather than re-deriving the rule.
+    if os.path.splitext(fpath)[1].lower() != ".dxf" and not path_mgr._is_survey_csv(safe):
+        raise ValueError(
+            "Path extensions are only configurable for DXF files and survey CSVs"
+        )
     return path_mgr.load_extension_config(safe)
 
 
@@ -2008,6 +2013,30 @@ async def plan_and_stage(name: str, req: PathPlanRequest):
                     ref_points_dxf=ref_points_dxf,
                     ref_points_gps=ref_points_gps,
                     close_loop=req.close_loop,
+                    # A15 (2026-07-27): these five were accepted by the request
+                    # model, documented, and then SILENTLY DROPPED on the way to
+                    # the planner — only /api/path/plan forwarded them. So the
+                    # preview route honoured `fit_arcs` while plan-and-stage, the
+                    # route that produces the mission the rover actually drives,
+                    # ignored it and always took path_manager's survey-CSV
+                    # auto-ON default. Measured on curve_6_points-1: preview with
+                    # fit_arcs=false gave 98 wp / 8 of 8 must-hit / 0.00 cm from
+                    # the surveyed stations; the staged mission gave 97 wp / 2 of
+                    # 8 / 1.95 cm mean, 3.36 cm max — HTTP 200, no warning.
+                    #
+                    # Passing them straight through (not conditionally) is
+                    # deliberate: all four fit_arcs fields default to None in
+                    # PathPlanRequest, and path_manager reads None as "auto"
+                    # (`fit_arcs = _is_survey_csv(name) if kw is None else ...`),
+                    # so omitting them from the request is byte-for-byte
+                    # unchanged. close_shape defaults False in both. This mirrors
+                    # /api/path/plan exactly, which is the point — the two routes
+                    # disagreeing is the bug.
+                    fit_arcs=req.fit_arcs,
+                    fit_arcs_rms_m=req.fit_arcs_rms_m,
+                    fit_arcs_corner_deg=req.fit_arcs_corner_deg,
+                    fit_arcs_max_dev_m=req.fit_arcs_max_dev_m,
+                    close_shape=req.close_shape,
                 ),
                 timeout=15.0,
             )

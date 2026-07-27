@@ -715,3 +715,80 @@ async def test_plan_and_stage_ignores_points_without_gps_frame(tmp_path, monkeyp
     with open(os.path.join(staging, f"{plan.mission_summary.mission_id}.json")) as f:
         staged = json.load(f)
     assert staged["spray_session"]["mode"] == "continuous"
+
+
+# ── A15: plan-and-stage must forward the shape controls it accepts ─────────────
+
+async def test_plan_and_stage_forwards_the_arc_fit_controls(tmp_path, monkeypatch):
+    """A15 regression. PathPlanRequest accepts fit_arcs + 3 companions +
+    close_shape, /api/path/plan forwarded them, and plan-and-stage silently
+    DROPPED all five — so the preview could honour a setting the driven mission
+    ignored, with HTTP 200 and no warning.
+
+    Measured on curve_6_points-1.csv before the fix:
+      /api/path/plan  fit_arcs=false -> 98 wp, 8/8 must-hit, 0.00 cm from stations
+      plan-and-stage  fit_arcs=false -> 97 wp, 2/8 must-hit, 1.95 cm mean
+
+    Fails if the fix is wrong: on pre-fix source none of the five keys reach
+    plan_path, so every assertion below raises KeyError. It cannot pass by
+    accident — the values asserted are non-default and distinct from each other.
+    """
+    mgr, _ = _setup(tmp_path, monkeypatch)
+    seen = {}
+    real = mgr.plan_path
+
+    def spy(name, **kwargs):
+        seen.update(kwargs)
+        return real(name, **kwargs)
+
+    monkeypatch.setattr(mgr, "plan_path", spy)
+
+    await path_route.plan_and_stage(
+        "square.dxf",
+        PathPlanRequest(
+            source="square.dxf",
+            origin_gps=[37.7749, -122.4194],
+            fit_arcs=False,
+            fit_arcs_rms_m=0.031,
+            fit_arcs_corner_deg=41.0,
+            fit_arcs_max_dev_m=0.017,
+            close_shape=True,
+        ),
+    )
+
+    assert seen["fit_arcs"] is False
+    assert seen["fit_arcs_rms_m"] == 0.031
+    assert seen["fit_arcs_corner_deg"] == 41.0
+    assert seen["fit_arcs_max_dev_m"] == 0.017
+    assert seen["close_shape"] is True
+
+
+async def test_omitting_the_arc_fit_controls_still_means_auto(tmp_path, monkeypatch):
+    """Scope guard for the fix above — the dangerous half.
+
+    path_manager reads fit_arcs=None as AUTO ("on for a survey CSV"). If the
+    forwarding had been written to send a concrete default instead of None, every
+    call would carry an EXPLICIT value and silently override that auto rule for
+    every mission — the exact trap models.py already warns about. So an omitted
+    field must arrive as None, not False.
+    """
+    mgr, _ = _setup(tmp_path, monkeypatch)
+    seen = {}
+    real = mgr.plan_path
+
+    def spy(name, **kwargs):
+        seen.update(kwargs)
+        return real(name, **kwargs)
+
+    monkeypatch.setattr(mgr, "plan_path", spy)
+
+    await path_route.plan_and_stage(
+        "square.dxf",
+        PathPlanRequest(source="square.dxf", origin_gps=[37.7749, -122.4194]),
+    )
+
+    assert seen["fit_arcs"] is None, "omitted must stay None so AUTO survives"
+    assert seen["fit_arcs_rms_m"] is None
+    assert seen["fit_arcs_corner_deg"] is None
+    assert seen["fit_arcs_max_dev_m"] is None
+    assert seen["close_shape"] is False
