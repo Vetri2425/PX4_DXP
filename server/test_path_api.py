@@ -2723,3 +2723,43 @@ def test_extensions_still_refuse_a_missing_file(tmp_path):
     mgr = PathManager(str(tmp_path))
     with pytest.raises(FileNotFoundError):
         mgr.save_extension_config("nope.csv", True, 0.5, 0.5, per_line=False)
+
+
+def test_survey_csv_preview_matches_plan_and_load_with_extensions(tmp_path):
+    """A16 follow-up: preview_path / load_path must honor the CSV extension
+    sidecar the same way plan_path does.
+
+    Before this, save_extension_config succeeded for a survey CSV (A16) but
+    preview still built a bare PathEngine — so the map showed no PRE/AFT while
+    plan-and-stage drove them. Mirror the DXF parity test
+    test_preview_spray_flags_match_executed_path_with_extensions.
+
+    per_line=False = chain-ends mode (open-run PRE/AFT only). Closed loops with
+    per_line=True are an operator choice via the sidecar; not asserted here.
+    """
+    (tmp_path / "curve.csv").write_text(_SURVEY_CSV)
+    mgr = PathManager(str(tmp_path))
+
+    off = mgr.plan_path("curve.csv", summary_only=False)
+    mark_off = off["mark_length_m"]
+    wp_off = off["num_waypoints"]
+
+    mgr.save_extension_config("curve.csv", True, 0.5, 0.5, per_line=False)
+
+    planned = mgr.plan_path("curve.csv", summary_only=False)
+    preview = mgr.preview_path("curve.csv")
+    executed = mgr.load_path("curve.csv")
+
+    assert preview.num_points == planned["num_waypoints"]
+    assert preview.num_points == len(executed)
+    assert [(w.north, w.east) for w in preview.waypoints] == planned["merged_waypoints"]
+    assert executed == planned["merged_waypoints"]
+
+    # PRE/AFT are TRANSIT → spray OFF at the ends.
+    assert preview.waypoints[0].spray is False
+    assert preview.waypoints[-1].spray is False
+
+    # MARK length byte-for-byte unchanged; only deadhead transit grows.
+    assert planned["mark_length_m"] == pytest.approx(mark_off, abs=1e-9)
+    assert planned["num_waypoints"] > wp_off
+    assert planned["transit_length_m"] > off["transit_length_m"]

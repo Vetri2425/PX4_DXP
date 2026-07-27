@@ -727,11 +727,12 @@ class PathManager:
         fpath = os.path.join(self._dir, os.path.basename(name))
         if os.path.isfile(fpath):
             ext = os.path.splitext(fpath)[1].lower()
-            if ext == ".dxf":
-                # Route DXF through the full planning pipeline so the executed
-                # mission honors the saved per-file extension config + tuning
-                # (and extension-aware auto-origin), matching the preview. A bare
-                # PathEngine() here would silently drop PRE/AFT legs and tuning.
+            if ext == ".dxf" or self._is_survey_csv(name):
+                # Route DXF and survey CSVs through the full planning pipeline so
+                # the executed mission honors the saved per-file extension config
+                # + tuning (and extension-aware auto-origin), matching the
+                # preview. A bare PathEngine() here would silently drop PRE/AFT
+                # legs and tuning. Legacy headerless NED CSVs stay below.
                 result = self.plan_path(
                     name,
                     summary_only=False,
@@ -744,11 +745,11 @@ class PathManager:
                 origin != (0.0, 0.0) or start_position is not None
             ):
                 from path_engine import PathEngine
-                # Arc-fit surveyed curves (no-op for a legacy NED CSV, which has
-                # no LINE_CHAIN); matches preview_path + plan_path.
+                # Legacy headerless NED CSV with an origin/start — densify only.
+                # Survey CSVs are handled above via plan_path.
                 cfg = self.load_line_config(name)
                 engine = PathEngine(
-                    fit_arcs=self._is_survey_csv(name),
+                    fit_arcs=False,
                     fit_arcs_max_dev_m=cfg["fit_arcs_max_dev_m"],
                     fillet_corners_m=cfg["fillet_corners_m"],
                 )
@@ -904,13 +905,25 @@ class PathManager:
                     # Arc-fit a surveyed curve so the preview shows a true arc,
                     # not straight chords between vertices. Matches execution
                     # (plan_path auto-enables fit_arcs for survey CSVs too) and
-                    # honours the same per-file line config, so a corner fillet
-                    # the operator asked for is visible BEFORE they drive it.
-                    cfg = self.load_line_config(os.path.basename(fpath))
+                    # honours the same per-file line config + extension sidecar
+                    # (A16), so PRE/AFT run-ups and a corner fillet the operator
+                    # asked for are visible BEFORE they drive it. A bare
+                    # PathEngine() here would drop PRE/AFT and desync spray-flag
+                    # length from plan_path / load_path — the DXF preview
+                    # branch already documents that trap.
+                    safe = os.path.basename(fpath)
+                    enabled, pre_m, aft_m, per_line = (
+                        self.resolve_extension_settings(safe)
+                    )
+                    cfg = self.load_line_config(safe)
                     plan = PathEngine(
                         fit_arcs=True,
                         fit_arcs_max_dev_m=cfg["fit_arcs_max_dev_m"],
                         fillet_corners_m=cfg["fillet_corners_m"],
+                        enable_path_extensions=enabled,
+                        pre_extension_m=pre_m,
+                        aft_extension_m=aft_m,
+                        per_line_extensions=per_line,
                     ).plan_file(fpath)
                     pts = list(plan.merged_waypoints)
                     spray_flags = list(plan.spray_flags)
@@ -1432,12 +1445,22 @@ class PathManager:
             from path_engine.parsers.survey_csv import looks_like_survey_csv
             if looks_like_survey_csv(fpath):
                 from path_engine import PathEngine
-                # Arc-fit surveyed curves (matches preview_path + plan_path).
-                cfg = self.load_line_config(os.path.basename(fpath))
+                # Arc-fit + honor the extension sidecar (matches preview_path /
+                # plan_path / load_path). load_path normally routes survey CSVs
+                # through plan_path; this keeps any leftover caller consistent.
+                safe = os.path.basename(fpath)
+                enabled, pre_m, aft_m, per_line = (
+                    self.resolve_extension_settings(safe)
+                )
+                cfg = self.load_line_config(safe)
                 return PathEngine(
                     fit_arcs=True,
                     fit_arcs_max_dev_m=cfg["fit_arcs_max_dev_m"],
                     fillet_corners_m=cfg["fillet_corners_m"],
+                    enable_path_extensions=enabled,
+                    pre_extension_m=pre_m,
+                    aft_extension_m=aft_m,
+                    per_line_extensions=per_line,
                 ).plan_file(fpath).merged_waypoints
             return read_ned_csv(fpath)
         if ext == ".dxf":
