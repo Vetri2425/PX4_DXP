@@ -31,6 +31,59 @@
           border: 1px solid var(--line); padding: 10px 14px; border-radius: 5px; }
   .fill { border-bottom: 1px solid var(--ink); display: inline-block; min-width: 130px; }
   ul { margin: 6px 0 6px 20px; padding: 0; } li { margin: 3px 0; }
+
+  /* ── PRINT ─────────────────────────────────────────────────────────────
+     This sheet is meant to be carried into the field and written on, so the
+     print rules prioritise legibility and pen-space over screen fidelity:
+       · tick boxes become real, ink-visible squares big enough for a pen
+       · the record sheet and notes get generous writing room
+       · nothing splits across a page mid-row
+       · coloured status boxes keep their left rule but drop the fill, so a
+         mono printer still shows PASS/WARN/STOP and no ink is wasted
+     Tested against A4 portrait. */
+  @page { size: A4 portrait; margin: 12mm 10mm; }
+
+  @media print {
+    body { font-size: 10.5pt; line-height: 1.35; padding: 0; max-width: none;
+           color: #000; }
+    h1 { font-size: 16pt; margin-bottom: 2px; }
+    h2 { font-size: 12.5pt; margin: 14pt 0 5pt; padding-top: 6pt;
+         border-top: 1.5pt solid #000; break-after: avoid; page-break-after: avoid; }
+    h3 { font-size: 10.5pt; margin: 9pt 0 3pt; break-after: avoid; }
+    .sub, .meta { font-size: 9pt; color: #000; }
+
+    /* Never split a check row, a warning box or a code block across pages. */
+    table, pre, .box { break-inside: avoid; page-break-inside: avoid; }
+    tr, td, th { break-inside: avoid; page-break-inside: avoid; }
+    table { font-size: 9pt; width: 100%; }
+    th, td { padding: 4pt 5pt; border: 0.5pt solid #666; }
+    th { background: #eee !important; -webkit-print-color-adjust: exact;
+         print-color-adjust: exact; }
+    code, pre { background: transparent !important; border: 0.4pt solid #bbb;
+                font-size: 8.5pt; }
+    pre { padding: 5pt 6pt; }
+
+    /* Status boxes: keep the semantic left rule, drop the fill. */
+    .box { background: transparent !important; border: 0.5pt solid #999;
+           border-left: 3pt solid #000 !important; padding: 6pt 9pt; margin: 8pt 0; }
+
+    /* A tick box you can actually tick. */
+    td.chk { font-size: 0; }
+    td.chk::before { content: ""; display: inline-block; width: 11pt; height: 11pt;
+                     border: 0.9pt solid #000; }
+
+    /* Writing room. */
+    .fill { min-width: 42mm; border-bottom: 0.6pt solid #000; }
+    h3 + p[style] { min-height: 34mm !important; border: 0.5pt solid #999 !important; }
+
+    /* Each numbered part starts a fresh page — 0 · Pre-flight is the exception,
+       it should sit under the header on page 1. */
+    h2 { page-break-before: always; break-before: page; }
+    h1 + .sub + .meta + .box + h2,
+    h2:first-of-type { page-break-before: auto; break-before: auto; }
+
+    a { text-decoration: none; color: #000; }
+  }
 </style>
 </head>
 <body>
