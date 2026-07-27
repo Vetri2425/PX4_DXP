@@ -847,8 +847,13 @@ def _load_extension_config_checked(path_mgr, name: str) -> dict:
     fpath = os.path.join(MISSION_DIR, safe)
     if not os.path.isfile(fpath):
         raise FileNotFoundError(f"Path not found: {name!r}")
-    if os.path.splitext(fpath)[1].lower() != ".dxf":
-        raise ValueError("Path extensions are only configurable for DXF files")
+    # A16: the pre-line CSV product needs extensions too — they are what move
+    # the entry transient and the terminal shutoff OFF the painted line. Mirror
+    # PathManager._require_extendable rather than re-deriving the rule.
+    if os.path.splitext(fpath)[1].lower() != ".dxf" and not path_mgr._is_survey_csv(safe):
+        raise ValueError(
+            "Path extensions are only configurable for DXF files and survey CSVs"
+        )
     return path_mgr.load_extension_config(safe)
 
 

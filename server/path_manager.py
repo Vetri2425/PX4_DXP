@@ -252,6 +252,37 @@ class PathManager:
             raise ValueError(f"{what} only available for DXF files")
         return safe, fpath
 
+    def _require_extendable(self, filename: str, what: str) -> tuple[str, str]:
+        """Validate *filename* is a DXF **or a survey CSV** in the missions dir.
+
+        A16 (2026-07-27): extensions were gated to DXF only, which locked the
+        pre-line CSV product out of the one feature that fixes both of its
+        measured endpoint defects — the entry transient (station 1 missed by
+        4.05 cm on the 07-27 curve run) and the terminal shutoff that leaves the
+        LAST surveyed station unpainted (5.03 cm on the same run, 13.7 cm on the
+        square). With extensions on, the mark is approached with a run-up and
+        overrun by a run-out, so both transients happen OFF the painted line —
+        and `engine.py` takes `runout = aft_extension_m` instead of the 0.10 m
+        stub.
+
+        The engine already supported it: planning both 07-27 field CSVs with
+        explicit extension kwargs produced correct geometry with the MARK length
+        byte-for-byte unchanged (curve 4.711 m, square 6.045 m) — only deadhead
+        transit was added. Only this guard stood in the way.
+
+        Legacy headerless NED CSVs stay excluded, matching `_is_survey_csv`,
+        so their frozen behaviour is untouched.
+        """
+        safe = os.path.basename(filename)
+        fpath = os.path.join(self._dir, safe)
+        if not os.path.isfile(fpath):
+            raise FileNotFoundError(f"Path not found: {filename!r}")
+        if os.path.splitext(fpath)[1].lower() == ".dxf":
+            return safe, fpath
+        if self._is_survey_csv(safe):
+            return safe, fpath
+        raise ValueError(f"{what} only available for DXF files and survey CSVs")
+
     @staticmethod
     def _write_sidecar(sidecar: str, payload: dict) -> None:
         """Atomically write a JSON sidecar (tmp + os.replace)."""
@@ -500,7 +531,9 @@ class PathManager:
         saved. This stops an older frontend that POSTs without the per_line field
         from silently resetting it to False. Pass an explicit True/False to set it.
         """
-        safe, fpath = self._require_dxf(filename, "Path extensions are")
+        # A16: extensions now apply to survey CSVs too (the pre-line product);
+        # entity ordering and overrides stay DXF-only.
+        safe, fpath = self._require_extendable(filename, "Path extensions are")
         if pre_extension_m < 0.0:
             raise ValueError("pre_extension_m must be >= 0.0")
         if aft_extension_m < 0.0:
