@@ -5,7 +5,7 @@ import time
 
 from fastapi import APIRouter, Depends
 
-from auth import require_operator_or_machine
+from auth import require_operator_or_machine, require_token
 from config import MAX_ACTIVITY_LOG
 
 router = APIRouter(tags=["system"])
@@ -58,6 +58,28 @@ async def health_bridge():
         "last_recovery_reason": None,
         **snap,
     }
+
+
+@router.get("/health/origin", dependencies=[Depends(require_token)])
+async def health_origin():
+    """Is the EKF local-frame origin trustworthy? Straight answer, with numbers.
+
+    Returns the exact verdict `resolve_surveyed_points` enforces: status
+    (OK / NO_ORIGIN / ORIGIN_INVALID / UNVERIFIABLE / INCONSISTENT), the
+    declared origin, the origin IMPLIED by the live pose/global pair, their
+    disagreement in metres, and the threshold. `trusted` false means a surveyed
+    mission will refuse to place right now.
+
+    Token-protected like /telemetry/latest: the payload carries coordinates.
+    """
+    from main import ros_node
+    if ros_node is None:
+        return {
+            "status": "UNVERIFIABLE",
+            "trusted": False,
+            "detail": "ROS bridge not available — no telemetry to verify against",
+        }
+    return ros_node.get_origin_health()
 
 
 @router.get(

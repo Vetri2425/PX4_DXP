@@ -135,6 +135,36 @@ GPS_FIX_STALE_MS = float(os.environ.get("ROVER_GPS_FIX_STALE_MS", "500"))
 ORIGIN_REQUEST_PERIOD_S = float(os.environ.get("ROVER_ORIGIN_REQ_PERIOD_S", "10.0"))
 ORIGIN_REQUEST_MAX_TRIES = int(os.environ.get("ROVER_ORIGIN_REQ_MAX_TRIES", "30"))
 
+# ── EKF local-frame origin trust (2026-07-27 stale-origin field bug) ──────────
+# Max allowed disagreement (metres) between the DECLARED origin (gp_origin) and
+# the origin IMPLIED by a simultaneous (lat, lon, pos_n, pos_e) sample. Beyond
+# this, placement refuses — see server/origin_health.py for the full derivation.
+#
+# Budget for a HEALTHY sample:
+#   GLOBAL_POSITION_INT degE7 quantisation .......... ~1.1 cm N, ~1.1 cm E
+#   pose/global receive skew (<=POSE_GLOBAL_MAX_SKEW_MS
+#     = 100 ms) at up to 1.0 m/s (SPD-T1 ceiling) ... <=10 cm
+#   RTK_FIXED solution noise ......................... ~1-2 cm
+#   => worst-case healthy ~12 cm; measured on the rig 2026-07-27: 1.9-2.0 cm.
+# Smallest observed FAULT: 0.91 m (declared-but-wrong), 2.15/2.25 m (stale).
+# 0.30 m sits 2.5x above the worst healthy case and 3x below the smallest
+# observed fault — the widest gap available between the two populations.
+ORIGIN_CONSISTENCY_MAX_M = float(os.environ.get("ROVER_ORIGIN_MAX_DELTA_M", "0.30"))
+# Fail closed when NO declared origin is available at all. With this set the
+# non-deterministic live pose/global fallback in resolve_surveyed_points is
+# unreachable and surveyed missions refuse to place until gp_origin arrives
+# (the bounded MAV_CMD_REQUEST_MESSAGE retry normally fetches it within
+# ORIGIN_REQUEST_PERIOD_S). Set ROVER_ORIGIN_REQUIRE_DECLARED=0 to re-enable
+# the fallback — it places accurately but varies ~1 cm run to run, so a mission
+# placed that way is NOT bit-reproducible.
+ORIGIN_REQUIRE_DECLARED = os.environ.get("ROVER_ORIGIN_REQUIRE_DECLARED", "1") == "1"
+# A gap this long in /mavros/state means the FCU link or MAVROS itself went
+# away and came back — a new EKF session is possible, so the cached origin is
+# dropped and re-requested. Deliberately far above BRIDGE_STATE_STALE_MS
+# (2.5 s): a spurious invalidation costs a real refusal window, so it must take
+# several consecutive missed /mavros/state publishes, not one scheduling hiccup.
+ORIGIN_LINK_GAP_S = float(os.environ.get("ROVER_ORIGIN_LINK_GAP_S", "5.0"))
+
 POSE_GLOBAL_MAX_SKEW_MS = float(os.environ.get("ROVER_POSE_GLOBAL_SKEW_MS", "100"))
 # Liveness of the RPP controller itself, measured on receipt of /rpp/debug (which it
 # publishes every control tick). Distinct from the controller's own self-reported

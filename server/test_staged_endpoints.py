@@ -46,6 +46,26 @@ def _write_square_dxf(path, side=2.0):
     doc.saveas(str(path))
 
 
+class _OriginNode:
+    """Stand-in for RosBridgeNode, exposing only get_origin_health().
+
+    /load-to-controller fails CLOSED on a surveyed mission when the EKF
+    local-frame origin cannot be verified, so a surveyed load test must say
+    which of the two worlds it is in. Default = healthy.
+    """
+
+    def __init__(self, trusted=True, status="OK", detail="origin agrees", delta=0.019):
+        self._h = {"status": status, "trusted": trusted, "detail": detail,
+                   "delta_m": delta, "threshold_m": 0.30}
+
+    def get_origin_health(self):
+        return dict(self._h)
+
+
+def _trusted_origin(monkeypatch, **kw):
+    monkeypatch.setattr(main, "ros_node", _OriginNode(**kw), raising=False)
+
+
 def _setup(tmp_path, monkeypatch, name="square.dxf"):
     """Real PathManager + tmp MISSION_DIR/STAGING_DIR. Returns (mgr, staging)."""
     _write_square_dxf(tmp_path / name)
@@ -582,6 +602,7 @@ async def test_point_mission_load_to_controller_gets_must_hit_points(
     _, staging = _setup(tmp_path, monkeypatch)
     ctrl = OffboardController(None, deque())
     monkeypatch.setattr(main, "offboard_ctrl", ctrl)
+    _trusted_origin(monkeypatch)
 
     plan = await path_route.plan_and_stage("pts.csv", _point_req([True, True, True]))
     mid = plan.mission_summary.mission_id
@@ -594,6 +615,80 @@ async def test_point_mission_load_to_controller_gets_must_hit_points(
     assert resp["placement_mode"] == "GPS_SURVEYED"
     assert ctrl._loaded_pts == [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)]
     assert ctrl._loaded_must_hit == [True, True, True]
+
+
+async def test_surveyed_load_refuses_when_the_ekf_origin_is_untrustworthy(
+    tmp_path, monkeypatch
+):
+    """Fail closed at the COMMITMENT point, not just at start.
+
+    Same staged mission as the test above; the only difference is the origin
+    verdict. If the gate were missing this would return 200 and the operator
+    would carry a mission that is silently displaced by the origin delta.
+    """
+    from fastapi import HTTPException
+    from models import LoadMissionRequest
+
+    _setup(tmp_path, monkeypatch)
+    ctrl = OffboardController(None, deque())
+    monkeypatch.setattr(main, "offboard_ctrl", ctrl)
+    _trusted_origin(monkeypatch)     # healthy while staging
+
+    plan = await path_route.plan_and_stage("pts.csv", _point_req([True, True, True]))
+    mid = plan.mission_summary.mission_id
+
+    # ...then the FCU reboots between staging and loading.
+    _trusted_origin(monkeypatch, trusted=False, status="INCONSISTENT",
+                    detail="off by 2.147 m (limit 0.30 m)", delta=2.147)
+    with pytest.raises(HTTPException) as exc:
+        await path_route.load_mission_to_controller(LoadMissionRequest(mission_id=mid))
+    assert exc.value.status_code == 409
+    assert "INCONSISTENT" in exc.value.detail
+    assert "2.147" in exc.value.detail
+    assert ctrl._loaded_pts is None, "nothing may reach the controller"
+
+
+async def test_surveyed_load_refuses_when_the_origin_cannot_be_probed(
+    tmp_path, monkeypatch
+):
+    """No ROS bridge => no way to verify => refuse. An unavailable probe must
+    never read as a pass; that is the fail-open hole this shape of bug lives in."""
+    from fastapi import HTTPException
+    from models import LoadMissionRequest
+
+    _setup(tmp_path, monkeypatch)
+    ctrl = OffboardController(None, deque())
+    monkeypatch.setattr(main, "offboard_ctrl", ctrl)
+    _trusted_origin(monkeypatch)
+
+    plan = await path_route.plan_and_stage("pts.csv", _point_req([True, True, True]))
+    mid = plan.mission_summary.mission_id
+
+    monkeypatch.setattr(main, "ros_node", None, raising=False)
+    with pytest.raises(HTTPException) as exc:
+        await path_route.load_mission_to_controller(LoadMissionRequest(mission_id=mid))
+    assert exc.value.status_code == 503
+    assert ctrl._loaded_pts is None
+
+
+async def test_local_ned_load_is_not_gated_on_the_ekf_origin(tmp_path, monkeypatch):
+    """Scope guard: a LOCAL_NED mission never touches the EKF origin, so a bad
+    origin must not block it. Without this, the gate would be over-broad."""
+    from models import LoadMissionRequest
+
+    _setup(tmp_path, monkeypatch)
+    ctrl = OffboardController(None, deque())
+    monkeypatch.setattr(main, "offboard_ctrl", ctrl)
+    monkeypatch.setattr(main, "ros_node", None, raising=False)
+
+    plan = await path_route.plan_and_stage(
+        "square.dxf", PathPlanRequest(source="square.dxf")
+    )
+    mid = plan.mission_summary.mission_id
+    resp = await path_route.load_mission_to_controller(LoadMissionRequest(mission_id=mid))
+
+    assert resp["status"] == "success"
+    assert resp["placement_mode"] == "LOCAL_NED"
 
 
 async def test_plan_and_stage_ignores_points_without_gps_frame(tmp_path, monkeypatch):

@@ -506,6 +506,37 @@ def _assert_origin_gps_usable(origin_gps) -> None:
         )
 
 
+def _surveyed_origin_health():
+    """(health_dict, reason_if_unavailable) for the live EKF local-frame origin."""
+    from main import ros_node
+    if ros_node is None:
+        return None, "ROS bridge not available — the EKF origin cannot be verified"
+    try:
+        return ros_node.get_origin_health(), None
+    except Exception as exc:  # noqa: BLE001 — never let a health probe 500 a route
+        return None, f"EKF origin health probe failed: {exc}"
+
+
+def _assert_origin_trusted_for_surveyed(mission_id: str) -> None:
+    """Refuse a GPS_SURVEYED commitment when the EKF origin cannot be trusted.
+
+    Fail CLOSED: an unavailable probe is a refusal, not a pass. A surveyed
+    mission placed against a stale origin is displaced by the origin delta
+    (measured 2.15 m / 2.25 m on 2026-07-27) and shows no symptom at all until
+    the rover drives.
+    """
+    health, unavailable = _surveyed_origin_health()
+    if unavailable is not None:
+        raise HTTPException(503, f"Refusing surveyed mission {mission_id}: {unavailable}")
+    if not health.get("trusted"):
+        raise HTTPException(
+            409,
+            f"Refusing surveyed mission {mission_id}: EKF local-frame origin is "
+            f"not trustworthy [{health.get('status')}] — {health.get('detail')} "
+            "See GET /api/health/origin.",
+        )
+
+
 def _jsonable_geometry(geometry: dict) -> dict:
     def convert(value):
         if isinstance(value, tuple):
@@ -1346,6 +1377,22 @@ def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
         json.dump(staged_payload, f)
     os.replace(tmp, staging_file)  # atomic publish
 
+    # Advisory only. Staging is a planning act and legitimately happens with the
+    # rover off or still acquiring RTK, so it is NOT refused here — the hard
+    # gates are /load-to-controller and mission start, which are the points that
+    # actually bind the mission to the ground. This warning exists so a stale
+    # origin leaves a trace in the log at the moment the mission was authored.
+    if origin_gps:
+        health, unavailable = _surveyed_origin_health()
+        if unavailable is not None:
+            log.info("staged surveyed mission %s — origin not checkable: %s",
+                     mission_id, unavailable)
+        elif not health.get("trusted"):
+            log.warning(
+                "staged surveyed mission %s while the EKF local-frame origin is "
+                "NOT trustworthy [%s]: %s — load and start will refuse until this "
+                "clears", mission_id, health.get("status"), health.get("detail"))
+
     # Commercial estimates. Speeds are > 0 (engine validates before we get here).
     paint_l = result["mark_length_m"] * SPRAY_LITERS_PER_METER
     runtime_s = (
@@ -1420,12 +1467,25 @@ async def load_mission_to_controller(req: LoadMissionRequest):
             anchor.get("rotation_deg", 0.0), anchor.get("scale", 1.0),
         )
 
+    placement_mode = staged.get("placement_mode") or (
+        "GPS_SURVEYED" if staged.get("origin_gps") else "LOCAL_NED"
+    )
+
+    # ── Fail closed on an untrustworthy EKF local-frame origin ───────────────
+    # A surveyed mission is bound to the ground at START, through the EKF's
+    # declared local-frame origin. Refusing only at start is too late to be
+    # useful: load is the commitment point — it publishes the mission geometry
+    # the spray node latches, and it is what the operator does before walking
+    # the rover out. So the same verdict start enforces is checked here, and
+    # the operator finds out at the desk instead of in the field.
+    # (Staging is deliberately NOT gated: planning legitimately happens with the
+    # rover off. It logs a warning instead — see _stage_mission.)
+    if placement_mode == "GPS_SURVEYED":
+        _assert_origin_trusted_for_surveyed(safe_id)
+
     try:
         spray_flags = [bool(f) for f in staged.get("spray_flags", [])]
         must_hit = [bool(f) for f in staged.get("must_hit", [])]
-        placement_mode = staged.get("placement_mode") or (
-            "GPS_SURVEYED" if staged.get("origin_gps") else "LOCAL_NED"
-        )
         origin_gps = staged.get("origin_gps")
         if origin_gps is not None:
             origin_gps = (float(origin_gps[0]), float(origin_gps[1]))

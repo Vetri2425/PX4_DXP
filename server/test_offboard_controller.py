@@ -102,6 +102,13 @@ def test_start_disarms_if_rpp_stays_idle_after_path_publish():
         offboard_module.SETPOINT_STREAM_GRACE_S = old_grace
 
 
+# The EKF local-frame origin this field sample actually implies. Placement
+# refuses outright without a declared origin that agrees with the live
+# pose/global pair (origin_health), so a fixture that omits it is not a
+# telemetry state the rover can ever be in.
+_SURVEY_EKF_ORIGIN = (13.072019284527872, 80.26196407384334)
+
+
 def _healthy_survey_state(rpp_state=RPP_TRACKING):
     return {
         "connected": True,
@@ -118,6 +125,9 @@ def _healthy_survey_state(rpp_state=RPP_TRACKING):
         "pos_e": -0.9070,
         "lat": 13.0720864,
         "lon": 80.2619557,
+        "ekf_origin_received": True,
+        "ekf_origin_lat": _SURVEY_EKF_ORIGIN[0],
+        "ekf_origin_lon": _SURVEY_EKF_ORIGIN[1],
     }
 
 
@@ -186,7 +196,12 @@ def test_surveyed_start_skips_entry_when_on_first_point():
     try:
         anchor = (13.072066, 80.261956)
         state = _healthy_survey_state()
-        state["lat"], state["lon"] = anchor      # rover AT the survey anchor → R_anchor ≈ 0
+        # Rover parked AT the survey anchor → R_anchor ≈ 0. Both halves of the
+        # sample move together: lat/lon AND the local pose the EKF would report
+        # for that lat/lon (computed independently of path_engine.ned, small-angle
+        # equirectangular on PX4's sphere, agrees to 0.02 mm).
+        state["lat"], state["lon"] = anchor
+        state["pos_n"], state["pos_e"] = 5.194523496337718, -0.8745059958907082
         node = FakeNode([state, dict(state)])
         ctrl = OffboardController(node, deque())
         # source[0] is 3.5 cm from the anchor origin — inside ENTRY_SKIP_DIST_M.
@@ -204,7 +219,7 @@ def test_surveyed_start_skips_entry_when_on_first_point():
         assert name == "publish_path"
         # First publish is the placed MARKING path (wp0 = live pose + source[0]),
         # not a [live_pose, target] entry leg.
-        assert pts[0] == pytest.approx((7.4629, -0.9420), abs=0.02)
+        assert pts[0] == pytest.approx((5.1945, -0.9095), abs=0.02)
     finally:
         offboard_module.SETPOINT_STREAM_GRACE_S = old_grace
 

@@ -40,6 +40,8 @@ from nav_msgs.msg import Path
 from std_msgs.msg import Bool, Float32MultiArray, String
 
 from config import (
+    ORIGIN_CONSISTENCY_MAX_M,
+    ORIGIN_LINK_GAP_S,
     ORIGIN_REQUEST_MAX_TRIES,
     ORIGIN_REQUEST_PERIOD_S,
     SRV_RPP_GET_PARAMS,
@@ -49,6 +51,7 @@ from config import (
     SRV_SPRAY_SET_PARAMS,
 )
 from logging_setup import get_logger
+from origin_health import INCONSISTENT, OK, UNVERIFIABLE, evaluate_origin_health
 from rpp_status import RppStatusMonitor
 
 log = get_logger("server.ros")
@@ -175,6 +178,13 @@ class RosBridgeNode(Node):
         "ekf_origin_lon": 0.0,
         "ekf_origin_received": False,
         "ekf_origin_stamp": None,
+        # Why the cached origin was last dropped (FCU reboot / MAVROS restart /
+        # measured inconsistency) and when — surfaced verbatim in the placement
+        # refusal and on GET /api/health/origin so the operator sees the cause,
+        # not just the symptom. None => never invalidated in this process.
+        "ekf_origin_invalid_reason": None,
+        "ekf_origin_invalidated_at": None,
+        "ekf_origin_invalidations": 0,
         "gps_fix_received": False,
         "heading_ned_deg": 0.0,
         "battery_v": 0.0,
@@ -440,11 +450,38 @@ class RosBridgeNode(Node):
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
     def _cb_state(self, msg) -> None:
-        self._state_recv_time = time.monotonic()
+        now = time.monotonic()
+        prev_recv = self._state_recv_time
+        self._state_recv_time = now
         with self._lock:
+            prev_connected = bool(self._state.get("connected", False))
             self._state["armed"] = msg.armed
             self._state["mode"] = msg.mode
             self._state["connected"] = msg.connected
+
+        # ── Cached-origin invalidation on link re-establishment ──────────────
+        # The EKF local-frame origin is per-EKF-session, but it lives in THIS
+        # process's state — which survives an FCU reboot and a MAVROS restart.
+        # Field bug 2026-07-27: the server kept serving a dead session's origin
+        # and placed two missions 2.15 m / 2.25 m off the surveyed line.
+        #
+        # Two independent signals, OR'd, because either alone can miss:
+        #   * connected False->True — MAVROS itself declaring the FCU link came
+        #     back (heartbeat timeout), the normal FCU-reboot signature.
+        #   * a long gap in /mavros/state — MAVROS restarted or the topic
+        #     stalled, which connected cannot report because a TRANSIENT_LOCAL
+        #     State message keeps reading connected=True while the process dies.
+        # Neither is trusted to be complete: the consistency gate in
+        # origin_health is the mechanism-independent backstop. This half is
+        # about RECOVERY (re-arm the request path), not detection.
+        gap_s = (now - prev_recv) if prev_recv is not None else None
+        if bool(msg.connected) and not prev_connected:
+            self._invalidate_ekf_origin("FCU link re-established (connected False->True)")
+        elif gap_s is not None and gap_s > ORIGIN_LINK_GAP_S:
+            self._invalidate_ekf_origin(
+                f"/mavros/state gap of {gap_s:.1f} s (> {ORIGIN_LINK_GAP_S:.1f} s) "
+                "— MAVROS restarted or the link stalled"
+            )
 
     def _cb_pose(self, msg) -> None:
         """ENU (MAVROS REP-103) → NED conversion."""
@@ -524,30 +561,89 @@ class RosBridgeNode(Node):
         stamp = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
         with self._lock:
             prev_lat = self._state.get("ekf_origin_lat")
+            prev_lon = self._state.get("ekf_origin_lon")
             prev_recv = self._state.get("ekf_origin_received")
             self._state["ekf_origin_lat"] = lat
             self._state["ekf_origin_lon"] = lon
             self._state["ekf_origin_stamp"] = stamp
             self._state["ekf_origin_received"] = True
+            # A value has arrived, so whatever caused the last drop is answered.
+            # Keep the counter (how many times this process has been through it)
+            # as a field-diagnostic breadcrumb.
+            self._state["ekf_origin_invalid_reason"] = None
+        # Fresh datum in hand: give the request path its full budget back for
+        # the NEXT fault episode, instead of burning the process-lifetime cap on
+        # the first one. Bounded per episode, not per process.
+        self._origin_req_count = 0
         if not prev_recv:
             log.info("EKF local-frame origin received: %.8f, %.8f", lat, lon)
-        elif prev_lat != lat:
+        elif prev_lat != lat or prev_lon != lon:
             # A moved origin invalidates any already-placed mission.
             log.warning(
-                "EKF local-frame origin CHANGED to %.8f, %.8f — previously placed "
-                "missions are no longer valid, re-place before driving", lat, lon)
+                "EKF local-frame origin CHANGED from %.8f, %.8f to %.8f, %.8f — "
+                "previously placed missions are no longer valid, re-place before "
+                "driving", prev_lat, prev_lon, lat, lon)
+
+    def _invalidate_ekf_origin(self, reason: str) -> None:
+        """Drop the cached EKF origin and re-arm the GPS_GLOBAL_ORIGIN request.
+
+        Called when something happened that could have started a NEW EKF session
+        (FCU reboot, MAVROS restart) or when the cached origin has been measured
+        to disagree with the live frame. The coordinates are cleared, not merely
+        flagged, so no consumer can read a dead session's datum by forgetting to
+        check `ekf_origin_received`.
+        """
+        with self._lock:
+            had = bool(self._state.get("ekf_origin_received"))
+            prev = (self._state.get("ekf_origin_lat"),
+                    self._state.get("ekf_origin_lon"))
+            self._state["ekf_origin_received"] = False
+            self._state["ekf_origin_lat"] = 0.0
+            self._state["ekf_origin_lon"] = 0.0
+            self._state["ekf_origin_stamp"] = None
+            self._state["ekf_origin_invalid_reason"] = reason
+            self._state["ekf_origin_invalidated_at"] = time.time()
+            if had:
+                self._state["ekf_origin_invalidations"] = (
+                    int(self._state.get("ekf_origin_invalidations", 0)) + 1
+                )
+        # Re-arm the bounded request path: without this reset the tick would
+        # never ask again once the process-lifetime cap had been reached.
+        self._origin_req_count = 0
+        if had:
+            log.warning(
+                "EKF local-frame origin INVALIDATED (was %.8f, %.8f): %s — surveyed "
+                "placement will REFUSE until a fresh GPS_GLOBAL_ORIGIN arrives; "
+                "re-place any staged mission before driving", prev[0], prev[1], reason)
 
     def _request_ekf_origin_tick(self) -> None:
-        """Ask PX4 for GPS_GLOBAL_ORIGIN until we have it (bounded retries).
+        """Ask PX4 for GPS_GLOBAL_ORIGIN while we do not have a trustworthy one.
 
         MAV_CMD_REQUEST_MESSAGE (512) with param1 = 49. This is a pure telemetry
         request — it cannot move the vehicle — but it is still a command to the
-        FCU, so it is bounded and stops the moment the origin arrives.
+        FCU, so it is bounded.
+
+        Two changes from the original "ask until we have any value at all":
+          * A measured-INCONSISTENT origin also re-requests. That is the case
+            where MAVROS is latching a value from a dead EKF session; asking
+            makes PX4 re-send the live one. (If PX4 itself is the one reporting
+            the wrong datum, re-asking cannot fix it — placement still refuses,
+            which is the point.)
+          * The budget resets whenever a trustworthy origin is in hand, so the
+            cap is per fault episode rather than per process lifetime. A rover
+            left running across several FCU reboots used to exhaust it once and
+            then never ask again.
         """
-        with self._lock:
-            have = bool(self._state.get("ekf_origin_received"))
-            connected = bool(self._state.get("connected"))
-        if have or not connected:
+        state = self.get_state()
+        if not state.get("connected"):
+            return
+        health = evaluate_origin_health(state, ORIGIN_CONSISTENCY_MAX_M)
+        if health.status == OK:
+            self._origin_req_count = 0
+            return
+        if health.status == UNVERIFIABLE and state.get("ekf_origin_received"):
+            # We hold an origin but cannot currently check it (no RTK fix yet,
+            # stale pose). Do not spam the FCU on the strength of a maybe.
             return
         if self._origin_req_count >= ORIGIN_REQUEST_MAX_TRIES:
             return
@@ -563,11 +659,13 @@ class RosBridgeNode(Node):
             fut = self._command_cli.call_async(req)
             fut.add_done_callback(lambda _f: None)
             log.info(
-                "requested GPS_GLOBAL_ORIGIN from PX4 (attempt %d/%d) — the latched "
-                "gp_origin topic was empty", self._origin_req_count,
-                ORIGIN_REQUEST_MAX_TRIES)
+                "requested GPS_GLOBAL_ORIGIN from PX4 (attempt %d/%d) — origin "
+                "status is %s", self._origin_req_count, ORIGIN_REQUEST_MAX_TRIES,
+                health.status)
         except Exception:
             log.exception("GPS_GLOBAL_ORIGIN request failed")
+        if health.status == INCONSISTENT:
+            log.warning("origin re-request reason: %s", health.detail)
     def _cb_gps_raw(self, msg) -> None:
         with self._lock:
             self._gps_fix_recv_time = time.monotonic()
@@ -759,6 +857,21 @@ class RosBridgeNode(Node):
             "armed": armed,
             "mode": mode,
         }
+
+    def get_origin_health(self) -> dict[str, Any]:
+        """Is the cached EKF local-frame origin the frame PX4 is publishing?
+
+        The SAME evaluation surveyed placement enforces, so the operator answer
+        and the machine decision can never disagree. Read-only; commands nothing.
+        """
+        state = self.get_state()
+        health = evaluate_origin_health(state, ORIGIN_CONSISTENCY_MAX_M)
+        out = health.as_dict()
+        out["invalidated_at"] = state.get("ekf_origin_invalidated_at")
+        out["invalidations"] = state.get("ekf_origin_invalidations", 0)
+        out["origin_stamp"] = state.get("ekf_origin_stamp")
+        out["fcu_connected"] = bool(state.get("connected", False))
+        return out
 
     def get_rpp_monitor(self) -> RppStatusMonitor:
         return self._rpp_monitor

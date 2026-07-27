@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends
 from auth import require_token
 from config import GPS_FIX_NAMES, RPP_STATE_NAMES, format_gps_coord
 from models import MissionState, TelemetryData
+from origin_health import evaluate_origin_health
 
 router = APIRouter(
     prefix="/telemetry",
@@ -23,6 +24,7 @@ async def telemetry_latest():
     if ros_node is None:
         return TelemetryData()
     s = ros_node.get_state()
+    origin = evaluate_origin_health(s)
     code = s.get("rpp_state", 0)
     spraying = bool(s.get("spraying", False))
     mission_running = (
@@ -71,4 +73,7 @@ async def telemetry_latest():
         global_position_age_ms= s.get("global_position_age_ms"),
         gps_fix_age_ms        = s.get("gps_fix_age_ms"),
         pose_global_skew_ms   = s.get("pose_global_skew_ms"),
+        origin_status         = origin.status,
+        origin_trusted        = origin.trusted,
+        origin_delta_m        = origin.delta_m,
     )

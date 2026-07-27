@@ -23,10 +23,17 @@ from collections.abc import Iterable
 from config import (
     GLOBAL_POSITION_STALE_MS,
     GPS_FIX_STALE_MS,
+    ORIGIN_REQUIRE_DECLARED,
     POSE_GLOBAL_MAX_SKEW_MS,
     POSE_STALE_MS,
 )
 from logging_setup import get_logger
+from origin_health import (
+    INCONSISTENT,
+    NO_ORIGIN,
+    OK,
+    evaluate_origin_health,
+)
 from path_engine.ned import latlon_to_ned
 
 log = get_logger("server.placement")
@@ -136,25 +143,49 @@ def resolve_surveyed_points(
     # (the skew gate permits 100 ms, which is 3.5 cm at 0.35 m/s). Measured
     # consequence of the live pair: the same file published paths 0.39-1.53 cm
     # apart, in scattered directions, run to run.
-    if state.get("ekf_origin_received"):
-        origin_lat, origin_lon = _finite_pair(
-            (state.get("ekf_origin_lat"), state.get("ekf_origin_lon")),
-            "EKF local-frame origin",
-        )
-        if -90.0 <= origin_lat <= 90.0 and -180.0 <= origin_lon <= 180.0:
-            translation = latlon_to_ned(
-                anchor_lat, anchor_lon, origin_lat, origin_lon
+    #
+    # But "we have an origin" is NOT the same as "the origin is right". The
+    # server caches it in process state, so a MAVROS restart or an FCU reboot
+    # leaves a datum from a DEAD EKF session in place — measured 2026-07-27:
+    # two runs placed 2.15 m and 2.25 m off the surveyed line, with no symptom
+    # until the rover moved. Freshness is not sufficient either: the same rig
+    # later held a present, recent origin that was still 0.91 m from the frame
+    # PX4 was publishing. So the origin is MEASURED against the live frame
+    # before it is used (origin_health.evaluate_origin_health), and anything
+    # short of agreement is a refusal — never a quiet downgrade to the live-pair
+    # fallback below, which would hide exactly this fault.
+    health = evaluate_origin_health(state)
+    if health.status == OK:
+        origin_lat, origin_lon = health.declared
+        translation = latlon_to_ned(anchor_lat, anchor_lon, origin_lat, origin_lon)
+        if not all(math.isfinite(v) for v in translation):
+            raise PlacementError(
+                "survey translation through the EKF origin is non-finite "
+                f"(anchor {anchor_lat}, {anchor_lon}; "
+                f"origin {origin_lat}, {origin_lon})"
             )
-            if all(math.isfinite(v) for v in translation):
-                return _apply_translation(source_points, translation)
-        log.warning(
-            "EKF origin present but invalid (%s, %s) — falling back to the live "
-            "pose/global pair", state.get("ekf_origin_lat"), state.get("ekf_origin_lon"))
-    else:
-        log.warning(
-            "no EKF local-frame origin (/mavros/global_position/gp_origin is empty) "
-            "— falling back to the live pose/global pair; placement will vary "
-            "~1 cm run to run")
+        return _apply_translation(source_points, translation)
+
+    if health.status != NO_ORIGIN or ORIGIN_REQUIRE_DECLARED:
+        # INCONSISTENT / ORIGIN_INVALID / UNVERIFIABLE always refuse; NO_ORIGIN
+        # refuses too unless the operator explicitly opted into the degraded
+        # live-pair mode. The message carries the measured numbers so the
+        # refusal is actionable rather than mysterious.
+        log.error("surveyed placement refused: %s", health.detail)
+        raise PlacementError(
+            "EKF local-frame origin is not trustworthy — "
+            + health.detail
+            + " Placement refuses rather than silently displace the mission; "
+            "check GET /api/health/origin and re-place once the origin is OK."
+        )
+
+    # ── Degraded, explicitly enabled (ROVER_ORIGIN_REQUIRE_DECLARED=0) ────────
+    # Only reachable when no origin was ever declared. A single live pair is
+    # self-consistent with the current frame — accurate — but not reproducible.
+    log.warning(
+        "no EKF local-frame origin (%s) and ROVER_ORIGIN_REQUIRE_DECLARED=0 — "
+        "placing from the live pose/global pair; placement will vary ~1 cm run "
+        "to run and is NOT reproducible", health.detail)
 
     # ── Fallback: single live pose/global pair (non-deterministic) ────────────
     rover_local_n, rover_local_e = _finite_pair(

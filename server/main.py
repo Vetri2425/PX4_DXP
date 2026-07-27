@@ -54,6 +54,7 @@ from config import (
 )
 from logging_setup import configure_logging, get_logger
 from models import MissionState
+from origin_health import evaluate_origin_health
 
 # ── sd_notify for systemd watchdog ────────────────────────────────────────────
 _sd_notifier = None
@@ -351,6 +352,7 @@ async def _telemetry_loop() -> None:
                     continue
 
                 s = ros_node.get_state()
+                origin_health = evaluate_origin_health(s)
                 code = s.get("rpp_state", 0)
                 now = time.time()
                 spraying = bool(s.get("spraying", False))
@@ -408,6 +410,12 @@ async def _telemetry_loop() -> None:
                     "global_position_age_ms": s.get("global_position_age_ms"),
                     "gps_fix_age_ms": s.get("gps_fix_age_ms"),
                     "pose_global_skew_ms": s.get("pose_global_skew_ms"),
+                    # EKF origin trust — the only warning the operator gets
+                    # before a stale origin displaces the whole mission. Same
+                    # evaluation the placement gate enforces.
+                    "origin_status": origin_health.status,
+                    "origin_trusted": origin_health.trusted,
+                    "origin_delta_m": origin_health.delta_m,
                 }
                 # Joystick/arbiter snapshot (plan §5) — load-bearing for client
                 # safety: the client detects lease loss / mission takeover only

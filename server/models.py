@@ -125,6 +125,16 @@ class TelemetryData(BaseModel):
     global_position_age_ms: Optional[float] = None
     gps_fix_age_ms: Optional[float] = None
     pose_global_skew_ms: Optional[float] = None
+    # EKF local-frame origin trust. `origin_trusted` false means a surveyed
+    # mission will REFUSE to place right now — the client should surface this
+    # before the operator walks the rover out, because a stale origin has no
+    # other symptom until the rover drives to the wrong place.
+    # `origin_delta_m` is the measured disagreement between the declared origin
+    # and the one implied by the live pose/global pair (see
+    # GET /api/health/origin for the full breakdown).
+    origin_status: Optional[str] = None
+    origin_trusted: Optional[bool] = None
+    origin_delta_m: Optional[float] = None
 
 
 class PathInfo(BaseModel):

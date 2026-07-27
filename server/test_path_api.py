@@ -1909,9 +1909,19 @@ async def test_plan_then_load_to_controller_round_trip(monkeypatch, tmp_path):
         def load_path(self, points, name=None, spray_flags=None, **kwargs):
             self.loaded = (list(points), name, spray_flags, kwargs)
 
+    class _OriginNode:
+        """Healthy EKF-origin verdict. /load-to-controller fails closed on a
+        surveyed mission without one, so the test has to declare which world
+        it is in rather than inherit whatever main.ros_node happens to be."""
+
+        def get_origin_health(self):
+            return {"status": "OK", "trusted": True, "delta_m": 0.019,
+                    "detail": "origin agrees", "threshold_m": 0.30}
+
     fake_ctrl = FakeController()
     monkeypatch.setattr(main, "path_mgr", FakePathManager())
     monkeypatch.setattr(main, "offboard_ctrl", fake_ctrl)
+    monkeypatch.setattr(main, "ros_node", _OriginNode(), raising=False)
 
     req = PathPlanRequest(source="soccer_field_penalty_area.dxf")
     data = await plan_path(req)
