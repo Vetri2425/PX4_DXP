@@ -1287,6 +1287,29 @@ def _surveyed_latlon_from_source(manifest) -> tuple[list, str]:
     # too so old test bundles keep working.
     staged = ((manifest or {}).get("plan_provenance")
               or (manifest or {}).get("staged_mission") or {})
+
+    # Preferred: ground truth staged INSIDE the mission artifact. An app-planned
+    # trajectory (POST /api/path/plan-trajectory) has no source file at all —
+    # the geometry was fitted in the app and posted as NED runs — so there is
+    # nothing for the file branch below to re-read and §8 would report "source
+    # file unavailable" on every such mission. It is still INDEPENDENT of the
+    # mission's own anchor, which is the property that makes §8 mean anything:
+    # these lat/lon came off the surveyor's receiver, not from inverting T.
+    gt = staged.get("survey_ground_truth")
+    if isinstance(gt, list) and gt:
+        pts = []
+        for row in gt:
+            if not isinstance(row, dict):
+                continue
+            try:
+                lat, lon = float(row["lat"]), float(row["lon"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if abs(lat) <= 90.0 and abs(lon) <= 180.0:
+                pts.append((lat, lon))
+        if pts:
+            return pts, f"staged survey_ground_truth ({len(pts)} point(s))"
+
     src = staged.get("source_file")
     if not src or not os.path.isfile(src):
         return [], f"source file unavailable ({src or 'not recorded'})"

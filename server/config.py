@@ -215,6 +215,18 @@ TOKEN_FILE_DEFAULT = os.environ.get(
 ALLOWED_UPLOAD_EXTENSIONS = {".waypoints", ".csv", ".dxf"}
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MiB (DXF files can be large)
 
+# ── App-planned trajectory limits (POST /api/path/plan-trajectory) ────────────
+# MAX_UPLOAD_BYTES guards multipart /upload; it does NOT see a JSON body, so
+# without these an oversized trajectory reaches the densifier and surfaces as an
+# opaque timeout. Both are checked by the request model / route validation, so a
+# too-large payload is a clear 422 naming the count and the limit.
+#
+# Sizing: the app's own worst case is ~1.1 km of road ≈ 4 k input points across
+# a few hundred runs. These sit an order of magnitude above that — they are a
+# runaway guard, not a working limit.
+MAX_TRAJECTORY_RUNS = 5000
+MAX_TRAJECTORY_POINTS = 200000
+
 # ── Joystick / manual control (docs/Architecture/JOYSTICK_CONTROLLER_PLAN.md) ──
 # Master switch. MUST stay "0" until the firmware gates in the plan (§7.1 axis
 # mapping, §7.2 COM_RC_IN_MODE) are bench-verified — see plan §8 phase J3.

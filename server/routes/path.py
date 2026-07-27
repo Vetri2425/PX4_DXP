@@ -13,6 +13,7 @@ POST   /api/path/plan          — run full planning pipeline, return PlannedPat
 POST   /api/path/{name}/align          — alignment only (coords + residuals)
 GET    /api/path/{name}/segments       — verification segments (MARK/TRANSIT/ext)
 POST   /api/path/{name}/plan-and-stage — heavy final plan + stage
+POST   /api/path/plan-trajectory       — densify + stage an app-planned trajectory
 GET    /api/path/staged/{mission_id}   — read a staged mission artifact
 DELETE /api/path/{filename}    — delete uploaded file
 """
@@ -32,6 +33,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
 from auth import require_token
 from config import (
+    MAX_TRAJECTORY_POINTS,
     MAX_UPLOAD_BYTES,
     MISSION_DIR,
     RMSE_MAX,
@@ -69,13 +71,18 @@ from models import (
     PathPreviewResponse,
     PathPublishRequest,
     PathSegmentsResponse,
+    PlanTrajectoryRequest,
+    PlanTrajectoryResponse,
     RefPointResidual,
     SegmentInfo,
     SprayModeDashRequest,
     SprayModePointRequest,
     StagedMissionResponse,
+    TrajectoryRunEcho,
 )
 from path_manager import UploadValidationError
+from path_engine.core import PathSegment, SegmentType
+from path_engine.engine import PathEngine
 from path_engine.entity_order import apply_entity_order as _apply_entity_order_shared
 
 log = logging.getLogger("server.routes.path")
@@ -1300,12 +1307,26 @@ def _source_detail(result: dict) -> dict | None:
     return detail or None
 
 
-def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
-                   rmse: float) -> MissionSummary:
+def _stage_mission(req: PathPlanRequest | PlanTrajectoryRequest, result: dict,
+                   alignment_meta: dict, rmse: float,
+                   survey_ground_truth: list[dict] | None = None) -> MissionSummary:
     """Write the aligned mission to a staging file and return its summary.
 
     The staged artifact is the single source of truth for the subsequent
     /load-to-controller step, so the operator loads exactly what was previewed.
+
+    ``req`` is duck-typed: everything read off it (spray_mode, the dash trio,
+    the point pair, survey_tolerance_m, marking_speed/transit_speed) is present
+    on both PathPlanRequest and PlanTrajectoryRequest, which is what lets the
+    app-planned trajectory flow reuse this staging code unchanged.
+
+    ``survey_ground_truth`` — surveyed lat/lon bound to the mission's own NED
+    vertices, staged INSIDE the artifact. Only the app-planned trajectory flow
+    passes it: that flow has no source file, so ``analyze_mission``'s §8
+    absolute accuracy has nothing to re-read and would go silent on every
+    mission from it — shipping the feature with the one whole-mission-
+    misplacement detector switched off. File-based missions pass None and keep
+    re-reading their source, byte-for-byte as before.
     """
     os.makedirs(STAGING_DIR, exist_ok=True)
     _prune_staging()
@@ -1370,6 +1391,11 @@ def _stage_mission(req: PathPlanRequest, result: dict, alignment_meta: dict,
             "total_length_m": result["total_length_m"],
         },
     }
+
+    # Absent, not null, when there is none — so an artifact from a file-based
+    # mission is byte-identical to what it was before this key existed.
+    if survey_ground_truth:
+        staged_payload["survey_ground_truth"] = survey_ground_truth
 
     staging_file = os.path.join(STAGING_DIR, f"{mission_id}.json")
     tmp = staging_file + ".tmp"
@@ -2033,6 +2059,480 @@ async def plan_and_stage(name: str, req: PathPlanRequest):
         planning_metadata=result.get("planning_metadata"),
         warnings=warnings or None,
         mission_summary=mission_summary,
+    )
+
+
+# ── App-planned trajectory: POST /api/path/plan-trajectory ────────────────────
+#
+# The app has already fitted the geometry and decided the order. This endpoint
+# densifies it and stages it. Nothing else.
+#
+# It exists because the file flow can express the same mission but has five
+# parameter traps, every one of which fails SILENTLY and paints the wrong thing:
+#
+#   optimize=False without explicit travel rows  → two paint runs 50 m apart
+#                                                  merge; the rover paints the gap
+#   header "north,east" not "north_m,east_m"     → routed to read_survey_csv and
+#                                                  the app's fit is re-derived
+#   corner_smooth_radius_m > 0                   → re-smooths already-fitted arcs
+#                                                  (not gated for NED CSV)
+#   two runs sharing an endpoint                 → group_shapes (hardcoded True in
+#                                                  plan_path) fuses them
+#   two coincident runs                          → engine step 1c drops one, so a
+#                                                  deliberate double pass vanishes
+#
+# Here all five are unreachable by construction rather than by the caller
+# remembering to avoid them: the request model cannot express the knobs, and the
+# engine is configured at THIS call site (see the contract block in
+# plan_trajectory) instead of taking values from the body.
+
+# How far two run endpoints may sit apart and still count as touching. The app
+# guarantees exact equality; this is the guard against the next client.
+_TRAJ_JOIN_TOL_M = 0.05
+# Heading change between consecutive runs above which the operator is warned
+# (not refused — a sharp reversal is legitimate on a real marking job).
+_TRAJ_HEADING_WARN_DEG = 120.0
+# Per-category cap. A 4000-run import with a systematic problem would otherwise
+# return 4000 warnings, which is the same as returning none — nobody reads it.
+_TRAJ_MAX_WARNINGS = 10
+
+
+def _traj_len(points) -> float:
+    """Arc length of a run, in metres."""
+    return sum(math.hypot(points[i + 1][0] - points[i][0],
+                          points[i + 1][1] - points[i][1])
+               for i in range(len(points) - 1))
+
+
+def _traj_heading(p0, p1) -> float | None:
+    """Bearing of p0→p1 in radians, or None for a zero-length step."""
+    dn, de = p1[0] - p0[0], p1[1] - p0[1]
+    if math.hypot(dn, de) < 1e-9:
+        return None
+    return math.atan2(de, dn)
+
+
+def _validate_trajectory(req: PlanTrajectoryRequest) -> list[str]:
+    """Reject the trajectories that today produce wrong paint with no error.
+
+    Raises HTTPException(422) on rule 1-8; returns the operator-judgement
+    warnings (which never block). Runs BEFORE any planning, so a bad payload
+    costs nothing and the message names the run that is wrong.
+
+    Rule 1 is the one that matters: two adjacent MARK runs with no travel leg
+    between them are one contiguous spray region to everything downstream, so
+    the rover paints straight across the gap between them.
+    """
+    runs = req.runs
+    warnings: list[str] = []
+
+    # Size ceiling first, before anything walks the points. MAX_UPLOAD_BYTES
+    # guards multipart /upload and never sees a JSON body, so this is the only
+    # thing standing between a pathological payload and a worker held for the
+    # full timeout.
+    total_points = sum(len(run.points) for run in runs)
+    if total_points > MAX_TRAJECTORY_POINTS:
+        raise HTTPException(
+            422,
+            f"trajectory has {total_points} points, over the {MAX_TRAJECTORY_POINTS} "
+            "limit for a single request — split the mission.",
+        )
+
+    # Rule 5 next: every later rule does geometry, and hypot(nan) propagates
+    # quietly into a "gap" of nan that compares False against every threshold —
+    # so an unchecked nan would sail through the continuity rules below.
+    for i, run in enumerate(runs):
+        for j, pt in enumerate(run.points):
+            if not (math.isfinite(pt[0]) and math.isfinite(pt[1])):
+                raise HTTPException(422, f"runs[{i}].points[{j}] is not finite")
+        # Rule 4. Normally unreachable — TrajectoryRun pins min_length=2, so
+        # pydantic rejects first. Kept because this function is also the
+        # contract for any caller that builds the model programmatically.
+        if len(run.points) < 2:
+            raise HTTPException(
+                422,
+                f"runs[{i}] has {len(run.points)} point"
+                f"{'' if len(run.points) == 1 else 's'}; a run needs at least 2",
+            )
+
+    # Rule 6.
+    if not any(run.kind == "mark" for run in runs):
+        raise HTTPException(422, "trajectory has no marking runs")
+
+    sharp_turns: list[tuple[int, float]] = []
+    for i in range(len(runs) - 1):
+        a, b = runs[i], runs[i + 1]
+
+        # Rule 1.
+        if a.kind == "mark" and b.kind == "mark":
+            raise HTTPException(
+                422,
+                f"runs[{i}] and runs[{i + 1}] are both 'mark' with no travel run "
+                "between them — the rover would paint across the gap",
+            )
+
+        # Rules 2/3. Stated in the request for travel legs specifically, but
+        # enforced at EVERY boundary: with optimize_order off the engine inserts
+        # no connectors, so any gap left here is not a gap the rover drives —
+        # it is a teleport in the merged waypoint list.
+        gap = math.hypot(b.points[0][0] - a.points[-1][0],
+                         b.points[0][1] - a.points[-1][1])
+        if gap > _TRAJ_JOIN_TOL_M:
+            verb = "start" if b.kind == "travel" else "continue"
+            raise HTTPException(
+                422,
+                f"runs[{i + 1}] {b.kind} leg does not {verb} where runs[{i}] ends "
+                f"(gap {gap:.1f} m)",
+            )
+
+        # Warn-only: a near-reversal between runs is legitimate (a double-back
+        # pass) but is also what a mis-ordered trajectory looks like.
+        head_a = _traj_heading(a.points[-2], a.points[-1])
+        head_b = _traj_heading(b.points[0], b.points[1])
+        if head_a is not None and head_b is not None:
+            turn = abs((math.degrees(head_b - head_a) + 180.0) % 360.0 - 180.0)
+            if turn > _TRAJ_HEADING_WARN_DEG:
+                sharp_turns.append((i, turn))
+
+    for i, turn in sharp_turns[:_TRAJ_MAX_WARNINGS]:
+        warnings.append(
+            f"runs[{i}] -> runs[{i + 1}] turns {turn:.0f} deg — check the run "
+            "order if that reversal was not intended."
+        )
+    if len(sharp_turns) > _TRAJ_MAX_WARNINGS:
+        warnings.append(
+            f"...and {len(sharp_turns) - _TRAJ_MAX_WARNINGS} more run-to-run "
+            f"turns over {_TRAJ_HEADING_WARN_DEG:.0f} deg."
+        )
+
+    # Warn-only: two MARK runs on the same ground. Deliberate (a double pass) or
+    # a duplicated import — the operator decides, but they get told.
+    #
+    # Uses the SAME key the engine's step 1c uses to decide what to drop
+    # (endpoints rounded onto a mark_spacing grid, direction-insensitive, plus
+    # the rounded length), so the warning fires exactly when the drop will
+    # happen rather than on an independent test that could disagree with it.
+    # An all-pairs distance test would be truer to "within 5 cm" but is O(n^2)
+    # — 5000 runs is 12.5M hypots on a request that has not been planned yet.
+    tol = max(req.line_spacing, 1e-3)
+    seen_marks: dict[tuple, int] = {}
+    coincident: list[tuple[int, int]] = []
+    for i, run in enumerate(runs):
+        if run.kind != "mark":
+            continue
+        a = (round(run.points[0][0] / tol), round(run.points[0][1] / tol))
+        b = (round(run.points[-1][0] / tol), round(run.points[-1][1] / tol))
+        key = (min(a, b), max(a, b), round(_traj_len(run.points) / tol))
+        if key in seen_marks:
+            coincident.append((seen_marks[key], i))
+        else:
+            seen_marks[key] = i
+    for ia, ib in coincident[:_TRAJ_MAX_WARNINGS]:
+        warnings.append(
+            f"runs[{ia}] and runs[{ib}] are coincident mark runs — "
+            "the same ground is marked twice."
+        )
+    if len(coincident) > _TRAJ_MAX_WARNINGS:
+        warnings.append(
+            f"...and {len(coincident) - _TRAJ_MAX_WARNINGS} more coincident "
+            "mark run pair(s)."
+        )
+
+    # Rule 7.
+    _assert_origin_gps_usable(list(req.origin_gps))
+
+    # Rule 8 — pre-flight, mirroring the DXF guard in path_manager.plan_path
+    # (which only runs `if is_dxf`, so a CSV mission spends the whole 15 s
+    # budget and surfaces an opaque 504). Here the geometry is straight-line
+    # densification of known runs, so the estimate is EXACT rather than a lower
+    # bound — no slack factor is warranted.
+    mark_len = sum(_traj_len(r.points) for r in runs if r.kind == "mark")
+    travel_len = sum(_traj_len(r.points) for r in runs if r.kind == "travel")
+    est = int(mark_len / max(req.line_spacing, 1e-3)
+              + travel_len / max(req.transit_spacing, 1e-3))
+    if est > req.max_waypoints:
+        raise HTTPException(
+            422,
+            f"Too many waypoints: ~{est} exceeds limit {req.max_waypoints}. "
+            "Increase line_spacing/transit_spacing or split the mission.",
+        )
+
+    return warnings
+
+
+def _trajectory_run_echo(runs, plan) -> list[TrajectoryRunEcho]:
+    """Echo the PLANNED run structure so the client can verify it survived.
+
+    Built from ``plan.segments`` — never from ``spray_flags``. Two adjacent MARK
+    segments produce one contiguous run of True flags, so a flag-derived view
+    (which is what ``_spray_runs`` and the staged ``segment_runs`` are) reports
+    ONE run where there are two. That is correct for their own purpose and
+    useless for verifying structure: a fusion is exactly what it cannot see.
+
+    The terminal run-out is appended separately: the engine adds it to
+    ``merged_waypoints`` only, not to ``plan.segments`` (path_engine/engine.py,
+    "Guarantee a terminal MARK->TRANSIT boundary"), so mapping segments alone
+    would under-count the waypoints the client is asked to reconcile.
+    """
+    labels = {i: run.label for i, run in enumerate(runs)}
+    echo = [
+        TrajectoryRunEcho(
+            index=idx,
+            kind="mark" if seg.segment_type == SegmentType.MARK else "travel",
+            num_points=len(seg.points),
+            length_m=round(seg.length, 3),
+            label=labels.get(seg.segment_id),
+        )
+        for idx, seg in enumerate(plan.segments)
+    ]
+
+    # Terminal run-out detection is exact, not heuristic: the engine appends it
+    # iff the mission ended on a MARK that is not a closed shape, and close_loop
+    # is False here. So "last segment is MARK but the last flag is False" can
+    # only mean the run-out point.
+    if (plan.segments
+            and plan.segments[-1].segment_type == SegmentType.MARK
+            and plan.spray_flags and not plan.spray_flags[-1]
+            and len(plan.merged_waypoints) >= 2):
+        tail = plan.merged_waypoints[-1]
+        prev = plan.merged_waypoints[-2]
+        echo.append(TrajectoryRunEcho(
+            index=len(echo),
+            kind="travel",
+            num_points=1,
+            length_m=round(math.hypot(tail[0] - prev[0], tail[1] - prev[1]), 3),
+            label="run-out",
+            generated=True,
+        ))
+
+    return echo
+
+
+def _resolve_ground_truth(req: PlanTrajectoryRequest) -> list[dict] | None:
+    """Bind each surveyed lat/lon to the NED vertex it was shot at.
+
+    Indices are validated rather than clamped: a ground truth pointing at a run
+    that does not exist is a client bug, and silently dropping it would leave §8
+    reporting a number computed from a subset nobody chose.
+    """
+    if not req.ground_truth:
+        return None
+    out: list[dict] = []
+    for k, gt in enumerate(req.ground_truth):
+        if gt.run_index >= len(req.runs):
+            raise HTTPException(
+                422,
+                f"ground_truth[{k}].run_index {gt.run_index} is out of range "
+                f"({len(req.runs)} runs)",
+            )
+        pts = req.runs[gt.run_index].points
+        if gt.point_index >= len(pts):
+            raise HTTPException(
+                422,
+                f"ground_truth[{k}].point_index {gt.point_index} is out of range "
+                f"(runs[{gt.run_index}] has {len(pts)} points)",
+            )
+        if not (math.isfinite(gt.lat) and math.isfinite(gt.lon)
+                and -90.0 <= gt.lat <= 90.0 and -180.0 <= gt.lon <= 180.0):
+            raise HTTPException(
+                422, f"ground_truth[{k}] lat/lon is not a valid coordinate")
+        pt = pts[gt.point_index]
+        out.append({
+            "north_m": float(pt[0]),
+            "east_m": float(pt[1]),
+            "lat": float(gt.lat),
+            "lon": float(gt.lon),
+        })
+    return out
+
+
+@path_router.post("/plan-trajectory", response_model=PlanTrajectoryResponse)
+async def plan_trajectory(req: PlanTrajectoryRequest):
+    """Densify and stage an app-planned trajectory. No file, no re-planning.
+
+    The line-mission analogue of the point-mission bypass in /plan-and-stage:
+    the caller's geometry is already final, so the planner is skipped as a
+    PLANNER and used only as a densifier. Everything downstream —
+    GET /staged/{mission_id}, /load-to-controller, /api/mission/start — is
+    unchanged and reused verbatim.
+
+    THE CONTRACT, in one sentence: the only thing this endpoint may do to the
+    caller's geometry is insert points along it. Point count changes; shape,
+    order and run boundaries do not.
+    """
+    warnings = _validate_trajectory(req)
+    ground_truth = _resolve_ground_truth(req)
+
+    # Label only — no file is read or written. Basenamed anyway because it lands
+    # in the staged artifact's metadata.source, which _source_detail resolves
+    # against MISSION_DIR.
+    safe = os.path.basename(req.mission_name.strip())
+    if not safe:
+        raise HTTPException(422, "mission_name is empty after normalisation")
+
+    segments = [
+        PathSegment(
+            segment_type=(SegmentType.MARK if run.kind == "mark"
+                          else SegmentType.TRANSIT),
+            points=[(float(n), float(e)) for n, e in run.points],
+            speed=float(run.speed_m_s),
+            segment_id=i,
+            source_entity=run.label or f"run_{i}",
+            # NO metadata, deliberately. Both fit passes (fit_arcs,
+            # fillet_corners) and the smoothing skip-list are gated on
+            # metadata["geometry_type"] == "LINE_CHAIN"; carrying no metadata
+            # keeps those gates shut regardless of the flags below.
+            metadata={},
+        )
+        for i, run in enumerate(req.runs)
+    ]
+
+    # Densify-only configuration. Every geometry-modifying pass is off HERE, at
+    # the call site — not defaulted, and not reachable from the request body.
+    #
+    #   optimize_order=False        the app decided the order
+    #   group_shapes=False          two touching runs must stay two runs. The
+    #                               PathEngine default stays True; DXF depends
+    #                               on it and is not touched.
+    #   corner_smooth_radius_m=0    would re-smooth already-fitted arcs
+    #   fit_arcs=False              already fitted
+    #   fillet_corners_m=0          already filleted
+    #   close_shape=False           shape closure is the app's decision
+    #   enable_path_extensions=False PRE/AFT is a DXF concept; travel legs here
+    #                               are explicit runs
+    #   compensate_spray=False      runtime compensation only (spray node)
+    #
+    # close_loop is a plan_segments argument, not an __init__ kwarg — passed
+    # False below, or the engine would append a closing TRANSIT leg nobody asked
+    # for.
+    engine = PathEngine(
+        mark_spacing=req.line_spacing,
+        transit_spacing=req.transit_spacing,
+        marking_speed=req.marking_speed,
+        transit_speed=req.transit_speed,
+        optimize_order=False,
+        group_shapes=False,
+        corner_smooth_radius_m=0.0,
+        fit_arcs=False,
+        fillet_corners_m=0.0,
+        close_shape=False,
+        enable_path_extensions=False,
+        compensate_spray=False,
+    )
+
+    origin_gps = (float(req.origin_gps[0]), float(req.origin_gps[1]))
+    try:
+        plan = await asyncio.wait_for(
+            asyncio.to_thread(
+                engine.plan_segments,
+                segments,
+                origin=(0.0, 0.0),
+                origin_gps=origin_gps,
+                close_loop=False,
+            ),
+            # This only densifies, so it should finish far inside the budget.
+            # Bounded anyway: a pathological payload fails cleanly instead of
+            # holding a worker.
+            timeout=15.0,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "Densification timed out (15s limit)")
+    except Exception as exc:
+        raise HTTPException(422, f"Planning error: {exc}")
+
+    run_echo = _trajectory_run_echo(req.runs, plan)
+
+    # Step 1c (coincident-MARK drop) runs unconditionally in the engine and has
+    # no flag. Rather than add one, surface it: the removal is now VISIBLE in
+    # warnings (it was only ever in planning_metadata), and the run count in
+    # run_echo drops too, which the client fails closed on.
+    dropped = ((plan.planning_metadata or {}).get("duplicate_geometry")
+               or {}).get("removed") or 0
+    if dropped:
+        warnings.append(
+            f"{dropped} coincident mark run(s) were dropped by the planner as "
+            "duplicate geometry — a deliberate double pass will NOT be marked "
+            "twice. Offset the second pass or send it as one run."
+        )
+
+    alignment_meta = dict(plan.alignment_metadata or {})
+
+    # The engine's gps_origin branch emits method/scale/rotation/offsets/origin
+    # but NOT rmse or fitted_scale (path_engine/engine.py — unlike the
+    # least_squares branch, there is no fit to residual against). The change
+    # request asserts they are already there; they are not. Fill them in HERE
+    # rather than in the engine, which the DXF flow shares:
+    #   - rmse feeds MissionSummary.rmse_m and the client reads it back;
+    #   - fitted_scale is what _assert_alignment_scale gates on.
+    # 0.0 / 1.0 are the truthful values: a single GPS origin is an exact
+    # translation, so there is no residual and no free scale to disagree with.
+    alignment_meta.setdefault("rmse", 0.0)
+    alignment_meta.setdefault("fitted_scale", 1.0)
+
+    result = {
+        "source": safe,
+        "num_waypoints": len(plan.merged_waypoints),
+        # Counts the terminal run-out, so the client's waypoint arithmetic and
+        # this figure agree.
+        "num_segments": len(run_echo),
+        "mark_length_m": round(plan.total_mark_length, 3),
+        "transit_length_m": round(plan.total_transit_length, 3),
+        "total_length_m": round(plan.total_mark_length + plan.total_transit_length, 3),
+        "segments": [
+            {
+                "runtime_segment_index": idx,
+                "runtime_sequence": idx + 1,
+                "type": "MARK" if seg.segment_type == SegmentType.MARK else "TRANSIT",
+                "segment_role": "mark" if seg.segment_type == SegmentType.MARK else "transit",
+                "source": seg.source_entity,
+                "parent_source_entity": seg.source_entity,
+                "parent_entity_id": None,
+                "order_source": "app_trajectory",
+                "is_extension": False,
+                "speed": seg.speed,
+                "length_m": round(seg.length, 3),
+            }
+            for idx, seg in enumerate(plan.segments)
+        ],
+        "merged_waypoints": [list(p) for p in plan.merged_waypoints],
+        "spray_flags": list(plan.spray_flags),
+        "must_hit": list(plan.must_hit or []),
+        "alignment_metadata": alignment_meta,
+        "planning_metadata": plan.planning_metadata or {},
+        "warnings": warnings,
+    }
+
+    # plan_segments with origin_gps produces method="gps_origin", rmse 0.0,
+    # scale 1.0 — the same alignment block the point-mission bypass synthesizes
+    # by hand. Assert it rather than trust it: _stage_mission keys placement
+    # mode off origin_gps, and a mission staged LOCAL_NED would silently skip
+    # the surveyed re-bind at start.
+    _assert_alignment_scale(alignment_meta)
+    _assert_origin_gps_usable(alignment_meta.get("origin_gps") or list(origin_gps))
+
+    mission_summary = None
+    if result["merged_waypoints"]:
+        mission_summary = _stage_mission(
+            req, result, alignment_meta, alignment_meta.get("rmse", 0.0),
+            survey_ground_truth=ground_truth,
+        )
+
+    return PlanTrajectoryResponse(
+        source=result["source"],
+        num_waypoints=result["num_waypoints"],
+        num_segments=result["num_segments"],
+        mark_length_m=result["mark_length_m"],
+        transit_length_m=result["transit_length_m"],
+        total_length_m=result["total_length_m"],
+        segments=result["segments"],
+        merged_waypoints=result["merged_waypoints"],
+        spray_flags=result["spray_flags"],
+        must_hit=result["must_hit"],
+        alignment_metadata=alignment_meta or None,
+        planning_metadata=result["planning_metadata"],
+        warnings=warnings or None,
+        mission_summary=mission_summary,
+        run_echo=run_echo,
     )
 
 
