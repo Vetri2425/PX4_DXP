@@ -1229,7 +1229,7 @@ class PathEngine:
         # Placed AFTER the close_loop block on purpose: a closed loop already
         # ends on a TRANSIT (spray_flags[-1] is False), so this is a no-op there
         # and cannot spur off the closing leg. This is purely additive — it only
-        # ever extends the deadhead tail by ~0.1 m and never alters a leg the
+        # ever extends the deadhead tail by ~0.05 m and never alters a leg the
         # rover actually marks.
         #
         # ONLY for an OPEN mission: a geometrically closed shape (last point
@@ -1262,8 +1262,17 @@ class PathEngine:
                     dn, de = 1.0, 0.0
             else:
                 dn, de = 1.0, 0.0
-            runout = self.aft_extension_m if self.enable_path_extensions else 0.1
-            runout = max(0.1, runout)
+            # Tail length: the floor is coupled to the spray node's B4 terminal
+            # shutoff (`terminal_off_epsilon_m`, 0.05 m in
+            # src/spray_controller_node.py). B4 closes the valve within epsilon
+            # of the PATH END at creep speed — with a tail shorter than epsilon
+            # that region crosses INTO the marked line and cuts the mark short
+            # of the final station. 0.05 keeps the valve open to the station
+            # while the rover overruns it by only ~5 cm (was 10 cm — the
+            # 2026-07-27 field session flagged the overrun past the surveyed
+            # endpoint).
+            runout = self.aft_extension_m if self.enable_path_extensions else 0.05
+            runout = max(0.05, runout)
             merged_waypoints.append((tail_n + dn * runout, tail_e + de * runout))
             spray_flags.append(False)
             must_hit.append(False)

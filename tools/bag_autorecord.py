@@ -317,33 +317,71 @@ def _environment() -> dict:
     }
 
 
-def _fcu_params() -> dict:
-    """Best-effort MAVROS ParamGet snapshot of the curated FCU knobs.
+def _parse_ros2_param_value(out: str | None):
+    """Parse `ros2 param get --hide-type` output → int | float | None."""
+    if not out:
+        return None
+    token = out.strip().splitlines()[-1].strip()
+    if not token or "not set" in out.lower() or "error" in out.lower():
+        return None
+    try:
+        return int(token)
+    except ValueError:
+        try:
+            return float(token)
+        except ValueError:
+            return None
 
-    Off the mission critical path (runs at finalise), bounded per-param, and
-    tolerant: a param that can't be read is recorded as null, never an error.
+
+def _fcu_params() -> dict:
+    """Best-effort snapshot of the curated FCU knobs (bug A12).
+
+    mavros2 (ROS2/Humble) does NOT provide the mavros1 `/mavros/param/get`
+    ParamGet service — FCU params are exposed as native ROS2 parameters on the
+    `/mavros/param` node. The old service call failed silently for every param,
+    which is why every manifest to date has `values: {pid: null}` (A12). Try
+    the native interface first, fall back to the legacy service, and record
+    failures EXPLICITLY (`missing` list) so an unprovable A/B label is visible
+    instead of silently null.
+
+    Off the mission critical path (runs at finalise), bounded per-param.
     """
     if not CAPTURE_FCU_PARAMS:
-        return {"captured": False, "reason": "disabled", "values": {}}
+        return {"captured": False, "reason": "disabled", "values": {}, "missing": []}
     values: dict = {}
-    any_ok = False
+    missing: list = []
+    method = None
     for pid in FCU_PARAM_NAMES:
-        out = _run(
-            ["ros2", "service", "call", "/mavros/param/get",
-             "mavros_msgs/srv/ParamGet", f"{{param_id: '{pid}'}}"],
+        # mavros2: native ROS2 parameter on the param plugin node
+        val = _parse_ros2_param_value(_run(
+            ["ros2", "param", "get", "--hide-type", "/mavros/param", pid],
             timeout=4.0,
-        )
-        val = None
-        if out and "success=True" in out.replace(" ", ""):
-            # response embeds mavros_msgs/ParamValue{integer, real}
-            m_int = re.search(r"integer=(-?\d+)", out)
-            m_real = re.search(r"real=(-?\d+\.?\d*(?:e-?\d+)?)", out)
-            iv = int(m_int.group(1)) if m_int else 0
-            rv = float(m_real.group(1)) if m_real else 0.0
-            val = rv if rv != 0.0 else iv
-            any_ok = True
+        ))
+        if val is not None:
+            method = method or "ros2_param"
+        else:
+            # mavros1 compat: ParamGet service
+            out = _run(
+                ["ros2", "service", "call", "/mavros/param/get",
+                 "mavros_msgs/srv/ParamGet", f"{{param_id: '{pid}'}}"],
+                timeout=4.0,
+            )
+            if out and "success=True" in out.replace(" ", ""):
+                m_int = re.search(r"integer=(-?\d+)", out)
+                m_real = re.search(r"real=(-?\d+\.?\d*(?:e-?\d+)?)", out)
+                iv = int(m_int.group(1)) if m_int else 0
+                rv = float(m_real.group(1)) if m_real else 0.0
+                val = rv if rv != 0.0 else iv
+                method = method or "param_get_service"
+        if val is None:
+            missing.append(pid)
         values[pid] = val
-    return {"captured": any_ok, "values": values}
+    return {
+        "captured": bool(values) and len(missing) < len(FCU_PARAM_NAMES),
+        "method": method,
+        "missing": missing,
+        "values": values,
+    }
 
 
 def _rpp_param_block() -> dict:
