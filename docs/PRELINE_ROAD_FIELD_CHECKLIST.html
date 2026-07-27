@@ -58,6 +58,65 @@ not exist. Those live in Phase F §1 row 3, row 7 and §2 — run them there whe
 becomes a product requirement.</p>
 </div>
 
+<h2>RESULTS — session 2026-07-27 (first run of this checklist)</h2>
+
+<div class="box ok">
+<p><strong>Operator verdict: rows 2.1–2.4 PASS in the field.</strong> 12 bags recorded,
+11 readable, every one <code>COMPLETE</code> with full traversal. Jetson, origin and Mac
+all at <code>2fa1016</code>; 873 tests green (334 server + 475 path_engine + 64 tools).
+Bags: <code>bags/27_07_2026/PRELINE_FIELD/session_bags/</code>.</p>
+</div>
+
+<table>
+<tr><th class="n">#</th><th>Row</th><th>Result</th><th>Evidence</th></tr>
+<tr><td class="n">1.1</td><td>Preview = mission</td><td><strong>PASS</strong></td>
+    <td>identical wp count and endpoints on both files</td></tr>
+<tr><td class="n">1.2</td><td>Surveyed stations preserved</td><td><strong>PASS / bug found</strong></td>
+    <td>square 4/4; curve 2 of 8 — <strong>B1 reproduced and localised to the arc fitter</strong>
+    (with fitting off, 8/8 survive)</td></tr>
+<tr><td class="n">1.3</td><td>Placement anchored to survey</td><td><strong>PASS</strong></td>
+    <td><code>GPS_SURVEYED</code>, origin = the CSV's own geo origin, every run</td></tr>
+<tr><td class="n">2.1</td><td>Straight, multi-leg</td><td><strong>PASS</strong> (with extensions)</td>
+    <td>operator-confirmed in the field</td></tr>
+<tr><td class="n">2.2</td><td>Surveyed curve ★</td><td><strong>PASS</strong> (with extensions)</td>
+    <td>arc-fit vs chords A/B measured: plan 1.95 vs 0.00 cm, physical 2.73 vs 3.59 cm
+    → <strong>arc fit stays ON</strong>; extensions then cleared it</td></tr>
+<tr><td class="n">2.3</td><td>Road corner ★★</td><td><strong>PASS</strong></td>
+    <td>2×2 square, corners 89.8° / 88.9°, cut <strong>2.83 and 1.44 cm</strong> —
+    the feared 5.5–6.5 cm did NOT reproduce</td></tr>
+<tr><td class="n">2.4</td><td>Dash</td><td><strong>PASS</strong></td>
+    <td>0.5 on / 0.5 off over 3.069 m; node confirmed <code>mode=dash, phase=on, armed</code></td></tr>
+<tr><td class="n">2.5</td><td>RTK dropout</td><td class="chk">⚠ <strong>NOT VERIFIED</strong></td>
+    <td>see below</td></tr>
+</table>
+
+<div class="box bad">
+<p><strong>Row 2.5 has no evidence and must not be recorded as a pass.</strong> The gate was
+never challenged: the spray node logs every <code>fix_type</code> change and there were
+<strong>zero transitions</strong> — GPS held <code>RTK_FIXED</code> at 29 sats for the whole
+run. Holding the antenna by hand did not degrade a dual-antenna UM982 enough, and the mark
+window is only ~9 s at 0.35 m/s over 3.07 m.</p>
+<p>A gate trip has a distinct signature that was never seen:
+<code>spray_active_desired=true</code> while <code>spraying=false</code>. What was observed
+instead was both going false together, which is the normal terminal shutoff.</p>
+<p><strong>To close it:</strong> use <code>POST /api/rtk/stop</code> mid-mark — deterministic,
+precisely timable, and the same failure as driving behind a building. Corrections stop, the
+fix drops below <code>spray_min_fix_type=6</code>, and the gate must fire. Restart NTRIP to
+watch the <code>gps_recover_hold_s=1.0</code> re-enable. Gate params verified live:
+<code>spray_require_rtk_fix=True</code>, <code>min_fix_type=6</code>,
+<code>gps_fix_timeout_s=2.0</code>, <code>gps_recover_hold_s=1.0</code>,
+<code>spray_max_hrms_m=0.10</code>.</p>
+</div>
+
+<div class="box">
+<p><strong>Open items from this session.</strong>
+(1) <strong>Frontend does not expose extensions for the CSV flow</strong> — the backend half
+landed (A16) and works, but the Fields page has no control, so extensions can only be set by
+API. (2) Bag <code>…183723</code> has an unreadable <code>manifest.json</code>.
+(3) The 0.3 vs 0.5 extension comparison and the per-station grading of these 12 bags have not
+been run yet — the numbers above for 2.2/2.3 come from the earlier no-extension runs.</p>
+</div>
+
 <h2>0 · Pre-flight — before any drive</h2>
 
 <table>
