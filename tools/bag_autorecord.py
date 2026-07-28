@@ -518,6 +518,14 @@ def _staged_mission(mission_id: str | None) -> dict:
         "unit_scale_m_per_unit": source.get("unit_scale_m_per_unit"),
         # Operator's per-survey vertex tolerance; None = analyser default.
         "survey_tolerance_m": (d.get("metadata") or {}).get("survey_tolerance_m"),
+        # Surveyed lat/lon staged INSIDE the artifact, for missions planned by
+        # the app (POST /api/path/plan-trajectory). Those have no source file
+        # for analyze_mission §8 to re-read, so without this the absolute
+        # accuracy check goes silent on every one of them. Lifted into the
+        # manifest because _surveyed_latlon_from_source only ever sees the
+        # manifest — the full artifact is snapshotted separately, but nothing
+        # passes the analyser a path to it.
+        "survey_ground_truth": d.get("survey_ground_truth"),
         "placement_mode": d.get("placement_mode"),
         "anchor": anchor or None,
         "alignment": {

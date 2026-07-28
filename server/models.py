@@ -7,6 +7,8 @@ from typing import Any, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
+from config import MAX_TRAJECTORY_RUNS
+
 
 class VehicleMode(str, Enum):
     MANUAL = "MANUAL"
@@ -690,6 +692,124 @@ class MissionSummary(BaseModel):
     estimated_paint_l: float
     estimated_runtime_s: float
     rmse_m: float
+
+
+# ── App-planned trajectory: POST /api/path/plan-trajectory ────────────────────
+# The app has already fitted the geometry (lines, arcs, transit legs, templates)
+# and decided the order. It sends the finished runs; the backend's ONLY job is to
+# densify them and stage the result. Every geometry-modifying planner pass is
+# disabled at the call site, not by default — see routes/path.py::plan_trajectory.
+#
+# Deliberately a SEPARATE request model from PathPlanRequest: the file flow's
+# knobs (optimize, layer_mapping, ref_points, corner_smooth_radius_m, fit_arcs…)
+# are exactly the five silent traps this endpoint exists to make unreachable, so
+# they must not be expressible here.
+
+class TrajectoryRun(BaseModel):
+    """One continuous run of the app-planned trajectory.
+
+    ``kind`` maps 1:1 onto SegmentType: "mark" → MARK (spray on), "travel" →
+    TRANSIT (spray off). Points are anchor-relative NED metres as
+    [north_m, east_m] — the same frame the staged artifact and /path use.
+
+    ``speed_m_s`` drives THIS run's geometry. It is not the same thing as the
+    request-level marking_speed/transit_speed, which feed the staged runtime
+    estimate; see PlanTrajectoryRequest.
+    """
+
+    kind: str = Field(..., pattern="^(mark|travel)$")
+    points: list[tuple[float, float]] = Field(..., min_length=2)
+    speed_m_s: float = Field(..., gt=0.0, le=5.0)
+    label: Optional[str] = None
+
+
+class SurveyGroundTruthPoint(BaseModel):
+    """One surveyed lat/lon, bound to the trajectory vertex it was shot at.
+
+    Staged inside the mission artifact so ``tools/analyze_mission.py`` §8
+    (absolute accuracy) still has an INDEPENDENT ground truth on a mission that
+    has no source file to re-read. Indexes into ``runs[run_index].points[
+    point_index]``, so the NED↔lat/lon correspondence is explicit rather than
+    positional — a reordered or re-densified run cannot silently mis-pair it.
+    """
+
+    run_index: int = Field(..., ge=0)
+    point_index: int = Field(..., ge=0)
+    lat: float
+    lon: float
+
+
+class PlanTrajectoryRequest(BaseModel):
+    """Body for POST /api/path/plan-trajectory.
+
+    Defaults mirror PathPlanRequest exactly, so a caller that omits the
+    spray-mode trio gets the same behaviour as the file flow.
+    """
+
+    mission_name: str = Field(..., min_length=1, max_length=200)
+    # Required: NED has no georeference, and the staged mission must be
+    # GPS_SURVEYED for /load-to-controller + /api/mission/start to place it.
+    origin_gps: list[float] = Field(..., min_length=2, max_length=2)
+    runs: list[TrajectoryRun] = Field(..., min_length=1, max_length=MAX_TRAJECTORY_RUNS)
+    ground_truth: Optional[list[SurveyGroundTruthPoint]] = None
+
+    line_spacing: float = Field(0.05, gt=0.0, le=1.0)      # MARK spacing (m)
+    transit_spacing: float = Field(0.15, gt=0.0, le=2.0)   # TRANSIT spacing (m)
+
+    # NOT redundant with runs[].speed_m_s. _stage_mission reads these two to
+    # compute the mission's runtime estimate; the per-run speed drives geometry.
+    marking_speed: float = Field(0.35, gt=0.0, le=5.0)
+    transit_speed: float = Field(0.50, gt=0.0, le=5.0)
+
+    # Read verbatim by _stage_mission — see routes/path.py::_stage_mission.
+    spray_mode: str = Field("continuous", pattern="^(continuous|dash|point)$")
+    dash_on_distance_m: Optional[float] = Field(None, gt=0.0, le=1000.0)
+    dash_off_distance_m: Optional[float] = Field(None, gt=0.0, le=1000.0)
+    dash_start_state: str = Field("on", pattern="^(on|off)$")
+    point_dwell_s: float = Field(1.0, gt=0.0, le=60.0)
+    point_arrival_tolerance_m: float = Field(0.10, gt=0.0, le=5.0)
+    survey_tolerance_m: Optional[float] = Field(None, gt=0.0, le=1.0)
+
+    # Same hard publication guard as PathPlanRequest. Checked BEFORE planning
+    # from the runs' own arc length, so an over-dense payload is a clear 422
+    # instead of a 504 after the densifier has already spent the budget.
+    max_waypoints: int = Field(100000, ge=100, le=500000)
+
+
+class TrajectoryRunEcho(BaseModel):
+    """One planned run, echoed back so the client can verify what it sent.
+
+    The app fails CLOSED on this: no echo, or an echo whose run count / kinds /
+    lengths disagree with what it built, and the operator cannot press Load. It
+    is therefore built from the PLANNED SEGMENT LIST, never from spray_flags —
+    two adjacent MARK segments produce one contiguous run of spray_flags=True,
+    so a flag-derived view reports one run where there are two and would pass a
+    structure that had actually been fused.
+
+    ``generated`` marks a run the planner added rather than one the client sent
+    (today: the terminal run-out, see path_engine/engine.py). The client skips
+    those in its structural compare.
+    """
+
+    index: int
+    kind: str                       # mark | travel
+    num_points: int
+    length_m: float
+    label: Optional[str] = None
+    generated: bool = False
+
+
+class PlanTrajectoryResponse(PathPlanResponse):
+    """Response for POST /api/path/plan-trajectory.
+
+    A SUBCLASS of PathPlanResponse rather than a new field on it: the client's
+    existing parsePlanAndStageResponse / getStagedMission code then works
+    unchanged, while /plan and /plan-and-stage keep emitting exactly the body
+    they emit today (adding run_echo to the base model would have put a
+    ``"run_echo": null`` into every DXF-flow response).
+    """
+
+    run_echo: list[TrajectoryRunEcho] = Field(default_factory=list)
 
 
 # ── Staged workflow: stage-specific endpoints ─────────────────────────────────
