@@ -557,6 +557,25 @@ def _jsonable_geometry(geometry: dict) -> dict:
     return {str(k): convert(v) for k, v in geometry.items()}
 
 
+# S5 — bound planning concurrency. asyncio.to_thread uses the default
+# 32-thread executor while the unit caps the whole server at CPUQuota=200%:
+# several concurrent plan requests each get a CPU slice and ALL hit the 15 s
+# timeout, instead of one finishing. Two permits ≈ the CPU quota; excess
+# requests queue INSIDE their route's asyncio.wait_for, so a queued request
+# whose turn never comes still times out with the route's own named 504.
+_PLAN_SEMAPHORE = asyncio.Semaphore(2)
+
+
+async def _plan_in_thread(fn, /, *args, **kwargs):
+    """to_thread for the heavy planners (plan_path / plan_segments) only.
+
+    Cheap sidecar reads stay on plain to_thread — queueing a 5 ms preview
+    behind a 10 s plan would be a regression, not a fix.
+    """
+    async with _PLAN_SEMAPHORE:
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+
 async def _sidecar_call(fn, *args, what: str, timeout: float = 5.0):
     """Run a blocking PathManager sidecar operation off the event loop.
 
@@ -1183,7 +1202,7 @@ async def plan_path(req: PathPlanRequest):
 
     try:
         result = await asyncio.wait_for(
-            asyncio.to_thread(
+            _plan_in_thread(
                 path_mgr.plan_path,
                 req.source,
                 summary_only=summary_only,
@@ -1783,7 +1802,7 @@ async def align_path(name: str, req: AlignRequest):
 
     try:
         result = await asyncio.wait_for(
-            asyncio.to_thread(
+            _plan_in_thread(
                 path_mgr.plan_path,
                 safe,
                 summary_only=False,
@@ -1855,7 +1874,7 @@ async def path_segments(name: str):
     safe = _require_dxf(name)
     try:
         result = await asyncio.wait_for(
-            asyncio.to_thread(
+            _plan_in_thread(
                 path_mgr.plan_path,
                 safe,
                 summary_only=False,
@@ -1997,7 +2016,7 @@ async def plan_and_stage(name: str, req: PathPlanRequest):
     else:
         try:
             result = await asyncio.wait_for(
-                asyncio.to_thread(
+                _plan_in_thread(
                     path_mgr.plan_path,
                     safe,
                     summary_only=False,
@@ -2460,7 +2479,7 @@ async def plan_trajectory(req: PlanTrajectoryRequest):
     origin_gps = (float(req.origin_gps[0]), float(req.origin_gps[1]))
     try:
         plan = await asyncio.wait_for(
-            asyncio.to_thread(
+            _plan_in_thread(
                 engine.plan_segments,
                 segments,
                 origin=(0.0, 0.0),
