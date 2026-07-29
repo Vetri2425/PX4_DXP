@@ -285,7 +285,7 @@ unimplemented (404).
 
 | # | Weakness | Where | Fix in this plan |
 |---|---|---|---|
-| **7.1** | **MANUAL_CONTROL axis mapping** puts steering in `y` (roll), `r=0`; diff-rover turn is normally `r` (yaw) | `manual_control_gateway.encode_manual_control` | **Bench-verify** which axes PX4 `rover_differential` reads in MANUAL; correct the encoder; add a mapping unit test with a golden frame. **HARD gate before J4.** |
+| ~~**7.1**~~ | ✅ **CLOSED — steering IS `y`, `r=0`.** The "turn is normally `r`" hypothesis was tested and **did not hold in the field**. | `manual_control_gateway.encode_manual_control` | Done: encoder carries the FIELD-confirmed mapping (PX4 v1.16.2 `rover_differential`), golden-frame tests pin it (`test_manual_control_gateway.py:55,61`). **No longer a gate.** |
 | **7.2** | **`COM_RC_IN_MODE`** may be `RC_ONLY` → PX4 silently ignores all frames | FCU param (QGC) | Verify via QGC (Mac is source of truth) that MAVLink stick input is enabled. **HARD gate before J3.** (Audit R9) |
 | **7.3** | **Acquire↔mission-start race** (concurrent) | arbiter + offboard lifecycle | Both must acquire the **same** lock (or strictly ordered locks). Add a concurrency test that fires both simultaneously. (Audit R1) |
 | **7.4** | **`contextvars` re-entry shim** in arbiter — hides a re-entrant call graph | `control_arbiter.py` | Design flat call graph; drop the shim. (§4.3) |
