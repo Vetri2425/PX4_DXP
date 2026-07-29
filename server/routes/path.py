@@ -2402,6 +2402,26 @@ def _resolve_ground_truth(req: PlanTrajectoryRequest) -> list[dict] | None:
     return out
 
 
+def _trajectory_run_metadata(run) -> dict:
+    """Segment metadata for one app-planned run — must-hit provenance only.
+
+    Returns {} when the app declares no ``must_hit_indices``, so the engine's
+    all-vertex fallback stands and the planned geometry is byte-identical to
+    before the field existed.
+
+    Indices are validated against the run's own point count and de-duplicated;
+    an out-of-range index is dropped rather than raising, because a stale index
+    must never block a mission whose geometry is otherwise sound. Declaring an
+    EMPTY list is meaningful and is preserved — it says "nothing here is
+    must-hit", which is different from declaring nothing at all.
+    """
+    raw = getattr(run, "must_hit_indices", None)
+    if raw is None:
+        return {}
+    n = len(run.points)
+    return {"control_indices": sorted({i for i in raw if 0 <= i < n})}
+
+
 @path_router.post("/plan-trajectory", response_model=PlanTrajectoryResponse)
 async def plan_trajectory(req: PlanTrajectoryRequest):
     """Densify and stage an app-planned trajectory. No file, no re-planning.
@@ -2434,11 +2454,19 @@ async def plan_trajectory(req: PlanTrajectoryRequest):
             speed=float(run.speed_m_s),
             segment_id=i,
             source_entity=run.label or f"run_{i}",
-            # NO metadata, deliberately. Both fit passes (fit_arcs,
-            # fillet_corners) and the smoothing skip-list are gated on
-            # metadata["geometry_type"] == "LINE_CHAIN"; carrying no metadata
-            # keeps those gates shut regardless of the flags below.
-            metadata={},
+            # Still NO geometry metadata, deliberately. Both fit passes
+            # (fit_arcs, fillet_corners) and the smoothing skip-list are gated
+            # on metadata["geometry_type"] == "LINE_CHAIN"; carrying none keeps
+            # those gates shut regardless of the flags below.
+            #
+            # control_indices is the ONE exception and it is not geometry: the
+            # engine reads it purely as must-hit provenance (engine.py merge
+            # step), so declaring it cannot change the planned shape — only
+            # which points the RPP simplifier is forbidden to delete.
+            # Omitted when the app declares nothing, so the engine's
+            # all-vertex fallback stands and behaviour is byte-identical to
+            # before this field existed.
+            metadata=_trajectory_run_metadata(run),
         )
         for i, run in enumerate(req.runs)
     ]

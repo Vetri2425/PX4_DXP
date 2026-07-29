@@ -609,3 +609,79 @@ def test_plan_trajectory_request_cannot_express_the_file_flow_traps():
                  "close_loop", "layer_mapping", "enable_path_extensions",
                  "compensate_spray", "ref_points"):
         assert trap not in fields, f"{trap} must not be settable on this endpoint"
+
+
+# ── must_hit_indices — survey-vertex provenance (field 2026-07-29) ───────────
+#
+# /api/path/plan derives must-hit from source geometry because the ENGINE
+# plans. In plan-trajectory the APP plans, so only the app knows which points
+# are surveyed vertices — and the schema had no way to say so. Without it the
+# RPP simplifier is free to delete them.
+
+def test_run_metadata_omitted_when_nothing_declared():
+    """No declaration must stay byte-identical to before the field existed."""
+    from routes.path import _trajectory_run_metadata
+
+    class _Run:
+        points = [(0.0, 0.0), (1.0, 0.0)]
+        must_hit_indices = None
+
+    assert _trajectory_run_metadata(_Run()) == {}
+
+
+def test_run_metadata_declares_control_indices():
+    from routes.path import _trajectory_run_metadata
+
+    class _Run:
+        points = [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 0.0)]
+        must_hit_indices = [3, 0]
+
+    assert _trajectory_run_metadata(_Run()) == {"control_indices": [0, 3]}
+
+
+def test_run_metadata_empty_list_is_a_real_declaration():
+    """[] means 'nothing is must-hit' — distinct from declaring nothing."""
+    from routes.path import _trajectory_run_metadata
+
+    class _Run:
+        points = [(0.0, 0.0), (1.0, 0.0)]
+        must_hit_indices = []
+
+    assert _trajectory_run_metadata(_Run()) == {"control_indices": []}
+
+
+def test_run_metadata_drops_out_of_range_and_dedupes():
+    """A stale index must not block an otherwise sound mission."""
+    from routes.path import _trajectory_run_metadata
+
+    class _Run:
+        points = [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)]
+        must_hit_indices = [0, 99, -1, 2, 2]
+
+    assert _trajectory_run_metadata(_Run()) == {"control_indices": [0, 2]}
+
+
+def test_declaration_narrows_must_hit_without_changing_geometry():
+    """The whole point: same waypoints, fewer protected vertices."""
+    from path_engine import PathEngine
+    from path_engine.core import PathSegment, SegmentType
+
+    verts = [(0.0, 0.0), (0.55, 0.05), (1.18, 0.06), (2.02, 0.35), (2.88, 1.30)]
+
+    def _plan(meta):
+        seg = PathSegment(
+            segment_type=SegmentType.MARK, points=list(verts), speed=0.35,
+            segment_id=0, source_entity="run_0", metadata=meta,
+        )
+        return PathEngine(mark_spacing=0.05).plan_segments([seg])
+
+    undeclared = _plan({})
+    narrowed = _plan({"control_indices": [0, 4]})
+
+    # Geometry identical — declaring provenance must never move a point.
+    assert undeclared.num_waypoints == narrowed.num_waypoints
+    assert undeclared.merged_waypoints == narrowed.merged_waypoints
+
+    # Provenance narrows to exactly what was declared.
+    assert sum(1 for m in narrowed.must_hit if m) == 2
+    assert sum(1 for m in undeclared.must_hit if m) > 2

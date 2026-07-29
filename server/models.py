@@ -721,6 +721,23 @@ class TrajectoryRun(BaseModel):
     points: list[tuple[float, float]] = Field(..., min_length=2)
     speed_m_s: float = Field(..., gt=0.0, le=5.0)
     label: Optional[str] = None
+    # Indices into `points` that are SURVEYED INTENT — a CAD/survey vertex the
+    # operator shot, not densification fill. The RPP's Douglas-Peucker
+    # simplifier (`_simplify_path_for_profile`) must never delete these.
+    #
+    # Why this exists (field 2026-07-29): /api/path/plan (CSV/DXF) derives
+    # must-hit from source geometry because the ENGINE plans. In
+    # plan-trajectory the APP plans, so only the app knows which points are
+    # vertices — and the schema had no way to say so. With no provenance the
+    # simplifier deleted 54 of 65 points on a curve mission; the rover then
+    # tracked ~50 cm chords instead of 8 cm arc steps and marking RMS went
+    # 1.47 cm (37 vertices declared) -> 5.84 cm (0 declared) across 10 bags.
+    #
+    # None = "no declaration" and preserves the old behaviour exactly: every
+    # point is treated as a source vertex (engine.py's all-vertex fallback),
+    # which over-preserves rather than silently deleting operator intent.
+    # An EMPTY list is a real declaration — "nothing here is must-hit".
+    must_hit_indices: Optional[list[int]] = Field(default=None)
 
 
 class SurveyGroundTruthPoint(BaseModel):
