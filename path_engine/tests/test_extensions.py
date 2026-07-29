@@ -2071,6 +2071,74 @@ class TestDuplicateGeometry:
         warnings = PathValidator().validate(eng.plan_segments([line, clone]))
         assert any("duplicate line" in w for w in warnings)
 
+    # ── P1 (audit 2026-07-29): rounding buckets replaced by a distance test ──
+
+    def _eng(self, **kw):
+        kw.setdefault("optimize_order", False)
+        kw.setdefault("mark_spacing", 0.05)
+        kw.setdefault("group_shapes", False)
+        return PathEngine(**kw)
+
+    @staticmethod
+    def _mark(pts, name):
+        return PathSegment(
+            segment_type=SegmentType.MARK, points=pts, speed=0.35,
+            source_entity=name, metadata={"geometry_type": "LINE", "line_like": True},
+        )
+
+    def test_bucket_straddling_duplicate_is_dropped(self):
+        """The old hash's false NEGATIVE: two coincident lines straddling a
+        rounding-bucket edge hashed apart and BOTH got painted — double-thick
+        line plus a 180° reversal, the failure the pass was written to stop.
+
+        With tol=0.05, round(x/tol) flips between 0.0249 and 0.0251. The two
+        lines here are 0.2 mm apart — physically the same stroke."""
+        a = self._mark([(0.0249, 0.0), (0.0249, 2.0)], "LINE_A")
+        b = self._mark([(0.0251, 0.0), (0.0251, 2.0)], "LINE_B")
+        plan = self._eng().plan_segments([a, b])
+        marks = [s for s in plan.segments if s.segment_type == SegmentType.MARK]
+        assert len(marks) == 1, "coincident lines straddling the old bucket edge must dedup"
+        assert plan.planning_metadata["duplicate_geometry"]["removed"] == 1
+
+    def test_close_parallel_lines_are_both_kept(self):
+        """The old hash's false POSITIVE: two DISTINCT parallel lines ~4 cm
+        apart with equal length could land in one bucket and one was silently
+        DELETED — data loss on tight road pre-line geometry (double centre
+        lines, stop-bar hatching). 4 cm is intent, not a duplicate."""
+        a = self._mark([(0.0, 0.0), (0.0, 2.0)], "LINE_A")
+        b = self._mark([(0.04, 0.0), (0.04, 2.0)], "LINE_B")
+        plan = self._eng().plan_segments([a, b])
+        marks = [s for s in plan.segments if s.segment_type == SegmentType.MARK]
+        assert len(marks) == 2, "distinct 4 cm-apart parallel lines must BOTH survive"
+        assert plan.planning_metadata["duplicate_geometry"]["removed"] == 0
+
+    def test_mirrored_arc_same_endpoints_is_kept(self):
+        """Same endpoints, same length, opposite bulge — different geometry.
+        The endpoint+length signature alone (old and new) cannot tell these
+        apart; the arc-length-midpoint term must."""
+        import math as _m
+        n = 16
+        up = [( _m.sin(_m.pi * i / n), 1.0 - _m.cos(_m.pi * i / n)) for i in range(n + 1)]
+        down = [( _m.sin(_m.pi * i / n), -(1.0 - _m.cos(_m.pi * i / n))) for i in range(n + 1)]
+        plan = self._eng().plan_segments(
+            [self._mark(up, "ARC_UP"), self._mark(down, "ARC_DOWN")]
+        )
+        marks = [s for s in plan.segments if s.segment_type == SegmentType.MARK]
+        assert len(marks) == 2, "mirrored arcs are distinct geometry, not duplicates"
+
+    def test_allow_duplicate_drop_false_refuses(self):
+        a = self._mark([(0.0, 0.0), (0.0, 2.0)], "LINE_A")
+        b = self._mark([(0.0, 0.0), (0.0, 2.0)], "LINE_B")
+        eng = self._eng(allow_duplicate_drop=False)
+        with pytest.raises(ValueError, match="LINE_A"):
+            eng.plan_segments([a, b])
+
+    def test_allow_duplicate_drop_false_passes_clean_geometry(self):
+        a = self._mark([(0.0, 0.0), (0.0, 2.0)], "LINE_A")
+        b = self._mark([(5.0, 0.0), (5.0, 2.0)], "LINE_B")
+        plan = self._eng(allow_duplicate_drop=False).plan_segments([a, b])
+        assert plan.planning_metadata["duplicate_geometry"]["removed"] == 0
+
 
 class TestRetraceSuppression:
     """A run-out must never be followed by a connector that drives straight back over it.

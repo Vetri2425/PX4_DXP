@@ -59,9 +59,54 @@ _SMOOTH_SKIP_GEOMETRY_TYPES = CURVED_GEOMETRY_TYPES
 
 _SEGMENT_JOIN_TOL_M = 0.01
 
+# Step 1c coincidence tolerance. Deliberately DECOUPLED from mark_spacing: a
+# true CAD duplicate is copy-paste geometry — identical to float precision, a
+# few mm at worst after re-digitising — so 1 cm is generous for "the same
+# line drawn twice". mark_spacing (5 cm) is a SAMPLING density; using it as a
+# coincidence radius made two *distinct* parallel lines 4 cm apart (double
+# centre lines, stop-bar hatching) legitimate dedup victims. Anything ≥1 cm
+# apart is treated as surveyed intent and kept.
+_DUPLICATE_TOL_M = 0.01
+
 
 def _point_distance(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.hypot(b[0] - a[0], b[1] - a[1])
+
+
+def _polyline_length(pts: list[tuple[float, float]]) -> float:
+    return sum(math.dist(pts[i], pts[i + 1]) for i in range(len(pts) - 1))
+
+
+def _polyline_arclength_midpoint(pts: list[tuple[float, float]]) -> tuple[float, float]:
+    """Point at half the polyline's arc length — direction-independent.
+
+    The same physical point whichever end the polyline is traversed from, so
+    a reversed duplicate has the same midpoint, while a mirrored arc (same
+    endpoints, same length, opposite bulge) has its midpoint on the other
+    side of the chord.
+    """
+    half = _polyline_length(pts) / 2.0
+    walked = 0.0
+    for a, b in zip(pts, pts[1:]):
+        step = math.dist(a, b)
+        if walked + step >= half and step > 0.0:
+            t = (half - walked) / step
+            return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+        walked += step
+    return pts[-1]
+
+
+def _coincident_mark_sig(a: tuple, b: tuple, tol: float) -> bool:
+    """True if two (p0, p1, length, midpoint, source) signatures describe the
+    same physical stroke: endpoints match in either direction, arc lengths
+    match, and arc-length midpoints match — each within tol."""
+    if abs(a[2] - b[2]) > tol:
+        return False
+    ends_match = (
+        (_point_distance(a[0], b[0]) <= tol and _point_distance(a[1], b[1]) <= tol)
+        or (_point_distance(a[0], b[1]) <= tol and _point_distance(a[1], b[0]) <= tol)
+    )
+    return ends_match and _point_distance(a[3], b[3]) <= tol
 
 
 def _unit_dir(a: tuple[float, float], b: tuple[float, float]) -> tuple[float, float] | None:
@@ -247,6 +292,14 @@ class PathEngine:
         # letting the route wander.
         avoid_wet_paint: bool = True,
         wet_paint_penalty_m: float = 5.0,
+        # Step 1c duplicate-geometry policy. True (default): a MARK entity
+        # coincident with one already kept is dropped with a warning — the
+        # sct_1.5m.DXF behaviour this pass was built for, and the contract the
+        # /plan-trajectory route surfaces to the app (drop + warning; client
+        # fails closed on the run count). False: planning refuses with a
+        # ValueError naming both entities — for flows where silently losing a
+        # segment is worse than failing the plan.
+        allow_duplicate_drop: bool = True,
     ):
         if mark_spacing <= 0:
             raise ValueError(f"mark_spacing must be > 0, got {mark_spacing}")
@@ -302,6 +355,7 @@ class PathEngine:
         self.extension_min_useful_m = extension_min_useful_m
         self.avoid_wet_paint = avoid_wet_paint
         self.wet_paint_penalty_m = wet_paint_penalty_m
+        self.allow_duplicate_drop = allow_duplicate_drop
 
     @staticmethod
     def _geo_origin_gps(entities, origin_gps, ref_points_gps):
@@ -809,34 +863,56 @@ class PathEngine:
         # 180 deg, and mark it again backwards. That is a double-thick line, wasted time,
         # and the exact reverse-flip the differential rover handles worst.
         #
-        # Coincident means same endpoints (either direction) within one mark_spacing.
+        # Coincident means: endpoints match (either direction), arc length
+        # matches, AND the arc-length midpoint matches — each within
+        # _DUPLICATE_TOL_M (1 cm). A real pairwise distance test over the kept
+        # MARKs (n is tens, so O(n^2) costs nothing). The previous
+        # implementation hashed rounding buckets (round(coord / tol)), and
+        # rounding is not proximity: two EXACT duplicates straddling a bucket
+        # edge hashed apart — both painted, the precise failure this pass
+        # exists to stop — while two distinct parallel lines ~4 cm apart could
+        # collide and silently delete surveyed geometry. The midpoint term
+        # keeps mirrored arcs (same endpoints, same length, opposite bulge)
+        # from reading as duplicates.
         duplicate_stats = {"removed": 0, "sources": []}
         if segments:
-            seen: dict[tuple, str] = {}
+            kept_sigs: list[tuple] = []   # (p0, p1, length, midpoint, source)
             deduped: list[PathSegment] = []
-            tol = max(self.mark_spacing, 1e-3)
             for seg in segments:
                 if seg.segment_type != SegmentType.MARK or len(seg.points) < 2:
                     deduped.append(seg)
                     continue
-                a = (round(seg.points[0][0] / tol), round(seg.points[0][1] / tol))
-                b = (round(seg.points[-1][0] / tol), round(seg.points[-1][1] / tol))
-                length = round(
-                    sum(math.dist(seg.points[i], seg.points[i + 1])
-                        for i in range(len(seg.points) - 1)) / tol
+                sig = (
+                    seg.points[0],
+                    seg.points[-1],
+                    _polyline_length(seg.points),
+                    _polyline_arclength_midpoint(seg.points),
+                    str(seg.source_entity),
                 )
-                key = (min(a, b), max(a, b), length)
-                if key in seen:
+                twin = next(
+                    (k for k in kept_sigs
+                     if _coincident_mark_sig(sig, k, _DUPLICATE_TOL_M)),
+                    None,
+                )
+                if twin is not None:
+                    if not self.allow_duplicate_drop:
+                        raise ValueError(
+                            f"duplicate geometry: {sig[4]} is coincident with "
+                            f"{twin[4]} (endpoints, length and midpoint all match "
+                            f"within {_DUPLICATE_TOL_M} m). Remove the duplicate "
+                            "from the drawing, or plan with "
+                            "allow_duplicate_drop=True to drop it."
+                        )
                     duplicate_stats["removed"] += 1
                     duplicate_stats["sources"].append(str(seg.source_entity))
                     log.warning(
                         "duplicate geometry: %s is coincident with %s — dropping it. "
                         "Left in, the rover would mark this line twice (and reverse 180 "
                         "deg between the two passes).",
-                        seg.source_entity, seen[key],
+                        seg.source_entity, twin[4],
                     )
                     continue
-                seen[key] = str(seg.source_entity)
+                kept_sigs.append(sig)
                 deduped.append(seg)
             segments = deduped
 
