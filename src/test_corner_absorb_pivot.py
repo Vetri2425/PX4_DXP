@@ -6,12 +6,46 @@ PART B — angle-aware pivot watchdog + hard release gate.
 
 Run on a ROS2-sourced host (needs rclpy):
     python3 -X utf8 src/test_corner_absorb_pivot.py
+
+Also collectable by pytest (tools/run_jetson_tests.sh): the test functions
+take ``cls`` / ``node`` arguments for the script runner in main(); the two
+fixtures below satisfy the same names under pytest, so one set of test
+bodies serves both entry points. Before the fixtures existed, pytest
+resolved ``cls``/``node`` as missing fixtures and reported 7 errors on
+every run — a permanently red health signal (audit N1).
 """
 import math
 import sys
 
+import pytest
 import rclpy
 from rclpy.parameter import Parameter
+
+
+# --------------------------------------------------------------------------
+# pytest fixtures mirroring main()'s wiring (bodies of the tests unchanged)
+# --------------------------------------------------------------------------
+@pytest.fixture(scope="module", name="cls")
+def _cls_fixture():
+    from rpp_controller_node import RPPControllerNode
+    return RPPControllerNode
+
+
+@pytest.fixture(name="node")
+def _node_fixture():
+    # Same init args as main(): the RTK gate must be off or the node refuses
+    # to drive in the release tests.
+    rclpy.init(args=["--ros-args", "-p", "require_rtk_fix:=false"])
+    try:
+        from rpp_controller_node import RPPControllerNode
+        node = RPPControllerNode()
+        for name in ("_vel_pub", "_yaw_rate_pub", "_dbg_pub",
+                     "_segment_dbg_pub", "_conditioned_path_pub", "_spray_active_pub"):
+            setattr(node, name, _Cap())
+        yield node
+        node.destroy_node()
+    finally:
+        rclpy.shutdown()
 
 
 # --------------------------------------------------------------------------
