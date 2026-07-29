@@ -118,6 +118,6 @@ Priority order. **Phase 1 and Phase 3 are the must-haves.**
 
 ## Not being tested today
 
-- `POST /api/path/plan-trajectory` — still never used in a field run
+- ~~`POST /api/path/plan-trajectory`~~ — **field-validated 2026-07-28**, no longer outstanding
 - Point missions — bug A11 still open
-- Joystick — disabled today
+- Joystick — re-enabled 16:35; J3 axis-mapping bench test still owed (see below)

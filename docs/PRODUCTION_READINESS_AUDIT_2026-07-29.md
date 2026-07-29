@@ -7,7 +7,10 @@
 
 > This audit scores the **code**. It does not score field verification — that is tracked separately in
 > [`MERGE_WAIVER_2026-07-27.md`](MERGE_WAIVER_2026-07-27.md) and remains the larger debt.
-> Dash mode and `POST /api/path/plan-trajectory` have never painted a line.
+> Dash mode has never painted a line.
+> **CORRECTED 2026-07-29 by the operator:** `POST /api/path/plan-trajectory` **IS field-validated**
+> (run 2026-07-28). Earlier statements in this document and in project memory calling it
+> "never used in a field run" were wrong.
 
 ---
 
