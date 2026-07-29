@@ -955,7 +955,11 @@ async def parse_point_csv(file: UploadFile = File(...)):
     PathPlanRequest.point_dwell_s.
     """
     pi = _import_point_ingest()
-    content = (await file.read()).decode("utf-8", errors="replace")
+    # Read up to MAX_UPLOAD_BYTES + 1 to detect oversize (same cap as /upload)
+    raw = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"File exceeds {MAX_UPLOAD_BYTES} bytes")
+    content = raw.decode("utf-8", errors="replace")
     try:
         points = pi.parse_point_csv_text(content)
     except ValueError as exc:
@@ -976,7 +980,11 @@ async def parse_point_gps_csv(file: UploadFile = File(...)):
     the mobile app hands back to /{name}/plan-and-stage.
     """
     pi = _import_point_ingest()
-    content = (await file.read()).decode("utf-8", errors="replace")
+    # Read up to MAX_UPLOAD_BYTES + 1 to detect oversize (same cap as /upload)
+    raw = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"File exceeds {MAX_UPLOAD_BYTES} bytes")
+    content = raw.decode("utf-8", errors="replace")
     try:
         parsed = pi.parse_point_gps_csv_text(content)
     except ValueError as exc:
