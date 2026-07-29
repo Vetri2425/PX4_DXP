@@ -174,6 +174,7 @@ from __future__ import annotations
 
 import math
 from enum import IntEnum
+from typing import NamedTuple
 
 import rclpy
 from rclpy.node import Node
@@ -228,6 +229,24 @@ class SegmentStateCode(IntEnum):
     # does CORNER_ALIGN pivot toward the next heading. Prevents approach
     # momentum from carrying the rover past the corner during the pivot.
     CORNER_STOP = 5
+
+
+# ---------------------------------------------------------------------------
+# Atomic mission handoff (_path_cb → control thread)
+# ---------------------------------------------------------------------------
+class _PendingMission(NamedTuple):
+    """One fully-conditioned mission, staged by _path_cb and installed by
+    _drain_pending_mission.
+
+    The handoff is a SINGLE reference assignment to `_pending_mission`
+    (atomic under the GIL); every actual field write happens in
+    _install_mission/_apply_run on the thread that runs the control tick.
+    Treat instances as immutable: nothing may mutate `runs` after staging.
+    """
+    runs: list
+    must_hit_keys: frozenset
+    stamp: object          # builtin_interfaces.msg.Time
+    frame_id: str
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +587,13 @@ class RPPControllerNode(Node):
         self._active_tracking_profile: str = "smooth"
         # Per-entity run queue (see _split_runs_by_flag / _apply_run)
         self._runs: list[dict] = []
+        # Mission mailbox: _path_cb stages a _PendingMission here as ONE
+        # reference; _drain_pending_mission (control thread) installs it.
+        # `is` comparison against _installed_mission makes the steady-state
+        # tick cost one attribute load + one identity check — no allocation,
+        # no lock, and no clear-write that could race a fresher staging.
+        self._pending_mission: _PendingMission | None = None
+        self._installed_mission: _PendingMission | None = None
         # Quantised (n,e) keys of points the planner flagged as source geometry.
         # Empty = no provenance on this path (legacy publisher) → simplification
         # falls back to the geometric tests alone.
@@ -822,20 +848,11 @@ class RPPControllerNode(Node):
         # Provenance travels by coordinate, not by index: run splitting reorders
         # and re-groups points but never MOVES them, so a quantised (n,e) key
         # survives the whole conditioning pipeline intact.
-        self._must_hit_keys = frozenset(
+        # Local until install: _path_cb writes NO tracked state directly —
+        # everything lands atomically via _install_mission.
+        must_hit_keys = frozenset(
             self._pt_key(p) for p, z in zip(raw_pts, _z) if z & 2
         )
-        # A fresh mission re-arms every point-hold dwell (Phase D A/B).
-        self._point_hold_done_keys = set()
-        self._point_hold_active_key = None
-        self._point_hold_start_ns = None
-        self._point_servo_start_ns = None
-        self._point_approach_speed = 0.0
-        # G4/G5 — re-arm the point handshake for the new mission.
-        self._point_spray_done_this_hold = False
-        self._point_wait_start_ns = None
-        self._point_done_seq_at_arm = self._point_done_seq
-        self._advance_count_at_wait = self._advance_count
         n_raw = len(raw_pts)
 
         resample_dx = float(self.get_parameter("path_resample_spacing_m").value)
@@ -890,7 +907,7 @@ class RPPControllerNode(Node):
                     max_offset_m=float(
                         self.get_parameter("segment_simplify_max_offset_m").value
                     ),
-                    must_hit_keys=self._must_hit_keys,
+                    must_hit_keys=must_hit_keys,
                 )
             else:
                 c_pts, c_flags = run_pts, run_flags
@@ -904,7 +921,7 @@ class RPPControllerNode(Node):
                     )
             runs.append({
                 "poses": self._build_poses(
-                    c_pts, c_flags, stamp, expected, self._must_hit_keys
+                    c_pts, c_flags, stamp, expected, must_hit_keys
                 ),
                 "flags": list(c_flags),
                 "profile": profile,
@@ -925,22 +942,20 @@ class RPPControllerNode(Node):
                 )
                 runs = kept
 
-        self._runs = runs
-        # Mission-level resets; per-run state is reset inside _apply_run.
-        # P0.1 — reset last speed so L_d bootstraps cleanly on new path
-        self._last_speed_cmd = 0.0
-        # R2 — first tick after path load must use nominal 1/CONTROL_HZ, not a
-        # dt that spans the whole conditioning/load wall time.
-        self._last_tick = None
-        # P0.2 — reset jump guard; first pose on new path is always "valid"
-        self._last_pos = None
-        # A3 — start each mission with a clean reset-offset frame. The path is
-        # re-anchored to the origin on every load, so any offset accumulated on
-        # a prior mission must not carry over.
-        self._ekf_reset_offset = (0.0, 0.0)
-        self._ekf_reset_count = 0
-        self._apply_run(0)
-        self._publish_conditioned_path(stamp, expected)
+        # Hand the whole mission over as ONE reference assignment; every real
+        # field write happens in _install_mission on the control thread. The
+        # inline drain below is what the serial executor already guarantees
+        # (install completes before the next timer tick), so behaviour today
+        # is byte-identical. A future MultiThreadedExecutor drops ONLY the
+        # inline call and installs at tick-top instead — the reverted MT
+        # experiment died exactly on the alternative: an e-stop 1-point path
+        # swapped in under a tick whose _closest_seg_hint sat deep inside a
+        # ~20k-point path → IndexError inside the control timer mid-e-stop.
+        self._pending_mission = _PendingMission(
+            runs=runs, must_hit_keys=must_hit_keys,
+            stamp=stamp, frame_id=expected,
+        )
+        self._drain_pending_mission()
 
         n_cond = sum(len(r["poses"]) for r in runs)
         n_seg_runs = sum(1 for r in runs if r["profile"] == "segment")
@@ -1663,6 +1678,63 @@ class RPPControllerNode(Node):
             ps.pose.orientation.w = 1.0
             poses.append(ps)
         return poses
+
+    def _drain_pending_mission(self) -> None:
+        """Install the latest staged mission unless it is already active.
+
+        Steady-state cost (called every control tick): one attribute load and
+        one identity compare — no allocation, no lock (a lock here would risk
+        priority inversion against the FIFO-80 control thread). The mailbox is
+        never cleared; tracking the installed object by identity means a
+        fresher mission staged mid-drain simply installs on the next tick
+        (last-writer-wins, same as today's serial execution).
+        """
+        pm = self._pending_mission
+        if pm is None or pm is self._installed_mission:
+            return
+        # Mark installed BEFORE installing: if _install_mission ever raises,
+        # the broken mission must not be retried at 50 Hz.
+        self._installed_mission = pm
+        self._install_mission(pm)
+
+    def _install_mission(self, pm: _PendingMission) -> None:
+        """Make a staged mission the actively tracked one.
+
+        Every write to mission/run/cursor state lives here or in _apply_run —
+        _path_cb only stages. Under the serial executor this runs inline from
+        _path_cb (identical to the historical behaviour); under a future
+        multi-threaded executor it runs only at the top of the control tick,
+        so the control loop can never observe a half-installed mission.
+        """
+        self._must_hit_keys = pm.must_hit_keys
+        # A fresh mission re-arms every point-hold dwell (Phase D A/B).
+        self._point_hold_done_keys = set()
+        self._point_hold_active_key = None
+        self._point_hold_start_ns = None
+        self._point_servo_start_ns = None
+        self._point_approach_speed = 0.0
+        # G4/G5 — re-arm the point handshake for the new mission.
+        self._point_spray_done_this_hold = False
+        self._point_wait_start_ns = None
+        self._point_done_seq_at_arm = self._point_done_seq
+        self._advance_count_at_wait = self._advance_count
+
+        self._runs = pm.runs
+        # Mission-level resets; per-run state is reset inside _apply_run.
+        # P0.1 — reset last speed so L_d bootstraps cleanly on new path
+        self._last_speed_cmd = 0.0
+        # R2 — first tick after path load must use nominal 1/CONTROL_HZ, not a
+        # dt that spans the whole conditioning/load wall time.
+        self._last_tick = None
+        # P0.2 — reset jump guard; first pose on new path is always "valid"
+        self._last_pos = None
+        # A3 — start each mission with a clean reset-offset frame. The path is
+        # re-anchored to the origin on every load, so any offset accumulated on
+        # a prior mission must not carry over.
+        self._ekf_reset_offset = (0.0, 0.0)
+        self._ekf_reset_count = 0
+        self._apply_run(0)
+        self._publish_conditioned_path(pm.stamp, pm.frame_id)
 
     def _apply_run(self, idx: int, *, pre_stopped: bool = False) -> None:
         """Make run `idx` the actively tracked path; reset per-run state."""
@@ -3405,6 +3477,14 @@ class RPPControllerNode(Node):
         it raises, the drive command for this tick has already been published
         by the impl, and we only lose one progress sample.
         """
+        # Atomic mission handoff: install any mission staged by _path_cb
+        # BEFORE dt is measured, so the R2 "_last_tick = None" reset inside
+        # _install_mission gives this very tick the nominal 1/CONTROL_HZ dt.
+        # No-op (one identity compare) on every tick without a fresh mission,
+        # and today also on ticks WITH one — _path_cb drains inline under the
+        # serial executor. This call is the future MT-executor install point.
+        self._drain_pending_mission()
+
         # R2 — measured dt once per tick (ROS clock, not wall time) so segment
         # and smooth accel ramps agree. Clamp at 0.1 s: without it a long stall
         # (blocked timer, debugger, load spike) produces one huge accel step.
