@@ -50,7 +50,7 @@ def _decision(**kwargs):
         "solenoid_close_delay_s": 0.05,
         "on_overspray_margin_m": 0.02,
         "off_overspray_margin_m": 0.0,
-        "max_xtrack_error_m": 0.10,
+        "max_xtrack_error_m": 0.03,
     }
     defaults.update(kwargs)
     return _make_spray_decision(**defaults)
@@ -115,7 +115,7 @@ def test_rpp_overrides_disagreeing_local_projection():
 
 
 def test_rpp_xtrack_gate_still_local_and_independent():
-    # RPP says spray, but the nozzle is 0.25 m off the line (> 0.10 gate). The
+    # RPP says spray, but the nozzle is 0.25 m off the line (> 0.03 gate). The
     # xtrack safety is computed from the LOCAL projection and must still block.
     d = _decision(nozzle_n=1.5, nozzle_e=0.25, rpp_in_mark=True,
                   rpp_boundary_kind=MARK_TO_TRANSIT, rpp_dist_to_boundary_m=0.5)

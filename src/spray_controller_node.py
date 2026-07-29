@@ -430,6 +430,7 @@ def _make_spray_decision(
     on_overspray_margin_m: float,
     off_overspray_margin_m: float,
     max_xtrack_error_m: float,
+    max_xtrack_source: str = "param",
     mode: str = "continuous",
     dash_meter: Optional["DashMeter"] = None,
     dt_s: float = 0.0,
@@ -516,7 +517,7 @@ def _make_spray_decision(
             safety_ok = False
             safety_reason = (
                 f"xtrack error {projection.xtrack_error_m:.3f}m "
-                f"> {max_xtrack_error_m:.3f}m"
+                f"> {max_xtrack_error_m:.3f}m ({max_xtrack_source})"
             )
         if mode == "dash" and dash_meter is not None:
             # Dash metering (plan §7.2): geometry_desired comes from cumulative
@@ -710,7 +711,7 @@ class SprayControllerNode(Node):
         # progress_timeout_s. Generalizes the existing pivot-gate pattern.
         self.declare_parameter("consume_rpp_progress", False)
         self.declare_parameter("progress_timeout_s", 0.3)   # s → fallback to /path
-        self.declare_parameter("max_xtrack_error_m", 0.10)
+        self.declare_parameter("max_xtrack_error_m", 0.03)
         self.declare_parameter("pose_timeout_s", 0.5)
         self.declare_parameter("velocity_timeout_s", 0.5)
         # ── Phase B: RTK / GPS fix-quality gate (plan §7.6) ──────────────────
@@ -813,6 +814,10 @@ class SprayControllerNode(Node):
         # _rebuild_point_meter). A new path is a new arc-length origin; patching
         # anchor_s on an already-armed meter is a no-op at arm-time read.
         self._dash_config: Optional[DashConfig] = None
+        # Per-mission xtrack gate from session_config (R3). Stashed separately
+        # because _path_cb overwrites _session_config with a continuous geometry
+        # mirror (same reason _dash_config is stashed). None → ROS param.
+        self._mission_max_xtrack_error_m: Optional[float] = None
         # Phase D point mode. _last_point_update lets _auto_safety_status apply
         # the pivot-gate exemption using the most recent point FSM state (it
         # runs one step before _make_spray_decision updates the meter).
@@ -1254,6 +1259,8 @@ class SprayControllerNode(Node):
         prev_mode = self._session_mode
         self._session_mode = cfg.mode
         self._session_config = cfg
+        # R3: stash per-mission xtrack (survives _path_cb geometry mirror).
+        self._mission_max_xtrack_error_m = cfg.max_xtrack_error_m
 
         self._dash_meter = None
         self._dash_config = None
@@ -1504,6 +1511,18 @@ class SprayControllerNode(Node):
             if self._point_meter is not None
             else None
         )
+        # R3: one resolved gate value for the decision. Mission session override
+        # wins when present; otherwise the ROS param. Provenance rides only in
+        # safety_reason so the operator knows which knob refused the spray.
+        if self._mission_max_xtrack_error_m is not None:
+            max_xtrack_error_m = float(self._mission_max_xtrack_error_m)
+            max_xtrack_source = "mission"
+        else:
+            max_xtrack_error_m = max(
+                0.0,
+                float(self.get_parameter("max_xtrack_error_m").value),
+            )
+            max_xtrack_source = "param"
         decision = _make_spray_decision(
             model=model,
             nozzle_n=nozzle_n,
@@ -1534,10 +1553,8 @@ class SprayControllerNode(Node):
                 0.0,
                 float(self.get_parameter("off_overspray_margin_m").value),
             ),
-            max_xtrack_error_m=max(
-                0.0,
-                float(self.get_parameter("max_xtrack_error_m").value),
-            ),
+            max_xtrack_error_m=max_xtrack_error_m,
+            max_xtrack_source=max_xtrack_source,
             terminal_off_epsilon_m=max(
                 0.0,
                 float(self.get_parameter("terminal_off_epsilon_m").value),

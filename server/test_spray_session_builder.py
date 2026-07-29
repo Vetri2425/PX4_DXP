@@ -101,6 +101,21 @@ def test_json_is_finite_and_valid():
     parse_session_config(json.loads(s))  # parses without raising
 
 
+def test_max_xtrack_omitted_when_none():
+    """R3: default callers keep an identical wire format (key absent, not null)."""
+    raw = build_session_config("continuous")
+    assert "max_xtrack_error_m" not in raw
+    cfg = parse_session_config(raw)
+    assert cfg.max_xtrack_error_m is None
+
+
+def test_max_xtrack_included_when_set():
+    raw = build_session_config("continuous", max_xtrack_error_m=0.03)
+    assert raw["max_xtrack_error_m"] == 0.03
+    cfg = parse_session_config(raw)
+    assert cfg.max_xtrack_error_m == 0.03
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

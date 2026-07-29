@@ -63,6 +63,10 @@ class SpraySessionConfig:
     flags: tuple  # tuple[bool, ...]  (per-point MARK/transit)
     dash: Optional[DashConfig]
     points_mode: Optional[PointsModeConfig]
+    # Optional per-mission xtrack gate (metres). None → node uses its ROS param.
+    # Additive (SCHEMA_VERSION unchanged): absent/null parse as None so old
+    # nodes ignore the key and new nodes fall back to the param.
+    max_xtrack_error_m: Optional[float] = None
 
     def path_fingerprint(self) -> str:
         """Stable hash over (points, flags) only — never over anything else.
@@ -256,6 +260,18 @@ def parse_session_config(data: dict) -> SpraySessionConfig:
         if points_mode_present:
             raise ConfigSchemaError("mode='continuous' must not include a 'points_mode' sub-config")
 
+    # Additive optional: absent or null → None (ROS-param fallback on the node).
+    # Do NOT bump SCHEMA_VERSION for this key — see module docstring / R3.
+    max_xtrack_raw = data.get("max_xtrack_error_m", None)
+    if max_xtrack_raw is None:
+        max_xtrack_error_m: Optional[float] = None
+    else:
+        max_xtrack_error_m = _finite_float(max_xtrack_raw, "max_xtrack_error_m")
+        if max_xtrack_error_m <= 0.0:
+            raise ConfigSchemaError(
+                f"max_xtrack_error_m must be > 0, got {max_xtrack_error_m}"
+            )
+
     return SpraySessionConfig(
         schema_version=SCHEMA_VERSION,
         mode=mode,
@@ -263,6 +279,7 @@ def parse_session_config(data: dict) -> SpraySessionConfig:
         flags=flags,
         dash=dash,
         points_mode=points_mode,
+        max_xtrack_error_m=max_xtrack_error_m,
     )
 
 
@@ -296,6 +313,10 @@ def to_dict(cfg: SpraySessionConfig) -> dict:
             "arrival_settle_s": cfg.points_mode.arrival_settle_s,
             "dwell_s": cfg.points_mode.dwell_s,
         }
+    # Omit when None so the wire format stays identical for callers that never
+    # set a per-mission gate (additive optional; do not send null).
+    if cfg.max_xtrack_error_m is not None:
+        d["max_xtrack_error_m"] = cfg.max_xtrack_error_m
     return d
 
 

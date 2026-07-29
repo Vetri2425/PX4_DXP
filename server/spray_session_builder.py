@@ -34,6 +34,7 @@ def build_session_config(
     point_arrival_settle_s: float = 0.2,
     point_dwell_s: float = 1.0,
     point_heading_tolerance_deg: Optional[float] = None,
+    max_xtrack_error_m: Optional[float] = None,
 ) -> dict:
     """Return a schema-1 SpraySessionConfig dict for the given mode.
 
@@ -43,6 +44,10 @@ def build_session_config(
     require coordinates here — its dwell targets come from the /path must-hit
     vertices (see the point branch below), so point always emits point mode with
     its params and (usually empty) coordinates.
+
+    max_xtrack_error_m is additive optional (R3): when None the key is omitted
+    so the wire format stays identical for every existing caller; when set the
+    node uses it instead of its ROS param.
     """
     mode = (mode or "continuous").lower()
     cfg = {
@@ -79,6 +84,8 @@ def build_session_config(
             "arrival_settle_s": float(point_arrival_settle_s),
             "dwell_s": float(point_dwell_s),
         }
+    if max_xtrack_error_m is not None:
+        cfg["max_xtrack_error_m"] = float(max_xtrack_error_m)
     return cfg
 
 

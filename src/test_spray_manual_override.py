@@ -289,7 +289,7 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "min_spray_speed_mps": _Param(0.05),
         "spray_off_during_pivot": _Param(True),
         "segment_state_timeout_s": _Param(1.0),
-        "max_xtrack_error_m": _Param(0.10),
+        "max_xtrack_error_m": _Param(0.03),
         "pose_timeout_s": _Param(0.5),
         "velocity_timeout_s": _Param(0.5),
         # Phase B RTK gate — OFF in the fixture (opt-in per test) so the many
@@ -350,6 +350,8 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     # B0 / Phase C mode state (default continuous == pre-B0 behaviour).
     node._session_mode = "continuous"
     node._dash_meter = None
+    node._dash_config = None
+    node._mission_max_xtrack_error_m = None
     node._point_meter = None
     node._last_point_update = None
     node._path_must_hit_points = []

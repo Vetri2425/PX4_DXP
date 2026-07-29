@@ -122,6 +122,20 @@ class SchemaVersionTest(unittest.TestCase):
         with self.assertRaises(ConfigSchemaError):
             parse_session_config(data)
 
+    def test_unknown_top_level_key_is_tolerated(self):
+        """Additive schema evolution: unknown top-level keys must not reject.
+
+        R3 / SCHEMA_VERSION trap: if the parser rejected unknowns, a new server
+        could not add optional keys without a version bump, and a bump against
+        an old node fails-static into the previous mission's mode. Prove the
+        additive path is available before relying on it.
+        """
+        data = _continuous_data()
+        data["some_future_key"] = 1
+        cfg = parse_session_config(data)
+        self.assertEqual(cfg.mode, "continuous")
+        self.assertEqual(cfg.schema_version, SCHEMA_VERSION)
+
 
 class PointsFlagsLengthTest(unittest.TestCase):
     def test_mismatched_length_raises(self):
@@ -309,6 +323,50 @@ class ToDictRoundTripTest(unittest.TestCase):
         d = to_dict(cfg)
         self.assertIsNone(d["dash"])
         self.assertIsNone(d["points_mode"])
+        self.assertNotIn("max_xtrack_error_m", d)
+
+
+class MaxXtrackErrorMTest(unittest.TestCase):
+    """R3: additive optional per-mission xtrack gate (SCHEMA_VERSION unchanged)."""
+
+    def test_absent_parses_as_none(self):
+        cfg = parse_session_config(_continuous_data())
+        self.assertIsNone(cfg.max_xtrack_error_m)
+
+    def test_null_parses_as_none(self):
+        data = _continuous_data()
+        data["max_xtrack_error_m"] = None
+        cfg = parse_session_config(data)
+        self.assertIsNone(cfg.max_xtrack_error_m)
+
+    def test_positive_value_parses(self):
+        data = _continuous_data()
+        data["max_xtrack_error_m"] = 0.03
+        cfg = parse_session_config(data)
+        self.assertAlmostEqual(cfg.max_xtrack_error_m, 0.03)
+
+    def test_zero_rejected(self):
+        data = _continuous_data()
+        data["max_xtrack_error_m"] = 0.0
+        with self.assertRaises(ConfigSchemaError) as ctx:
+            parse_session_config(data)
+        self.assertIn("must be > 0", str(ctx.exception))
+
+    def test_negative_rejected(self):
+        data = _continuous_data()
+        data["max_xtrack_error_m"] = -0.01
+        with self.assertRaises(ConfigSchemaError):
+            parse_session_config(data)
+
+    def test_to_dict_omits_when_none_includes_when_set(self):
+        cfg = parse_session_config(_continuous_data())
+        self.assertNotIn("max_xtrack_error_m", to_dict(cfg))
+        data = _continuous_data()
+        data["max_xtrack_error_m"] = 0.025
+        cfg2 = parse_session_config(data)
+        d2 = to_dict(cfg2)
+        self.assertEqual(d2["max_xtrack_error_m"], 0.025)
+        self.assertEqual(parse_session_config(d2), cfg2)
 
 
 class ClearedConfigTest(unittest.TestCase):

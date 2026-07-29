@@ -49,7 +49,7 @@ def _decision(**kwargs):
         "solenoid_close_delay_s": 0.05,
         "on_overspray_margin_m": 0.02,
         "off_overspray_margin_m": 0.0,
-        "max_xtrack_error_m": 0.10,
+        "max_xtrack_error_m": 0.03,
     }
     defaults.update(kwargs)
     return _make_spray_decision(**defaults)
@@ -290,12 +290,13 @@ def test_cross_track_gate_forces_off_on_mark_geometry():
         model=_mark_only_path(),
         nozzle_n=1.0,
         nozzle_e=0.25,
-        max_xtrack_error_m=0.10,
+        max_xtrack_error_m=0.03,
     )
     assert decision.geometry_desired is True
     assert decision.desired is False
     assert decision.safety_ok is False
     assert "xtrack error" in decision.safety_reason
+    assert "(param)" in decision.safety_reason
 
 
 def test_velocity_stale_forces_off():
@@ -395,12 +396,13 @@ def test_path_published_before_arm_survives_to_drive():
 
 def test_xtrack_gate_forces_off_through_tick():
     node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=1.0)
-    node._pose_ned = (1.0, 0.25, 0.0)  # 0.25m off the e=0 line > 0.10 gate
+    node._pose_ned = (1.0, 0.25, 0.0)  # 0.25m off the e=0 line > 0.03 gate
     node._pose_recv_time = node.get_clock().now()
     node._distance_aware_tick()
     assert node._desired_debounced is False
     assert node._fsm.commanded is False
     assert "xtrack error" in node._last_safety_block_reason
+    assert "(param)" in node._last_safety_block_reason
 
 
 def test_startup_unconfirmed_off_is_commanded_while_disarmed():
@@ -572,7 +574,7 @@ def test_terminal_shutoff_when_stopped_short_at_endpoint():
         speed_mps=0.008, safety_ok=True, safety_reason="",
         solenoid_open_delay_s=0.10, solenoid_close_delay_s=0.05,
         on_overspray_margin_m=0.02, off_overspray_margin_m=0.0,
-        max_xtrack_error_m=0.10,
+        max_xtrack_error_m=0.03,
     )
     assert d.geometry_desired is False
     assert d.event == "terminal_off"
@@ -585,7 +587,7 @@ def test_terminal_shutoff_at_exact_endpoint():
         speed_mps=0.0, safety_ok=True, safety_reason="",
         solenoid_open_delay_s=0.10, solenoid_close_delay_s=0.05,
         on_overspray_margin_m=0.02, off_overspray_margin_m=0.0,
-        max_xtrack_error_m=0.10,
+        max_xtrack_error_m=0.03,
     )
     assert d.geometry_desired is False
 
@@ -598,7 +600,7 @@ def test_terminal_shutoff_is_end_specific_not_a_speed_gate():
         speed_mps=0.008, safety_ok=True, safety_reason="",
         solenoid_open_delay_s=0.10, solenoid_close_delay_s=0.05,
         on_overspray_margin_m=0.02, off_overspray_margin_m=0.0,
-        max_xtrack_error_m=0.10,
+        max_xtrack_error_m=0.03,
     )
     assert d.geometry_desired is True
     assert d.event == ""
@@ -613,7 +615,7 @@ def test_terminal_shutoff_does_not_fire_while_moving_near_end():
         speed_mps=1.0, safety_ok=True, safety_reason="",
         solenoid_open_delay_s=0.10, solenoid_close_delay_s=0.05,
         on_overspray_margin_m=0.02, off_overspray_margin_m=0.0,
-        max_xtrack_error_m=0.10,
+        max_xtrack_error_m=0.03,
     )
     assert d.event == "off_early"          # NOT terminal_off
     assert d.geometry_desired is False
@@ -707,7 +709,7 @@ def _dash_drive(model, meter, n_start, n_end, *, step=0.02, speed=1.0, dt=1.0):
             safety_ok=True, safety_reason="",
             solenoid_open_delay_s=0.0, solenoid_close_delay_s=0.0,
             on_overspray_margin_m=0.0, off_overspray_margin_m=0.0,
-            max_xtrack_error_m=0.10, mode="dash", dash_meter=meter, dt_s=dt,
+            max_xtrack_error_m=0.03, mode="dash", dash_meter=meter, dt_s=dt,
         )
     return d
 
@@ -734,7 +736,7 @@ def test_dash_respects_safety_gate():
         safety_ok=False, safety_reason="pivoting in place",
         solenoid_open_delay_s=0.0, solenoid_close_delay_s=0.0,
         on_overspray_margin_m=0.0, off_overspray_margin_m=0.0,
-        max_xtrack_error_m=0.10, mode="dash", dash_meter=meter, dt_s=1.0,
+        max_xtrack_error_m=0.03, mode="dash", dash_meter=meter, dt_s=1.0,
     )
     assert blocked.geometry_desired is True   # pattern still wants ON
     assert blocked.desired is False           # but safety gate wins
@@ -760,7 +762,7 @@ def test_dash_never_paints_transit_connector():
             safety_ok=True, safety_reason="",
             solenoid_open_delay_s=0.0, solenoid_close_delay_s=0.0,
             on_overspray_margin_m=0.0, off_overspray_margin_m=0.0,
-            max_xtrack_error_m=0.10, mode="dash", dash_meter=meter, dt_s=1.0,
+            max_xtrack_error_m=0.03, mode="dash", dash_meter=meter, dt_s=1.0,
         )
         assert d.desired is False, f"painted transit at n={n:.3f}"
         assert d.geometry_desired is False
@@ -770,7 +772,7 @@ def test_dash_never_paints_transit_connector():
         safety_ok=True, safety_reason="",
         solenoid_open_delay_s=0.0, solenoid_close_delay_s=0.0,
         on_overspray_margin_m=0.0, off_overspray_margin_m=0.0,
-        max_xtrack_error_m=0.10, mode="dash", dash_meter=meter, dt_s=1.0,
+        max_xtrack_error_m=0.03, mode="dash", dash_meter=meter, dt_s=1.0,
     )
     assert on_mark.desired is True
     assert on_mark.geometry_desired is True
@@ -787,7 +789,7 @@ def test_dash_terminal_shutoff_when_stopped_short():
         safety_ok=True, safety_reason="",
         solenoid_open_delay_s=0.10, solenoid_close_delay_s=0.05,
         on_overspray_margin_m=0.02, off_overspray_margin_m=0.0,
-        max_xtrack_error_m=0.10, mode="dash", dash_meter=meter, dt_s=1.0,
+        max_xtrack_error_m=0.03, mode="dash", dash_meter=meter, dt_s=1.0,
     )
     assert d.geometry_desired is False
     assert d.event == "terminal_off"
@@ -815,7 +817,7 @@ def test_dash_mark_gate_opens_with_solenoid_lead():
             safety_ok=True, safety_reason="",
             solenoid_open_delay_s=0.10, solenoid_close_delay_s=0.05,
             on_overspray_margin_m=0.02, off_overspray_margin_m=0.0,
-            max_xtrack_error_m=0.10, mode="dash", dash_meter=meter, dt_s=0.1,
+            max_xtrack_error_m=0.03, mode="dash", dash_meter=meter, dt_s=0.1,
         )
 
     # Arm and approach from well before the lead window.
@@ -841,6 +843,27 @@ def test_session_config_cb_selects_dash():
     assert node._dash_meter.on_distance_m == 6.0
     assert node._dash_meter.off_distance_m == 3.0
     assert node._dash_config is not None
+
+
+def test_mission_max_xtrack_overrides_param_and_labels_reason():
+    """R3: session max_xtrack_error_m wins; safety_reason says (mission)."""
+    node = _make_distance_node(path_model=_mark_only_path(), pose_n=1.0, speed=1.0)
+    # Param stays at fixture 0.03; mission tightens to 0.02. Pose is 0.025 m off
+    # → would pass the param but fail the mission gate.
+    node._session_config_cb(_Msg(_json.dumps({
+        "schema_version": SCHEMA_VERSION,
+        "mode": "continuous",
+        "points": [],
+        "flags": [],
+        "max_xtrack_error_m": 0.02,
+    })))
+    assert node._mission_max_xtrack_error_m == 0.02
+    node._pose_ned = (1.0, 0.025, 0.0)
+    node._pose_recv_time = node.get_clock().now()
+    node._distance_aware_tick()
+    assert node._desired_debounced is False
+    assert "(mission)" in node._last_safety_block_reason
+    assert "0.020m" in node._last_safety_block_reason
 
 
 def test_session_config_cb_back_to_continuous_clears_meter():
@@ -988,7 +1011,7 @@ def test_point_mode_no_meter_commands_off_not_continuous():
         safety_ok=True, safety_reason="",
         solenoid_open_delay_s=0.0, solenoid_close_delay_s=0.0,
         on_overspray_margin_m=0.0, off_overspray_margin_m=0.0,
-        max_xtrack_error_m=0.10, mode="point", point_meter=None,
+        max_xtrack_error_m=0.03, mode="point", point_meter=None,
         yaw=0.0, now_s=1.0, off_confirmed=True,
     )
     assert d.geometry_desired is False and d.desired is False
@@ -1003,7 +1026,7 @@ def test_point_decision_routes_to_meter():
         safety_ok=True, safety_reason="",
         solenoid_open_delay_s=0.0, solenoid_close_delay_s=0.0,
         on_overspray_margin_m=0.0, off_overspray_margin_m=0.0,
-        max_xtrack_error_m=0.10, mode="point", point_meter=meter,
+        max_xtrack_error_m=0.03, mode="point", point_meter=meter,
         yaw=0.0, now_s=1.0, off_confirmed=True,
     )
     assert d.geometry_desired is True and d.desired is True   # dwelling on the dot
