@@ -6,15 +6,15 @@ Lifespan order (startup → ready → shutdown):
   3. rclpy.init() + RosBridgeNode + MultiThreadedExecutor in daemon thread
   4. Build shared singletons (PathManager, OffboardController, EmergencyHandler)
   5. Register Socket.IO handlers
-  6. Start telemetry push loop (10 Hz) — also runs:
-       · auto-completion (RUNNING → COMPLETED on RPP DONE settle)
-       · pose-stale watchdog (RUNNING + STALE > grace → estop)
-       · disconnect notification
-  7. Start UDP discovery beacon
+  6. Start telemetry push loop (10 Hz) — auto-completion, disconnect notify,
+     and safety_abort Socket.IO emits (fed by the safety task's queue)
+  7. Start safety watchdog task (10 Hz) — E-stop on unhealthy RUNNING/ENTRY;
+     systemd WATCHDOG=1 heartbeat (must fire even when ros_node is None)
+  8. Start UDP discovery beacon
 
-Shutdown reverses the order. Telemetry loop catches and logs every exception
-without dying. Beacon and rclpy threads use Event-based stop signals so
-shutdown completes within ~1 s.
+Shutdown reverses the order. Both loops catch and log every exception without
+dying. Beacon and rclpy threads use Event-based stop signals so shutdown
+completes within ~1 s.
 """
 
 from __future__ import annotations
@@ -74,6 +74,9 @@ _executor: Optional["object"] = None
 _beacon: Optional["object"] = None
 _listener: Optional["object"] = None
 _telemetry_task: Optional[asyncio.Task] = None
+_safety_task: Optional[asyncio.Task] = None
+# Safety task → telemetry loop: estop payloads for Socket.IO (safety never emits).
+_safety_abort_q: Optional[asyncio.Queue] = None
 bridge_health: Optional["object"] = None
 rtk_manager: Optional["object"] = None
 joystick_ctrl: Optional["object"] = None
@@ -83,6 +86,10 @@ joystick_ctrl: Optional["object"] = None
 activity_log: deque = deque(maxlen=MAX_ACTIVITY_LOG)
 
 log = get_logger("server.main")
+
+# Per-SID emit ceiling. A phone leaving WiFi with a full TCP buffer must not
+# stall the telemetry tick (or, historically, the co-located E-stop watchdog).
+_EMIT_TIMEOUT_S = 0.5
 
 
 # ── Socket.IO ASGI app ────────────────────────────────────────────────────────
@@ -101,7 +108,8 @@ socket_app = socketio.ASGIApp(sio)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global ros_node, offboard_ctrl, path_mgr, emergency_handler
-    global _executor, _beacon, _listener, _telemetry_task, bridge_health, rtk_manager
+    global _executor, _beacon, _listener, _telemetry_task, _safety_task
+    global _safety_abort_q, bridge_health, rtk_manager
     global joystick_ctrl
 
     configure_logging()
@@ -166,8 +174,10 @@ async def lifespan(app: FastAPI):
 
     register_handlers(sio)
 
-    # ── Start telemetry + watchdog loop ───────────────────────────────────────
+    # ── Start telemetry + safety watchdog (separate tasks — S2) ───────────────
+    _safety_abort_q = asyncio.Queue()
     _telemetry_task = asyncio.create_task(_telemetry_loop(), name="telemetry-loop")
+    _safety_task = asyncio.create_task(_safety_watchdog_loop(), name="safety-watchdog")
 
     # ── Start bridge-health watchdog (Phase 3A: observe-only by default) ───────
     try:
@@ -227,6 +237,13 @@ async def lifespan(app: FastAPI):
         _telemetry_task.cancel()
         try:
             await _telemetry_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    if _safety_task:
+        _safety_task.cancel()
+        try:
+            await _safety_task
         except (asyncio.CancelledError, Exception):
             pass
 
@@ -326,36 +343,64 @@ async def _emit_authenticated(event: str, data: dict) -> None:
     Each emit is isolated: a sid that disconnects between the authenticated_sids()
     snapshot and its awaited emit raises, and without this guard that exception
     would abandon the whole tick — dropping telemetry for every *other* connected
-    operator too.
+    operator too. Each emit is also time-bounded (S2): a phone leaving WiFi with
+    a full TCP buffer must not stall the tick — log and continue to the next SID.
     """
     for sid in authenticated_sids():
         try:
-            await sio.emit(event, data, to=sid)
+            await asyncio.wait_for(
+                sio.emit(event, data, to=sid),
+                timeout=_EMIT_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "emit %s to sid=%s timed out after %.1fs — continuing",
+                event,
+                sid,
+                _EMIT_TIMEOUT_S,
+            )
         except Exception:
             log.debug("emit %s to sid=%s failed (client likely gone)", event, sid, exc_info=True)
 
 
-async def _telemetry_loop() -> None:
+async def _drain_safety_aborts() -> None:
+    """Forward queued safety-abort payloads to authenticated Socket.IO clients.
+
+    The safety task never touches Socket.IO — it only enqueues. Emitting here
+    keeps a wedged emit from starving the E-stop path (S2).
+    """
+    if _safety_abort_q is None:
+        return
+    while True:
+        try:
+            payload = _safety_abort_q.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        await _emit_authenticated("safety_abort", payload)
+
+
+async def _safety_watchdog_loop() -> None:
+    """E-stop watchdog + systemd heartbeat — never touches Socket.IO (S2).
+
+    Calls only ros_node.get_state() and emergency_handler.estop_async(). Abort
+    UI notification is queued for the telemetry loop. WATCHDOG=1 lives here
+    because the process state worth protecting is the safety abort, not the
+    telemetry push; must still fire when ros_node is None (S1-a).
+    """
     interval = 1.0 / TELEMETRY_HZ
-    prev_connected: Optional[bool] = None
     stale_since: Optional[float] = None
     consecutive_errors = 0
     _watchdog_counter = 0
     _WATCHDOG_EVERY_N = TELEMETRY_HZ * 3  # ping systemd every ~3s
 
-    log.info("telemetry loop started @ %d Hz", TELEMETRY_HZ)
+    log.info("safety watchdog started @ %d Hz", TELEMETRY_HZ)
     try:
         while True:
             try:
                 await asyncio.sleep(interval)
-                # Systemd watchdog heartbeat — attests THE LOOP IS ALIVE, not
-                # that ROS is healthy. Must sit above the ros_node None continue:
-                # lifespan catches ROS2 startup failure on purpose so the server
-                # still comes up (unit file graceful-degradation note). With
-                # Type=notify + WatchdogSec, skipping WATCHDOG=1 in that mode
-                # permanently kills the unit via StartLimitBurst. A throwing
-                # loop keeps feeding this (loud in the journal); a HUNG await
-                # is what WatchdogSec exists to catch.
+
+                # Systemd heartbeat — loop alive, not "ROS healthy". Above the
+                # ros_node None continue so degraded boot still feeds WatchdogSec.
                 _watchdog_counter += 1
                 if _sd_notifier and _watchdog_counter >= _WATCHDOG_EVERY_N:
                     _sd_notifier.notify("WATCHDOG=1")
@@ -365,9 +410,122 @@ async def _telemetry_loop() -> None:
                     continue
 
                 s = ros_node.get_state()
-                origin_health = evaluate_origin_health(s)
                 code = s.get("rpp_state", 0)
                 now = time.time()
+                # B2: RPP_UNHEALTHY_CODES covers STALE (-1), RTK_WAIT (4),
+                # JUMP_SKIP (5). All three mean "controller is publishing
+                # zero velocity for a safety reason" — same response.
+                pose_age = s.get("pose_age_ms") or 0.0
+                running = (
+                    offboard_ctrl is not None
+                    and offboard_ctrl.state in (MissionState.RUNNING, MissionState.ENTRY)
+                )
+                # Controller-death detection. `code` and `pose_age` above are BOTH
+                # self-reported by the RPP controller, so when that process dies they
+                # freeze at their last healthy values and this watchdog would happily
+                # keep trusting a corpse. rpp_debug_age_ms is measured by us, on
+                # receipt, and is the only field the dead process cannot fake.
+                #
+                # This also closes the mid-mission restart hazard: /path is published
+                # TRANSIENT_LOCAL and RPP's _path_cb always _apply_run(0) with no
+                # persisted progress, so a crashed-and-restarted controller would pick
+                # the latched mission back up and re-drive it from run 0 across
+                # already-marked ground. (PX4's own failsafe does NOT save us here:
+                # twist_to_setpoint keeps streaming zero-velocity setpoints, so the
+                # OFFBOARD stream never gaps and the rover stays armed.) Tripping the
+                # watchdog runs estop_async(), which publishes a single-point stop-path
+                # — replacing the latched mission — so a restarting RPP wakes up to a
+                # stop, not a re-run.
+                #
+                # None => never heard from RPP at all; we can't judge, so don't trip
+                # (avoids false aborts where /rpp/debug simply isn't wired).
+                rpp_age = s.get("rpp_debug_age_ms")
+                rpp_dead = rpp_age is not None and rpp_age > RPP_DEBUG_STALE_MS
+                unhealthy = (
+                    code in RPP_UNHEALTHY_CODES
+                    or pose_age > POSE_STALE_MS
+                    or rpp_dead
+                    or s.get("connected") is False
+                )
+                if running and unhealthy:
+                    if stale_since is None:
+                        stale_since = now
+                    elif now - stale_since > SAFETY_STALE_GRACE_S:
+                        if emergency_handler is not None:
+                            rpp_name = RPP_STATE_NAMES.get(code, f"?{code}")
+                            # Name the actual cause. "controller not responding" and
+                            # "pose stale" call for very different operator responses,
+                            # and a dead controller must not be reported as a bad fix.
+                            if rpp_dead:
+                                reason = "RPP controller not responding (process died?)"
+                            elif s.get("connected") is False:
+                                reason = "FCU disconnected"
+                            elif pose_age > POSE_STALE_MS:
+                                reason = "pose stale"
+                            else:
+                                reason = f"RPP unhealthy: {rpp_name}"
+                            log.warning(
+                                "safety abort: %s | pose_stale=%.0fms rpp_debug_age=%s "
+                                "rpp=%s(%s) connected=%s",
+                                reason,
+                                pose_age,
+                                f"{rpp_age:.0f}ms" if rpp_age is not None else "never",
+                                code,
+                                rpp_name,
+                                s.get("connected"),
+                            )
+                            await emergency_handler.estop_async()
+                            if _safety_abort_q is not None:
+                                await _safety_abort_q.put(
+                                    {
+                                        "reason": reason,
+                                        "pose_age_ms": pose_age,
+                                        "rpp_debug_age_ms": rpp_age,
+                                        "rpp_state": code,
+                                        "rpp_state_name": RPP_STATE_NAMES.get(
+                                            code, "UNKNOWN"
+                                        ),
+                                        "connected": s.get("connected"),
+                                    }
+                                )
+                        stale_since = None
+                else:
+                    stale_since = None
+
+                consecutive_errors = 0
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                consecutive_errors += 1
+                log.exception(
+                    "safety watchdog iteration failed (n=%d)", consecutive_errors
+                )
+                await asyncio.sleep(min(1.0, 0.05 * consecutive_errors))
+    finally:
+        log.info("safety watchdog exited")
+
+
+async def _telemetry_loop() -> None:
+    interval = 1.0 / TELEMETRY_HZ
+    prev_connected: Optional[bool] = None
+    consecutive_errors = 0
+
+    log.info("telemetry loop started @ %d Hz", TELEMETRY_HZ)
+    try:
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                # Forward any E-stop notifications from the safety task before
+                # other work — each emit is time-bounded (S2).
+                await _drain_safety_aborts()
+
+                if ros_node is None:
+                    continue
+
+                s = ros_node.get_state()
+                origin_health = evaluate_origin_health(s)
+                code = s.get("rpp_state", 0)
                 spraying = bool(s.get("spraying", False))
                 mission_running = (
                     offboard_ctrl is not None
@@ -495,88 +653,8 @@ async def _telemetry_loop() -> None:
                         except Exception:
                             log.exception("disarm-on-complete failed")
 
-                # ── 3. Watchdog: RUNNING + unhealthy/disconnected → estop ──────
-                # B2: RPP_UNHEALTHY_CODES covers STALE (-1), RTK_WAIT (4),
-                # JUMP_SKIP (5). All three mean "controller is publishing
-                # zero velocity for a safety reason" — same response.
-                pose_age = s.get("pose_age_ms") or 0.0
-                running = (
-                    offboard_ctrl is not None
-                    and offboard_ctrl.state in (MissionState.RUNNING, MissionState.ENTRY)
-                )
-                # Controller-death detection. `code` and `pose_age` above are BOTH
-                # self-reported by the RPP controller, so when that process dies they
-                # freeze at their last healthy values and this watchdog would happily
-                # keep trusting a corpse. rpp_debug_age_ms is measured by us, on
-                # receipt, and is the only field the dead process cannot fake.
-                #
-                # This also closes the mid-mission restart hazard: /path is published
-                # TRANSIENT_LOCAL and RPP's _path_cb always _apply_run(0) with no
-                # persisted progress, so a crashed-and-restarted controller would pick
-                # the latched mission back up and re-drive it from run 0 across
-                # already-marked ground. (PX4's own failsafe does NOT save us here:
-                # twist_to_setpoint keeps streaming zero-velocity setpoints, so the
-                # OFFBOARD stream never gaps and the rover stays armed.) Tripping the
-                # watchdog runs estop_async(), which publishes a single-point stop-path
-                # — replacing the latched mission — so a restarting RPP wakes up to a
-                # stop, not a re-run.
-                #
-                # None => never heard from RPP at all; we can't judge, so don't trip
-                # (avoids false aborts where /rpp/debug simply isn't wired).
-                rpp_age = s.get("rpp_debug_age_ms")
-                rpp_dead = rpp_age is not None and rpp_age > RPP_DEBUG_STALE_MS
-                unhealthy = (
-                    code in RPP_UNHEALTHY_CODES
-                    or pose_age > POSE_STALE_MS
-                    or rpp_dead
-                    or s.get("connected") is False
-                )
-                if running and unhealthy:
-                    if stale_since is None:
-                        stale_since = now
-                    elif now - stale_since > SAFETY_STALE_GRACE_S:
-                        if emergency_handler is not None:
-                            rpp_name = RPP_STATE_NAMES.get(code, f"?{code}")
-                            # Name the actual cause. "controller not responding" and
-                            # "pose stale" call for very different operator responses,
-                            # and a dead controller must not be reported as a bad fix.
-                            if rpp_dead:
-                                reason = "RPP controller not responding (process died?)"
-                            elif s.get("connected") is False:
-                                reason = "FCU disconnected"
-                            elif pose_age > POSE_STALE_MS:
-                                reason = "pose stale"
-                            else:
-                                reason = f"RPP unhealthy: {rpp_name}"
-                            log.warning(
-                                "safety abort: %s | pose_stale=%.0fms rpp_debug_age=%s "
-                                "rpp=%s(%s) connected=%s",
-                                reason,
-                                pose_age,
-                                f"{rpp_age:.0f}ms" if rpp_age is not None else "never",
-                                code,
-                                rpp_name,
-                                s.get("connected"),
-                            )
-                            await emergency_handler.estop_async()
-                            await _emit_authenticated(
-                                "safety_abort",
-                                {
-                                    "reason": reason,
-                                    "pose_age_ms": pose_age,
-                                    "rpp_debug_age_ms": rpp_age,
-                                    "rpp_state": code,
-                                    "rpp_state_name": RPP_STATE_NAMES.get(
-                                        code, "UNKNOWN"
-                                    ),
-                                    "connected": s.get("connected"),
-                                },
-                            )
-                        stale_since = None
-                else:
-                    stale_since = None
-
-                # ── 4. Disconnect notification (transition: was connected) ─────
+                # ── 3. Disconnect notification (transition: was connected) ─────
+                # E-stop watchdog lives in _safety_watchdog_loop (S2).
                 connected = bool(s.get("connected", False))
                 if prev_connected is True and not connected:
                     await _emit_authenticated("rover_disconnected", {})
