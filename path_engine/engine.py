@@ -270,8 +270,22 @@ class PathEngine:
         group_shapes: bool = True,
         # Endpoint-coincidence tolerance for deciding whether two shape primitives
         # meet at the same junction. Stays at 5cm — real CAD exports leave gaps this
-        # big between segments that are meant to connect. This is a *connectivity*
-        # tolerance; it is NOT a point-culling tolerance (see _merge_chain).
+        # big between segments that are meant to connect.
+        #
+        # CORRECTED 2026-07-29: this comment used to claim "it is NOT a
+        # point-culling tolerance (see _merge_chain)". That is FALSE, and it
+        # cited as proof the very code that refutes it. _merge_chain
+        # (shape_grouping.py:~222) DOES fold a seam vertex into its predecessor
+        # when the two are within this tolerance. Provenance is transferred, so
+        # must-hit is never lost — but the vertex POSITION snaps by up to 5 cm.
+        #
+        # That is correct for the design case (two edges meant to connect,
+        # separated only by a CAD gap — the gap was never real line). It is a
+        # real geometry loss for two OVERLAPPING collinear strokes sharing a
+        # start, which lose their outermost <=5 cm at the seam. Bounded by this
+        # value and pinned by a property test; not fixed, because the design
+        # case is the common one. Do not raise this value without re-reading
+        # _merge_chain — at 5 cm the snap is already 2.5x the +/-2 cm marking spec.
         group_join_tol_m: float = 0.05,
         # ── Extension safety limits (see docs/upgrade_path/03_EXTENSION_GEOMETRY_DEFECTS.md)
         # E2: pre/aft_extension_m is only a CEILING. A 10 cm line was being given 97 cm
