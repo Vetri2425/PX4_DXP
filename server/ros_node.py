@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import (
     DurabilityPolicy,
@@ -149,6 +149,11 @@ class RosExecutorThread:
             while rclpy.ok() and not self._stop.is_set():
                 # spin_once with timeout lets us notice the stop event
                 self._exe.spin_once(timeout_sec=0.1)
+        except ExternalShutdownException:
+            # SIGTERM: rclpy's signal handler shuts the context down while
+            # spin_once is blocked in it. Expected on every service stop —
+            # logging it as a crash buried real tracebacks in restart noise.
+            log.info("rclpy context externally shut down — executor thread exiting")
         except Exception:
             log.exception("rclpy executor crashed")
         finally:

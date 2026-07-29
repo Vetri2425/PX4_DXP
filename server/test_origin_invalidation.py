@@ -56,7 +56,8 @@ def _install_ros_stubs() -> None:
     rclpy = _mod("rclpy", ok=lambda: True, init=lambda *a, **k: None)
     _mod("rclpy.callback_groups",
          MutuallyExclusiveCallbackGroup=object, ReentrantCallbackGroup=object)
-    _mod("rclpy.executors", MultiThreadedExecutor=object)
+    _mod("rclpy.executors", MultiThreadedExecutor=object,
+         ExternalShutdownException=type("ExternalShutdownException", (Exception,), {}))
     _mod("rclpy.node", Node=_Node)
     _mod("rclpy.qos", DurabilityPolicy=_Enum, HistoryPolicy=_Enum,
          QoSProfile=lambda **k: None, ReliabilityPolicy=_Enum)

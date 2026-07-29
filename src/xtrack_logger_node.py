@@ -51,6 +51,7 @@ import os
 from datetime import datetime
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
@@ -272,7 +273,9 @@ def main():
     try:
         node = XTrackLoggerNode()
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
+        # ExternalShutdownException is the normal SIGTERM path under systemd —
+        # a traceback here on every service stop is noise, not a crash.
         pass
     finally:
         if node:
