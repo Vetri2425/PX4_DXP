@@ -1253,9 +1253,12 @@ class PathEngine:
             # to just those vertices; absent one, every source vertex counts.
             # That is what keeps a long exported road tangent tractable — 200
             # vertices, 6 declared, 194 free to simplify.
+            # `is not None`, not truthiness: a declared-empty [] means "protect
+            # nothing" and must NOT fall through to the all-source-vertex
+            # fallback (the schema promises [] is a real declaration).
             raw_ctrl = seg.metadata.get("control_indices")
             raw_vidx = seg.metadata.get("vertex_indices")
-            if raw_ctrl:
+            if raw_ctrl is not None:
                 vertex_set = set(raw_ctrl)
             elif raw_vidx is not None:
                 vertex_set = set(raw_vidx)

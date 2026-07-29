@@ -124,8 +124,10 @@ def densify_segment(
     # Declared control points index the ORIGINAL vertex list; remap them onto the
     # densified list so the declaration survives densification. Without this the
     # indices would silently point at interpolated fill.
+    # `is not None`, not truthiness: [] is a real declaration ("protect
+    # nothing"), distinct from absent — it must survive densification as [].
     ctrl = segment.metadata.get("control_indices")
-    if ctrl:
+    if ctrl is not None:
         meta["control_indices"] = [
             vertex_indices[k] for k in ctrl if 0 <= k < len(vertex_indices)
         ]

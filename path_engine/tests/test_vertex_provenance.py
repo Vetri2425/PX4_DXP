@@ -268,3 +268,78 @@ def test_engine_multipiece_square_flags_all_corners_must_hit():
         assert min(
             math.hypot(corner[0] - p[0], corner[1] - p[1]) for p in flagged
         ) < 1e-6, f"corner {corner} not flagged must-hit end-to-end"
+
+
+# ---------------------------------------------------------------------------
+# Declared control_indices: None vs [] vs subset (plan-trajectory contract)
+#
+# The schema promises `must_hit_indices: []` is a REAL declaration — "nothing
+# here is must-hit" — distinct from absent (None), which falls back to
+# all-source-vertices. Both densify (remap) and the engine merge used
+# truthiness (`if ctrl:`), so a declared-empty list silently degraded to the
+# fallback: 8 collinear points with control_indices=[] staged must_hit=8.
+# These tests pin the three-way contract at the engine level.
+
+# The 2026-07-29 field shape: a 2-point survey line pre-subdivided to 8 points.
+EIGHT_COLLINEAR = [(i * 0.348, 0.0) for i in range(8)]
+
+
+def _mark_segment(ctrl):
+    meta = {} if ctrl is _ABSENT else {"control_indices": list(ctrl)}
+    return PathSegment(
+        segment_type=SegmentType.MARK, points=list(EIGHT_COLLINEAR), metadata=meta
+    )
+
+
+_ABSENT = object()
+
+
+def test_densify_preserves_declared_empty_control_indices():
+    seg = PathSegment(
+        segment_type=SegmentType.MARK,
+        points=list(EIGHT_COLLINEAR),
+        metadata={"control_indices": []},
+    )
+    dense = densify_segment(seg, mark_spacing=0.05)
+    assert dense.metadata["control_indices"] == [], \
+        "declared-empty [] must survive densification as [], not vanish"
+
+
+def test_engine_declared_empty_protects_nothing():
+    from path_engine.engine import PathEngine
+
+    engine = PathEngine(mark_spacing=0.05, optimize_order=False)
+    plan = engine.plan_segments([_mark_segment([])])
+
+    assert len(plan.must_hit) == len(plan.merged_waypoints)
+    assert not any(plan.must_hit), \
+        "control_indices=[] is a declaration: NO waypoint may be must-hit"
+
+
+def test_engine_undeclared_falls_back_to_all_source_vertices():
+    from path_engine.engine import PathEngine
+
+    engine = PathEngine(mark_spacing=0.05, optimize_order=False)
+    plan = engine.plan_segments([_mark_segment(_ABSENT)])
+
+    flagged = [p for p, m in zip(plan.merged_waypoints, plan.must_hit) if m]
+    # No declaration → every one of the 8 input points is source geometry.
+    for original in EIGHT_COLLINEAR:
+        assert min(
+            math.hypot(original[0] - p[0], original[1] - p[1]) for p in flagged
+        ) < 1e-6, f"undeclared source vertex {original} lost its fallback must-hit"
+
+
+def test_engine_declared_subset_narrows_to_exactly_those_vertices():
+    from path_engine.engine import PathEngine
+
+    engine = PathEngine(mark_spacing=0.05, optimize_order=False)
+    plan = engine.plan_segments([_mark_segment([0, 7])])
+
+    flagged = [p for p, m in zip(plan.merged_waypoints, plan.must_hit) if m]
+    assert len(flagged) == 2, \
+        f"declared [0, 7] must flag exactly 2 waypoints, got {len(flagged)}"
+    for original in (EIGHT_COLLINEAR[0], EIGHT_COLLINEAR[7]):
+        assert min(
+            math.hypot(original[0] - p[0], original[1] - p[1]) for p in flagged
+        ) < 1e-6, f"declared vertex {original} not flagged"
