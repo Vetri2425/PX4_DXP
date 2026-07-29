@@ -3489,11 +3489,15 @@ class RPPControllerNode(Node):
         # R2 — measured dt once per tick (ROS clock, not wall time) so segment
         # and smooth accel ramps agree. Clamp at 0.1 s: without it a long stall
         # (blocked timer, debugger, load spike) produces one huge accel step.
+        # Floor at 0.0: a backward ROS-clock step would otherwise give negative
+        # dt, and `max_accel * dt` then LOWERS the speed ceiling below
+        # _last_speed_cmd — one spurious decel tick. dt=0 just holds the
+        # previous ceiling (dt is only ever a multiplier in the two ramps).
         now = self.get_clock().now()
         if self._last_tick is None:
             self._tick_dt = 1.0 / self.CONTROL_HZ
         else:
-            self._tick_dt = min(0.1, (now - self._last_tick).nanoseconds * 1e-9)
+            self._tick_dt = max(0.0, min(0.1, (now - self._last_tick).nanoseconds * 1e-9))
         self._last_tick = now
 
         self._control_loop_impl()
