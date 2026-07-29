@@ -61,9 +61,20 @@ Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/home/flash/PX4_DXP/config/fastdds_no
 Environment=HOME=/home/flash
 Environment=FASTAPI_PORT=5001
 Environment=ROVER_TOKEN_FILE=/home/flash/PX4_DXP/config/rover_token
-# Auth disabled during dev bring-up. Remove this line to enforce X-Rover-Token
-# (token auto-generated at the ROVER_TOKEN_FILE path above on first boot).
-Environment=ROVER_DISABLE_AUTH=1
+# S3 CLOSED 2026-07-29 — operator auth is ENFORCED. The old
+# `Environment=ROVER_DISABLE_AUTH=1` line lived here since dev bring-up and was
+# removed after the Jul-11 operator password was confirmed usable.
+#
+# Two names disable auth and BOTH must stay absent (config.py:203-207):
+# ROVER_DISABLE_AUTH and ROVER_AUTH_DISABLED. The latter also had a Jetson-only
+# drop-in (50-auth-disabled.conf) that was removed the same day — deleting one
+# and not the other silently leaves auth OFF while login still rejects bad
+# passwords, which reads exactly like a working gate. Verified by an
+# unauthenticated LAN request to /api/mission/status returning 401, not 200.
+#
+# Disabling auth also forces a loopback bind (run.sh:16, config.py:309); the
+# 20-host.conf drop-in overrides that to 0.0.0.0, so auth-off here means
+# unauthenticated AND LAN-reachable. Do not re-add either name.
 
 # Output
 StandardOutput=journal
