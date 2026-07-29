@@ -37,11 +37,25 @@ def _build_node(compensation: bool):
 
     node = RPPControllerNode()
     node.set_parameters(
-        [rclpy.parameter.Parameter(
-            "ekf_reset_compensation",
-            rclpy.parameter.Parameter.Type.BOOL,
-            compensation,
-        )]
+        [
+            rclpy.parameter.Parameter(
+                "ekf_reset_compensation",
+                rclpy.parameter.Parameter.Type.BOOL,
+                compensation,
+            ),
+            # Isolate the unit under test. This exercises run 0's TRACKING
+            # path; with entry pre-align active run 0 instead holds in an
+            # alignment pivot, velocity is forced to zero, and the 2 cm drift
+            # this test injects never registers ("real drift lost: 0.000").
+            # Pinned explicitly rather than inherited so the test cannot be
+            # silently re-coupled by a future default change — which is exactly
+            # what happened when entry_prealign_enabled flipped to True.
+            rclpy.parameter.Parameter(
+                "entry_prealign_enabled",
+                rclpy.parameter.Parameter.Type.BOOL,
+                False,
+            ),
+        ]
     )
 
     node._vel_pub = _CapturePub()
