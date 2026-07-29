@@ -176,8 +176,6 @@ import math
 from enum import IntEnum
 
 import rclpy
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time as RclTime
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
@@ -658,6 +656,10 @@ class RPPControllerNode(Node):
 
         # P0.1 — closed-loop L_d: persist last commanded speed
         self._last_speed_cmd: float = 0.0
+        # R2 — measured control-tick dt for accel ramps (ROS clock). None until
+        # the first tick after a path load so that tick uses 1/CONTROL_HZ.
+        self._last_tick: RclTime | None = None
+        self._tick_dt: float = 1.0 / self.CONTROL_HZ
 
         # P0.5 — explicit yaw_setpoint: persist last commanded yaw for freeze
         self._last_yaw_cmd: float = 0.0
@@ -738,17 +740,7 @@ class RPPControllerNode(Node):
         # ------------------------------------------------------------------
         # Subscribers
         # ------------------------------------------------------------------
-        # Path conditioning (resample/smooth/DP-simplify) can take hundreds of
-        # ms on a long pre-line. Own MutuallyExclusiveCallbackGroup so it can
-        # run on the second MultiThreadedExecutor thread without blocking the
-        # 50 Hz control timer. Keep pose/vel/timer in the DEFAULT group
-        # together — they share _pose / _latest_vel_ned / _pose_recv_time with
-        # no locking and are only safe while mutually exclusive.
-        self._path_cb_group = MutuallyExclusiveCallbackGroup()
-        self.create_subscription(
-            Path, "/path", self._path_cb, path_qos,
-            callback_group=self._path_cb_group,
-        )
+        self.create_subscription(Path, "/path", self._path_cb, path_qos)
         self.create_subscription(
             PoseStamped, "/mavros/local_position/pose", self._pose_cb, be_qos
         )
@@ -937,6 +929,9 @@ class RPPControllerNode(Node):
         # Mission-level resets; per-run state is reset inside _apply_run.
         # P0.1 — reset last speed so L_d bootstraps cleanly on new path
         self._last_speed_cmd = 0.0
+        # R2 — first tick after path load must use nominal 1/CONTROL_HZ, not a
+        # dt that spans the whole conditioning/load wall time.
+        self._last_tick = None
         # P0.2 — reset jump guard; first pose on new path is always "valid"
         self._last_pos = None
         # A3 — start each mission with a clean reset-offset frame. The path is
@@ -3344,7 +3339,7 @@ class RPPControllerNode(Node):
         max_accel = float(self.get_parameter("max_linear_accel").value)
         speed_before_accel = speed
         if max_accel > 0.0:
-            speed = min(speed, self._last_speed_cmd + max_accel / self.CONTROL_HZ)
+            speed = min(speed, self._last_speed_cmd + max_accel * self._tick_dt)
 
         p4_floor = float(self.get_parameter("p4_zero_vel_threshold").value)
         if speed < p4_floor and speed_before_accel < p4_floor and self._last_speed_cmd > 0.0:
@@ -3410,6 +3405,16 @@ class RPPControllerNode(Node):
         it raises, the drive command for this tick has already been published
         by the impl, and we only lose one progress sample.
         """
+        # R2 — measured dt once per tick (ROS clock, not wall time) so segment
+        # and smooth accel ramps agree. Clamp at 0.1 s: without it a long stall
+        # (blocked timer, debugger, load spike) produces one huge accel step.
+        now = self.get_clock().now()
+        if self._last_tick is None:
+            self._tick_dt = 1.0 / self.CONTROL_HZ
+        else:
+            self._tick_dt = min(0.1, (now - self._last_tick).nanoseconds * 1e-9)
+        self._last_tick = now
+
         self._control_loop_impl()
         if bool(self.get_parameter("progress_publish_enabled").value):
             try:
@@ -3921,11 +3926,11 @@ class RPPControllerNode(Node):
         # Decel is deliberately unbounded: the P4 floor relies on a clean
         # step-to-zero at the goal, and a symmetric decel limiter would
         # cause goal overshoot beyond the 2 cm xy_goal_tolerance.
+        # Uses self._tick_dt from _control_loop (same value as segment ramp).
         speed_before_accel = speed
         max_accel = self.get_parameter("max_linear_accel").value
         if max_accel > 0.0:
-            delta_up = max_accel / self.CONTROL_HZ
-            speed = min(speed, self._last_speed_cmd + delta_up)
+            speed = min(speed, self._last_speed_cmd + max_accel * self._tick_dt)
 
         # ---- Step 7: P4 floor — exact zero below threshold for clean stop ----
         # Apply the floor only when the intended target speed is below the
@@ -4531,23 +4536,12 @@ class RPPControllerNode(Node):
 def main():
     rclpy.init()
     node = None
-    executor = None
     try:
         node = RPPControllerNode()
-        # num_threads=2: one for default-group control (timer/pose/vel), one
-        # for _path_cb conditioning. Do not raise further without revisiting
-        # shared-state assumptions between those groups.
-        executor = MultiThreadedExecutor(num_threads=2)
-        executor.add_node(node)
-        executor.spin()
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        if executor is not None:
-            try:
-                executor.shutdown()
-            except Exception:
-                pass
         if node:
             # Last-gasp zero velocity on the way out — best-effort,
             # twist_to_setpoint_node will continue heartbeats with its own zero.
