@@ -6,21 +6,24 @@ Wants=rpp-pipeline.service
 # so we do NOT use PartOf here. Only stop the server explicitly.
 
 [Service]
-# S1 BLOCKED 2026-07-29 — reverted to simple after a live deploy attempt.
-# Type=notify + WatchdogSec=15 was installed on the Jetson and the unit never
-# left `activating`: /api/ping answered (so the lifespan reached yield) but
-# WatchdogTimestamp stayed n/a, i.e. main.py's _sd_notifier was None. Cause:
-# `sdnotify` is pinned at server/requirements.txt:9 but is NOT installed on the
-# Jetson — the server runs on system python3 with no venv. Installing it fails:
-# the 0.3.2 sdist trips a setuptools/packaging incompatibility on that host
-# (canonicalize_version() got an unexpected keyword 'strip_trailing_zero'), and
-# fixing that pair risks ROS2's own python stack.
-# DO NOT re-enable Type=notify until `python3 -c "import sdnotify"` succeeds on
-# the Jetson. Without it systemd kills the unit every TimeoutStartSec and
+# S1 — systemd watchdog. HARD DEPENDENCY: `python3 -c "import sdnotify"` MUST
+# succeed for the service user, or main.py's _sd_notifier is None (main.py:60-66),
+# READY=1 is never sent, systemd kills the unit at TimeoutStartSec, and
 # StartLimitBurst=10 takes rover-server DOWN PERMANENTLY after ~10 attempts.
-# The main.py side (S1-a: heartbeat above the ros_node-None guard) is correct
-# and harmless under Type=simple — leave it in place.
-Type=simple
+# That exact failure happened on 2026-07-29 — the unit sat in `activating` while
+# /api/ping answered fine, because the lifespan reached yield but the notify
+# no-op'd.
+#
+# Install it from APT, never pip: `sudo apt install python3-sdnotify` (0.3.1-2,
+# zero dependencies, lands in /usr/lib/python3/dist-packages so it is readable
+# under ProtectSystem=strict). pip cannot build the 0.3.2 sdist on this Jetson —
+# setuptools 80.9.0 in ~/.local shadows the system one and calls
+# canonicalize_version(strip_trailing_zero=...) which apt's packaging 21.3 lacks.
+# That breaks EVERY sdist install on the box, not just this one.
+#
+# Verify after any OS reimage or python change:
+#   sudo -u flash python3 -c "import sdnotify"    # must exit 0
+Type=notify
 User=flash
 Group=flash
 WorkingDirectory=/home/flash/PX4_DXP/server
@@ -28,15 +31,19 @@ WorkingDirectory=/home/flash/PX4_DXP/server
 # operator's UI/telemetry surface and must come up even when MAVROS is down so
 # /api/mission/status can report fcu_connected:False (graceful degradation).
 # Upholds= (from px4-dxp) + Restart= reconnect once MAVROS returns.
-# When Type=notify is restored: READY=1 is sent by main.py after ROS init /
-# node / executor / beacon, and WATCHDOG=1 comes from the SAFETY task (S2 moved
-# it there — the process state worth protecting is the E-stop path, not the
-# telemetry push). Add WatchdogSec=15 back at the same time, not before.
+# READY=1 is sent by main.py once ROS init / node / executor / beacon are up.
+# WATCHDOG=1 comes from the SAFETY task, not the telemetry loop (S2) — the
+# process state worth protecting is the E-stop path. It is emitted every ~3 s
+# ABOVE the `ros_node is None` guard (S1-a), so a failed rclpy init still feeds
+# the watchdog instead of boot-looping a deliberately degraded server.
+# WatchdogSec=15 gives 5 beats of margin; estop_async can block the safety task
+# ~10 s worst case (two 5 s service timeouts), which fits inside that.
 ExecStart=/home/flash/PX4_DXP/server/run.sh
 Restart=on-failure
 RestartSec=5
 StartLimitInterval=300
 StartLimitBurst=10
+WatchdogSec=15
 
 # Security hardening
 NoNewPrivileges=yes
