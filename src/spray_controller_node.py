@@ -61,6 +61,7 @@ from spray_flow_model import FlowModulator
 from spray_modes import DashMeter, PointMeter
 from spray_session_config import (
     ConfigSchemaError,
+    DashConfig,
     SpraySessionConfig,
     cleared_config,
     continuous_config_from_path,
@@ -363,6 +364,60 @@ def _first_mark_start_s(model: SprayPathModel) -> Optional[float]:
     return None
 
 
+def _apply_mark_boundary_lead(
+    geometry_desired: bool,
+    src_kind: Optional[str],
+    src_dist: float,
+    on_lead: float,
+    off_lead: float,
+) -> tuple[bool, str]:
+    """Apply solenoid/overspray lead at a MARK↔TRANSIT boundary.
+
+    ON fires early by open-delay + on-overspray; OFF fires early by close-delay
+    (minus off-overspray). Returns (new_geometry_desired, event) where event is
+    '' | 'on_early' | 'off_early'. Shared by continuous and dash so both modes
+    get the same physical paint edges (B2).
+    """
+    if src_kind is None or not math.isfinite(src_dist):
+        return geometry_desired, ""
+    if (
+        not geometry_desired
+        and src_kind == TRANSIT_TO_MARK
+        and src_dist <= on_lead
+    ):
+        return True, "on_early"
+    if (
+        geometry_desired
+        and src_kind == MARK_TO_TRANSIT
+        and src_dist <= off_lead
+    ):
+        return False, "off_early"
+    return geometry_desired, ""
+
+
+def _mark_region_with_lead(
+    model: SprayPathModel,
+    projection: SprayProjection,
+    on_lead: float,
+    off_lead: float,
+) -> bool:
+    """True when the nozzle is inside the led MARK region (dash flag gate).
+
+    Same lead math as continuous: opens early before TRANSIT_TO_MARK, closes
+    early before MARK_TO_TRANSIT. Without this, AND-ing raw current_flag makes
+    the first dash of every marked run start late and overrun the end.
+    """
+    base = projection.current_flag
+    boundary = _next_boundary(model, projection.s, projection.current_flag)
+    if boundary is None:
+        return base
+    src_dist = boundary.s - projection.s
+    gated, _event = _apply_mark_boundary_lead(
+        base, boundary.kind, src_dist, on_lead, off_lead
+    )
+    return gated
+
+
 def _make_spray_decision(
     model: Optional[SprayPathModel],
     nozzle_n: Optional[float],
@@ -472,9 +527,9 @@ def _make_spray_decision(
             # physical toggle lands on the ideal grid. Corner deferral is
             # handled upstream by the pivot-state gate (plan §5), so the meter
             # keeps integrating through a stop and the phase never drifts.
-            # R5: the meter still integrates across TRANSIT connectors (locked
-            # "continuous across mission" decision), but the valve must stay
-            # shut on those runs — AND with the static spray flag.
+            # R5/B2: meter still integrates across TRANSIT connectors (locked
+            # "continuous across mission"), but the valve follows the led MARK
+            # region — same on_early/off_early as continuous, not raw flag.
             on_lead = speed_mps * solenoid_open_delay_s + on_overspray_margin_m
             off_lead = max(
                 0.0, speed_mps * solenoid_close_delay_s - off_overspray_margin_m
@@ -483,7 +538,10 @@ def _make_spray_decision(
             du = dash_meter.update(
                 projection.s, speed_mps, dt_s, xtrack_ok, on_lead, off_lead
             )
-            geometry_desired = du.geometry_desired and projection.current_flag
+            mark_gate = _mark_region_with_lead(
+                model, projection, on_lead, off_lead
+            )
+            geometry_desired = du.geometry_desired and mark_gate
             boundary = None
             distance_to_boundary = float("inf")
         else:
@@ -514,26 +572,18 @@ def _make_spray_decision(
                 # ON is intentionally early by solenoid delay plus overspray
                 # margin. OFF is early only by close delay; an explicit OFF
                 # overspray margin delays shutoff so the MARK tail is not cut
-                # short.
+                # short. Shared helper with dash (B2) — continuous output must
+                # stay byte-for-byte identical to the inlined form.
                 on_lead = speed_mps * solenoid_open_delay_s + on_overspray_margin_m
                 off_lead = max(
                     0.0,
                     speed_mps * solenoid_close_delay_s - off_overspray_margin_m,
                 )
-                if (
-                    not geometry_desired
-                    and src_kind == TRANSIT_TO_MARK
-                    and src_dist <= on_lead
-                ):
-                    geometry_desired = True
-                    event = "on_early"
-                elif (
-                    geometry_desired
-                    and src_kind == MARK_TO_TRANSIT
-                    and src_dist <= off_lead
-                ):
-                    geometry_desired = False
-                    event = "off_early"
+                geometry_desired, lead_event = _apply_mark_boundary_lead(
+                    geometry_desired, src_kind, src_dist, on_lead, off_lead
+                )
+                if lead_event:
+                    event = lead_event
 
         # B4 terminal shutoff — fires independently of any boundary/lead so
         # it works even when the rover stops short of the final MARK station
@@ -758,6 +808,11 @@ class SprayControllerNode(Node):
         # receives a session_config behaves exactly as it did before B0.
         self._session_mode: str = "continuous"
         self._dash_meter: Optional[DashMeter] = None
+        # Stashed dash params from session_config — mirrored by
+        # _rebuild_dash_meter on every /path (same pattern as _point_params /
+        # _rebuild_point_meter). A new path is a new arc-length origin; patching
+        # anchor_s on an already-armed meter is a no-op at arm-time read.
+        self._dash_config: Optional[DashConfig] = None
         # Phase D point mode. _last_point_update lets _auto_safety_status apply
         # the pivot-gate exemption using the most recent point FSM state (it
         # runs one step before _make_spray_decision updates the meter).
@@ -1065,6 +1120,7 @@ class SprayControllerNode(Node):
             self._fsm.note_event_reset(time.monotonic())
             self._set_auto_desired(False, source="distance")
             self._rebuild_point_meter()
+            self._rebuild_dash_meter()
             self.get_logger().warn("spray path cleared: received empty /path")
             return
         try:
@@ -1074,6 +1130,8 @@ class SprayControllerNode(Node):
             self._session_config = cleared_config()
             self._config_fingerprint = self._session_config.path_fingerprint()
             self._set_auto_desired(False, source="distance")
+            self._rebuild_point_meter()
+            self._rebuild_dash_meter()
             self.get_logger().warn(f"spray path rejected: {exc}")
             return
         # Internal SpraySessionConfig mirror of the same geometry (plan §3).
@@ -1087,15 +1145,45 @@ class SprayControllerNode(Node):
         # Point mode: the dwell targets just changed (new placed /path), so
         # rebuild the meter from the fresh must-hit vertices. No-op otherwise.
         self._rebuild_point_meter()
-        # Dash: pattern origin is the first MARK_START on this path. Config may
-        # have built the meter before /path arrived — update the anchor now.
-        if self._dash_meter is not None:
-            self._dash_meter.set_anchor_s(_first_mark_start_s(self._path_model))
+        # Dash (B1): a new /path is a new arc-length origin — rebuild the meter
+        # with the fresh MARK_START anchor. set_anchor_s alone is not enough:
+        # the anchor is read once at arm time, so an already-armed entry-leg
+        # meter would keep its stale grid through advance_entry_to_marking.
+        self._rebuild_dash_meter()
         self.get_logger().info(
             f"spray path loaded: {len(points)} points, "
             f"{len(self._path_model.boundaries)} boundaries"
             f"{f', {len(self._path_must_hit_points)} must-hit' if self._path_must_hit_points else ''}"
         )
+
+    def _rebuild_dash_meter(self) -> None:
+        """(Re)build the dash arc-length meter from stashed config + current /path.
+
+        Mirrors `_rebuild_point_meter`: session_config stashes the on/off/start
+        params; every /path rebuilds so the geometry anchor (first MARK_START)
+        matches the path the rover is about to drive. No-op outside dash mode.
+        """
+        if self._session_mode != "dash" or self._dash_config is None:
+            return
+        anchor_s = (
+            _first_mark_start_s(self._path_model)
+            if self._path_model is not None
+            else None
+        )
+        try:
+            self._dash_meter = DashMeter(
+                self._dash_config.on_distance_m,
+                self._dash_config.off_distance_m,
+                self._dash_config.start_state,
+                anchor_s=anchor_s,
+            )
+        except ValueError as exc:
+            self.get_logger().warn(
+                f"dash meter rebuild failed ({exc}); reverting to continuous"
+            )
+            self._dash_meter = None
+            self._dash_config = None
+            self._session_mode = "continuous"
 
     def _rebuild_point_meter(self) -> None:
         """(Re)build the point-dwell meter from the current coordinate source.
@@ -1168,26 +1256,14 @@ class SprayControllerNode(Node):
         self._session_config = cfg
 
         self._dash_meter = None
+        self._dash_config = None
         self._point_meter = None
         self._last_point_update = None
         if cfg.mode == "dash" and cfg.dash is not None:
-            try:
-                anchor_s = (
-                    _first_mark_start_s(self._path_model)
-                    if self._path_model is not None
-                    else None
-                )
-                self._dash_meter = DashMeter(
-                    cfg.dash.on_distance_m,
-                    cfg.dash.off_distance_m,
-                    cfg.dash.start_state,
-                    anchor_s=anchor_s,
-                )
-            except ValueError as exc:
-                self.get_logger().warn(
-                    f"dash config invalid ({exc}); reverting to continuous"
-                )
-                self._session_mode = "continuous"
+            # Stash params; rebuild picks up the current /path anchor (or None
+            # if path has not arrived yet — a later /path rebuilds again).
+            self._dash_config = cfg.dash
+            self._rebuild_dash_meter()
         elif cfg.mode == "point" and cfg.points_mode is not None:
             # Store the dwell/tolerance PARAMS + any config-supplied coordinates
             # (fallback). The authoritative dwell targets are the /path must-hit

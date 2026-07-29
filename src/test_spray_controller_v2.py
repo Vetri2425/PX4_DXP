@@ -794,6 +794,41 @@ def test_dash_terminal_shutoff_when_stopped_short():
     assert d.desired is False
 
 
+def test_dash_mark_gate_opens_with_solenoid_lead():
+    """B2: valve opens ~on_lead before TRANSIT_TO_MARK, not at the boundary.
+
+    At marking_speed 0.35 with shipped defaults: on_lead = 0.35*0.10+0.02 = 5.5 cm.
+    Raw current_flag would open late; the shared lead helper must restore it.
+    """
+    model = _build_path_model(
+        [(0.0, 0.0), (2.0, 0.0), (12.0, 0.0)],
+        [False, True, True],
+    )
+    meter = DashMeter(6.0, 3.0, "on", anchor_s=2.0)
+    speed = 0.35
+    on_lead = speed * 0.10 + 0.02
+    assert abs(on_lead - 0.055) < 1e-9
+
+    def _tick(n):
+        return _make_spray_decision(
+            model=model, nozzle_n=n, nozzle_e=0.0, speed_mps=speed,
+            safety_ok=True, safety_reason="",
+            solenoid_open_delay_s=0.10, solenoid_close_delay_s=0.05,
+            on_overspray_margin_m=0.02, off_overspray_margin_m=0.0,
+            max_xtrack_error_m=0.10, mode="dash", dash_meter=meter, dt_s=0.1,
+        )
+
+    # Arm and approach from well before the lead window.
+    n = 0.0
+    while n < 2.0 - on_lead - 0.02:
+        assert _tick(n).desired is False, f"sprayed too early at n={n:.3f}"
+        n += 0.02
+    # Just outside the lead window — still OFF.
+    assert _tick(2.0 - on_lead - 0.01).desired is False
+    # Just inside — ON, ~5.5 cm before MARK_START.
+    assert _tick(2.0 - on_lead + 0.001).desired is True
+
+
 def test_session_config_cb_selects_dash():
     node = make_node()
     cfg = SpraySessionConfig(
@@ -805,6 +840,7 @@ def test_session_config_cb_selects_dash():
     assert node._dash_meter is not None
     assert node._dash_meter.on_distance_m == 6.0
     assert node._dash_meter.off_distance_m == 3.0
+    assert node._dash_config is not None
 
 
 def test_session_config_cb_back_to_continuous_clears_meter():
@@ -816,6 +852,7 @@ def test_session_config_cb_back_to_continuous_clears_meter():
         SCHEMA_VERSION, "continuous", (), (), None, None)))))
     assert node._session_mode == "continuous"
     assert node._dash_meter is None
+    assert node._dash_config is None
 
 
 def test_bad_session_config_keeps_last_mode():
@@ -859,6 +896,56 @@ def _path_msg(points_xyz):
         for (x, y, z) in points_xyz
     ]
     return types.SimpleNamespace(poses=poses)
+
+
+def test_dash_rebuilds_meter_on_marking_path_after_entry_leg():
+    """B1: GPS_SURVEYED two-phase entry must not leave the dash grid on the entry arm.
+
+    session_config(dash) → entry /path (all spray-OFF) → arm → marking /path
+    → toggle stations must match marking MARK_START, not the entry arm point.
+    """
+    node = make_node()
+    node._session_config_cb(_Msg(_json.dumps(to_dict(SpraySessionConfig(
+        SCHEMA_VERSION, "dash", (), (), DashConfig(6.0, 3.0, "on"), None)))))
+    assert node._dash_meter is not None
+
+    # Entry leg: all spray-OFF → _first_mark_start_s returns None (legacy).
+    node._path_cb(_path_msg([(0.0, 0.0, 0.0), (5.0, 0.0, 0.0)]))
+    assert node._dash_meter is not None
+    assert node._dash_meter._anchor_s is None
+    assert node._dash_meter.armed is False
+
+    # Rover drives entry; xtrack_ok arms with raw_s (the bug without rebuild).
+    node._dash_meter.update(1.0, 1.0, 1.0, xtrack_ok=True)
+    assert node._dash_meter.armed is True
+    assert abs(node._dash_meter.s_at_last_toggle - 1.0) < 1e-9
+    entry_meter_id = id(node._dash_meter)
+
+    # Marking path: TRANSIT [0,2) then MARK [2,20] → MARK_START at s=2.
+    node._path_cb(_path_msg([
+        (0.0, 0.0, 0.0),
+        (2.0, 0.0, 1.0),
+        (20.0, 0.0, 1.0),
+    ]))
+    assert node._dash_meter is not None
+    assert id(node._dash_meter) != entry_meter_id  # rebuilt, not patched
+    assert node._dash_meter.armed is False
+    assert abs(node._dash_meter._anchor_s - 2.0) < 1e-9
+
+    # Arm at a different raw_s than MARK_START; toggle grid must follow anchor=2.
+    node._dash_meter.update(0.5, 1.0, 1.0, xtrack_ok=True)
+    stations: list[float] = []
+    last = node._dash_meter.s_at_last_toggle
+    s = 0.5
+    while s <= 20.0:
+        u = node._dash_meter.update(s, 1.0, 1.0, True)
+        if abs(u.s_at_last_toggle - last) > 1e-9:
+            stations.append(u.s_at_last_toggle)
+            last = u.s_at_last_toggle
+        s += 0.02
+    assert stations == [8.0, 11.0, 17.0, 20.0]
+    # Explicitly not the entry-arm grid (would be 1+6=7, 7+3=10, ...).
+    assert 7.0 not in stations
 
 
 def test_point_meter_uses_path_must_hit_over_config_coords():
