@@ -1,21 +1,20 @@
 """Operator authentication endpoints."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from auth import (
     AuthContext,
     login,
-    logout,
     operator_token_ids,
-    require_operator_token,
+    require_operator_token_allow_default,
     revoke_other_sessions,
+    revoke_token_id,
     rotate_session_token,
     set_password_after_verified,
     socket_sids_for_token,
 )
-from config import TOKEN_HEADER_NAME
 from models import MissionState
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -30,6 +29,7 @@ class LoginResponse(BaseModel):
     session_id: str
     expires_at: str
     ttl_s: int
+    must_change_password: bool
 
 
 class ChangePasswordRequest(BaseModel):
@@ -67,17 +67,19 @@ async def auth_login(req: LoginRequest):
 
 @router.post("/logout")
 async def auth_logout(
-    x_rover_token: str | None = Header(default=None, alias=TOKEN_HEADER_NAME),
+    context: AuthContext = Depends(require_operator_token_allow_default),
 ):
-    revoked = logout(x_rover_token)
+    # allow_default: logout must work while bootstrap password is in force.
+    revoked = revoke_token_id(context.token_id)
     return {"logged_out": revoked}
 
 
 @router.post("/change-password", response_model=ChangePasswordResponse)
 async def change_password(
     req: ChangePasswordRequest,
-    context: AuthContext = Depends(require_operator_token),
+    context: AuthContext = Depends(require_operator_token_allow_default),
 ):
+    # allow_default: this is the only way off the bootstrap password.
     _assert_password_change_safe()
     set_password_after_verified(req.current_password, req.new_password)
 

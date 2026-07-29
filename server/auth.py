@@ -22,6 +22,8 @@ from typing import Literal
 from fastapi import Header, HTTPException, status
 
 from config import (
+    AUTH_BOOTSTRAP_ENABLED,
+    AUTH_BOOTSTRAP_PASSWORD,
     AUTH_DISABLED,
     AUTH_MACHINE_TOKENS_FILE,
     AUTH_PASSWORD_FILE,
@@ -165,10 +167,23 @@ def verify_password(password: str) -> bool:
     return hmac.compare_digest(actual, expected)
 
 
-def write_password_hash(password: str, path: Path | None = None) -> None:
+def write_password_hash(
+    password: str,
+    path: Path | None = None,
+    *,
+    is_default: bool = False,
+) -> None:
+    """Persist a password hash.
+
+    When ``is_default`` is False (rotation / CLI setup), the ``is_default`` key
+    is omitted from the record on purpose — never copy it forward from a prior
+    bootstrap record, or the rover stays permanently 403'd after a real change.
+    """
     global _password_hash
     target = path or _password_file
     record = hash_password(password)
+    if is_default:
+        record["is_default"] = True
     _atomic_write_json(target, record)
     if target == _password_file:
         _password_hash = record
@@ -180,8 +195,9 @@ def init_auth(
 ) -> None:
     """Load persisted auth material.
 
-    Missing password files are allowed so the local CLI can perform first setup
-    without the API auto-generating a secret.
+    When no password file exists and AUTH_BOOTSTRAP_ENABLED, write the
+    documented bootstrap hash with ``is_default: true``. Rotation is mandatory
+    via require_operator_token until cleared — do not treat bootstrap as optional.
     """
     global _password_file, _machine_tokens_file, _password_hash, _machine_tokens
     _password_file = Path(password_path)
@@ -197,16 +213,49 @@ def init_auth(
         if isinstance(item, dict) and item.get("token_id")
     }
     if _password_hash is None:
-        log.warning("auth: operator password not configured; run rover-auth setup")
+        if AUTH_BOOTSTRAP_ENABLED:
+            write_password_hash(
+                AUTH_BOOTSTRAP_PASSWORD,
+                path=_password_file,
+                is_default=True,
+            )
+            # Never log AUTH_BOOTSTRAP_PASSWORD itself.
+            log.warning(
+                "auth: bootstrap password is in force (is_default=true) — "
+                "MUST rotate via POST /api/auth/change-password before "
+                "operating the rover"
+            )
+        else:
+            log.warning(
+                "auth: operator password not configured; run rover-auth setup"
+            )
     log.info(
-        "auth: loaded operator_configured=%s machine_tokens=%d",
+        "auth: loaded operator_configured=%s is_default=%s machine_tokens=%d",
         _password_hash is not None,
+        is_default_password(),
         len(_machine_tokens),
     )
 
 
 def is_configured() -> bool:
     return _password_hash is not None
+
+
+def is_default_password() -> bool:
+    """True only when the on-disk record explicitly sets is_default.
+
+    Existing password files that lack the field are treated as False — already
+    configured rovers must not suddenly 403 after this upgrade.
+    """
+    return bool(_password_hash and _password_hash.get("is_default") is True)
+
+
+_PASSWORD_CHANGE_REQUIRED = {
+    "code": "password_change_required",
+    "message": (
+        "Default bootstrap password must be changed before operating the rover"
+    ),
+}
 
 
 def login(password: str) -> dict:
@@ -238,6 +287,7 @@ def login(password: str) -> dict:
             session.expires_at, dt.timezone.utc
         ).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "ttl_s": int(AUTH_SESSION_TTL_S),
+        "must_change_password": is_default_password(),
     }
 
 
@@ -282,9 +332,13 @@ def _validate_machine_token(token: str | None, scope: MachineScope) -> AuthConte
 _BYPASS_CONTEXT = AuthContext(kind="operator", token_id="dev-bypass", session_id="dev")
 
 
-def require_operator_token(
+def require_operator_token_allow_default(
     x_rover_token: str | None = Header(default=None, alias=TOKEN_HEADER_NAME),
 ) -> AuthContext:
+    """Valid session only — skips the bootstrap rotation gate.
+
+    Allowed exclusively for change-password and logout. Nothing else may use it.
+    """
     if AUTH_DISABLED:
         return _BYPASS_CONTEXT
     context = validate_operator_token(x_rover_token)
@@ -292,6 +346,19 @@ def require_operator_token(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing rover session",
+        )
+    return context
+
+
+def require_operator_token(
+    x_rover_token: str | None = Header(default=None, alias=TOKEN_HEADER_NAME),
+) -> AuthContext:
+    """Operator session required; blocks while bootstrap password is in force."""
+    context = require_operator_token_allow_default(x_rover_token=x_rover_token)
+    if not AUTH_DISABLED and is_default_password():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=_PASSWORD_CHANGE_REQUIRED,
         )
     return context
 
@@ -311,6 +378,13 @@ def require_operator_or_machine(scope: MachineScope):
             return _BYPASS_CONTEXT
         operator = validate_operator_token(x_rover_token)
         if operator is not None:
+            # Same gate as require_operator_token — an operator session must
+            # not bypass rotation via a machine-scoped route.
+            if is_default_password():
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=_PASSWORD_CHANGE_REQUIRED,
+                )
             return operator
         machine = _validate_machine_token(x_rover_token, scope)
         if machine is not None:
@@ -417,6 +491,11 @@ def bind_socket_sid(sid: str, token: str | None) -> AuthContext | None:
         session.socket_sids.add(sid)
         _sid_to_token_id[sid] = session.token_id
         return _BYPASS_CONTEXT
+    # Bootstrap gate: Socket.IO is the drive/joystick path and does not use
+    # require_operator_token. Refuse connect while the default is in force so
+    # knowing the documented bootstrap password cannot arm or steer.
+    if is_default_password():
+        return None
     context = validate_operator_token(token)
     if context is None:
         return None
@@ -481,7 +560,9 @@ async def disconnect_sids_for_revoked(token_ids: list[str], preserve: str | None
 def set_password_after_verified(current_password: str, new_password: str) -> None:
     if not verify_password(current_password):
         raise HTTPException(status_code=401, detail="Invalid current password")
-    write_password_hash(new_password)
+    # Fresh record via hash_password — is_default is omitted (not copied), so
+    # a legitimate rotation clears the bootstrap gate permanently.
+    write_password_hash(new_password, is_default=False)
 
 
 def create_machine_token(name: str, *, path: Path | None = None) -> str:

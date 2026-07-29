@@ -205,6 +205,21 @@ AUTH_DISABLED = (
     os.environ.get("ROVER_AUTH_DISABLED", "").lower() in {"1", "true", "yes"}
     or os.environ.get("ROVER_DISABLE_AUTH", "").lower() in {"1", "true", "yes"}
 )
+# Headless first-boot: ship a known default password, then FORCE rotation via
+# require_operator_token (403 password_change_required) until changed.
+# Env-overridable so a site can set its own at deploy time. NEVER log the value.
+# Set ROVER_AUTH_BOOTSTRAP_ENABLED=0 to keep the old "CLI setup required" behaviour.
+AUTH_BOOTSTRAP_ENABLED = os.environ.get(
+    "ROVER_AUTH_BOOTSTRAP_ENABLED", "1"
+).lower() in {"1", "true", "yes"}
+AUTH_BOOTSTRAP_PASSWORD = os.environ.get(
+    "ROVER_BOOTSTRAP_PASSWORD", "rover-setup-0000"
+)
+if len(AUTH_BOOTSTRAP_PASSWORD) < 8:
+    raise ValueError(
+        "ROVER_BOOTSTRAP_PASSWORD must be at least 8 characters "
+        f"(got length {len(AUTH_BOOTSTRAP_PASSWORD)})"
+    )
 # Legacy path name for bag tooling; machine tokens live in AUTH_MACHINE_TOKENS_FILE.
 TOKEN_FILE_DEFAULT = os.environ.get(
     "ROVER_TOKEN_FILE",
