@@ -21,6 +21,17 @@ mkdir -p "$(dirname "$RESULT_JSON")"
 
 PYTHON="${PYTHON:-python3}"
 
+# Source ROS2 BEFORE probing for rclpy. A non-interactive ssh (`ssh host
+# './tools/run_jetson_tests.sh'`) gets no login shell, so ROS is not on the
+# path and the probe below would fail on the Jetson itself — which is exactly
+# how this ran on 2026-07-29. Probe-then-source is the wrong order.
+if [[ -z "${ROS_DISTRO:-}" && -f /opt/ros/humble/setup.bash ]]; then
+  # shellcheck disable=SC1091
+  set +u
+  source /opt/ros/humble/setup.bash
+  set -u
+fi
+
 if ! "$PYTHON" -c "import rclpy" 2>/dev/null; then
   cat >&2 <<EOF
 ERROR: rclpy is not importable with: $PYTHON
@@ -46,14 +57,6 @@ out.write_text(json.dumps({
 }, indent=2) + "\n")
 sys.exit(127)
 PY
-fi
-
-# Source ROS2 if present and not already sourced (Jetson typical layout).
-if [[ -z "${ROS_DISTRO:-}" && -f /opt/ros/humble/setup.bash ]]; then
-  # shellcheck disable=SC1091
-  set +u
-  source /opt/ros/humble/setup.bash
-  set -u
 fi
 
 export PYTHONPATH="${ROOT}/src:${ROOT}:${PYTHONPATH:-}"

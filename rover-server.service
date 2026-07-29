@@ -6,7 +6,21 @@ Wants=rpp-pipeline.service
 # so we do NOT use PartOf here. Only stop the server explicitly.
 
 [Service]
-Type=notify
+# S1 BLOCKED 2026-07-29 — reverted to simple after a live deploy attempt.
+# Type=notify + WatchdogSec=15 was installed on the Jetson and the unit never
+# left `activating`: /api/ping answered (so the lifespan reached yield) but
+# WatchdogTimestamp stayed n/a, i.e. main.py's _sd_notifier was None. Cause:
+# `sdnotify` is pinned at server/requirements.txt:9 but is NOT installed on the
+# Jetson — the server runs on system python3 with no venv. Installing it fails:
+# the 0.3.2 sdist trips a setuptools/packaging incompatibility on that host
+# (canonicalize_version() got an unexpected keyword 'strip_trailing_zero'), and
+# fixing that pair risks ROS2's own python stack.
+# DO NOT re-enable Type=notify until `python3 -c "import sdnotify"` succeeds on
+# the Jetson. Without it systemd kills the unit every TimeoutStartSec and
+# StartLimitBurst=10 takes rover-server DOWN PERMANENTLY after ~10 attempts.
+# The main.py side (S1-a: heartbeat above the ros_node-None guard) is correct
+# and harmless under Type=simple — leave it in place.
+Type=simple
 User=flash
 Group=flash
 WorkingDirectory=/home/flash/PX4_DXP/server
@@ -14,15 +28,15 @@ WorkingDirectory=/home/flash/PX4_DXP/server
 # operator's UI/telemetry surface and must come up even when MAVROS is down so
 # /api/mission/status can report fcu_connected:False (graceful degradation).
 # Upholds= (from px4-dxp) + Restart= reconnect once MAVROS returns.
-# Type=notify waits for READY=1 (main.py after ROS init / node / executor /
-# beacon). WatchdogSec expects WATCHDOG=1 ~every 3s from the telemetry loop
-# today; S2 must move that heartbeat onto the safety task when it splits.
+# When Type=notify is restored: READY=1 is sent by main.py after ROS init /
+# node / executor / beacon, and WATCHDOG=1 comes from the SAFETY task (S2 moved
+# it there — the process state worth protecting is the E-stop path, not the
+# telemetry push). Add WatchdogSec=15 back at the same time, not before.
 ExecStart=/home/flash/PX4_DXP/server/run.sh
 Restart=on-failure
 RestartSec=5
 StartLimitInterval=300
 StartLimitBurst=10
-WatchdogSec=15
 
 # Security hardening
 NoNewPrivileges=yes
