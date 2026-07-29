@@ -348,6 +348,19 @@ async def _telemetry_loop() -> None:
         while True:
             try:
                 await asyncio.sleep(interval)
+                # Systemd watchdog heartbeat — attests THE LOOP IS ALIVE, not
+                # that ROS is healthy. Must sit above the ros_node None continue:
+                # lifespan catches ROS2 startup failure on purpose so the server
+                # still comes up (unit file graceful-degradation note). With
+                # Type=notify + WatchdogSec, skipping WATCHDOG=1 in that mode
+                # permanently kills the unit via StartLimitBurst. A throwing
+                # loop keeps feeding this (loud in the journal); a HUNG await
+                # is what WatchdogSec exists to catch.
+                _watchdog_counter += 1
+                if _sd_notifier and _watchdog_counter >= _WATCHDOG_EVERY_N:
+                    _sd_notifier.notify("WATCHDOG=1")
+                    _watchdog_counter = 0
+
                 if ros_node is None:
                     continue
 
@@ -571,12 +584,6 @@ async def _telemetry_loop() -> None:
                 prev_connected = connected
 
                 consecutive_errors = 0
-
-                # ── 5. Systemd watchdog heartbeat ──────────────────────────────
-                _watchdog_counter += 1
-                if _sd_notifier and _watchdog_counter >= _WATCHDOG_EVERY_N:
-                    _sd_notifier.notify("WATCHDOG=1")
-                    _watchdog_counter = 0
 
             except asyncio.CancelledError:
                 raise
