@@ -250,8 +250,15 @@ class RosBridgeNode(Node):
         # joystick MANUAL-mode check reads it). In the shared group a burst of
         # pose/GPS/rpp callbacks can starve it, which cascades into joystick
         # transport/mode rejections → gateway deadman neutral → jerky drive.
+        # Same argument for pose (telemetry + joystick deadman freshness) and
+        # /rpp/debug (safety-watchdog rpp_debug_age_ms + rpp_state): isolate
+        # them so a GPS/battery/spray burst cannot starve the hot paths.
+        # Do NOT change num_threads or touch _svc_group — ReentrantCallbackGroup
+        # on service clients is what keeps arm/disarm responsive (safety path).
         self._sub_group = MutuallyExclusiveCallbackGroup()
         self._state_sub_group = MutuallyExclusiveCallbackGroup()
+        self._pose_group = MutuallyExclusiveCallbackGroup()   # /mavros/local_position/pose
+        self._rpp_group = MutuallyExclusiveCallbackGroup()    # /rpp/debug
         self._svc_group = ReentrantCallbackGroup()
 
         if not _HAS_MAVROS:
@@ -271,7 +278,7 @@ class RosBridgeNode(Node):
                 "/mavros/local_position/pose",
                 self._cb_pose,
                 _qos_best_effort(),
-                callback_group=self._sub_group,
+                callback_group=self._pose_group,
             )
             self.create_subscription(
                 BatteryState,
@@ -312,7 +319,7 @@ class RosBridgeNode(Node):
             "/rpp/debug",
             self._cb_rpp_debug,
             _qos_best_effort(),
-            callback_group=self._sub_group,
+            callback_group=self._rpp_group,
         )
         self.create_subscription(
             Vector3Stamped,

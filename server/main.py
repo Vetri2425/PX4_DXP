@@ -175,6 +175,8 @@ async def lifespan(app: FastAPI):
     register_handlers(sio)
 
     # ── Start telemetry + safety watchdog (separate tasks — S2) ───────────────
+    # Unbounded + put_nowait: a future maxsize must not turn enqueue into a
+    # blocking await on the E-stop path. Prefer dropping a UI notification.
     _safety_abort_q = asyncio.Queue()
     _telemetry_task = asyncio.create_task(_telemetry_loop(), name="telemetry-loop")
     _safety_task = asyncio.create_task(_safety_watchdog_loop(), name="safety-watchdog")
@@ -183,8 +185,11 @@ async def lifespan(app: FastAPI):
     try:
         from bridge_health import BridgeHealthManager
 
+        async def _bounded_bridge_emit(event: str, data: dict) -> None:
+            await asyncio.wait_for(sio.emit(event, data), timeout=_EMIT_TIMEOUT_S)
+
         bridge_health = BridgeHealthManager(
-            ros_node, offboard_ctrl, _record, sio.emit
+            ros_node, offboard_ctrl, _record, _bounded_bridge_emit
         )
         bridge_health.start()
     except Exception as exc:
@@ -386,6 +391,15 @@ async def _safety_watchdog_loop() -> None:
     UI notification is queued for the telemetry loop. WATCHDOG=1 lives here
     because the process state worth protecting is the safety abort, not the
     telemetry push; must still fire when ros_node is None (S1-a).
+
+    Estop wall-clock budget vs WatchdogSec=15: estop_async can block this task
+    ~10 s on two back-to-back 5 s set_mode/arm service timeouts. That misses
+    ~3 of 5 WATCHDOG beats but still lands inside 15 s, so systemd does not
+    restart mid-stop. publish_stop_path() is synchronous and runs FIRST inside
+    estop_async, so the vehicle-stopping ROS publish lands before any await.
+    Do not add a third awaited service call (or raise those timeouts) without
+    revisiting this budget — a longer stall would let systemd kill the process
+    in the middle of an emergency stop.
     """
     interval = 1.0 / TELEMETRY_HZ
     stale_since: Optional[float] = None
@@ -476,18 +490,27 @@ async def _safety_watchdog_loop() -> None:
                             )
                             await emergency_handler.estop_async()
                             if _safety_abort_q is not None:
-                                await _safety_abort_q.put(
-                                    {
-                                        "reason": reason,
-                                        "pose_age_ms": pose_age,
-                                        "rpp_debug_age_ms": rpp_age,
-                                        "rpp_state": code,
-                                        "rpp_state_name": RPP_STATE_NAMES.get(
-                                            code, "UNKNOWN"
-                                        ),
-                                        "connected": s.get("connected"),
-                                    }
-                                )
+                                try:
+                                    _safety_abort_q.put_nowait(
+                                        {
+                                            "reason": reason,
+                                            "pose_age_ms": pose_age,
+                                            "rpp_debug_age_ms": rpp_age,
+                                            "rpp_state": code,
+                                            "rpp_state_name": RPP_STATE_NAMES.get(
+                                                code, "UNKNOWN"
+                                            ),
+                                            "connected": s.get("connected"),
+                                        }
+                                    )
+                                except asyncio.QueueFull:
+                                    # Unrepresentable with unbounded Queue; if a
+                                    # maxsize appears later, drop the UI notice
+                                    # rather than block the E-stop path.
+                                    log.error(
+                                        "safety_abort queue full — UI notification "
+                                        "dropped (estop already ran)"
+                                    )
                         stale_since = None
                 else:
                     stale_since = None

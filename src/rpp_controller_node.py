@@ -176,6 +176,8 @@ import math
 from enum import IntEnum
 
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time as RclTime
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
@@ -736,7 +738,17 @@ class RPPControllerNode(Node):
         # ------------------------------------------------------------------
         # Subscribers
         # ------------------------------------------------------------------
-        self.create_subscription(Path, "/path", self._path_cb, path_qos)
+        # Path conditioning (resample/smooth/DP-simplify) can take hundreds of
+        # ms on a long pre-line. Own MutuallyExclusiveCallbackGroup so it can
+        # run on the second MultiThreadedExecutor thread without blocking the
+        # 50 Hz control timer. Keep pose/vel/timer in the DEFAULT group
+        # together — they share _pose / _latest_vel_ned / _pose_recv_time with
+        # no locking and are only safe while mutually exclusive.
+        self._path_cb_group = MutuallyExclusiveCallbackGroup()
+        self.create_subscription(
+            Path, "/path", self._path_cb, path_qos,
+            callback_group=self._path_cb_group,
+        )
         self.create_subscription(
             PoseStamped, "/mavros/local_position/pose", self._pose_cb, be_qos
         )
@@ -4519,12 +4531,23 @@ class RPPControllerNode(Node):
 def main():
     rclpy.init()
     node = None
+    executor = None
     try:
         node = RPPControllerNode()
-        rclpy.spin(node)
+        # num_threads=2: one for default-group control (timer/pose/vel), one
+        # for _path_cb conditioning. Do not raise further without revisiting
+        # shared-state assumptions between those groups.
+        executor = MultiThreadedExecutor(num_threads=2)
+        executor.add_node(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        if executor is not None:
+            try:
+                executor.shutdown()
+            except Exception:
+                pass
         if node:
             # Last-gasp zero velocity on the way out — best-effort,
             # twist_to_setpoint_node will continue heartbeats with its own zero.
