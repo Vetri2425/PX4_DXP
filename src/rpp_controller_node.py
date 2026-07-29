@@ -415,11 +415,34 @@ class RPPControllerNode(Node):
         self.declare_parameter("segment_simplify_max_offset_m",        0.01)
         # D2 (runtime entry): when true, run 0 pivots in place to its first
         # heading before tracking (spray OFF via _run_alignment_hold) instead of
-        # the emergent forward-cone arc at tracking speed. Default OFF — enabling
-        # it is the D2 field-validation A/B; it does not change the validated
-        # auto-origin square/line missions until flipped on. See
-        # docs/RUNTIME_ENTRY_VELOCITY_PLAN.md §4 D2.
-        self.declare_parameter("entry_prealign_enabled",             False)
+        # the emergent forward-cone arc at tracking speed.
+        #
+        # DEFAULT FLIPPED False -> True, 2026-07-29, on field evidence. The A/B
+        # is done and this side won.
+        #
+        # The `or run["flags"][0]` clause below already forces a pre-align when
+        # run 0 starts on a MARK — but a GPS_SURVEYED two-phase entry publishes
+        # the ENTRY leg first with spray_flags [False, False], so that clause
+        # does NOT fire there and the rover drove the entry leg from whatever
+        # heading it was parked at. It then reached the first point crooked and
+        # never recovered.
+        #
+        # Measured, same missions, same code, same session:
+        #   OFF : 2.01 cm and 10.58 cm on ONE mission run twice; the bad run
+        #         reported "none — no CORNER_STOP->ALIGN->TRACK pivots" and
+        #         carried a -2.67 cm bias (55 % left) the whole line.
+        #   ON  : 0.96 / 1.65 / 2.15 / 2.17 cm across four runs, every one with
+        #         a pivot, the two repeats of one mission agreeing to 0.02 cm.
+        #
+        # It was left OFF as a D2 A/B flag and never flipped after the A/B
+        # concluded. Because it is a declare_parameter default with nothing
+        # overriding it in rpp_start.sh or the launch file, a runtime
+        # `ros2 param set` silently reverted on every rpp-pipeline restart —
+        # which is why one session produced both 2 cm and 10 cm runs with no
+        # log line explaining the difference.
+        #
+        # See docs/RUNTIME_ENTRY_VELOCITY_PLAN.md §4 D2.
+        self.declare_parameter("entry_prealign_enabled",              True)
         self.declare_parameter("segment_slowdown_dist",               0.50)
         self.declare_parameter("segment_min_corner_speed",             0.08)
         # Final-segment (run-endpoint) goal-approach floor. A per-line PRE/AFT
