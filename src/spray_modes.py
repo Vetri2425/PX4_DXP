@@ -71,6 +71,7 @@ class DashMeter:
         *,
         jump_tolerance_factor: float = 3.0,
         jump_reject_accept_after: int = 5,
+        anchor_s: float | None = None,
     ) -> None:
         on_d = float(on_distance_m)
         off_d = float(off_distance_m)
@@ -85,12 +86,19 @@ class DashMeter:
         self.phase = start_state
         self.jump_tolerance_factor = max(1.0, float(jump_tolerance_factor))
         self.jump_reject_accept_after = max(1, int(jump_reject_accept_after))
+        # Geometry-defined pattern origin (first MARK_START station). None keeps
+        # the legacy arm-at-raw_s behaviour so existing tests stay valid.
+        self._anchor_s = float(anchor_s) if anchor_s is not None else None
 
         self.armed = False
         self.s_dash = 0.0
         self.s_at_last_toggle = 0.0
         self._reject_count = 0
         self._reject_ref: float | None = None
+
+    def set_anchor_s(self, anchor_s: float | None) -> None:
+        """Update the geometry pattern origin (e.g. when /path arrives after config)."""
+        self._anchor_s = float(anchor_s) if anchor_s is not None else None
 
     def _target(self) -> float:
         return self.on_distance_m if self.phase == "on" else self.off_distance_m
@@ -130,10 +138,14 @@ class DashMeter:
                     False, False, self.phase, self.s_dash,
                     self.s_at_last_toggle, False, False,
                 )
-            # Arm at the first on-path tick: anchor the pattern here.
+            # Arm at the first on-path tick. s_dash tracks live arc-length from
+            # here; the toggle grid is anchored to geometry (first MARK_START)
+            # when given, otherwise to this arm-time raw_s (legacy).
             self.armed = True
             self.s_dash = raw_s
-            self.s_at_last_toggle = raw_s
+            self.s_at_last_toggle = (
+                self._anchor_s if self._anchor_s is not None else raw_s
+            )
             self._reject_count = 0
             self._reject_ref = None
         else:

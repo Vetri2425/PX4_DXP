@@ -349,6 +349,20 @@ def _next_boundary(
     return None
 
 
+def _first_mark_start_s(model: SprayPathModel) -> Optional[float]:
+    """Arc-length of the first MARK_START station (dash pattern geometry origin).
+
+    Prefers the first TRANSIT_TO_MARK boundary. If the path opens already on a
+    MARK (no transit lead-in), that is s=0 at the first station.
+    """
+    for boundary in model.boundaries:
+        if boundary.kind == TRANSIT_TO_MARK:
+            return float(boundary.s)
+    if model.flags and model.flags[0]:
+        return float(model.cumulative_s[0])
+    return None
+
+
 def _make_spray_decision(
     model: Optional[SprayPathModel],
     nozzle_n: Optional[float],
@@ -458,6 +472,9 @@ def _make_spray_decision(
             # physical toggle lands on the ideal grid. Corner deferral is
             # handled upstream by the pivot-state gate (plan §5), so the meter
             # keeps integrating through a stop and the phase never drifts.
+            # R5: the meter still integrates across TRANSIT connectors (locked
+            # "continuous across mission" decision), but the valve must stay
+            # shut on those runs — AND with the static spray flag.
             on_lead = speed_mps * solenoid_open_delay_s + on_overspray_margin_m
             off_lead = max(
                 0.0, speed_mps * solenoid_close_delay_s - off_overspray_margin_m
@@ -466,7 +483,7 @@ def _make_spray_decision(
             du = dash_meter.update(
                 projection.s, speed_mps, dt_s, xtrack_ok, on_lead, off_lead
             )
-            geometry_desired = du.geometry_desired
+            geometry_desired = du.geometry_desired and projection.current_flag
             boundary = None
             distance_to_boundary = float("inf")
         else:
@@ -518,19 +535,21 @@ def _make_spray_decision(
                     geometry_desired = False
                     event = "off_early"
 
-            # B4 terminal shutoff — fires independently of any boundary/lead so
-            # it works even when the rover stops short of the final MARK station
-            # (the off_early path above cannot: its lead is ~1 mm at creep
-            # speed). END-specific, NOT a speed gate: it requires proximity to
-            # the FINAL station, so a slow mid-line MARK keeps painting.
-            if (
-                geometry_desired
-                and model.cumulative_s
-                and speed_mps <= terminal_off_speed_mps
-                and (model.cumulative_s[-1] - projection.s) <= terminal_off_epsilon_m
-            ):
-                geometry_desired = False
-                event = "terminal_off"
+        # B4 terminal shutoff — fires independently of any boundary/lead so
+        # it works even when the rover stops short of the final MARK station
+        # (the off_early path above cannot: its lead is ~1 mm at creep
+        # speed). END-specific, NOT a speed gate: it requires proximity to
+        # the FINAL station, so a slow mid-line MARK keeps painting.
+        # Shared by continuous and dash (R6): previously nested under the
+        # continuous-only else, so dash sessions never reached it.
+        if (
+            geometry_desired
+            and model.cumulative_s
+            and speed_mps <= terminal_off_speed_mps
+            and (model.cumulative_s[-1] - projection.s) <= terminal_off_epsilon_m
+        ):
+            geometry_desired = False
+            event = "terminal_off"
 
     desired = bool(geometry_desired and safety_ok)
     debug = [
@@ -1068,6 +1087,10 @@ class SprayControllerNode(Node):
         # Point mode: the dwell targets just changed (new placed /path), so
         # rebuild the meter from the fresh must-hit vertices. No-op otherwise.
         self._rebuild_point_meter()
+        # Dash: pattern origin is the first MARK_START on this path. Config may
+        # have built the meter before /path arrived — update the anchor now.
+        if self._dash_meter is not None:
+            self._dash_meter.set_anchor_s(_first_mark_start_s(self._path_model))
         self.get_logger().info(
             f"spray path loaded: {len(points)} points, "
             f"{len(self._path_model.boundaries)} boundaries"
@@ -1149,10 +1172,16 @@ class SprayControllerNode(Node):
         self._last_point_update = None
         if cfg.mode == "dash" and cfg.dash is not None:
             try:
+                anchor_s = (
+                    _first_mark_start_s(self._path_model)
+                    if self._path_model is not None
+                    else None
+                )
                 self._dash_meter = DashMeter(
                     cfg.dash.on_distance_m,
                     cfg.dash.off_distance_m,
                     cfg.dash.start_state,
+                    anchor_s=anchor_s,
                 )
             except ValueError as exc:
                 self.get_logger().warn(

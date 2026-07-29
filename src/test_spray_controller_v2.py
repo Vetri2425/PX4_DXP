@@ -740,6 +740,60 @@ def test_dash_respects_safety_gate():
     assert blocked.desired is False           # but safety gate wins
 
 
+def test_dash_never_paints_transit_connector():
+    """R5: meter may be ON through a TRANSIT run; valve must stay shut there.
+
+    Path: TRANSIT [0,2) then MARK [2,12]. 6-on pattern arms on the transit and
+    would paint it without the current_flag AND.
+    """
+    model = _build_path_model(
+        [(0.0, 0.0), (2.0, 0.0), (12.0, 0.0)],
+        [False, True, True],
+    )
+    meter = DashMeter(6.0, 3.0, "on", anchor_s=2.0)
+    # Fine-step the transit; every tick must refuse to spray.
+    k = max(1, int(round(1.9 / 0.02)))
+    for i in range(k + 1):
+        n = 0.0 + i * 0.02
+        d = _make_spray_decision(
+            model=model, nozzle_n=n, nozzle_e=0.0, speed_mps=1.0,
+            safety_ok=True, safety_reason="",
+            solenoid_open_delay_s=0.0, solenoid_close_delay_s=0.0,
+            on_overspray_margin_m=0.0, off_overspray_margin_m=0.0,
+            max_xtrack_error_m=0.10, mode="dash", dash_meter=meter, dt_s=1.0,
+        )
+        assert d.desired is False, f"painted transit at n={n:.3f}"
+        assert d.geometry_desired is False
+    # Enter the MARK: meter still ON (anchor at 2, 6 m on) → may spray.
+    on_mark = _make_spray_decision(
+        model=model, nozzle_n=2.5, nozzle_e=0.0, speed_mps=1.0,
+        safety_ok=True, safety_reason="",
+        solenoid_open_delay_s=0.0, solenoid_close_delay_s=0.0,
+        on_overspray_margin_m=0.0, off_overspray_margin_m=0.0,
+        max_xtrack_error_m=0.10, mode="dash", dash_meter=meter, dt_s=1.0,
+    )
+    assert on_mark.desired is True
+    assert on_mark.geometry_desired is True
+
+
+def test_dash_terminal_shutoff_when_stopped_short():
+    """R6: B4 terminal shutoff must fire in dash mode, not only continuous."""
+    model = _terminal_mark_path()  # 4.804 m all-MARK, ends ON
+    meter = DashMeter(6.0, 3.0, "on", anchor_s=0.0)
+    # Arm and drive into the ON phase near the end (still within first 6 m ON).
+    _dash_drive(model, meter, 0.0, 4.79, step=0.02, speed=1.0, dt=1.0)
+    d = _make_spray_decision(
+        model=model, nozzle_n=4.790, nozzle_e=0.0, speed_mps=0.008,
+        safety_ok=True, safety_reason="",
+        solenoid_open_delay_s=0.10, solenoid_close_delay_s=0.05,
+        on_overspray_margin_m=0.02, off_overspray_margin_m=0.0,
+        max_xtrack_error_m=0.10, mode="dash", dash_meter=meter, dt_s=1.0,
+    )
+    assert d.geometry_desired is False
+    assert d.event == "terminal_off"
+    assert d.desired is False
+
+
 def test_session_config_cb_selects_dash():
     node = make_node()
     cfg = SpraySessionConfig(

@@ -142,6 +142,41 @@ def test_bad_config_rejected():
         pass
 
 
+def test_anchor_s_toggle_stations_independent_of_arm_raw_s():
+    """R4: same geometry anchor + two arm-time raw_s → identical toggle stations.
+
+    Customer-visible: re-marking a road must lay new dashes over the old ones,
+    regardless of where on the entry the meter first saw xtrack_ok.
+    """
+    anchor = 2.0
+
+    def toggle_stations(arm_raw_s: float) -> list[float]:
+        m = DashMeter(6.0, 3.0, "on", anchor_s=anchor)
+        m.update(arm_raw_s, 1.0, 1.0, xtrack_ok=True)
+        stations: list[float] = []
+        last = m.s_at_last_toggle
+        for _s, u in drive(m, arm_raw_s, 25.0, record=True):
+            if abs(u.s_at_last_toggle - last) > 1e-9:
+                stations.append(u.s_at_last_toggle)
+                last = u.s_at_last_toggle
+        return stations
+
+    a = toggle_stations(0.5)
+    b = toggle_stations(1.7)
+    assert a == b
+    # Geometry grid from anchor=2: on 6 → 8, off 3 → 11, on 6 → 17, off 3 → 20.
+    assert a == [8.0, 11.0, 17.0, 20.0]
+
+
+def test_anchor_s_none_preserves_arm_at_raw_s():
+    """anchor_s=None (default) still anchors the pattern at the arm-time raw_s."""
+    m = DashMeter(6.0, 3.0, "on")  # no anchor_s
+    m.update(2.0, 1.0, 1.0, xtrack_ok=True)
+    assert abs(m.s_at_last_toggle - 2.0) < 1e-9
+    assert drive(m, 2.0, 7.9).geometry_desired is True
+    assert drive(m, 7.9, 8.1).geometry_desired is False
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
