@@ -5,68 +5,58 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Field Checklist — Dash Run 2026-07-29</title>
 <style>
-  :root { --ink:#111; --mut:#666; --line:#d8d8d2; --warn:#8a4b00; --bad:#a32d2d; --ok:#0f6e56; }
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-         max-width: 1000px; margin: 0 auto; padding: 24px 18px 80px; color: var(--ink);
-         line-height: 1.55; font-size: 15px; }
-  h1 { font-size: 24px; margin: 0 0 4px; }
-  h2 { font-size: 18px; margin: 32px 0 8px; padding-top: 12px; border-top: 2px solid var(--ink); }
-  h3 { font-size: 15px; margin: 20px 0 6px; }
-  .sub { color: var(--mut); margin: 0 0 18px; }
-  table { border-collapse: collapse; width: 100%; margin: 10px 0 18px; font-size: 13.5px; }
-  th, td { border: 1px solid var(--line); padding: 7px 9px; vertical-align: top; text-align: left; }
-  th { background: #f4f3ee; font-weight: 600; }
-  td.n { width: 34px; text-align: center; font-weight: 600; }
-  td.chk { width: 34px; text-align: center; font-size: 17px; }
-  code { background: #f4f3ee; padding: 1px 4px; border-radius: 3px; font-size: 12.5px;
-         font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  pre { background: #f4f3ee; padding: 10px 12px; border-radius: 5px; overflow-x: auto;
-        font-size: 12.5px; line-height: 1.45; }
-  .box { border: 1px solid var(--line); border-left: 4px solid var(--warn);
-         padding: 10px 14px; margin: 14px 0; background: #fdfaf5; }
-  .box.bad { border-left-color: var(--bad); background: #fdf5f5; }
-  .box.ok  { border-left-color: var(--ok);  background: #f4faf8; }
-  .box p:first-child { margin-top: 0; } .box p:last-child { margin-bottom: 0; }
-  .meta { display: flex; gap: 28px; flex-wrap: wrap; font-size: 13.5px; color: var(--mut);
-          border: 1px solid var(--line); padding: 10px 14px; border-radius: 5px; }
-  .fill { border-bottom: 1px solid var(--ink); display: inline-block; min-width: 130px; }
-  ul { margin: 6px 0 6px 20px; padding: 0; } li { margin: 3px 0; }
-  .ok-t  { color: var(--ok);  font-weight: 600; }
-  .bad-t { color: var(--bad); font-weight: 600; }
+  :root { --ink:#111; --mut:#666; --line:#c9c9c2; --warn:#8a4b00; --bad:#a32d2d; --ok:#0f6e56; }
+  *{box-sizing:border-box}
+  body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         max-width:900px; margin:0 auto; padding:14px 14px 40px; color:var(--ink);
+         line-height:1.32; font-size:13px; }
+  h1 { font-size:17px; margin:0 0 2px; }
+  h2 { font-size:12px; margin:9px 0 3px; text-transform:uppercase; letter-spacing:.04em;
+       border-bottom:1.5px solid var(--ink); padding-bottom:1px; }
+  .sub { color:var(--mut); margin:0 0 7px; font-size:11px; }
+  table { border-collapse:collapse; width:100%; margin:0 0 6px; font-size:11px; }
+  th,td { border:.5px solid var(--line); padding:2.5px 5px; vertical-align:top; text-align:left; }
+  th { background:#f2f1ec; font-weight:600; }
+  td.chk { width:20px; text-align:center; }
+  td.n { width:16px; text-align:center; font-weight:600; }
+  code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:10px;
+         background:#f2f1ec; padding:0 3px; border-radius:2px; }
+  .meta { display:flex; gap:14px; flex-wrap:wrap; font-size:11px; color:var(--mut);
+          border:.5px solid var(--line); padding:4px 8px; border-radius:3px; margin-bottom:7px; }
+  .fill { border-bottom:.7px solid var(--ink); display:inline-block; min-width:80px; }
+  .rule { border-bottom:.7px solid var(--ink); display:block; min-width:100%; height:11px; }
+  .note { border-left:3px solid var(--warn); background:#fdfaf5; padding:4px 8px;
+          margin:0 0 6px; font-size:11px; }
+  .note.bad { border-left-color:var(--bad); background:#fdf5f5; }
+  .ok-t{color:var(--ok);font-weight:600} .bad-t{color:var(--bad);font-weight:600}
+  .two { display:grid; grid-template-columns:1fr 1fr; gap:0 14px; }
 
-  @page { size: A4 portrait; margin: 12mm 10mm; }
+  @page { size:A4 portrait; margin:8mm 8mm; }
   @media print {
-    body { font-size: 10.5pt; line-height: 1.35; padding: 0; max-width: none; color: #000; }
-    h1 { font-size: 16pt; margin-bottom: 2px; }
-    h2 { font-size: 12.5pt; margin: 14pt 0 5pt; padding-top: 6pt;
-         border-top: 1.5pt solid #000; break-after: avoid; page-break-after: avoid; }
-    h3 { font-size: 10.5pt; margin: 9pt 0 3pt; break-after: avoid; }
-    .sub, .meta { font-size: 9pt; color: #000; }
-    table, pre, .box { break-inside: avoid; page-break-inside: avoid; }
-    tr, td, th { break-inside: avoid; page-break-inside: avoid; }
-    table { font-size: 9pt; width: 100%; }
-    th, td { padding: 4pt 5pt; border: 0.5pt solid #666; }
-    th { background: #eee !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-    code, pre { background: transparent !important; border: 0.4pt solid #bbb; font-size: 8.5pt; }
-    pre { padding: 5pt 6pt; }
-    .box { background: transparent !important; border: 0.5pt solid #999;
-           border-left: 3pt solid #000 !important; padding: 6pt 9pt; margin: 8pt 0; }
-    td.chk { font-size: 0; }
-    td.chk::before { content: ""; display: inline-block; width: 11pt; height: 11pt;
-                     border: 0.9pt solid #000; }
-    .fill { min-width: 42mm; border-bottom: 0.6pt solid #000; }
-    h2 { page-break-before: always; break-before: page; }
-    h2:first-of-type { page-break-before: auto; break-before: auto; }
-    a { text-decoration: none; color: #000; }
+    body { font-size:8.4pt; line-height:1.22; padding:0; max-width:none; color:#000; }
+    h1 { font-size:13pt; } h2 { font-size:8.6pt; margin:6pt 0 2pt; }
+    .sub,.meta { font-size:7.4pt; color:#000; }
+    table { font-size:7.4pt; margin-bottom:4pt; }
+    th,td { padding:1.6pt 3pt; border:.4pt solid #777; }
+    th { background:#eee!important; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+    code { font-size:6.9pt; background:transparent!important; border:.3pt solid #bbb; }
+    .note { font-size:7.4pt; padding:2.5pt 5pt; margin-bottom:4pt;
+            background:transparent!important; border-left:2.2pt solid #000!important; }
+    td.chk{font-size:0} td.chk::before{content:"";display:inline-block;width:8pt;height:8pt;border:.7pt solid #000}
+    .fill{min-width:26mm;border-bottom:.5pt solid #000} .rule{height:8pt}
+    table,.note{break-inside:avoid;page-break-inside:avoid}
+    tr,td,th{break-inside:avoid;page-break-inside:avoid}
+    h2{break-after:avoid;page-break-after:avoid}
+    a{text-decoration:none;color:#000}
   }
 </style>
 </head>
 <body>
 
 <h1>Field Checklist — Dash Run · 2026-07-29</h1>
-<p class="sub">3WD marking rover · branch <code>prod/audit-stage3b</code> @ <code>e0a8e16</code> ·
-validates 10 spray/control fixes that have never painted a line ·
-<strong>baseline_master is untouched at 6fe6c76 — it is the fallback</strong></p>
+<p class="sub">3WD marking rover · <code>prod/audit-stage3b</code> @ <code>2392b3d</code> ·
+validates 10 spray/control fixes never yet painted ·
+<strong>fallback = <code>baseline_master</code> @ 6fe6c76, unchanged</strong></p>
 
 <div class="meta">
   <span>Date <span class="fill"></span></span>
@@ -77,135 +67,80 @@ validates 10 spray/control fixes that have never painted a line ·
   <span>End <span class="fill"></span></span>
 </div>
 
-<div class="box bad">
-<p><strong>Roles.</strong> Operator at the rover with the e-stop. Claude drives the API and watches
-telemetry. <strong>No arm or motion command without the operator saying "start" — for every run,
-not once.</strong></p>
-</div>
+<div class="note bad"><strong>No arm or motion without the operator saying “start” — every run.</strong>
+Operator at the rover with the e-stop; Claude drives the API and watches telemetry.</div>
 
-<h2>0 · Mission file</h2>
-
-<p>Must have <strong>at least two separate marked runs with a TRANSIT connector between them</strong>,
-or R5 is untestable.</p>
-
+<h2>1 · Mission file</h2>
 <table>
-<tr><th>File</th><th>Planned result</th><th>Verdict</th></tr>
-<tr><td><code>curve_6_points.csv</code></td><td>8 pts, one code <code>P</code> → <strong>MARK 4.70 m</strong>, single run, 97 wp</td><td class="ok-t">USE — lead file, most dash cycles</td></tr>
-<tr><td><code>2x2_square.csv</code> <em>as authored</em></td><td>4 pts, 4 different codes → 4 one-point lines → <strong>MARK 0.00 m</strong>, all 6.14 m transit</td><td class="bad-t">DO NOT USE — paints nothing</td></tr>
-<tr><td><code>2x2_square</code> re-coded, 2 codes</td><td><strong>2 runs × 2.02 m + 2.04 m connector</strong></td><td class="ok-t">USE — the only R5 test available</td></tr>
-<tr><td>Both <code>.dxf</code></td><td>degenerate polylines / POINT-only (default <code>ignore</code>)</td><td class="bad-t">unusable</td></tr>
+<tr><th>File</th><th>Plans to</th><th>Use?</th></tr>
+<tr><td><code>curve_6_points.csv</code></td><td>MARK <strong>4.70 m</strong>, 1 run, 97 wp</td><td class="ok-t">YES — lead file</td></tr>
+<tr><td><code>2x2_square.csv</code> as-authored</td><td>4 codes = 4 one-point lines → <strong>MARK 0.00 m</strong></td><td class="bad-t">NO — paints nothing</td></tr>
+<tr><td><code>2x2_square</code> re-coded, 2 codes</td><td>2 runs × 2.02 m + <strong>2.04 m connector</strong></td><td class="ok-t">YES — only R5 test</td></tr>
+<tr><td>both <code>.dxf</code></td><td>degenerate / POINT-only</td><td class="bad-t">NO</td></tr>
 </table>
 
-<h2>1 · GO / NO-GO gates — all four before any motion</h2>
-
+<h2>2 · GO / NO-GO — all four before motion</h2>
 <table>
-<tr><th class="n">#</th><th class="chk">✓</th><th>Gate</th><th>How</th><th>Abort if</th></tr>
-<tr><td class="n">1</td><td class="chk"></td><td><strong>RTK FIXED</strong></td><td>Start NTRIP from the app (<code>POST /api/rtk/ntrip/start</code>); confirm <code>fix_type=6</code></td><td>stays 3D/FLOAT — accuracy claims meaningless</td></tr>
-<tr><td class="n">2</td><td class="chk"></td><td><strong>App login</strong></td><td>Jul-11 password; telemetry must stream</td><td>client can't auth → roll auth back, file app bug</td></tr>
-<tr><td class="n">3</td><td class="chk"></td><td><strong>EKF origin</strong></td><td><code>GET /api/health/origin</code></td><td><code>INCONSISTENT</code> or delta &gt; 5 cm</td></tr>
-<tr><td class="n">4</td><td class="chk"></td><td><strong>Valve closed at rest</strong></td><td><code>/spray/state</code> = false</td><td>reads ON at rest</td></tr>
+<tr><th class="n">#</th><th class="chk">✓</th><th>Gate</th><th>Abort if</th></tr>
+<tr><td class="n">1</td><td class="chk"></td><td><strong>RTK FIXED</strong> — start NTRIP from app, confirm <code>fix_type=6</code></td><td>stays 3D / FLOAT</td></tr>
+<tr><td class="n">2</td><td class="chk"></td><td><strong>App login</strong> (Jul-11 password) — telemetry streams</td><td>client can’t auth → roll auth back</td></tr>
+<tr><td class="n">3</td><td class="chk"></td><td><strong>EKF origin</strong> — <code>GET /api/health/origin</code></td><td><code>INCONSISTENT</code> or Δ &gt; 5 cm</td></tr>
+<tr><td class="n">4</td><td class="chk"></td><td><strong>Valve closed at rest</strong> — <code>/spray/state</code> false</td><td>reads ON</td></tr>
 </table>
 
-<h2>2 · Phase 1 — DRY RUN (empty tank) — mandatory</h2>
-
-<div class="box bad">
-<p>Project rule: the first live run after a spray-path change is dry.
-<strong>Ten fixes changed that path today.</strong></p>
-</div>
-
+<h2>3 · Runs — in order</h2>
 <table>
-<tr><th class="chk">✓</th><th>Check</th><th>Pass</th><th>Observed</th></tr>
-<tr><td class="chk"></td><td>Valve opens on marked runs</td><td>ON during MARK</td><td class="fill"></td></tr>
-<tr><td class="chk"></td><td><strong>Valve shut across the connector</strong> (R5)</td><td>OFF for the whole 2.04 m</td><td class="fill"></td></tr>
-<tr><td class="chk"></td><td>Valve closes at mission end</td><td>OFF, latched</td><td class="fill"></td></tr>
-</table>
+<tr><th>Phase</th><th class="chk">✓</th><th>Check</th><th>Fix</th><th>Pass</th><th>Measured</th></tr>
+<tr><td rowspan="3"><strong>1 DRY</strong><br>empty tank<br><em>mandatory</em></td>
+    <td class="chk"></td><td>Valve opens on marked runs</td><td>—</td><td>ON during MARK</td><td class="fill"></td></tr>
+<tr><td class="chk"></td><td><strong>Valve shut across connector</strong></td><td>R5</td><td>OFF all 2.04 m</td><td class="fill"></td></tr>
+<tr><td class="chk"></td><td>Valve closes at end</td><td>R6</td><td>OFF, latched</td><td class="fill"></td></tr>
 
-<div class="box bad"><p><strong>If the valve opens on the connector — STOP.</strong>
-That is R5 failing and it would be paint on the ground.</p></div>
-
-<h2>3 · Phase 2 — WET RUN #1</h2>
-
-<table>
-<tr><th class="chk">✓</th><th>Check</th><th>Fix</th><th>Pass</th><th>Measured</th></tr>
-<tr><td class="chk"></td><td>Paint starts at / just before line start</td><td>B2</td><td>≤ ~2 cm early. <span class="bad-t">LATE = FAIL</span></td><td class="fill"></td></tr>
+<tr><td rowspan="5"><strong>2 WET #1</strong></td>
+    <td class="chk"></td><td>Paint starts at / before line start</td><td>B2</td><td>≤ 2 cm early · <span class="bad-t">LATE = FAIL</span></td><td class="fill"></td></tr>
 <tr><td class="chk"></td><td>Connectors dry</td><td>R5</td><td>zero paint between runs</td><td class="fill"></td></tr>
-<tr><td class="chk"></td><td>Dash on/off lengths</td><td>R4</td><td>match configured pattern</td><td class="fill"></td></tr>
+<tr><td class="chk"></td><td>Dash on/off lengths (first 3)</td><td>R4</td><td>match pattern</td><td class="fill"></td></tr>
 <tr><td class="chk"></td><td>Valve closes at end</td><td>R6</td><td>no puddle past last station</td><td class="fill"></td></tr>
-<tr><td class="chk"></td><td>Accel in first 2 m</td><td>R2</td><td>smooth; no jerk, no crawl</td><td class="fill"></td></tr>
+<tr><td class="chk"></td><td>Accel, first 2 m</td><td>R2</td><td>smooth; no jerk / crawl</td><td class="fill"></td></tr>
+
+<tr><td><strong>3 WET #2</strong><br><span class="bad-t">★ CRITICAL</span></td>
+    <td class="chk"></td><td><strong>Re-run — DO NOT move rover, DO NOT re-stage.</strong> Dashes overprint run #1?</td>
+    <td>R4 B1</td><td class="ok-t">land on top</td><td class="fill"></td></tr>
+
+<tr><td><strong>4 STOP</strong><br>drop if tight</td>
+    <td class="chk"></td><td>Stop mid-run → valve closes</td><td>R6</td><td>within ~5 cm</td><td class="fill"></td></tr>
 </table>
 
-<p><strong>Measure with a tape, not by eye:</strong> line-start → first paint, and the first three
-dash on/off lengths.</p>
+<div class="note">Measure with a <strong>tape, not by eye</strong>: line-start → first paint, and the
+first three dash on/off lengths. Phase 3 is a comparison — it is the only test of the geometry anchor.</div>
 
-<h2>4 · Phase 3 — WET RUN #2 ★ THE CRITICAL TEST</h2>
-
-<div class="box">
-<p><strong>Re-run the same mission. Do NOT move the rover. Do NOT re-stage.</strong></p>
-<p>This is the only way to test the R4 geometry anchor and the B1 entry rebuild, and it is the
-single most important measurement today.</p>
-</div>
-
-<table>
-<tr><th class="chk">✓</th><th>Check</th><th>Pass</th><th>Fail</th><th>Observed</th></tr>
-<tr><td class="chk"></td><td><strong>Run #2 dashes overprint run #1</strong></td><td class="ok-t">land on top</td><td class="bad-t">any visible offset → anchor not working</td><td class="fill"></td></tr>
-</table>
-
-<p>Overprint is the customer-visible requirement — it is what re-marking a road actually needs.</p>
-
-<h2>5 · Phase 4 — STOP-SHORT (drop first if time is tight)</h2>
-
-<table>
-<tr><th class="chk">✓</th><th>Check</th><th>Pass</th><th>Observed</th></tr>
-<tr><td class="chk"></td><td>Stop mid-run → valve closes</td><td>within ~5 cm</td><td class="fill"></td></tr>
-</table>
-
-<h2>6 · Live abort criteria — Claude calls these</h2>
-
+<h2>4 · Abort triggers · expected behaviour</h2>
+<div class="two">
 <table>
 <tr><th>Signal</th><th>Stop if</th></tr>
 <tr><td><code>xtrack_m</code></td><td>&gt; 5 cm sustained</td></tr>
-<tr><td><code>rpp_state</code></td><td><code>STALE</code>, <code>RTK_WAIT</code>, <code>JUMP_SKIP</code> mid-run</td></tr>
-<tr><td><code>safety_reason</code></td><td>anything unexpected — read verbatim to the operator</td></tr>
-<tr><td><code>/spray/state</code></td><td>ON during a connector, or after mission end</td></tr>
-<tr><td><code>gps_fix</code></td><td>drops below RTK_FIXED</td></tr>
+<tr><td><code>rpp_state</code></td><td>STALE / RTK_WAIT / JUMP_SKIP</td></tr>
+<tr><td><code>/spray/state</code></td><td>ON in connector or after end</td></tr>
+<tr><td><code>gps_fix</code></td><td>below RTK_FIXED</td></tr>
 </table>
-
-<div class="box">
-<p><strong>Expect more spray refusals than usual.</strong> The xtrack gate went 10 cm → 3 cm today
-(R3). A refusal on a good fix is <em>the product working</em>. Refusals <em>constantly</em> on a good
-fix means 3 cm is too tight and we tune — a data outcome, not a bug. The reason string now ends in
-<code>(param)</code> or <code>(mission)</code> so you can tell which knob fired.</p>
+<div class="note"><strong>More spray refusals are expected.</strong> Gate went 10 cm → 3 cm today (R3).
+A refusal on a good fix = product working. Constant refusals on a good fix = 3 cm too tight, tune it.
+Reason string ends <code>(param)</code> or <code>(mission)</code>.</div>
 </div>
 
-<h2>7 · Priority if time runs short</h2>
-
-<ol>
-<li>Dry run — safety, non-negotiable</li>
-<li>Wet #1 + Wet #2 overprint ★</li>
-<li>Stop-short</li>
-<li>P1 DXF pass — only if suitable CAD is to hand</li>
-</ol>
-
-<h2>8 · Not tested today</h2>
-
-<ul>
-<li>Point missions — bug A11 still open</li>
-<li>P1 dedup — needs CAD with geometry in the 1–5 cm band</li>
-<li><s><code>POST /api/path/plan-trajectory</code></s> — <span class="ok-t">field-validated 2026-07-28</span>, not outstanding</li>
-<li>Joystick — re-enabled 16:38; §7.1 axis mapping is <span class="ok-t">field-confirmed</span>, not a gate</li>
-</ul>
-
-<h2>9 · Sign-off</h2>
-
+<h2>5 · Sign-off</h2>
 <table>
 <tr><th>Item</th><th>Result</th><th>Notes</th></tr>
-<tr><td>Dry run</td><td class="fill"></td><td class="fill"></td></tr>
-<tr><td>Wet #1</td><td class="fill"></td><td class="fill"></td></tr>
-<tr><td>Wet #2 overprint ★</td><td class="fill"></td><td class="fill"></td></tr>
-<tr><td>Stop-short</td><td class="fill"></td><td class="fill"></td></tr>
-<tr><td>Bag analysis verdict</td><td class="fill"></td><td class="fill"></td></tr>
-<tr><td><strong>Promote stage3b → baseline_master?</strong></td><td class="fill"></td><td class="fill"></td></tr>
+<tr><td>Dry run</td><td class="fill"></td><td><span class="rule"></span></td></tr>
+<tr><td>Wet #1</td><td class="fill"></td><td><span class="rule"></span></td></tr>
+<tr><td>Wet #2 overprint ★</td><td class="fill"></td><td><span class="rule"></span></td></tr>
+<tr><td>Stop-short</td><td class="fill"></td><td><span class="rule"></span></td></tr>
+<tr><td>Bag analysis verdict</td><td class="fill"></td><td><span class="rule"></span></td></tr>
+<tr><td><strong>Promote stage3b → baseline_master?</strong></td><td class="fill"></td><td><span class="rule"></span></td></tr>
 </table>
+
+<p class="sub">Not tested today: point missions (bug A11) · P1 dedup (needs CAD with 1–5 cm geometry).
+<code>plan-trajectory</code> field-validated 07-28. Joystick re-enabled 16:38; §7.1 field-confirmed, not a gate.</p>
 
 </body>
 </html>
