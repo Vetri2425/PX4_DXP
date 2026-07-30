@@ -387,12 +387,22 @@ class RPPControllerNode(Node):
         # Pure pursuit cuts inside an arc by e ≈ L²·κ/8, speed-independent. Cap
         # the lookahead at sqrt(8·e_target/κ) so that cut stays bounded.
         #
-        # FROZEN CONTROLLER — default 0.0 = OFF, exactly the pre-P5.1 geometry.
-        # This is a named A/B: set smooth_max_arc_cut_m to enable.
-        #   0.005 (5 mm) reproduces the field-validated L≈0.30 m at κ=0.43,
-        #   which took curve marking RMS 2.31 → 1.34 cm over 3 runs.
-        # Only the SMOOTH profile is affected; segment mode is untouched.
-        self.declare_parameter("smooth_max_arc_cut_m",                0.0)
+        # Default 0.005 (5 mm) FIELD-VALIDATED 2026-07-30 on the curve mission
+        # (3 runs, ~14:00): valve-gated marking RMS 1.51 → 1.23/1.24/1.30 cm,
+        # spread 0.07 cm; the inside-cut signature +1.17 → −0.39 cm (nulled);
+        # full coverage in ONE spray interval instead of two. It caps l_d at
+        # ≈0.305 m for the measured κ=0.43 (R≈2.4 m).
+        #
+        # 0.0 restores the pre-P5.1 geometry exactly — keep that as the A/B arm
+        # if a regression appears. Only the SMOOTH profile is affected; segment
+        # mode is untouched, so straight-line and stop/pivot behaviour on the
+        # frozen controller is unchanged by this default.
+        #
+        # ⚠ NOT yet regression-tested on the 2x2 square (the shape that came
+        # back partial at a globally-forced L=0.30). The cap is curvature-
+        # conditional, so it should not bind on the square's straights — but
+        # that is reasoning, not a measurement.
+        self.declare_parameter("smooth_max_arc_cut_m",                0.005)
         # Hard floor on the capped lookahead, so an over-tight cap on a sharp
         # arc cannot collapse l_d toward zero and degenerate the lookahead walk
         # (the IDLE-fallback path). 0.25 m is below every value tested and well

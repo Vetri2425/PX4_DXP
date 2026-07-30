@@ -207,8 +207,14 @@ class TestArcCutCap(unittest.TestCase):
     """The cap law itself: L = sqrt(8*e_target/kappa), floored.
 
     Mirrors the expression in the smooth tracker. Anchored on field data:
-    kappa=0.43, e_target=0.005 -> 0.305 m, and L=0.30 measured marking RMS
-    2.31 -> 1.34 cm with the inside-cut going +1.15 -> -0.40 cm.
+    kappa=0.43, e_target=0.005 -> 0.305 m, which is the L the 2026-07-30 curve
+    runs flew: valve-gated marking RMS 1.51 -> 1.23/1.24/1.30 cm, inside-cut
+    +1.17 -> -0.39 cm.
+
+    NOTE the earlier "2.31 -> 1.34 cm" figure is RETRACTED -- both sides of it
+    came from the pre-`ff3a9bb` analyser, which folded DRY samples into
+    marking_only and over-reported the baseline. Re-scored consistently on the
+    valve, the same runs give 1.51 -> 1.26 (a 17% gain, not 42%).
     """
     E_TARGET = 0.005
     FLOOR = 0.25
@@ -242,19 +248,57 @@ class TestArcCutCap(unittest.TestCase):
         self.assertGreater(self.FLOOR, 0.21)
 
     def test_cut_scales_as_L_squared(self):
-        """The law the L=1.00 arm confirmed: ratio 3.30 measured vs 3.10 pred."""
+        """Pure algebra: e = L^2*kappa/8, so the cut ratio is the L ratio squared.
+
+        The "L=1.00 arm confirmed this, 3.30 measured vs 3.10 predicted" claim
+        is RETRACTED -- that arm's valve was open for only 3.5-5.3 s of a 13.5 s
+        line, and the lookahead DURING paint was 0.174 m, not 1.00. It measured
+        a selection effect, not the law. The law itself still holds; it is just
+        not field-confirmed at L=1.00.
+        """
         k = 0.43
         cut = lambda L: L * L * k / 8.0
         self.assertAlmostEqual(cut(0.982) / cut(0.558), (0.982 / 0.558) ** 2, places=6)
 
 
-class TestParamDefaultsAreOptIn(unittest.TestCase):
-    def test_cap_is_declared_off_by_default(self):
-        """Frozen controller: P5.1 must be a named A/B, not a silent change."""
+class TestParamDefaultsArePinned(unittest.TestCase):
+    def test_cap_default_is_the_field_validated_5mm(self):
+        """P5.1 shipped ON at 5 mm after the 2026-07-30 curve runs.
+
+        It was declared 0.0 (a named A/B) until that field pass: 3 runs took
+        valve-gated marking RMS 1.51 -> 1.23/1.24/1.30 cm with the inside-cut
+        signature nulled (+1.17 -> -0.39 cm) and full coverage in one spray
+        interval. The default is pinned here so it cannot drift silently in
+        either direction -- flipping it is a controller change and must come
+        with its own field evidence.
+        """
         src = open(rc.__file__).read()
-        self.assertIn('declare_parameter("smooth_max_arc_cut_m",                0.0)', src)
+        self.assertIn('declare_parameter("smooth_max_arc_cut_m",                0.005)', src)
         self.assertIn("curvature_baseline_m", src)
         self.assertIn("smooth_min_arc_ld_m", src)
+
+    def test_zero_still_restores_the_pre_p5_1_geometry(self):
+        """The A/B arm must survive as a real escape hatch, not just a comment.
+
+        Mirrors the controller's branch: cut_target = 0 skips the cap entirely
+        and falls through to the legacy coeff FLOOR, which is what the frozen
+        controller did before P5.1.
+        """
+        raw, kappa, ld_coeff = 0.56, 0.43, 0.20
+
+        def l_d(cut_target):
+            if kappa > 1e-6 and cut_target > 0.0:
+                return max(min(raw, math.sqrt(8.0 * cut_target / kappa)), 0.25)
+            if kappa > 1e-6 and ld_coeff > 0.0:
+                return max(raw, ld_coeff / kappa)
+            return raw
+
+        # At the field kappa the legacy coeff floor (0.465) sits BELOW the
+        # velocity-scaled raw, so pre-P5.1 the rover ran the full 0.56 m.
+        self.assertAlmostEqual(l_d(0.0), raw, places=6)
+        self.assertAlmostEqual(l_d(0.005), 0.305, places=3)
+        self.assertLess(l_d(0.005), l_d(0.0),
+                        "the cap must bind BELOW the pre-P5.1 lookahead or it is inert")
 
 
 if __name__ == "__main__":
