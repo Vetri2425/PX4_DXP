@@ -2642,10 +2642,41 @@ class RPPControllerNode(Node):
         t = self._clamp(t_raw, 0.0, 1.0)
         foot_n = a.x + t * dx
         foot_e = a.y + t * dy
-        d = self._dist(pos_n, pos_e, foot_n, foot_e)
-        cross_z = dx * (pos_e - foot_e) - dy * (pos_n - foot_n)
-        signed_e = math.copysign(d, cross_z) if d > 0.0 else 0.0
         seg_len = math.sqrt(seg_sq)
+
+        # Signed perpendicular offset from this segment's INFINITE line.
+        #
+        # The 2D cross product of the segment direction with (pos − foot)
+        # annihilates any along-track component, so cross_z / seg_len is the
+        # exact perpendicular distance even when t was clamped and `foot` is
+        # a vertex rather than the true perpendicular foot. For 0 < t < 1 it
+        # is identical to the old copysign(|pos − foot|, cross_z) — this is a
+        # no-op in the segment interior.
+        #
+        # It is NOT a no-op at the ends, which is the point. The old form used
+        # |pos − foot| as the magnitude, so a clamped t made the ALONG-track
+        # gap to the vertex masquerade as cross-track. That fires on every
+        # segment handover: seg_idx advances one control cycle before the
+        # rover physically reaches the vertex, t_raw goes negative, and for
+        # exactly one cycle the reported cross-track jumps to the remaining
+        # along-track distance.
+        #
+        # Field evidence 2026-07-30, bags stg_1bda4c36_..._151006 and
+        # stg_bbb8e1a5_..._152342 (tes_cross_line_2, 0.5 m extensions, RTK
+        # fixed, segment profile). Four spikes per run at the four segment
+        # boundaries: reported −4.88 / −4.44 / +4.85 / +4.65 cm while the true
+        # offset from the surveyed line was −0.34 / −0.15 / +0.44 / +0.12 cm.
+        # The magnitude matched the along-track gap every time — at 151006's
+        # exit, dist_to_end_along was 0.068 m one sample before the switch, so
+        # at 0.35 m/s and 0.1 s/cycle ~0.033 m remained, reported as 3.42 cm.
+        # Those paths are perfectly COLLINEAR, so no genuine cross-track can
+        # exist at a handover at all.
+        #
+        # `t`, `foot_*` and `dist_to_end_along` deliberately stay clamped: the
+        # segment state machine and the lookahead placement (which walks
+        # forward from `foot`) both require a point ON the segment.
+        cross_z = dx * (pos_e - foot_e) - dy * (pos_n - foot_n)
+        signed_e = cross_z / seg_len
         dist_to_end_along = (1.0 - t) * seg_len
         return t, foot_n, foot_e, signed_e, dist_to_end_along
 
