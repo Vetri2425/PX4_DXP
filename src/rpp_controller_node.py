@@ -502,11 +502,13 @@ class RPPControllerNode(Node):
         # non-extension square's within-run corners or arc approaches.
         self.declare_parameter("segment_endpoint_approach_speed",      0.03)   # m/s
         self.declare_parameter("segment_corner_acceptance_radius",     0.05)
-        # Pivot exit tolerance. 2.0° gives the "spin in place, exit facing the
-        # next point" behaviour; pair with FCU param RD_TRANS_TRN_DRV lowered
-        # to the same angle (set via QGC) or the firmware starts driving
-        # forward at its own 5° default while RPP is still waiting.
-        self.declare_parameter("segment_heading_tolerance_deg",        2.0)
+        # Pivot exit tolerance. MUST sit strictly ABOVE the firmware's
+        # RD_TRANS_TRN_DRV stop angle (2.0° as flown): the firmware stops
+        # turning at ITS threshold, so an equal companion tolerance deadlocks —
+        # PX4 quits at exactly the angle RPP still requires it to cross.
+        # 2026-07-30 bags: 6/6 pivots stalled 8-14 s pinned at ~2.5°, escaping
+        # only on EKF yaw noise (P0-1). 3.0° accepts before the firmware quits.
+        self.declare_parameter("segment_heading_tolerance_deg",        3.0)
         self.declare_parameter("segment_yaw_rate_gain",                1.5)
         # CORNER_STOP: confirm the rover is physically stopped at the corner
         # before pivoting. Both linear speed AND yaw-rate (from velocity_local)
@@ -569,8 +571,11 @@ class RPPControllerNode(Node):
         # still require yaw-rate settling. Never launch onto the next line
         # merely because the timer expired while the rover is still turning.
         self.declare_parameter("segment_turn_timeout_s",               5.0)    # s
-        # Precision runs never relax beyond the normal 2° heading gate.
-        self.declare_parameter("segment_timeout_heading_tolerance_deg", 2.0)   # deg
+        # Timeout release band. MUST be strictly wider than
+        # segment_heading_tolerance_deg or the watchdog is a no-op:
+        # max(tol, timeout_tol) relaxes nothing when both are equal — which is
+        # exactly how every 2026-07-30 pivot stall escaped only on EKF drift.
+        self.declare_parameter("segment_timeout_heading_tolerance_deg", 4.0)   # deg
         # Angle-aware pivot watchdog (Part B): a fixed timeout is wrong for a
         # corner whose magnitude varies. The rover spot-turns at a roughly
         # constant rate, so the budget scales with the corner angle:
@@ -584,9 +589,11 @@ class RPPControllerNode(Node):
         # Hard release gate: never launch onto the next leg while the heading
         # error to that leg exceeds this, regardless of timeout. Backstops the
         # relaxed timeout band so a mis-set tolerance cannot release a large
-        # residual error into forward TRACK acceleration. Tightened to 3° for
-        # precision (per-line extension) missions where MARK entry must be <2 cm.
-        self.declare_parameter("segment_pivot_release_max_deg",        3.0)    # deg
+        # residual error into forward TRACK acceleration. MUST sit above
+        # segment_timeout_heading_tolerance_deg — this cap is applied with
+        # min(), so a cap at/below the timeout band silently re-disables the
+        # watchdog (the 2026-07-30 stall had 3.0 capping a 2.0/2.0 pair).
+        self.declare_parameter("segment_pivot_release_max_deg",        5.0)    # deg
         # Connector absorption (Part A): adjacent apex waypoints can leave a
         # sub-threshold "connector" segment (e.g. 8 cm) between two real legs.
         # If it survives into run-splitting it becomes its own pivot target and
