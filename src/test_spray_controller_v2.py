@@ -129,6 +129,31 @@ def test_on_overspray_margin_extends_mark_start():
     assert without_margin.desired is False
 
 
+def test_xtrack_gate_default_is_pinned_at_5cm():
+    """The gate default has cost a field day once; pin it in both places.
+
+    History: 0.10 -> 0.03 in c4fdcde (2026-07-29) on the reasoning that 0.10
+    never fired. The 2026-07-30 bags showed 0.03 sits INSIDE the rover's own
+    error distribution -- the gate chattered and broke single lines into 2-3
+    painted fragments, eating 19-41% of the mark window on the worst runs, with
+    every suppression reading "xtrack error 0.031m > 0.030m (param)". 0.05
+    clears the observed p95 (2.4-4.8 cm) so a settling line paints continuously.
+
+    Moving this is a field-visible change: re-run a straight line and count the
+    spray intervals on /spray/state before and after. It is a paint-continuity
+    floor, NOT an accuracy spec.
+    """
+    node_src = open(scn.__file__).read()
+    assert 'declare_parameter("max_xtrack_error_m", 0.05)' in node_src
+
+    # The app's param schema must agree, or the operator sees a "default" that
+    # is not the one the node actually boots with.
+    here = os.path.dirname(os.path.abspath(scn.__file__))
+    schema_src = open(os.path.join(here, "..", "server", "routes", "spray_params.py")).read()
+    entry = schema_src.split('"max_xtrack_error_m"', 1)[1].split("}", 1)[0]
+    assert '"default": 0.05' in entry, entry
+
+
 def test_safety_off_when_disarmed():
     node = make_node(armed=False)
     node._path_model = _straight_mark_path()

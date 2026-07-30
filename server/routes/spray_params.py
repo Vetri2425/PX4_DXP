@@ -169,7 +169,7 @@ SPRAY_PARAM_SCHEMA: dict[str, dict] = {
     },
     "max_xtrack_error_m": {
         "type": "float",
-        "default": 0.03,
+        "default": 0.05,
         "group": "Distance-Aware Spray",
         "description": "Spray is suppressed when cross-track error exceeds this (m). Prevents off-path marking",
         "min": 0.01,

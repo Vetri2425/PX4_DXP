@@ -711,7 +711,26 @@ class SprayControllerNode(Node):
         # progress_timeout_s. Generalizes the existing pivot-gate pattern.
         self.declare_parameter("consume_rpp_progress", False)
         self.declare_parameter("progress_timeout_s", 0.3)   # s → fallback to /path
-        self.declare_parameter("max_xtrack_error_m", 0.03)
+        # Suppress spray when the nozzle's cross-track error exceeds this.
+        #
+        # 0.10 -> 0.03 in c4fdcde (Stage 1 R3, 2026-07-29) on the reasoning that
+        # 0.10 was 5x the +/-2 cm spec and therefore never actually fired. The
+        # 2026-07-30 bags showed why that reasoning was wrong: 0.03 sits INSIDE
+        # the rover's own error distribution, so the gate chatters and breaks a
+        # single line into 2-3 painted fragments. Every suppression in all 11
+        # bags that day had the same reason string, "xtrack error 0.031m >
+        # 0.030m (param)", and the gate ate 19-41% of the mark window on the
+        # worst runs -- while the underlying tracking was a benign +/-3-4 cm
+        # entry transient, not an off-path excursion.
+        #
+        # 0.05 is the operator's call: above the observed p95 (2.4-4.8 cm) so a
+        # settling line still paints continuously, but still tight enough to cut
+        # a genuine excursion. A broken line is worse than a line 3 cm off.
+        #
+        # This is a FLOOR on paint continuity, not an accuracy spec -- do not
+        # read it as "5 cm is acceptable marking error". Per-mission override
+        # via session_config max_xtrack_error_m (R3) still wins when present.
+        self.declare_parameter("max_xtrack_error_m", 0.05)
         self.declare_parameter("pose_timeout_s", 0.5)
         self.declare_parameter("velocity_timeout_s", 0.5)
         # ── Phase B: RTK / GPS fix-quality gate (plan §7.6) ──────────────────
