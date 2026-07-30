@@ -403,11 +403,20 @@ class RPPControllerNode(Node):
         # conditional, so it should not bind on the square's straights — but
         # that is reasoning, not a measurement.
         self.declare_parameter("smooth_max_arc_cut_m",                0.005)
-        # Hard floor on the capped lookahead, so an over-tight cap on a sharp
-        # arc cannot collapse l_d toward zero and degenerate the lookahead walk
-        # (the IDLE-fallback path). 0.25 m is below every value tested and well
-        # clear of the 0.12-0.21 m band that went unstable on 2026-07-29.
-        self.declare_parameter("smooth_min_arc_ld_m",                 0.25)
+        # Hard floor on the capped lookahead. Raised 0.25 -> 0.40 (2026-07-30):
+        # the floor must keep the lookahead TIME clear of the vehicle's control
+        # lag, not just keep the walk alive. Measured lag is ~0.45 s (0.30 s
+        # velocity loop + 0.15 s pose); at 0.35 m/s a 0.25 m lookahead is a
+        # 0.71 s horizon — 1.6x lag, marginally stable — and on the
+        # curve_6_points-1 G0 kinks the P5.1 cap collapsed l_d to exactly this
+        # floor, the command saturated at kappa=-3.7, and the rover ran 6.4 cm
+        # wide (reproduced in sim; same mechanism as the 0.12-0.21 m band that
+        # went unstable on 2026-07-29). 0.40 m = 1.14 s horizon (~2.5x lag);
+        # sim on the same kinked path: max error 8.1 -> under 2 cm. Costs some
+        # of P5.1's smooth-arc benefit: inside-cut on the validated R=2.4 arc
+        # rises 0.49 -> 0.84 cm (e = L^2*kappa/8) — still under 1 cm.
+        # 0.25 restores the previous behaviour as the A/B arm.
+        self.declare_parameter("smooth_min_arc_ld_m",                 0.40)
         # Half-baseline for path curvature estimation, in metres of arc length.
         # MUST stay ≥ ~0.10 m: three-point curvature on a 4-10 cm densified
         # path is noise-dominated (measured 0.626 at 0.05 m vs 0.42-0.43 from
