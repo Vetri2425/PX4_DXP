@@ -2355,7 +2355,12 @@ def _trajectory_run_echo(runs, plan) -> list[TrajectoryRunEcho]:
         echo.append(TrajectoryRunEcho(
             index=len(echo),
             kind="travel",
-            num_points=1,
+            # TWO points: the boundary terminator (mark end repeated, flagged
+            # TRANSIT) plus the far tail. `prev` is that terminator, coincident
+            # with the mark end, so length_m below is still exactly the run-out.
+            # The client reconciles sum(num_points) against num_waypoints, so
+            # this must match the engine or its arithmetic is off by one.
+            num_points=2,
             length_m=round(math.hypot(tail[0] - prev[0], tail[1] - prev[1]), 3),
             label="run-out",
             generated=True,

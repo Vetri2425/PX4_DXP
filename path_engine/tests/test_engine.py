@@ -29,11 +29,19 @@ def test_engine_plan_segments_single_mark():
     plan = engine.plan_segments([seg])
     assert plan.num_waypoints > 2  # Densified
     assert plan.total_mark_length > 0
-    # Every marked waypoint is MARK, but the engine now appends one short
-    # TRANSIT run-out so a mission that ends on MARK still has a terminal
-    # MARK->TRANSIT boundary — without it the spray node latches ON forever at
-    # the endpoint (no boundary => off_early can never fire).
-    assert all(plan.spray_flags[:-1])  # all marked points are MARK
+    # Every marked waypoint is MARK, but the engine appends a terminal TRANSIT
+    # run-out so a mission ending on MARK still has a MARK->TRANSIT boundary —
+    # without it the spray node latches ON forever at the endpoint (no boundary
+    # => off_early can never fire).
+    #
+    # TWO trailing points, not one: the boundary itself is a duplicated
+    # coincident vertex (mark end as True, then again as False), because
+    # spray_flags[i] is the flag of the segment LEAVING point i. Emitting only
+    # the far tail point put the transition on the far end and made the whole
+    # run-out read as MARK — 10 cm of overspray, see the BOUNDARY TERMINATOR
+    # block in engine.py for the field evidence.
+    assert all(plan.spray_flags[:-2])  # all marked points are MARK
+    assert plan.spray_flags[-2] is False  # boundary terminator at the mark end
     assert plan.spray_flags[-1] is False  # terminal run-out is TRANSIT
     assert plan.origin == (0.0, 0.0)
 

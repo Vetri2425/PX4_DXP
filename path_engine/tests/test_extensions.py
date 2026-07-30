@@ -803,11 +803,13 @@ class TestDisabledMode:
         )
         plan = engine.plan_segments([self._seg()])
         # No per-line PRE/AFT extension segments are injected, but the engine
-        # appends one short terminal TRANSIT run-out so a mission that ends on
-        # MARK still has a MARK->TRANSIT boundary for the spray node (otherwise
-        # spray latches ON at the endpoint). So every flag is True except the
-        # final run-out point.
-        assert all(f is True for f in plan.spray_flags[:-1])
+        # appends a terminal TRANSIT run-out so a mission that ends on MARK still
+        # has a MARK->TRANSIT boundary for the spray node (otherwise spray
+        # latches ON at the endpoint). That boundary is a duplicated coincident
+        # vertex, so the last TWO flags are False — see the BOUNDARY TERMINATOR
+        # block in engine.py.
+        assert all(f is True for f in plan.spray_flags[:-2])
+        assert plan.spray_flags[-2] is False
         assert plan.spray_flags[-1] is False
 
     def test_disabled_same_waypoint_count_as_legacy(self):

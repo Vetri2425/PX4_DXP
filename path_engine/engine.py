@@ -1376,6 +1376,56 @@ class PathEngine:
             # overrun needs terminal deceleration, not a shorter tail.
             runout = self.aft_extension_m if self.enable_path_extensions else 0.1
             runout = max(0.1, runout)
+
+            # BOUNDARY TERMINATOR — the mark end repeated, flagged TRANSIT.
+            #
+            # `spray_flags[i]` is the flag of the segment LEAVING point i, so a
+            # MARK->TRANSIT boundary is encoded as a DUPLICATED coincident
+            # vertex: the mark end once as True (closing the mark run) and again
+            # as False (opening the transit run). The main merge loop produces
+            # exactly that — its junction dedup at the top of this function is
+            # deliberately skipped when the flag differs.
+            #
+            # Emitting only the far tail point (as this block did until
+            # 2026-07-30) puts the flag transition on the FAR end of the run-out,
+            # so the run-out segment itself inherits flags[i] = True and the
+            # spray node reads the whole tail as MARK. The terminal boundary then
+            # sits `runout` metres too far along and the valve stays open for the
+            # entire tail. Overspray == the run-out length.
+            #
+            # Field evidence 2026-07-30, /spray/debug[7] (boundary.s) — the
+            # station the spray node believed was the mark end:
+            #
+            #   bag                       run-out  true end  boundary.s  overspray
+            #   stg_21a505b9_..._150612     0.1     3.0687     3.1687     +9.4 cm
+            #   stg_21a505b9_..._150750     0.1     3.0687     3.1687     +9.6 cm
+            #   stg_8b8cf09c_..._174708     0.1     2.3372     2.4372     +9.5 cm
+            #   stg_8b8cf09c_..._174916     0.1     2.3372     2.4372    +10.0 cm
+            #   stg_1bda4c36_..._151006     1.0     3.5687     3.5687 OK  -0.8 cm
+            #
+            # boundary.s was finite and pinned to the PATH END on every tick of
+            # all four failing runs. The clean run is the extensions-ON case,
+            # whose AFT run-out is a real TRANSIT PathSegment through the merge
+            # loop and therefore already carries this vertex — which is what the
+            # "structurally identical" claim in the comment above always meant
+            # and, until this fix, did not deliver.
+            #
+            # NOT a speed effect. The OFF lead is solenoid_close_delay_s * v =
+            # 0.05 * v, so it accounts for ~1 cm of the 10; even at full
+            # 0.35 m/s a 0.1 m tail oversprays ~8.2 cm. Speed and run-out length
+            # are confounded in field data (a rover braking to rest inside 0.1 m
+            # is always slow at the mark end); boundary.s separates them because
+            # it is a function of the path alone. Do NOT "fix" this by raising
+            # solenoid_close_delay_s — that papers over the geometry error and
+            # then cuts real marks short.
+            #
+            # Adds a zero-length segment, which is routine at every interior
+            # boundary and already handled by the spray node's seg_len_sq guard.
+            # total_transit is unchanged: the duplicate contributes no length.
+            merged_waypoints.append((tail_n, tail_e))
+            spray_flags.append(False)
+            must_hit.append(False)
+
             merged_waypoints.append((tail_n + dn * runout, tail_e + de * runout))
             spray_flags.append(False)
             must_hit.append(False)

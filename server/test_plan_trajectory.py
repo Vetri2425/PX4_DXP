@@ -98,7 +98,7 @@ async def test_mark_travel_mark_stages_four_runs_in_order(staging):
     assert [e.generated for e in plan.run_echo] == [False, False, False, True]
     # The client reconciles num_waypoints against the echo, so the run-out has
     # to be in both or its arithmetic is off by one.
-    assert sum(e.num_points for e in plan.run_echo) == plan.num_waypoints == 538
+    assert sum(e.num_points for e in plan.run_echo) == plan.num_waypoints == 539
     assert plan.num_segments == 4
 
 
@@ -110,11 +110,13 @@ async def test_response_matches_the_engine_the_app_measured(staging):
     """
     plan = await path_route.plan_trajectory(_req(_mark_travel_mark()))
 
-    assert plan.num_waypoints == 538
+    # 539 not 538: the terminal run-out is TWO points — the boundary
+    # terminator (mark end repeated as TRANSIT) plus the far tail.
+    assert plan.num_waypoints == 539
     assert plan.mark_length_m == 20.0
     assert plan.transit_length_m == 20.1          # 20.0 leg + 0.1 run-out
     assert plan.total_length_m == 40.1
-    assert [e.num_points for e in plan.run_echo] == [201, 135, 201, 1]
+    assert [e.num_points for e in plan.run_echo] == [201, 135, 201, 2]
     assert plan.alignment_metadata["method"] == "gps_origin"
     assert plan.alignment_metadata["rmse"] == 0.0
     assert plan.alignment_metadata["scale"] == 1.0
@@ -127,7 +129,15 @@ async def test_densifies_mark_at_5cm_and_travel_at_15cm(staging):
 
     steps = {True: [], False: []}
     wp, flags = plan.merged_waypoints, plan.spray_flags
-    for i in range(len(wp) - 1):
+    # Stop one leg short: the last leg is the terminal run-out, a single
+    # deliberately un-densified 0.1 m tail. It used to be excluded here by
+    # accident — pre-2026-07-30 the run-out was one point whose flag differed
+    # from its predecessor, so the junction filter below swallowed it and the
+    # 0.1 m step was never measured against the 0.15 m transit spacing. Now that
+    # the boundary terminator makes both tail points TRANSIT, the leg is real and
+    # has to be excluded on purpose. Its length is asserted separately in
+    # path_engine/tests/test_terminal_boundary_vertex.py.
+    for i in range(len(wp) - 2):
         if flags[i] == flags[i + 1]:            # skip the boundary junctions
             steps[flags[i]].append(math.dist(wp[i], wp[i + 1]))
 
@@ -532,7 +542,7 @@ async def test_staged_mission_loads_and_starts(staging, monkeypatch):
     resp = await path_route.load_mission_to_controller(LoadMissionRequest(mission_id=mid))
     assert resp["status"] == "success"
     assert resp["placement_mode"] == "GPS_SURVEYED"
-    assert resp["num_waypoints"] == 538
+    assert resp["num_waypoints"] == 539
     assert ctrl.loaded_path_summary()["mission_id"] == mid
 
     started = {}
@@ -553,7 +563,7 @@ async def test_staged_mission_loads_and_starts(staging, monkeypatch):
 async def test_staged_artifact_is_readable_through_the_staged_endpoint(staging):
     plan = await path_route.plan_trajectory(_req(_mark_travel_mark()))
     got = await path_route.get_staged_mission(plan.mission_summary.mission_id)
-    assert got.num_waypoints == 538
+    assert got.num_waypoints == 539
     assert got.metadata["source"] == "haddows_road"
     assert got.alignment_metadata["method"] == "gps_origin"
 
