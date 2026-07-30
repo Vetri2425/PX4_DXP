@@ -437,6 +437,19 @@ class RPPControllerNode(Node):
         # `sharp` is accepted as a runtime alias for `segment`.
         self.declare_parameter("tracking_profile",                    "auto")
         self.declare_parameter("segment_corner_threshold_deg",         45.0)
+        # Max turn at a vertex that the segment-mode lookahead may look
+        # THROUGH instead of clipping at. See _segment_lookahead_point for the
+        # full rationale and the 2026-07-30 field evidence.
+        #
+        # 5.0 matches the `collinear_tol_deg` the simplifier already uses to
+        # decide what counts as a straight run, so this crosses exactly the
+        # vertices that survived simplification for a non-geometric reason
+        # (spray-flag boundaries, declared must-hit points) and never a corner.
+        #
+        # 0.0 restores the pre-fix clip-at-segment-end geometry EXACTLY — that
+        # is the A/B arm if a regression appears. Set it as a default, not at
+        # runtime: runtime params on this node are lost on restart.
+        self.declare_parameter("segment_lookahead_cross_collinear_deg",  5.0)
         # Segment-mode simplification keeps a "collinear" vertex anyway if it
         # sits more than this far off the straight run (metric Douglas-Peucker
         # test). Stops near-straight must-hit points (a few cm off, only ~3 deg)
@@ -2621,6 +2634,97 @@ class RPPControllerNode(Node):
         h1 = math.atan2(c.y - b.y, c.x - b.x)
         return math.degrees(self._heading_delta(h0, h1))
 
+    def _segment_lookahead_point(
+        self,
+        seg_idx: int,
+        foot_n: float,
+        foot_e: float,
+        l_d: float,
+        max_junction_deg: float,
+    ) -> tuple[float, float]:
+        """Place the lookahead point `l_d` ahead of the foot along the path,
+        crossing a vertex only while the turn there is collinear to within
+        `max_junction_deg`. Stops at the first real corner, or at path end.
+
+        Why this exists — segment mode used to clip the lookahead at the
+        current segment's end:
+
+            lookahead_along = min(max(0.0, dist_to_end_along), l_d)
+
+        so `l_d` was silently overridden by whatever the segment happened to
+        be, and decayed to ~0 as the rover approached each vertex. Note it
+        bypassed `min_lookahead_dist` (0.52) entirely — the floor could not
+        protect it.
+
+        That is fine at a real corner, where the rover is about to stop and
+        pivot anyway and MUST NOT steer toward geometry past the turn. It is
+        wrong at a COLLINEAR vertex, which is not a corner at all.
+        `_simplify_path_for_profile` deletes collinear fill, so the collinear
+        vertices that survive into segment mode are exactly the deliberate
+        anchors: spray-flag boundaries and declared must-hit points. Clipping
+        there truncates the lookahead for no geometric reason.
+
+        Field evidence 2026-07-30, bag stg_95d11205_..._154238 (tes_cross_line_2,
+        0.5 m extensions). The extension leg is split 0.375 m + 0.125 m by the
+        flag-boundary anchor, so the lookahead ran 0.286 -> 0.187 -> 0.054 m
+        across the approach and then jumped to 0.560 m on the marked line.
+        Pure-pursuit steering gain goes as 1/L^2, so the rover hit the line
+        under roughly a hundredfold gain spike, overshot from -2.2 cm to
+        +5.2 cm, and did not recover until s = 1.4 m — well inside the paint.
+        The valve correctly shut at 5.1 cm and the line came out in two pieces.
+        Its sibling run 154444 entered without the crossing rate and stayed
+        under 1.4 cm.
+
+        A LONGER extension does not fix this: extra length arrives as more
+        short legs, and the truncation is per-segment. This is the same root
+        cause as the 2026-07-29 must-hit failure (short segments capping the
+        lookahead into marginal steering stability) — third instance.
+
+        `max_junction_deg <= 0.0` restores the pre-fix geometry exactly and is
+        the A/B arm. Reduction is exact, not approximate: with the walk
+        disabled, or when `l_d` fits inside the current segment, or at a
+        non-collinear junction, this returns precisely what the old two-line
+        form returned. Only the collinear-crossing case is new.
+
+        ⚠ FIELD-UNVERIFIED at the time of writing. Real corners are untouched
+        by construction (they exceed the threshold and terminate the walk), so
+        the blast radius is paths carrying flag/must-hit anchors on a straight
+        run — i.e. any marked line with extensions.
+        """
+        n_pts = len(self._path)
+        if n_pts < 2:
+            p = self._path[0].pose.position
+            return p.x, p.y
+
+        remaining = max(0.0, l_d)
+        cur = max(0, min(seg_idx, n_pts - 2))
+        pn, pe = foot_n, foot_e
+
+        while cur + 1 < n_pts:
+            b = self._path[cur + 1].pose.position
+            seg_rem = self._dist(pn, pe, b.x, b.y)
+            if seg_rem >= remaining:
+                if seg_rem <= 1e-9:
+                    return b.x, b.y
+                f = remaining / seg_rem
+                return pn + (b.x - pn) * f, pe + (b.y - pe) * f
+
+            # The lookahead outruns this segment. Crossing the vertex at
+            # cur+1 is only legitimate when it is not a corner.
+            if max_junction_deg <= 0.0:
+                return b.x, b.y
+            angle = self._segment_angle_deg(cur)
+            # NaN means cur+1 is the last vertex — nothing left to cross into.
+            if not (abs(angle) <= max_junction_deg):
+                return b.x, b.y
+
+            remaining -= seg_rem
+            pn, pe = b.x, b.y
+            cur += 1
+
+        last = self._path[n_pts - 1].pose.position
+        return last.x, last.y
+
     def _project_onto_segment(self, pos_n: float, pos_e: float, seg_idx: int):
         n_pts = len(self._path)
         if n_pts == 1:
@@ -3454,14 +3558,10 @@ class RPPControllerNode(Node):
         l_d_raw = ld_gain * v_for_ld + xt_ld_gain * abs(signed_xtrack)
         l_d = self._clamp(l_d_raw, l_min, l_max)
 
-        dir_n = (b.x - a.x) / seg_len
-        dir_e = (b.y - a.y) / seg_len
-        lookahead_along = min(max(0.0, dist_to_end_along), l_d)
-        if lookahead_along <= 1e-6:
-            lh_n, lh_e = b.x, b.y
-        else:
-            lh_n = foot_n + dir_n * lookahead_along
-            lh_e = foot_e + dir_e * lookahead_along
+        lh_n, lh_e = self._segment_lookahead_point(
+            seg_idx, foot_n, foot_e, l_d,
+            float(self.get_parameter("segment_lookahead_cross_collinear_deg").value),
+        )
 
         dn = lh_n - pos_n
         de = lh_e - pos_e
