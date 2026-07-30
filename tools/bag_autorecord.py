@@ -27,7 +27,7 @@ Env overrides:
   BAG_API_GRACE_S             default 8     (stop+finalise if API unreachable this long while recording)
 """
 from __future__ import annotations
-import hashlib, json, os, re, shutil, signal, socket, subprocess, sys, time, urllib.request
+import hashlib, json, os, re, shutil, signal, socket, subprocess, sys, threading, time, urllib.request
 from datetime import datetime, timezone, timedelta
 
 API_BASE   = os.environ.get("ROVER_API_BASE", "http://127.0.0.1:5001").rstrip("/")
@@ -617,20 +617,30 @@ def _preflight_free_space(bags_dir: str) -> bool:
     return True
 
 
-def _enforce_retention(bags_dir: str) -> None:
+# P0-3: bundles whose finalisation is still running in a background thread.
+# Retention must never delete one of these — with async finalise the bundle
+# being finalised is no longer the newest once the next mission starts.
+_FINALISING: set[str] = set()
+_FINALISING_LOCK = threading.Lock()
+
+
+def _enforce_retention(bags_dir: str, protect: set[str] | None = None) -> None:
     """Delete oldest bundles until under the byte cap AND above the low-free mark.
 
     Never touches an in-progress bundle (no end + no manifest outcome) that is the
-    newest; only fully-finalised older bundles are candidates. Degrades the
-    recorder's own store only — never any rover service.
+    newest, a bundle in *protect*, or one still being finalised in the background;
+    only fully-finalised older bundles are candidates. Degrades the recorder's
+    own store only — never any rover service.
     """
     try:
+        with _FINALISING_LOCK:
+            shielded = set(_FINALISING) | (protect or set())
         bundles = _list_bundles(bags_dir)
         if not bundles:
             return
         total = sum(_dir_bytes(b) for b in bundles)
         # keep the newest bundle regardless (it may be the one just written)
-        candidates = bundles[:-1]
+        candidates = [b for b in bundles[:-1] if b not in shielded]
         while candidates and (
             total > MAX_TOTAL_BYTES or _free_bytes(bags_dir) < LOW_FREE_BYTES
         ):
@@ -709,6 +719,8 @@ class Recorder:
         self.manifest: dict | None = None
         self.start_t: float = 0.0
         self._last_refuse_log: float = 0.0
+        # P0-3: background finalise threads still running (joined on shutdown).
+        self._finalise_threads: list[threading.Thread] = []
 
     @property
     def active(self) -> bool:
@@ -777,35 +789,69 @@ class Recorder:
         _write_manifest(self.bundle_dir, self.manifest)
 
     def stop(self, reason: str) -> None:
+        """Hand the recording off to a background finalise thread.
+
+        P0-3 (2026-07-30): finalisation ran synchronously inside the 0.2 s
+        poll loop — SIGINT + wait (≤25 s) + per-param ros2 ParamGet at 4 s
+        timeout each + full-bundle SHA + retention sweep. A mission started
+        inside that window was silently recorded from mid-path: two of three
+        07-30 bags lost their first ~56 s including the entire curved stroke.
+        The poll loop must be free to start the NEXT bag immediately, so
+        everything slow now runs in a thread. The new bag records to its own
+        directory/process, independent of the one still flushing.
+        """
         if not self.active:
             self.proc = None
             return
-        bundle = self.bundle_dir
-        log(f"STOP recording ({reason}) → finalising {os.path.basename(bundle or '')}")
+        proc, bundle, manifest = self.proc, self.bundle_dir, self.manifest
+        self.proc = None
+        self.bundle_dir = None
+        self.bag_dir = None
+        self.manifest = None
+        log(f"STOP recording ({reason}) → finalising {os.path.basename(bundle or '')} (background)")
+        with _FINALISING_LOCK:
+            _FINALISING.add(bundle)
+        t = threading.Thread(
+            target=self._finalise, args=(proc, bundle, manifest, reason),
+            name=f"finalise-{os.path.basename(bundle or '')}", daemon=False,
+        )
+        self._finalise_threads = [x for x in self._finalise_threads if x.is_alive()]
+        self._finalise_threads.append(t)
+        t.start()
+
+    def _finalise(self, proc, bundle, manifest, reason: str) -> None:
         try:
-            os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)  # rosbag2 writes metadata.yaml on SIGINT
-            self.proc.wait(timeout=15)
+            self._finalise_inner(proc, bundle, manifest, reason)
+        except Exception as e:
+            log(f"  finalise thread error (bag is safe on disk): {e}")
+        finally:
+            with _FINALISING_LOCK:
+                _FINALISING.discard(bundle)
+
+    def _finalise_inner(self, proc, bundle, manifest, reason: str) -> None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGINT)  # rosbag2 writes metadata.yaml on SIGINT
+            proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
             log("  finalise slow — sending SIGTERM")
             try:
-                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
-                self.proc.wait(timeout=10)
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                proc.wait(timeout=10)
             except Exception:
-                os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except Exception as e:
             log(f"  stop error: {e}")
-        self.proc = None
 
         # Finalise the manifest (G2/G3) — bag is now closed on disk.
-        if bundle and self.manifest is not None:
+        if bundle and manifest is not None:
             try:
                 ended = _now_utc()
-                # FCU params captured here: mission is terminal, so a few seconds
-                # of ParamGet can't affect it. MAVROS (px4-dxp) is still up.
-                self.manifest["as_run_config"]["fcu_params"] = _fcu_params()
-                self.manifest["timestamps"]["recorder_end"] = _stamp(ended)
-                self.manifest["timestamps"]["mission_end_observed"] = _stamp(ended)
-                self.manifest["outcome"] = {
+                # FCU params captured here, off the poll loop (P0-3): the old
+                # in-loop capture at 4 s/param was most of the blind window.
+                manifest["as_run_config"]["fcu_params"] = _fcu_params()
+                manifest["timestamps"]["recorder_end"] = _stamp(ended)
+                manifest["timestamps"]["mission_end_observed"] = _stamp(ended)
+                manifest["outcome"] = {
                     # RECORDER status only: the bag was closed in an orderly way.
                     # It is NOT a statement about the mission — a clean abort at
                     # 40% and a full traversal both land here, which is why runs
@@ -824,24 +870,24 @@ class Recorder:
                 # (it is spawned just below). PENDING is written now so that a
                 # missing verdict reads as "not analysed yet" rather than as a
                 # silent pass — absence must never look like success.
-                self.manifest["traversal"] = {
+                manifest["traversal"] = {
                     "status": "PENDING",
                     "source": "awaiting analyze_mission",
                 }
-                _write_manifest(bundle, self.manifest)
+                _write_manifest(bundle, manifest)
                 log(f"  saved: {bundle}  (manifest + integrity written)")
             except Exception as e:
                 log(f"  finalise-manifest error (bag is safe): {e}")
             # G6 wiring — kick off the offline behaviour analysis (detached).
             _spawn_analyzer(bundle)
-            # G4 — keep the store bounded after each capture.
-            _enforce_retention(BAGS_DIR)
+            # G4 — keep the store bounded after each capture. Protect the bundle
+            # the recorder may have started while this thread was finalising.
+            _enforce_retention(
+                BAGS_DIR,
+                protect={self.bundle_dir} if self.bundle_dir else None,
+            )
         else:
             log(f"  saved: {bundle}")
-
-        self.bundle_dir = None
-        self.bag_dir = None
-        self.manifest = None
 
 
 def main() -> int:
@@ -890,6 +936,14 @@ def main() -> int:
 
     if rec.active:
         rec.stop("service_shutdown")
+    # P0-3: don't drop finalisation on the floor at shutdown — the manifest,
+    # integrity hashes and analyser spawn all happen in those threads. Bound the
+    # wait so a hung ParamGet can't stall systemd stop indefinitely.
+    for t in list(rec._finalise_threads):
+        t.join(timeout=60)
+        if t.is_alive():
+            log(f"WARN finalise thread {t.name} still running at exit — bundle "
+                f"will be reconciled INCOMPLETE on next start")
     log("exiting")
     return 0
 
