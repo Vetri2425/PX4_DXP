@@ -619,11 +619,23 @@ class RPPControllerNode(Node):
         # the controller is about to use it. We also extend the pose-age
         # acceptance window by `imu_max_extrap_age_s` so a 50-150 ms MAVROS
         # latency stays usable instead of tripping STALE.
-        # Backwards compat: default off.
-        self.declare_parameter("use_imu_extrapolation",               False)
+        # Default ON since 2026-07-31: the 07-30 bags measured the EKF pose
+        # lagging the GNSS receiver by 152-158 ms along-track (reproducible to
+        # 3 ms across runs) — at 0.35 m/s that is ~5.5 cm of position the
+        # controller steers on late. Closing it is the difference between a
+        # 3.7 cm and a ~2 cm worst-case curve transient in the lag-model sim.
+        # Set false to restore the pre-07-31 behaviour as the A/B arm.
+        self.declare_parameter("use_imu_extrapolation",               True)
         # Cap on how far past pose_max_age_s we'll trust extrapolation.
         # 0.10 s + the existing 0.20 s pose_max_age = 300 ms total budget.
         self.declare_parameter("imu_max_extrap_age_s",                0.10)
+        # Sensor-chain latency bias added to the extrapolation horizon. The
+        # MAVROS transport age above is only ~20 ms; the dominant lag is
+        # UPSTREAM of the pose message — GNSS epoch -> EKF fusion -> pose
+        # publish, measured at 152-158 ms on the 07-30 bags (raw receiver fix
+        # vs EKF pose, along-track skew / speed). pose_age alone cannot see
+        # it, so it is closed with this constant. 0.0 disables (pure P2.4).
+        self.declare_parameter("pose_latency_bias_s",                 0.15)
 
         # P3.1 — Feedforward yaw rate via body-rate mode
         # When enabled, RPP computes ω_ff = κ·v and sends it directly to PX4
@@ -3921,7 +3933,12 @@ class RPPControllerNode(Node):
             # (otherwise we'd be applying a stale velocity to a stale pose).
             if vel_age_s < extrap_horizon:
                 v_n, v_e = self._latest_vel_ned
-                dt = pose_age_s
+                # pose_age closes the MAVROS transport gap (~20 ms); the
+                # constant bias closes the measured GNSS->EKF sensor-chain lag
+                # (~150 ms) that pose_age structurally cannot see.
+                dt = pose_age_s + max(
+                    0.0, float(self.get_parameter("pose_latency_bias_s").value)
+                )
                 d_n = v_n * dt
                 d_e = v_e * dt
 

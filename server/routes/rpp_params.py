@@ -365,9 +365,9 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     # ── Latency Closure (P2.4) ────────────────────────────────────────────────
     "use_imu_extrapolation": {
         "type": "bool",
-        "default": False,
+        "default": True,
         "group": "Latency Closure",
-        "description": "Enable velocity-based pose extrapolation to close MAVROS pose latency",
+        "description": "Enable velocity-based pose extrapolation to close MAVROS pose latency (default ON since 2026-07-31)",
     },
     "imu_max_extrap_age_s": {
         "type": "float",
@@ -376,6 +376,14 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
         "description": "Max extrapolation age beyond pose_max_age_s (s). 0.10 + 0.20 = 300 ms total budget",
         "min": 0.0,
         "max": 1.0,
+    },
+    "pose_latency_bias_s": {
+        "type": "float",
+        "default": 0.15,
+        "group": "Latency Closure",
+        "description": "Constant GNSS→EKF sensor-chain lag closed on top of pose_age (s). Measured 0.152–0.158 on the 2026-07-30 bags; 0.0 disables",
+        "min": 0.0,
+        "max": 0.5,
     },
     # ── Feedforward Yaw Rate (P3.1) ────────────────────────────────────────────
     "use_feedforward_yaw_rate": {
