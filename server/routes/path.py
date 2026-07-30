@@ -2151,6 +2151,10 @@ _TRAJ_HEADING_WARN_DEG = 120.0
 # Per-category cap. A 4000-run import with a systematic problem would otherwise
 # return 4000 warnings, which is the same as returning none — nobody reads it.
 _TRAJ_MAX_WARNINGS = 10
+# G1 kink blend: max distance the blend may move the line at an arc-fit joint
+# (see the contract block in plan_trajectory). 1 cm sits below the survey's own
+# ~1.2 cm point RMS and two orders under the 15 cm the app's fit gate allows.
+_TRAJ_KINK_BLEND_DEV_M = 0.01
 
 
 def _traj_len(points) -> float:
@@ -2438,8 +2442,18 @@ async def plan_trajectory(req: PlanTrajectoryRequest):
     unchanged and reused verbatim.
 
     THE CONTRACT, in one sentence: the only thing this endpoint may do to the
-    caller's geometry is insert points along it. Point count changes; shape,
-    order and run boundaries do not.
+    caller's geometry is insert points along it — plus ONE disclosed, bounded
+    exception: single-vertex tangent kinks in MARK runs are blended into G1
+    biarcs that move the line at most _TRAJ_KINK_BLEND_DEV_M (1 cm). Point
+    count changes; order and run boundaries do not; shape changes only at
+    kinks, only within the cap, and every blend is reported in `warnings`.
+
+    Why the exception (2026-07-30, curve_6_points-1): the app's sparse arc fit
+    joins per-span arcs at surveyed stakes with ~10° tangent jumps. Staged
+    verbatim, those G0 joints are physically untrackable at speed — the rover
+    ran 6.4 cm wide and the spray gate cut a 31 cm hole in the mark. A 1 cm
+    bounded blend is smaller than the survey's own 1.2 cm RMS; refusing to
+    blend paints a worse line, not a truer one.
     """
     warnings = _validate_trajectory(req)
     ground_truth = _resolve_ground_truth(req)
@@ -2504,6 +2518,10 @@ async def plan_trajectory(req: PlanTrajectoryRequest):
         corner_smooth_radius_m=0.0,
         fit_arcs=False,
         fillet_corners_m=0.0,
+        # The one geometry pass that IS on: bounded G1 blend of tangent kinks
+        # at the app's arc-fit joints (contract block above). Every blend is
+        # surfaced in the response warnings below.
+        blend_kinks_max_dev_m=_TRAJ_KINK_BLEND_DEV_M,
         close_shape=False,
         enable_path_extensions=False,
         compensate_spray=False,
@@ -2535,6 +2553,21 @@ async def plan_trajectory(req: PlanTrajectoryRequest):
     # no flag. Rather than add one, surface it: the removal is now VISIBLE in
     # warnings (it was only ever in planning_metadata), and the run count in
     # run_echo drops too, which the client fails closed on.
+    # Kink-blend disclosure: the contract's one shape-changing exception must
+    # be visible in the response, not only in planning_metadata.
+    _blends = [r for r in ((plan.planning_metadata or {}).get("kink_blend") or [])
+               if r.get("blended")]
+    if _blends:
+        worst = max(r.get("max_dev_m", 0.0) for r in _blends)
+        turns = ", ".join(f"{abs(r['turn_deg']):.1f}°" for r in _blends[:5])
+        warnings.append(
+            f"{len(_blends)} tangent kink(s) at arc-fit joints were blended into "
+            f"G1 arcs (turns {turns}{'…' if len(_blends) > 5 else ''}); the line "
+            f"moved at most {100 * worst:.1f} cm there (cap "
+            f"{100 * _TRAJ_KINK_BLEND_DEV_M:.0f} cm). A G0 joint is untrackable "
+            "at speed — fix the app's arc fit to emit tangent-continuous joints."
+        )
+
     dropped = ((plan.planning_metadata or {}).get("duplicate_geometry")
                or {}).get("removed") or 0
     if dropped:

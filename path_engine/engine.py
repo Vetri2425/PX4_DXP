@@ -27,6 +27,7 @@ from .parsers.csv_parser import read_ned_csv_enhanced
 from .parsers.waypoints_parser import read_qgc_waypoints_as_segment
 from .planners.arc_chain import MAX_ARC_DEVIATION_M, fit_line_chain
 from .planners.corner_fillet import fillet_corners
+from .planners.kink_blend import blend_kinks
 from .planners.straight_line import densify_segment
 from .planners.extensions import (
     decompose_line_chain_to_edges,
@@ -260,6 +261,16 @@ class PathEngine:
         # radius. Needed because a road survey captures a bend as two straights
         # meeting at one vertex, leaving no arc for fit_arcs to recover.
         fillet_corners_m: float = 0.0,
+        # Blend single-vertex tangent kinks (G0 arc-fit joints) in MARK
+        # segments into G1 biarcs, moving the line at most this far (metres).
+        # 0 = off (default — byte-identical to before this pass existed).
+        # UNLIKE fillet_corners this works BETWEEN arcs, needs no straight
+        # baseline, and its geometry change is bounded by the cap rather than
+        # by an operator-chosen radius. Added 2026-07-30: the app's sparse arc
+        # fit joins per-span arcs at surveyed stakes with ~10° tangent jumps,
+        # which the rover physically cannot track at speed (6.4 cm excursion,
+        # 31 cm spray gap on curve_6_points-1).
+        blend_kinks_max_dev_m: float = 0.0,
         # Paint the closing side of an open MARK shape. Distinct from close_loop
         # (which closes with spray OFF, a deadhead). Default OFF. On, a MARK
         # segment whose first and last points differ gets a copy of its first
@@ -358,6 +369,11 @@ class PathEngine:
                 f"fillet_corners_m must be >= 0.0, got {fillet_corners_m}"
             )
         self.fillet_corners_m = fillet_corners_m
+        if blend_kinks_max_dev_m < 0.0:
+            raise ValueError(
+                f"blend_kinks_max_dev_m must be >= 0.0, got {blend_kinks_max_dev_m}"
+            )
+        self.blend_kinks_max_dev_m = blend_kinks_max_dev_m
         self.close_shape = close_shape
         self.use_two_opt = use_two_opt
         self.max_two_opt_segments = max_two_opt_segments
@@ -697,6 +713,29 @@ class PathEngine:
                     )
                     seg.points = new_pts
                     seg.metadata["control_indices"] = ctrl
+
+        # Kink blend (opt-in, deviation-bounded). Runs AFTER the fit passes so
+        # it only sees what is STILL a tangent kink, and unlike them it is NOT
+        # gated on LINE_CHAIN metadata: its purpose is app-authored geometry
+        # (plan-trajectory), which deliberately carries no geometry_type. MARK
+        # segments only — a kink on a travel leg costs nothing but time.
+        kink_blend_report: list[dict] = []
+        if self.blend_kinks_max_dev_m > 0.0:
+            for seg in segments:
+                if seg.segment_type == SegmentType.MARK and len(seg.points) >= 3:
+                    new_pts, ctrl, blended = blend_kinks(
+                        seg.points,
+                        seg.metadata.get("control_indices"),
+                        max_dev_m=self.blend_kinks_max_dev_m,
+                    )
+                    for r in blended:
+                        r["segment_id"] = seg.segment_id
+                    kink_blend_report.extend(blended)
+                    # Mutate only when something actually blended — a report of
+                    # skips must leave the segment byte-identical.
+                    if any(r["blended"] for r in blended):
+                        seg.points = new_pts
+                        seg.metadata["control_indices"] = ctrl
 
         # Close the shape (opt-in): append a copy of the first point to any open
         # MARK shape so its closing side is a genuine sprayed MARK edge — unlike
@@ -1500,6 +1539,7 @@ class PathEngine:
             "bbox": bbox,
             "extensions": extension_report,
             "duplicate_geometry": duplicate_stats,
+            "kink_blend": kink_blend_report,
             "spacing": {
                 "mark_m": self.mark_spacing,
                 "transit_m": self.transit_spacing,
