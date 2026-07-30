@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Field Checklist 2026-08-01 — One-Week Work Verification (A/B)</title>
+<style>
+  @page { size: A4 portrait; margin: 8mm; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:#14171c;
+         font-size: 9.6px; line-height: 1.25; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .page { width: 194mm; height: 281mm; margin: 0 auto; display: flex; flex-direction: column; }
+  h1 { font-size: 14px; } h2 { font-size: 10.5px; background:#14171c; color:#fff; padding:2px 6px; margin:5px 0 3px; }
+  .hdr { display:flex; justify-content:space-between; align-items:baseline; border-bottom:2px solid #14171c; padding-bottom:3px; }
+  .hdr .meta { font-size: 9px; text-align:right; }
+  .cols { display:flex; gap:8px; } .col { flex:1; }
+  ul { list-style:none; } li { margin:1.5px 0; padding-left:14px; position:relative; }
+  li::before { content:"☐"; position:absolute; left:0; font-size:10.5px; }
+  li.note::before { content:"→"; }
+  b.k { background:#eef; padding:0 3px; border-radius:2px; font-family:Menlo,monospace; font-size:8.8px; font-weight:600;}
+  table { width:100%; border-collapse:collapse; margin:2px 0; }
+  th,td { border:1px solid #999; padding:1.5px 3px; font-size:9px; text-align:left; }
+  th { background:#e8e8e8; }
+  .pass td:first-child { font-weight:700; }
+  .warn { background:#fff3cd; border:1px solid #d4a017; padding:3px 5px; margin:3px 0; font-size:9.3px; }
+  .crit { background:#fdecec; border:1px solid #c0392b; padding:3px 5px; margin:3px 0; font-size:9.3px; }
+  .log td { height:13px; } .log .sm { width:9mm; } .log .md { width:16mm; }
+  .foot { margin-top:auto; border-top:2px solid #14171c; padding-top:3px; font-size:8.8px; }
+  .mono { font-family:Menlo,monospace; font-size:8.6px; }
+</style>
+</head>
+<body><div class="page">
+
+<div class="hdr">
+  <h1>FIELD DAY 2026-08-01 — verify the full week (07-22→31). No new code until all verified.</h1>
+  <div class="meta">Crew: ______ &nbsp; Site: ______ &nbsp; Wind/Sun: ______<br>
+  <b>ARM A</b> = Jetson <span class="mono">prod/audit-stage3b @0e97f3a</span> + app as-installed &nbsp;·&nbsp;
+  <b>ARM B</b> = <span class="mono">fix/field-findings-2026-07-30 @1d80190</span> + app <span class="mono">59b72ea</span></div>
+</div>
+
+<h2>0 · PRE-FLIGHT (once, before anything drives)</h2>
+<div class="cols"><div class="col"><ul>
+  <li><b class="k">ntrip</b> service STARTED (it is disabled on boot!) — telemetry shows <b>RTK_FIXED</b>, hrms ≤ 0.02</li>
+  <li>Services green: <b class="k">px4-dxp</b> · <b class="k">rpp-pipeline</b> · <b class="k">rover-server</b> · <b class="k">bag-autorecord</b></li>
+  <li>Confirm ARM A deployed: <span class="mono">git log -1</span> on Jetson = <b>0e97f3a</b></li>
+</ul></div><div class="col"><ul>
+  <li>Battery rover + RS3 + phone charged; paint/valve primed (manual <b class="k">POST /api/spray/test</b>)</li>
+  <li><b class="k">GET /api/health/origin</b> OK (&lt; 3 cm) after EKF settles</li>
+  <li>E-stop tested once before first mission</li>
+</ul></div></div>
+
+<h2>1 · SURVEY (Reach RS3) — one geometry reused ALL DAY, both arms</h2>
+<ul>
+  <li>On road: <b>curve of 8 pts</b> (~0.5–0.7 m spacing, gentle S like curve_6_points) + <b>1 straight line 2 pts (~3 m)</b> + <b>1 straight 2 pts (~2.5 m)</b>. FIX-only, averaged occupation, Lateral RMS ≤ 0.017 recorded per point</li>
+  <li><b>Chalk-cross every surveyed point on the asphalt</b> (ground truth for §5) · Export Emlid CSV, note point IDs: ______________</li>
+</ul>
+
+<h2>2 · ARM A — BASELINE, 5 runs on audit-stage3b (reproduce last week's defects on fresh data)</h2>
+<ul>
+  <li>App: import CSV → build curve+lines → <b>plan-trajectory</b> → stage → check mark length ≈ survey → load → drive+spray. Same mission all 5 runs</li>
+  <li>Runs A1–A3 spaced normally; <b>A4–A5 back-to-back with NO pause</b> (recorder blind-window evidence)</li>
+  <li class="note">EXPECT (this is the baseline, not failure): pivot aligns 8–14 s · curve overshoot ~5–6 cm near mid-curve · possible spray gap on curve · A5 bag may start mid-path</li>
+  <li>After each run: <span class="mono">report.txt</span> → log marking RMS/max, longest CORNER_ALIGN, spray gaps, truncated? (grid below)</li>
+</ul>
+
+<h2>3 · DEPLOY GATE (mid-day — do NOT skip the test suite)</h2>
+<ul>
+  <li>Jetson: checkout <b class="k">fix/field-findings-2026-07-30</b> @ <b>1d80190</b> → <b class="k">./deploy.sh</b> → restart <b class="k">rpp-pipeline</b> + <b class="k">rover-server</b> + <b class="k">bag-autorecord</b></li>
+  <li><b class="k">make jetson-tests</b> — <b>MUST be green (was 430/0). Red = stop, revert to ARM A, done for the day.</b></li>
+  <li>Update phone app to build <b>59b72ea</b> · verify params live via <b class="k">GET /api/rpp/params</b>: <span class="mono">use_imu_extrapolation=true · pose_latency_bias_s=0.15 · smooth_min_arc_ld_m=0.40 · segment_heading_tolerance_deg=3.0 · xtrack_trip_error_m=0.08</span></li>
+  <li>NTRIP still up · origin health OK again. <b>NO FCU/QGC changes</b> — RD_TRANS_TRN_DRV stays 2.0</li>
+</ul>
+
+<h2>4 · ARM B — NEW STACK, ≥5 runs, SAME survey CSV re-planned FRESH in the app</h2>
+<ul>
+  <li><b>B0 dry run (valve off / no paint)</b> — spray changes rule: watch pivots release in ≤ ~5 s, curve tracked, no stall, no fault</li>
+  <li>Re-plan check at staging: <b>ZERO kink-blend warnings</b> in plan-trajectory response (G1 payload proof). Any blend warning = old app build, fix before continuing</li>
+  <li>B1–B2 paint runs, then <b>B3–B5 back-to-back NO pause</b> (P0-3 proof: each bag first pose at rest, no TRUNCATED banner)</li>
+</ul>
+<table class="pass">
+  <tr><th>PASS criteria (arm B)</th><th>Target</th><th>B1</th><th>B2</th><th>B3</th><th>B4</th><th>B5</th></tr>
+  <tr><td>Curve marking RMS (report §1, valve-gated)</td><td><b>≤ 2.0 cm</b></td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>Curve max xtrack</td><td>≤ ~2.5 cm (watch R≈1.2 m section)</td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>Lines RMS / max</td><td>≤ 1.2 / ≤ 2.5 cm</td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>Paint continuous (no gap &gt; 2 cm mid-mark)</td><td>YES</td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>Longest CORNER_ALIGN</td><td>≤ 6 s (was 13–19 s)</td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>Bag starts at rest / no TRUNCATED</td><td>YES (esp. B3–B5)</td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>Analyzer verdict / health has State data</td><td>PASS / samples &gt; 0</td><td></td><td></td><td></td><td></td><td></td></tr>
+</table>
+
+<h2>5 · GROUND TRUTH (closes error-budget 4 — no log can do this)</h2>
+<ul>
+  <li>Best B run: tape-measure <b>paint centreline vs chalk cross at all 8 curve points + 4 line ends</b> (or re-shoot with RS3). Record signed offsets (L/R of travel): ____________________</li>
+  <li>Note consistent left/right bias (feeds B3 antenna `EKF2_GPS_POS_Y` calibration) · photo every measured point</li>
+</ul>
+
+<table class="log">
+  <tr><th class="sm">Run</th><th class="sm">Arm</th><th class="md">Time</th><th class="md">RMS/max cm</th><th class="md">Align max s</th><th class="md">Gaps?</th><th class="sm">Trunc?</th><th>Notes (stall / gap position / weirdness)</th></tr>
+  <tr><td>A1</td><td>A</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>A2</td><td>A</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>A3</td><td>A</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>A4</td><td>A</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>A5</td><td>A</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>B0</td><td>B</td><td></td><td colspan="4">DRY RUN — pivots ok? ______ curve ok? ______</td><td></td></tr>
+  <tr><td>B1</td><td>B</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>B2</td><td>B</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>B3</td><td>B</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>B4</td><td>B</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>B5</td><td>B</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+</table>
+
+<div class="warn"><b>If arm B misbehaves</b> — single-param fallbacks, one at a time, note which: pivots weird → <span class="mono">segment_heading_tolerance_deg=2.0 / timeout=2.0 / release_max=3.0</span> · curve worse → <span class="mono">use_imu_extrapolation=false</span>, then <span class="mono">smooth_min_arc_ld_m=0.25</span> · spray odd → <span class="mono">xtrack_trip_error_m=0.0</span> (old hard gate). Entry looks wrong at line start → note it (entry_prealign ⚠ b92d1b6), don't tune in field.</div>
+<div class="crit"><b>HARD RULES:</b> no FCU pushes from Jetson · no NTRIP disable · no code edits in the field · every run gets its bundle pulled to Mac <span class="mono">bags/01_08_2026/</span> before leaving · ≥10 runs across days before declaring anything settled — today proves direction, not closure.</div>
+
+<div class="foot">Pass day = every B-row green + ground truth measured → then CLAUDE.md param table reconciled + branch merged. Next milestones (their own days, params stay OFF today): dash mode · point-mission ladder (Phase D→G3→G4/G5) · Phase E flow after bench cal. &nbsp;·&nbsp; Generated 2026-07-31, branch @1d80190.</div>
+
+</div></body></html>
