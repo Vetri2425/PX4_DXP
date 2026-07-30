@@ -209,6 +209,10 @@ class SprayDecision:
     event: str
     debug: list[float]
     point_update: object = None  # Phase D: the PointUpdate for this tick, else None
+    # P0-2 hysteresis latch (2026-07-30): True while the xtrack gate is tripped.
+    # The node feeds this back in next tick so the gate clears at the tight
+    # threshold only after tripping at the wide one — no single-threshold chatter.
+    xtrack_tripped: bool = False
 
 
 def _build_path_model(
@@ -431,6 +435,17 @@ def _make_spray_decision(
     off_overspray_margin_m: float,
     max_xtrack_error_m: float,
     max_xtrack_source: str = "param",
+    # P0-2 (2026-07-30): xtrack gate hysteresis. A single hard threshold
+    # chatters when tracking error sits ON it — the 07-30 curve run cut a
+    # 31 cm hole mid-mark at 5.12 cm vs a 5.00 cm gate while geometry still
+    # wanted paint. Trip at the WIDE level, clear at the tight one, and once
+    # tripped stay off at least xtrack_gate_min_off_s (solenoid protection).
+    # trip <= clear (e.g. 0.0 default) degrades to the old single-threshold
+    # behaviour exactly.
+    xtrack_trip_error_m: float = 0.0,
+    xtrack_tripped: bool = False,
+    xtrack_tripped_elapsed_s: float = float("inf"),
+    xtrack_gate_min_off_s: float = 0.0,
     mode: str = "continuous",
     dash_meter: Optional["DashMeter"] = None,
     dt_s: float = 0.0,
@@ -510,14 +525,27 @@ def _make_spray_decision(
 
     if model is not None and nozzle_n is not None and nozzle_e is not None:
         projection = _project_onto_path(model, nozzle_n, nozzle_e)
+    new_xtrack_tripped = False
     if projection is not None:
         boundary = _next_boundary(model, projection.s, projection.current_flag)
         geometry_desired = projection.current_flag
-        if projection.xtrack_error_m > max_xtrack_error_m:
+        # Hysteresis: trip at the wide level; once tripped, clear only when the
+        # error is back under the tight level AND the minimum off-dwell has
+        # elapsed. With trip <= clear this reduces to the old single threshold.
+        trip_level = max(max_xtrack_error_m, xtrack_trip_error_m)
+        if xtrack_tripped:
+            new_xtrack_tripped = (
+                projection.xtrack_error_m > max_xtrack_error_m
+                or xtrack_tripped_elapsed_s < xtrack_gate_min_off_s
+            )
+        else:
+            new_xtrack_tripped = projection.xtrack_error_m > trip_level
+        if new_xtrack_tripped:
             safety_ok = False
             safety_reason = (
                 f"xtrack error {projection.xtrack_error_m:.3f}m "
-                f"> {max_xtrack_error_m:.3f}m ({max_xtrack_source})"
+                f"gate trip>{trip_level:.3f}m clear<={max_xtrack_error_m:.3f}m "
+                f"({max_xtrack_source})"
             )
         if mode == "dash" and dash_meter is not None:
             # Dash metering (plan §7.2): geometry_desired comes from cumulative
@@ -627,6 +655,7 @@ def _make_spray_decision(
         distance_to_boundary_m=distance_to_boundary,
         event=event,
         debug=debug,
+        xtrack_tripped=new_xtrack_tripped,
     )
 
 
@@ -731,6 +760,17 @@ class SprayControllerNode(Node):
         # read it as "5 cm is acceptable marking error". Per-mission override
         # via session_config max_xtrack_error_m (R3) still wins when present.
         self.declare_parameter("max_xtrack_error_m", 0.05)
+        # P0-2 (2026-07-30): hysteresis on the gate above. The 07-30 curve run
+        # showed 0.05 STILL chatters when tracking error rides the threshold
+        # (max 5.12 cm vs gate 5.00 → a 31 cm unpainted hole mid-mark, and the
+        # same mechanism that made 0.03 chatter before e4b04d1). Trip only
+        # above this WIDE level; clear back at max_xtrack_error_m. Set <= the
+        # clear level to disable hysteresis (old single-threshold behaviour).
+        self.declare_parameter("xtrack_trip_error_m", 0.08)
+        # Once tripped, hold the gate off at least this long — bounds solenoid
+        # cycling if error oscillates fast across both levels. Keep small: every
+        # extra tenth of a second tripped is ~3.5 cm of unpainted line at cruise.
+        self.declare_parameter("xtrack_gate_min_off_s", 0.2)
         self.declare_parameter("pose_timeout_s", 0.5)
         self.declare_parameter("velocity_timeout_s", 0.5)
         # ── Phase B: RTK / GPS fix-quality gate (plan §7.6) ──────────────────
@@ -833,6 +873,10 @@ class SprayControllerNode(Node):
         # _rebuild_point_meter). A new path is a new arc-length origin; patching
         # anchor_s on an already-armed meter is a no-op at arm-time read.
         self._dash_config: Optional[DashConfig] = None
+        # P0-2 xtrack-gate hysteresis latch: tripped flag + monotonic stamp of
+        # the trip edge, fed back into _make_spray_decision each tick.
+        self._xtrack_tripped: bool = False
+        self._xtrack_trip_mono: Optional[float] = None
         # Per-mission xtrack gate from session_config (R3). Stashed separately
         # because _path_cb overwrites _session_config with a continuous geometry
         # mirror (same reason _dash_config is stashed). None → ROS param.
@@ -1574,6 +1618,20 @@ class SprayControllerNode(Node):
             ),
             max_xtrack_error_m=max_xtrack_error_m,
             max_xtrack_source=max_xtrack_source,
+            xtrack_trip_error_m=max(
+                0.0,
+                float(self.get_parameter("xtrack_trip_error_m").value),
+            ),
+            xtrack_tripped=self._xtrack_tripped,
+            xtrack_tripped_elapsed_s=(
+                (now_mono - self._xtrack_trip_mono)
+                if self._xtrack_trip_mono is not None
+                else float("inf")
+            ),
+            xtrack_gate_min_off_s=max(
+                0.0,
+                float(self.get_parameter("xtrack_gate_min_off_s").value),
+            ),
             terminal_off_epsilon_m=max(
                 0.0,
                 float(self.get_parameter("terminal_off_epsilon_m").value),
@@ -1587,6 +1645,11 @@ class SprayControllerNode(Node):
             rpp_dist_to_boundary_m=rpp_dist_m,
             rpp_at_point_gate=rpp_at_point_gate,
         )
+        # P0-2: advance the hysteresis latch. Stamp the rising edge so the
+        # min-off dwell measures from the trip, not from every tripped tick.
+        if decision.xtrack_tripped and not self._xtrack_tripped:
+            self._xtrack_trip_mono = now_mono
+        self._xtrack_tripped = decision.xtrack_tripped
         # Feeds _fsm_safety_ok() so the FSM's safety_ok input reflects the
         # full distance-aware gate stack (armed/offboard/path/pose/vel/speed
         # from _auto_safety_status, plus the xtrack gate folded in above).
