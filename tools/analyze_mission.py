@@ -645,22 +645,69 @@ def collect(bag_dir: str) -> Series:
 # analysis sections
 # ═══════════════════════════════════════════════════════════════════════════
 def analyze_tracking(s: Series) -> dict:
-    """Cross-track from /rpp/debug[0] (signed, m). Overall + marking-only."""
+    """Cross-track from /rpp/debug[0] (signed, m). Overall + marking-only.
+
+    `marking_only` grades PAINT, so it must be gated on the topic that means
+    "the valve is open" — /spray/state — and nothing earlier in the chain.
+
+    Field 2026-07-30, bag stg_1cad4f00_..._132302: gating on /spray/active
+    reported marking RMS 4.05 cm / max 9.70 and a FAIL verdict, while the
+    valve-gated truth was 1.33 cm. /spray/active is published by the RPP from
+    `_spray_flags[seg] and _spray_flags[seg+1]` — it is the path's geometric
+    INTENT ("this segment should be painted"), and it went true 1.8 s before
+    the valve. The spray controller holds the valve shut through its own gates
+    (cross-track, pivot state, RTK), so the intent-gated window counts exactly
+    the samples those gates were built to exclude: in that bag the 9.70 cm
+    excursion was the rover recovering from a pivot that released 17.47° off,
+    entirely dry. Over-reporting was 3.0x there, 1.7-1.8x on two other runs
+    the same day, and negligible whenever the pivot was clean.
+
+    The intent-vs-valve gap is not noise — it is a real defect signal — so it
+    is reported separately as `approach_dry`, and never mixed into the verdict.
+    """
     if not s.rpp:
         return {"available": False, "reason": "no /rpp/debug"}
     xt_all = [d[0] for (_t, d) in s.rpp if d and len(d) > 0 and math.isfinite(d[0])]
     out = {"available": True, "overall": _stat_block(xt_all)}
-    # marking-only: xtrack while spray desired is ON (if we have that signal)
-    spray = s.spray_active or s.spray_desired
-    if spray:
+
+    # Valve truth, best available. state == actual valve; commanded == what the
+    # spray node asked the FCU for (equals state absent an actuator fault);
+    # desired == pre-gate want; active == RPP geometric intent (earliest, and
+    # the one that caused the over-report). Degrade in that order, and record
+    # which we used so a reader can tell a valve-gated number from a fallback.
+    for name, sig in (("spray_state", s.spray_state),
+                      ("spray_commanded", s.spray_commanded),
+                      ("spray_desired", s.spray_desired),
+                      ("spray_active", s.spray_active)):
+        if sig:
+            valve, valve_src = sig, name
+            break
+    else:
+        valve, valve_src = None, None
+
+    if valve:
+        out["marking_gate"] = valve_src
+        out["marking_gate_is_valve"] = valve_src in ("spray_state", "spray_commanded")
         xt_mark = []
         for (t, d) in s.rpp:
             if not d or not math.isfinite(d[0]):
                 continue
-            on = _nearest(spray, t)
-            if on:
+            if _nearest(valve, t):
                 xt_mark.append(d[0])
         out["marking_only"] = _stat_block(xt_mark) if xt_mark else None
+
+        # Intended-to-paint but valve still shut: the approach transient the
+        # spray gate suppressed. Large values here mean a bad run entry (e.g.
+        # a pivot that released off-heading), NOT bad paint.
+        if s.spray_active and valve_src != "spray_active":
+            xt_dry = []
+            for (t, d) in s.rpp:
+                if not d or not math.isfinite(d[0]):
+                    continue
+                if _nearest(s.spray_active, t) and not _nearest(valve, t):
+                    xt_dry.append(d[0])
+            out["approach_dry"] = _stat_block(xt_dry) if xt_dry else None
+
     # B7: the verdict grades the PAINTED span when a spray signal exists. The
     # overall block averages in pivot/idle placeholder zeros (32% of samples in
     # the 2026-07-25 bags) and can dilute a 5 cm marking error below the gate.
@@ -1516,8 +1563,15 @@ def _fmt_report(a: dict) -> str:
              f"zero {o.get('zero_frac', 0)*100:.0f}%)")
         if tr.get("marking_only"):
             mo = tr["marking_only"]
+            gate = tr.get("marking_gate", "?")
+            note = "" if tr.get("marking_gate_is_valve") else "  ⚠ NOT valve-gated"
             line(f"   marking : RMS {mo['rms_cm']}  p95 {mo['p95_cm']}  max {mo['max_cm']} cm"
-                 f"   (n={mo['n']})")
+                 f"   (n={mo['n']}, gate={gate}){note}")
+        if tr.get("approach_dry"):
+            ad = tr["approach_dry"]
+            line(f"   approach: RMS {ad['rms_cm']}  max {ad['max_cm']} cm  (n={ad['n']}) — "
+                 f"intended-to-paint but valve SHUT; not paint error, but a large")
+            line(f"             value flags a bad run entry (e.g. pivot released off-heading)")
         line(f"   verdict : {tr['verdict']}  on {tr.get('verdict_basis', 'overall')} "
              f"(production class RMS ≤ {XTRACK_PROD_CM} cm)")
     else:

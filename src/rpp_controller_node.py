@@ -383,6 +383,28 @@ class RPPControllerNode(Node):
         # l_min still protects the lookahead walk).
         self.declare_parameter("smooth_curvature_ld_coeff",           0.20)
 
+        # P5.1 — arc inside-cut cap (see the CAP block in the smooth tracker).
+        # Pure pursuit cuts inside an arc by e ≈ L²·κ/8, speed-independent. Cap
+        # the lookahead at sqrt(8·e_target/κ) so that cut stays bounded.
+        #
+        # FROZEN CONTROLLER — default 0.0 = OFF, exactly the pre-P5.1 geometry.
+        # This is a named A/B: set smooth_max_arc_cut_m to enable.
+        #   0.005 (5 mm) reproduces the field-validated L≈0.30 m at κ=0.43,
+        #   which took curve marking RMS 2.31 → 1.34 cm over 3 runs.
+        # Only the SMOOTH profile is affected; segment mode is untouched.
+        self.declare_parameter("smooth_max_arc_cut_m",                0.0)
+        # Hard floor on the capped lookahead, so an over-tight cap on a sharp
+        # arc cannot collapse l_d toward zero and degenerate the lookahead walk
+        # (the IDLE-fallback path). 0.25 m is below every value tested and well
+        # clear of the 0.12-0.21 m band that went unstable on 2026-07-29.
+        self.declare_parameter("smooth_min_arc_ld_m",                 0.25)
+        # Half-baseline for path curvature estimation, in metres of arc length.
+        # MUST stay ≥ ~0.10 m: three-point curvature on a 4-10 cm densified
+        # path is noise-dominated (measured 0.626 at 0.05 m vs 0.42-0.43 from
+        # 0.10 m up on the same arc). 0.0 restores the legacy adjacent-vertex
+        # estimate — do not use it for anything that scales a control quantity.
+        self.declare_parameter("curvature_baseline_m",                0.15)
+
         # P1.3 — Path conditioning on receipt
         # path_resample_spacing_m: if > 0, linearly resample the path to this
         #   uniform spacing on receipt. Densifies sparse polylines so the
@@ -2617,19 +2639,48 @@ class RPPControllerNode(Node):
         dist_to_end_along = (1.0 - t) * seg_len
         return t, foot_n, foot_e, signed_e, dist_to_end_along
 
-    def _path_curvature_at(self, seg_idx: int) -> float:
-        """Estimate path curvature at the projection foot using Menger
-        curvature of three consecutive path vertices centred on seg_idx.
+    def _path_curvature_at(self, seg_idx: int, baseline_m: float = 0.0) -> float:
+        """Estimate path curvature at the projection foot (Menger curvature).
 
         Returns 1/m curvature (0.0 for straight lines, >0 for curves).
-        Used to enforce a curvature-adequate minimum lookahead on arcs.
+
+        `baseline_m` is the HALF-baseline: the neighbours are walked outward
+        until they are at least this far along the path from the centre point.
+        0.0 keeps the legacy adjacent-vertex behaviour.
+
+        ⚠ Adjacent vertices are NOT safe for anything quantitative. Conditioned
+        paths arrive densified at 4-10 cm, and a three-point circle on that
+        spacing is dominated by coordinate noise: on the 2026-07-30 curve bags
+        it reported kappa_max 1.251 (R = 0.80 m) where the true geometry was a
+        near-constant R = 2.3-2.4 m arc — a 3x error that produced a completely
+        wrong diagnosis (an imagined yaw-rate saturation) until a field test
+        disproved it. Convergence measured on that path: half-baseline 0.05 m
+        -> 0.626, 0.10 -> 0.417, 0.20 -> 0.450, 0.30 -> 0.430, 0.50 -> 0.422.
+        It is stable from ~0.10 m up, so any consumer that scales a control
+        quantity by curvature must pass a baseline of at least that.
         """
         n_pts = len(self._path)
         if n_pts < 3:
             return 0.0
-        i0 = max(0, seg_idx - 1)
-        i1 = seg_idx
-        i2 = min(n_pts - 1, seg_idx + 1)
+        i1 = max(0, min(seg_idx, n_pts - 1))
+        i0, i2 = max(0, i1 - 1), min(n_pts - 1, i1 + 1)
+        if baseline_m > 0.0:
+            p1 = self._path[i1].pose.position
+            # Walk outward on arc length, not index, so the baseline is
+            # independent of how finely the path was densified.
+            d = 0.0
+            while i0 > 0 and d < baseline_m:
+                a = self._path[i0].pose.position
+                b = self._path[i0 + 1].pose.position
+                d += math.hypot(b.x - a.x, b.y - a.y)
+                i0 -= 1
+            d = 0.0
+            while i2 < n_pts - 1 and d < baseline_m:
+                a = self._path[i2].pose.position
+                b = self._path[i2 - 1].pose.position
+                d += math.hypot(b.x - a.x, b.y - a.y)
+                i2 += 1
+            del p1
         if i2 - i0 < 2:
             return 0.0
         a = self._path[i0].pose.position
@@ -3924,16 +3975,52 @@ class RPPControllerNode(Node):
         l_d_raw = ld_gain * v_for_ld + xt_ld_gain * abs(signed_xtrack)
         l_d = self._clamp(l_d_raw, l_min, l_max)
 
-        # Fix 1: curvature-aware minimum lookahead — on arcs, ensure l_d
-        # spans a fraction of the radius so the lookahead walk reliably
-        # reaches past the foot. Without this, short lookaheads on tight
-        # arcs can land at the rover position, triggering the IDLE path.
-        # B2: coefficient is a parameter (0.35 = frozen); this floor is
-        # applied after the [l_min, l_max] clamp and can exceed
-        # max_lookahead_dist — the inside-cut on arcs scales ~L².
-        kappa_path = self._path_curvature_at(seg_idx)
+        # Curvature-aware lookahead on arcs. Robust baseline (NOT adjacent
+        # vertices) — see _path_curvature_at for why that distinction is
+        # load-bearing.
+        kappa_path = self._path_curvature_at(
+            seg_idx, baseline_m=float(self.get_parameter("curvature_baseline_m").value)
+        )
+
+        # P5.1 (CAP): pure pursuit geometrically cuts INSIDE an arc by
+        # e ≈ L²/(8R) = L²·κ/8 — no speed term, which is why halving
+        # mission_speed on 2026-07-30 changed the curve error by nothing while
+        # the lookahead sweep changed it by 3x. Bound that cut instead:
+        #
+        #     e ≤ e_target  ⇒  L ≤ sqrt(8·e_target/κ)
+        #
+        # Field-anchored: κ=0.43, e_target=0.005 ⇒ L ≤ 0.305 m. Measured at
+        # L=0.30 on that arc: inside-cut went +1.15 cm → −0.40 cm and marking
+        # RMS 2.31 → 1.34 cm (3/3 runs in spec, spread 0.09 cm), no ringing.
+        # L=1.00 gave +3.80 cm, ratio 3.30 vs L² prediction 3.10.
+        #
+        # SMOOTH-PROFILE ONLY, by design. Segment mode keeps the long lookahead
+        # so straights and ≥45° corners are untouched — a short lookahead there
+        # is the 2026-07-29 instability regime (lookahead truncated to
+        # 0.12-0.21 m gave bimodal 1.4/8 cm runs). Two `2x2 square` runs at a
+        # global L=0.30 came back partial, which is why this is conditional.
+        #
+        # The cap REPLACES the Fix-1 floor rather than combining with it. They
+        # are irreconcilable: floor = coeff/κ ∝ 1/κ, cap = sqrt(8e/κ) ∝ 1/√κ,
+        # so the floor always wins as κ→0 — at the field-tested κ=0.43 it is
+        # 0.465 m against a 0.305 m cap and would erase the effect entirely.
+        # That is exactly why the validated field config also set
+        # smooth_curvature_ld_coeff=0.0. The floor is also mis-shaped for its
+        # own stated purpose (stopping the lookahead point landing on the
+        # rover): coeff/κ = coeff·R GROWS on gentle arcs, where there is no
+        # degeneracy risk at all. Degeneracy is guarded instead by the absolute
+        # smooth_min_arc_ld_m floor plus the existing IDLE-fallback retry.
         ld_coeff = float(self.get_parameter("smooth_curvature_ld_coeff").value)
-        if kappa_path > 1e-6 and ld_coeff > 0.0:
+        cut_target = float(self.get_parameter("smooth_max_arc_cut_m").value)
+        if kappa_path > 1e-6 and cut_target > 0.0:
+            l_cap = math.sqrt(8.0 * cut_target / kappa_path)
+            l_d = max(min(l_d, l_cap),
+                      float(self.get_parameter("smooth_min_arc_ld_m").value))
+        elif kappa_path > 1e-6 and ld_coeff > 0.0:
+            # Fix 1 (legacy FLOOR), unchanged when the cap is off: ensure l_d
+            # spans a fraction of the radius so the lookahead walk reliably
+            # reaches past the foot. Applied after the [l_min, l_max] clamp and
+            # may exceed max_lookahead_dist.
             l_d = max(l_d, ld_coeff / kappa_path)
 
         # ---- Step 3: Lookahead point (NED), then body-frame for κ ----

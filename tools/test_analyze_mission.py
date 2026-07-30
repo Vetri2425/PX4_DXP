@@ -5,7 +5,13 @@ No bag or ROS needed — hand-built CDR buffers validate the little-endian XCDR1
 reader (esp. member alignment), and synthetic series validate the stat / corner
 / edge helpers.
 
-Run:  python3 tools/test_analyze_mission.py
+Run:  python3 -m pytest tools/test_analyze_mission.py     ← full suite (51)
+      python3 tools/test_analyze_mission.py               ← unittest classes only (23)
+
+The file is a hybrid: unittest.TestCase classes plus bare pytest-style
+`def test_*` functions. `unittest.main()` cannot see the latter, so **pytest is
+the authoritative runner**. (Until 2026-07-30 the `__main__` block also sat
+mid-file, so the script path ran 18 of 51 and still printed OK.)
 """
 import json
 import math
@@ -239,10 +245,6 @@ class TestStopsCoastRegression(unittest.TestCase):
         st = am.analyze_stops(self._there_and_back())
         for e in st["stops"]:
             self.assertNotIn("max_dist_after_arrival_cm", e)
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 # ── §8 ABSOLUTE ACCURACY ─────────────────────────────────────────────────────
@@ -626,3 +628,82 @@ def test_source_is_reported_in_the_result():
     g = am.analyze_geometry_fidelity(s, survey_tol_cm=3.0, survey_tol_source="unit test")
     assert g["survey_tol_cm"] == 3.0
     assert g["survey_tol_source"] == "unit test"
+
+
+# ---------------------------------------------------------------------------
+# marking_only must be gated on the VALVE, not on the RPP's geometric intent.
+#
+# Field 2026-07-30, bag stg_1cad4f00_..._132302: gating on /spray/active
+# reported marking RMS 4.05 cm / max 9.70 (FAIL) where the valve-gated truth
+# was 1.33 cm. /spray/active is `_spray_flags[seg] and _spray_flags[seg+1]` —
+# the path's INTENT — and led the valve by 1.8 s, so the window swallowed the
+# dry recovery from a pivot that released 17.47° off heading. There was no
+# coverage of analyze_tracking at all, which is how it shipped.
+
+def _tracking_series(rpp_xt, active_win, state_win, dt=0.1):
+    """rpp_xt = [xtrack_m]; *_win = (t_on, t_off) for that boolean signal."""
+    s = am.Series()
+    s.rpp = [(i * dt, [x] + [0.0] * 10) for i, x in enumerate(rpp_xt)]
+    n = len(rpp_xt)
+    for win, dest in ((active_win, "spray_active"), (state_win, "spray_state")):
+        if win is None:
+            continue
+        on, off = win
+        getattr(s, dest).extend(
+            (i * dt, on <= i * dt < off) for i in range(n)
+        )
+    return s
+
+
+class TestMarkingGate(unittest.TestCase):
+    # 0.0-1.0 s: 10 cm excursion (dry approach). 1.0-2.0 s: 1 cm (painted).
+    XT = [0.10] * 10 + [0.01] * 10
+
+    def test_gates_on_spray_state_not_active(self):
+        s = _tracking_series(self.XT, active_win=(0.0, 2.0), state_win=(1.0, 2.0))
+        t = am.analyze_tracking(s)
+        self.assertEqual(t["marking_gate"], "spray_state")
+        self.assertTrue(t["marking_gate_is_valve"])
+        # Painted span only → 1 cm, not the 10 cm dry excursion.
+        self.assertAlmostEqual(t["marking_only"]["rms_cm"], 1.0, places=1)
+        self.assertEqual(t["verdict"], "PASS")
+
+    def test_dry_approach_is_reported_separately(self):
+        s = _tracking_series(self.XT, active_win=(0.0, 2.0), state_win=(1.0, 2.0))
+        t = am.analyze_tracking(s)
+        self.assertIsNotNone(t["approach_dry"])
+        self.assertAlmostEqual(t["approach_dry"]["rms_cm"], 10.0, places=1)
+        # ...and never folded into the paint verdict.
+        self.assertEqual(t["verdict_basis"], "marking_only")
+
+    def test_intent_gating_would_have_inflated_it(self):
+        """Pins the magnitude of the bug this fix removes."""
+        s = _tracking_series(self.XT, active_win=(0.0, 2.0), state_win=None)
+        t = am.analyze_tracking(s)
+        self.assertEqual(t["marking_gate"], "spray_active")
+        self.assertFalse(t["marking_gate_is_valve"])   # flagged in the report
+        # Both spans averaged: sqrt((10²+1²)/2) ≈ 7.1 cm — the over-report.
+        self.assertGreater(t["marking_only"]["rms_cm"], 5.0)
+
+    def test_falls_back_through_the_chain_and_says_so(self):
+        s = _tracking_series(self.XT, active_win=None, state_win=None)
+        s.spray_commanded = [(i * 0.1, 1.0 <= i * 0.1 < 2.0) for i in range(20)]
+        t = am.analyze_tracking(s)
+        self.assertEqual(t["marking_gate"], "spray_commanded")
+        self.assertTrue(t["marking_gate_is_valve"])
+        self.assertAlmostEqual(t["marking_only"]["rms_cm"], 1.0, places=1)
+
+    def test_no_spray_signal_falls_back_to_overall(self):
+        s = _tracking_series(self.XT, active_win=None, state_win=None)
+        t = am.analyze_tracking(s)
+        self.assertIsNone(t.get("marking_only"))
+        self.assertEqual(t["verdict_basis"], "overall")
+
+
+# Must stay LAST: unittest.main() only sees classes already defined when it
+# runs. It previously sat mid-file, so `python3 tools/test_analyze_mission.py`
+# executed 18 of 51 tests and reported OK — every test below that point (§8
+# absolute accuracy, geometry fidelity, the marking gate) was dead unless the
+# suite happened to be run under pytest.
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
