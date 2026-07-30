@@ -94,6 +94,16 @@ COVERAGE_RADIUS_M = 0.25    # a path point counts as reached within this distanc
 COVERAGE_COMPLETE = 0.98    # at/above this the path was traversed end to end
 COVERAGE_PARTIAL = 0.75     # below this it is not a full run at all
 
+# P0-3 truncation guard. A recording whose FIRST pose is already moving faster
+# than this began mid-mission: the recorder was still finalising the previous
+# bundle when the mission started. 2026-07-30: two bags opened at 0.349 and
+# 0.293 m/s, 48% along the path — three independent reviews then derived wrong
+# root causes from the missing half. A rover genuinely at rest reads ≤~0.02.
+# Deliberately NOT a distance-to-path[0] check: a complete run may legally
+# start AT REST far from path[0] and drive a dry entry leg (the 191918 control
+# run did exactly that from 40% up the path).
+TRUNC_START_SPEED_MPS = 0.10
+
 
 _WGS84_A = 6378137.0
 _WGS84_F = 1.0 / 298.257223563
@@ -240,12 +250,27 @@ def _p_postarget(d):
 
 
 def _p_state(d):
-    # mavros_msgs/State on this stack has NO std header (validated on real bags).
-    r = _CDR(d)
-    connected = r.boolean(); armed = r.boolean(); guided = r.boolean()
-    manual = r.boolean(); mode = r.string(); system_status = r.u8()
-    return {"connected": connected, "armed": armed, "guided": guided,
-            "manual_input": manual, "mode": mode, "system_status": system_status}
+    # mavros_msgs/State CDR layout drifted across MAVROS builds: older bags have
+    # NO std header (validated on 2026-06/07 bags), the 2026-07-30 bags carry a
+    # std_msgs/Header. P2-9: the headerless-only parser raised on every message
+    # of the new layout and read_bag silently dropped them — 89/83 recorded
+    # State samples decoded as zero and HEALTH graded PASS from an empty list.
+    # Try both layouts; accept the first that yields a plausible mode string.
+    last_err = None
+    for with_header in (False, True):
+        try:
+            r = _CDR(d)
+            if with_header:
+                r.header()
+            connected = r.boolean(); armed = r.boolean(); guided = r.boolean()
+            manual = r.boolean(); mode = r.string(); system_status = r.u8()
+            if len(mode) <= 32 and all(32 <= ord(c) < 127 for c in mode):
+                return {"connected": connected, "armed": armed, "guided": guided,
+                        "manual_input": manual, "mode": mode,
+                        "system_status": system_status}
+        except Exception as e:
+            last_err = e
+    raise ValueError(f"State CDR layout unrecognised: {last_err}")
 
 
 def _p_f32ma(d):
@@ -1029,7 +1054,14 @@ def analyze_health(s: Series) -> dict:
     verdict = "PASS"
     if events or gaps or jumps or st_flags:
         verdict = "WARN"
+    # P2-9: absence of evidence must never grade as evidence of absence. With
+    # zero decoded State samples, "0 OFFBOARD drops" is manufactured — the
+    # 2026-07-30 bags recorded 89/83 State messages that a stale CDR layout
+    # silently dropped, and this section printed PASS from an empty list.
+    if not s.state:
+        verdict = "UNAVAILABLE"
     return {"available": True,
+            "state_samples": len(s.state),
             "offboard_drops": len(events),
             "setpoint_gaps_over_0p5s": gaps,
             "max_setpoint_gap_s": round(max_gap, 3),
@@ -1088,6 +1120,40 @@ def resolve_survey_tol_cm(manifest, cli_cm: float | None = None) -> tuple[float,
         return SURVEY_TOL_CM, f"default (staged value {val_m} m out of range)"
 
     return SURVEY_TOL_CM, "built-in default — not set for this survey"
+
+
+def analyze_recording_integrity(s: Series) -> dict:
+    """Was the recorder actually running when the mission started? (P0-3)
+
+    Every downstream section silently assumes the bag covers the whole
+    mission. When the recorder's blind window eats the opening, coverage
+    metrics report SKIPPED/STARTED_LATE for geometry that was driven but not
+    recorded — and reviews then build root causes on the gap. The signature is
+    unambiguous: a bag that begins mid-mission begins with the rover already
+    at speed. One is flagged here so no consumer has to re-derive it.
+    """
+    path = (s.paths[0][1] if s.paths else None) or s.path
+    if not s.pose:
+        return {"available": False, "reason": "no pose samples"}
+    t0, n0, e0, _ = s.pose[0]
+    speed0 = _nearest(s.vel_meas, t0) if s.vel_meas else None
+    if speed0 is None and len(s.pose) > 1:
+        # fall back to pose differencing over the opening half-second
+        w = [p for p in s.pose if p[0] <= t0 + 0.5]
+        dt = w[-1][0] - w[0][0] if len(w) > 1 else 0.0
+        if dt > 0:
+            speed0 = math.hypot(w[-1][1] - w[0][1], w[-1][2] - w[0][2]) / dt
+    out = {"available": True,
+           "first_pose_speed_mps": round(speed0, 3) if speed0 is not None else None,
+           "truncated": bool(speed0 is not None and speed0 > TRUNC_START_SPEED_MPS)}
+    if path:
+        ni = min(range(len(path)),
+                 key=lambda i: math.hypot(path[i][0] - n0, path[i][1] - e0))
+        out["first_pose_nearest_path_index"] = ni
+        out["first_pose_dist_to_path0_m"] = round(
+            math.hypot(path[0][0] - n0, path[0][1] - e0), 3)
+        out["path_points"] = len(path)
+    return out
 
 
 def analyze_traversal(s: Series, radius_m: float = COVERAGE_RADIUS_M) -> dict:
@@ -1639,7 +1705,12 @@ def _fmt_report(a: dict) -> str:
 
     h = a["health"]
     line("6. HEALTH / ANOMALIES")
-    if h.get("available"):
+    if h.get("available") and h.get("verdict") == "UNAVAILABLE":
+        line(f"   ! zero /mavros/state samples decoded ({h.get('state_samples', 0)}) — ")
+        line("   ! OFFBOARD continuity is UNVERIFIED, not verified-clean. If the bag")
+        line("   ! contains State messages, the CDR layout drifted past the parser.")
+        line(f"   verdict {h['verdict']}")
+    elif h.get("available"):
         line(f"   OFFBOARD drops {h['offboard_drops']}  setpoint gaps>0.5s "
              f"{h['setpoint_gaps_over_0p5s']} (max {h['max_setpoint_gap_s']}s)")
         line(f"   RTK degraded {h['rtk_degraded_samples']}  EKF jumps {h['ekf_position_jumps']}  "
@@ -1710,6 +1781,17 @@ def _fmt_report(a: dict) -> str:
         line(f"   verdict : {ab['verdict']}")
     line("")
 
+    rc = a.get("recording") or {}
+    if rc.get("truncated"):
+        line("!" * 72)
+        line(f"!! RECORDING TRUNCATED — first pose already moving at "
+             f"{rc.get('first_pose_speed_mps')} m/s")
+        if rc.get("first_pose_nearest_path_index") is not None:
+            line(f"!! bag opens at path index {rc['first_pose_nearest_path_index']}"
+                 f"/{rc.get('path_points', '?')} — the mission opening was NOT recorded")
+        line("!! every section in this report describes the RECORDING, not the")
+        line("!! mission. Do not root-cause geometry that is merely unrecorded.")
+        line("!" * 72)
     tv = a.get("traversal") or {}
     line("9. TRAVERSAL (did the rover reach the whole path, or stop part way?)")
     line("   every section above describes only the part that WAS driven — an abort")
@@ -1907,12 +1989,19 @@ def analyze(root: str, survey_tol_cm: float | None = None,
                                          survey_tol_source=tol_source)
     absolute = analyze_absolute(s, manifest)
     traversal = analyze_traversal(s)
+    recording = analyze_recording_integrity(s)
     config = analyze_config(s, manifest)
     geo = analyze_geo(s, manifest, out_dir or root)
 
     # overall verdict + worst offenders
     offenders = []
     fails = []
+    if recording.get("truncated"):
+        offenders.append(
+            f"RECORDING TRUNCATED — first pose already moving at "
+            f"{recording['first_pose_speed_mps']} m/s (rest reads ≤~0.02): the bag "
+            f"missed the mission opening. Coverage/traversal below describe the "
+            f"RECORDING, not the mission — do not root-cause the missing span")
     for name, sec in (("tracking", tracking), ("stops", stops), ("pivots", pivots),
                       ("geometry", geometry), ("absolute", absolute),
                       ("traversal", traversal)):
@@ -1962,6 +2051,10 @@ def analyze(root: str, survey_tol_cm: float | None = None,
             "silent; settle unmeasurable)")
     if health.get("offboard_drops"):
         offenders.append(f"{health['offboard_drops']} OFFBOARD drop(s)")
+    if health.get("verdict") == "UNAVAILABLE":
+        offenders.append(
+            "health UNAVAILABLE — zero /mavros/state samples decoded; OFFBOARD "
+            "continuity is unverified, not verified-clean")
     if absolute.get("available") and absolute.get("bias_cm", 0) > ABS_BIAS_FAIL_CM:
         offenders.append(
             f"the whole mission sits {absolute['bias_cm']:.1f}cm off its surveyed position "
@@ -1970,7 +2063,7 @@ def analyze(root: str, survey_tol_cm: float | None = None,
     elif absolute.get("available") and absolute.get("max_cm", 0) > ABS_MISS_FAIL_CM:
         offenders.append(
             f"worst absolute miss {absolute['max_cm']:.1f}cm vs the surveyed lat/lon")
-    verdict = "FAIL" if fails else ("WARN" if (offenders or health.get("verdict") == "WARN") else "PASS")
+    verdict = "FAIL" if fails else ("WARN" if (offenders or health.get("verdict") != "PASS") else "PASS")
 
     return {
         "schema": "analyze_mission@1",
@@ -1991,6 +2084,7 @@ def analyze(root: str, survey_tol_cm: float | None = None,
         "geometry": geometry,
         "absolute": absolute,
         "traversal": traversal,
+        "recording": recording,
         "config": config,
         "geo": geo,
         "worst_offenders": offenders,
@@ -2023,8 +2117,10 @@ def main() -> int:
     # detectable by reading manifest.json alone — no bag, no analysis.json.
     tv = result.get("traversal") or {}
     if tv.get("available"):
+        _rc = result.get("recording") or {}
         written = _write_traversal_to_manifest(args.bundle, {
-            "status": tv["status"],
+            "status": ("TRUNCATED_RECORDING" if _rc.get("truncated") else tv["status"]),
+            "recording_truncated": bool(_rc.get("truncated")),
             "shape": tv["shape"],
             "coverage": tv["coverage"],
             "points_covered": tv["points_covered"],
