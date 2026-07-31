@@ -671,7 +671,9 @@ class RPPControllerNode(Node):
         # and EKF jump threshold — are derived from this value at runtime so the
         # operator never has to touch them.
         # Roads/large fields: 1.0 m/s  |  Sports fields/tight marking: 0.3–0.5 m/s
-        self.declare_parameter("mission_speed",                       0.35)  # m/s
+        # 0.35 -> 0.50 (2026-08-01): field-test default. Braking from 0.5
+        # is 0.36 m — inside the 0.6 m approach zone, so no other param moves.
+        self.declare_parameter("mission_speed",                       0.50)  # m/s
 
         # P4.2 — Deceleration limit used ONLY for braking-distance derivation.
         # Separate from max_linear_accel because the accel ramp is one-way
