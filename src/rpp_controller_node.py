@@ -632,10 +632,14 @@ class RPPControllerNode(Node):
         # Sensor-chain latency bias added to the extrapolation horizon. The
         # MAVROS transport age above is only ~20 ms; the dominant lag is
         # UPSTREAM of the pose message — GNSS epoch -> EKF fusion -> pose
-        # publish, measured at 152-158 ms on the 07-30 bags (raw receiver fix
-        # vs EKF pose, along-track skew / speed). pose_age alone cannot see
-        # it, so it is closed with this constant. 0.0 disables (pure P2.4).
-        self.declare_parameter("pose_latency_bias_s",                 0.15)
+        # publish. pose_age alone cannot see it.
+        # ⚠ NOT A CONSTANT: measured 152-158 ms on the 07-30 bags but only
+        # ~19 ms on the 07-31 bags — same rover, next day. A stale bias
+        # overcorrects every boundary/stop by v·bias (~5 cm at 0.35 m/s), so
+        # the default is 0.0 (pure P2.4 transport-age closure — always safe).
+        # Set nonzero ONLY from a same-session skew measurement
+        # (EKF-vs-GNSS along-track / speed; analyze_mission §6).
+        self.declare_parameter("pose_latency_bias_s",                 0.0)
 
         # P3.1 — Feedforward yaw rate via body-rate mode
         # When enabled, RPP computes ω_ff = κ·v and sends it directly to PX4

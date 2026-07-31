@@ -66,7 +66,7 @@
 <ul>
   <li>Jetson: checkout <b class="k">fix/field-findings-2026-07-30</b> @ <b>1d80190</b> → <b class="k">./deploy.sh</b> → restart <b class="k">rpp-pipeline</b> + <b class="k">rover-server</b> + <b class="k">bag-autorecord</b></li>
   <li><b class="k">make jetson-tests</b> — <b>MUST be green (was 430/0). Red = stop, revert to ARM A, done for the day.</b></li>
-  <li>Update phone app to build <b>59b72ea</b> · verify params live via <b class="k">GET /api/rpp/params</b>: <span class="mono">use_imu_extrapolation=true · pose_latency_bias_s=0.15 · smooth_min_arc_ld_m=0.40 · segment_heading_tolerance_deg=3.0 · xtrack_trip_error_m=0.08</span></li>
+  <li>Update phone app to build <b>59b72ea</b> · verify params live via <b class="k">GET /api/rpp/params</b>: <span class="mono">use_imu_extrapolation=true · pose_latency_bias_s=<b>0.0</b> (skew is per-day: 156→19 ms!) · smooth_min_arc_ld_m=0.40 · segment_heading_tolerance_deg=3.0 · xtrack_trip_error_m=0.08</span></li>
   <li>NTRIP still up · origin health OK again. <b>NO FCU/QGC changes</b> — RD_TRANS_TRN_DRV stays 2.0</li>
 </ul>
 

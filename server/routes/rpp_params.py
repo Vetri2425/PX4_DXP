@@ -379,9 +379,9 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "pose_latency_bias_s": {
         "type": "float",
-        "default": 0.15,
+        "default": 0.0,
         "group": "Latency Closure",
-        "description": "Constant GNSS→EKF sensor-chain lag closed on top of pose_age (s). Measured 0.152–0.158 on the 2026-07-30 bags; 0.0 disables",
+        "description": "GNSS→EKF sensor-chain lag closed on top of pose_age (s). NOT constant (0.156 on 07-30, 0.019 on 07-31) — set only from a same-session measurement; 0.0 = safe pure-P2.4",
         "min": 0.0,
         "max": 0.5,
     },
