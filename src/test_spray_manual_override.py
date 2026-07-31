@@ -352,6 +352,10 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     # replaces the old _commanded/_off_confirmed/_cmd_seq bookkeeping.
     node._fsm = _fresh_confirmed_off_fsm()
     node._path_model = None
+    # P0-2 hysteresis latch state (mirrors __init__; nodes here are built via
+    # __new__ so every instance attribute must be seeded by hand).
+    node._xtrack_tripped = False
+    node._xtrack_trip_mono = None
     node._session_config = cleared_config()
     node._config_fingerprint = node._session_config.path_fingerprint()
     # B0 / Phase C mode state (default continuous == pre-B0 behaviour).
