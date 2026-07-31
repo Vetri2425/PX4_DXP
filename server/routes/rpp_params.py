@@ -385,6 +385,31 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
         "min": 0.0,
         "max": 0.5,
     },
+    # ── Spray valve heading gates (P3/P7, 2026-08-01) ─────────────────────────
+    "spray_entry_max_heading_deg": {
+        "type": "float",
+        "default": 5.0,
+        "group": "Spray Heading Gates",
+        "description": "Entry gate: hold the valve at each run start until |heading err| is inside this band (deg). 07-31 bags: valve opened at 4-13 deg residual, painting up to 8 cm off-line. 0 = disabled",
+        "min": 0.0,
+        "max": 45.0,
+    },
+    "spray_entry_release_travel_m": {
+        "type": "float",
+        "default": 0.6,
+        "group": "Spray Heading Gates",
+        "description": "Entry-gate backstop: release the hold after this much run travel (m) even if the heading band was never met — never withhold paint indefinitely",
+        "min": 0.0,
+        "max": 5.0,
+    },
+    "spray_heading_cut_deg": {
+        "type": "float",
+        "default": 30.0,
+        "group": "Spray Heading Gates",
+        "description": "Force the valve closed whenever |heading err| exceeds this (deg) — pivoting/spinning is never painting (07-31: terminal pivot painted at 80 deg). Normal tracking peaks ~16 deg. 0 = disabled",
+        "min": 0.0,
+        "max": 180.0,
+    },
     # ── Feedforward Yaw Rate (P3.1) ────────────────────────────────────────────
     "use_feedforward_yaw_rate": {
         "type": "bool",

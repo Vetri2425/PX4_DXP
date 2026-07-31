@@ -173,6 +173,7 @@ Frame conventions
 from __future__ import annotations
 
 import math
+from collections import deque
 from enum import IntEnum
 from typing import NamedTuple
 
@@ -519,6 +520,24 @@ class RPPControllerNode(Node):
         # only on EKF yaw noise (P0-1). 3.0° accepts before the firmware quits.
         self.declare_parameter("segment_heading_tolerance_deg",        3.0)
         self.declare_parameter("segment_yaw_rate_gain",                1.5)
+        # P3/P7 valve heading gates (2026-08-01, from the 07-31 bag decode —
+        # bags/31_07_2026/ANALYSIS_2026-07-31_CONTROLLER_POSTFIX.md):
+        #   entry — the valve opened with 4–13° of pivot residual still
+        #   unwound in 8/10 runs, painting up to 8.03 cm off-line in the
+        #   first metre. Hold spray at each run start until the residual is
+        #   inside spray_entry_max_heading_deg (5.0 = segment_pivot_release_
+        #   max_deg, the worst heading a released pivot may hand over), or
+        #   the run has travelled spray_entry_release_travel_m — the travel
+        #   backstop guarantees paint is never withheld indefinitely.
+        #   cut — 183235 painted through its terminal pivot at 80° heading
+        #   error (n=4 endpoint family). Any |heading error| beyond
+        #   spray_heading_cut_deg means the rover is pivoting/spinning, not
+        #   tracking: force the valve closed. Normal tracking peaks at ~16°
+        #   through the worst kink cluster, so 30° only catches broken states.
+        # 0 disables either gate.
+        self.declare_parameter("spray_entry_max_heading_deg",          5.0)
+        self.declare_parameter("spray_entry_release_travel_m",         0.6)
+        self.declare_parameter("spray_heading_cut_deg",                30.0)
         # CORNER_STOP: confirm the rover is physically stopped at the corner
         # before pivoting. Both linear speed AND yaw-rate (from velocity_local)
         # must be below their thresholds for segment_stop_dwell_s. The 2 s
@@ -808,8 +827,20 @@ class RPPControllerNode(Node):
         self._latest_vel_time: RclTime | None = None
         self._latest_yaw_rate_ned: float = 0.0   # EKF yaw-rate, NED CW+ (rad/s)
 
+        # P3 entry gate — valve held at each run start until the pivot
+        # residual heading error is steered out (see _gate_spray).
+        self._entry_spray_hold: bool = True
+
         # P0.2 — EKF jump detection: last accepted NED position
         self._last_pos: tuple[float, float] | None = None
+        # P0.2 fix (2026-08-01) — recent pose inter-arrival gaps (s). The jump
+        # guard compares poses whose real time separation is the POSE-ARRIVAL
+        # interval (p99 75–130 ms measured on every 2026-07-31 bag), not the
+        # 20 ms control period, so the threshold must be scaled by the worst
+        # recent gap or ordinary transport jitter at ≥0.7 m/s reads as a
+        # "jump" (10–21 false trips/run measured, each resetting the accel
+        # ramp to zero). ~2 s of history at the ~30 Hz pose rate.
+        self._pose_gaps: deque[float] = deque(maxlen=64)
 
         # A3 — EKF reset compensation: cumulative offset (NED, m) absorbed from
         # position jumps this mission, and a count for post-hoc correlation.
@@ -1078,8 +1109,15 @@ class RPPControllerNode(Node):
 
     def _pose_cb(self, msg: PoseStamped):
         """Store latest pose. Frame conversion happens at use-site."""
+        now = self.get_clock().now()
+        # P0.2 fix — record the inter-arrival gap for the jump-guard scaling.
+        # Gaps ≥1 s are a stall, not jitter; STALE handling owns those.
+        if self._pose_recv_time is not None:
+            gap_s = (now - self._pose_recv_time).nanoseconds * 1e-9
+            if 0.0 < gap_s < 1.0:
+                self._pose_gaps.append(gap_s)
         self._pose = msg
-        self._pose_recv_time = self.get_clock().now()
+        self._pose_recv_time = now
 
     # P0.3 — RTK fix gate callback
     def _gps_cb(self, msg: GPSRAW):
@@ -1848,6 +1886,9 @@ class RPPControllerNode(Node):
         run = self._runs[idx]
         self._run_align_pending = False
         self._run_align_turn_rad = 0.0
+        # P3 entry gate (2026-08-01): each run starts with the valve held
+        # until the pivot residual is steered out (see _gate_spray).
+        self._entry_spray_hold = True
         if prev_run and len(prev_run["poses"]) > 1 and len(run["poses"]) > 1:
             # Pivot before this run only if the heading steps by a hard corner.
             # Connector absorption (_absorb_short_connectors) runs in
@@ -3896,11 +3937,32 @@ class RPPControllerNode(Node):
             (max_v * max_v) / (2.0 * max_decel) + 0.10,
         )
 
-        # EKF jump threshold: per-cycle physical max = mission_speed / Hz + 3σ_RTK.
-        # max(param, derived) keeps the manual param as a hard floor.
+        # EKF jump threshold — P0.2 + P4.2, fixed 2026-08-01.
+        # The guard compares poses whose real separation is the POSE-ARRIVAL
+        # interval (p99 75–130 ms on every 2026-07-31 bag), NOT the 20 ms
+        # control period, and the rover cruises up to ~10 % above
+        # mission_speed. Deriving from 1/CONTROL_HZ made ordinary transport
+        # jitter at ≥0.7 m/s read as a "jump": 10–21 false JUMP_SKIPs per run,
+        # each resetting the accel ramp to zero (2 s speed collapse).
+        # LOCAL_POSITION_NED (MAVLink id 32) carries no xy_reset_counter /
+        # delta_xy — PX4 keeps those in VehicleLocalPosition, which MAVROS
+        # does not forward — so this distance heuristic is all we have and it
+        # must bound physically-possible motion across the WORST recent pose
+        # gap at the MEASURED speed. max(param, derived) keeps the manual
+        # param as a hard floor; genuine EKF resets (typically ≫10 cm) still
+        # trip.
+        pose_gap_worst = (
+            min(max(self._pose_gaps), 0.3) if self._pose_gaps
+            else 1.0 / self.CONTROL_HZ
+        )
+        v_meas = (
+            math.hypot(*self._latest_vel_ned) if self._vel_is_fresh() else 0.0
+        )
         jump_thr    = max(                                                # P0.2 + P4.2
             self.get_parameter("ekf_jump_threshold_m").value,
-            max_v / self.CONTROL_HZ + 0.03,
+            max(max_v, v_meas)
+            * max(pose_gap_worst, 1.0 / self.CONTROL_HZ)
+            + 0.03,
         )
 
         # ---- Pose freshness check ----
@@ -4741,10 +4803,18 @@ class RPPControllerNode(Node):
         self._publish_velocity(0.0, 0.0)
         self._publish_yaw_rate(0.0)  # P3.1: zero yaw rate on stop
         # R8 fix: reset commanded-speed memory so that after a pause
-        # (STALE / RTK_WAIT / JUMP_SKIP) the accel ramp restarts from 0
-        # instead of resuming from the pre-pause speed and bypassing the
-        # motor-start jerk protection.
-        self._last_speed_cmd = 0.0
+        # (STALE / RTK_WAIT) the accel ramp restarts from 0 instead of
+        # resuming from the pre-pause speed and bypassing the motor-start
+        # jerk protection.
+        # 2026-08-01: JUMP_SKIP is exempt — it is a SINGLE-TICK estimator
+        # skip, the rover is still physically moving at ~the last commanded
+        # speed, so restarting the ramp from 0 commanded a 2 s speed
+        # collapse (0.7→0→0.7 at the accel limit) for a one-tick glitch —
+        # measured 10–21×/run at 0.7 m/s on 2026-07-31. Jerk protection is
+        # only needed from a genuine stop, which STALE/RTK_WAIT/IDLE/DONE
+        # still reset.
+        if state != StateCode.JUMP_SKIP:
+            self._last_speed_cmd = 0.0
         self._publish_debug(
             cross_track=float("nan"),
             heading_err=float("nan"),
@@ -4789,6 +4859,47 @@ class RPPControllerNode(Node):
         msg.data = bool(active)
         self._spray_active_pub.publish(msg)
 
+    def _gate_spray(self, spray_active: bool, heading_err: float) -> bool:
+        """P3/P7 valve heading gates (2026-08-01). Single choke point —
+        every spray_active value flows through _publish_debug, so gating here
+        covers both tracking profiles and every branch uniformly.
+
+        Entry (P3): at each run start the valve is held until the pivot
+        residual is inside spray_entry_max_heading_deg, or the run has
+        travelled spray_entry_release_travel_m (backstop — never withhold
+        paint indefinitely). Measured 2026-07-31: the valve opened at 4–13°
+        residual in 8/10 runs, painting up to 8.03 cm off-line.
+
+        Cut (P7): |heading error| ≥ spray_heading_cut_deg means the rover is
+        pivoting/spinning, not tracking — force the valve closed (183235
+        painted through its terminal pivot at 80°).
+
+        NaN heading (the zero-publish paths) passes both comparisons safely —
+        those branches already pass spray_active=False.
+        """
+        if not spray_active:
+            return False
+        hd_deg = abs(math.degrees(heading_err))
+        cut_deg = float(self.get_parameter("spray_heading_cut_deg").value)
+        if cut_deg > 0.0 and hd_deg >= cut_deg:
+            return False
+        if self._entry_spray_hold:
+            entry_deg = float(
+                self.get_parameter("spray_entry_max_heading_deg").value
+            )
+            release_travel = float(
+                self.get_parameter("spray_entry_release_travel_m").value
+            )
+            if (
+                entry_deg <= 0.0
+                or hd_deg <= entry_deg
+                or self._path_travel_m >= release_travel
+            ):
+                self._entry_spray_hold = False
+            else:
+                return False
+        return True
+
     def _publish_debug(
         self,
         cross_track: float,
@@ -4814,6 +4925,8 @@ class RPPControllerNode(Node):
         Index [39]: spray_active.
         Indices [40..46]: active tracking profile and segment-mode params.
         """
+        # P3/P7 (2026-08-01): heading gates applied at the single choke point.
+        spray_active = self._gate_spray(spray_active, heading_err)
         self._publish_spray_active(spray_active)
         msg = Float32MultiArray()
         msg.layout.dim.append(MultiArrayDimension(label="rpp_debug",
