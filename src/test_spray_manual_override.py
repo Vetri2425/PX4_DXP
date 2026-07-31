@@ -290,6 +290,13 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "spray_off_during_pivot": _Param(True),
         "segment_state_timeout_s": _Param(1.0),
         "max_xtrack_error_m": _Param(0.03),
+        # P0-2 hysteresis (b6a8436): trip level + minimum-off dwell. Trip is
+        # kept EQUAL to the clear level here so every pre-hysteresis test sees
+        # the old single-threshold gate unchanged; dwell 0 keeps re-open
+        # timing byte-identical. Hysteresis-specific behaviour has its own
+        # tests with real defaults.
+        "xtrack_trip_error_m": _Param(0.03),
+        "xtrack_gate_min_off_s": _Param(0.0),
         "pose_timeout_s": _Param(0.5),
         "velocity_timeout_s": _Param(0.5),
         # Phase B RTK gate — OFF in the fixture (opt-in per test) so the many
