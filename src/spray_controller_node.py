@@ -532,7 +532,14 @@ def _make_spray_decision(
         # Hysteresis: trip at the wide level; once tripped, clear only when the
         # error is back under the tight level AND the minimum off-dwell has
         # elapsed. With trip <= clear this reduces to the old single threshold.
-        trip_level = max(max_xtrack_error_m, xtrack_trip_error_m)
+        # R3 contract: a MISSION override IS the gate — it may tighten below
+        # the param trip, so the param band must not widen it (the Jetson
+        # rclpy suite pins this). Param-sourced gates keep the anti-chatter
+        # band; the min-off dwell applies to both.
+        if max_xtrack_source == "mission":
+            trip_level = max_xtrack_error_m
+        else:
+            trip_level = max(max_xtrack_error_m, xtrack_trip_error_m)
         if xtrack_tripped:
             new_xtrack_tripped = (
                 projection.xtrack_error_m > max_xtrack_error_m
