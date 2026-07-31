@@ -149,7 +149,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "approach_velocity_scaling_dist": {
         "type": "float",
-        "default": 0.6,
+        "default": 0.9,
         "group": "Goal Handling",
         "description": "Distance from goal where approach speed scaling begins (m)",
         "min": 0.0,
@@ -419,7 +419,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "mission_speed": {
         "type": "float",
-        "default": 0.50,
+        "default": 0.70,
         "group": "Mission Control",
         "description": "Operator-facing mission speed (m/s). Single knob per job. 1.0 for roads, 0.3-0.5 for fields",
         "min": 0.0,

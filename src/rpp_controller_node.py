@@ -306,7 +306,7 @@ class RPPControllerNode(Node):
         self.declare_parameter("close_loop_threshold_m",              0.15)   # endpoint gap → "closed"
         self.declare_parameter("close_loop_min_len_m",                1.0)    # only guard runs longer than this
         self.declare_parameter("closed_loop_min_travel_frac",         0.9)    # fraction of circumference required
-        self.declare_parameter("approach_velocity_scaling_dist",      0.6)    # m
+        self.declare_parameter("approach_velocity_scaling_dist",      0.9)    # m
         self.declare_parameter("min_approach_linear_velocity",        0.1)
         self.declare_parameter("p4_zero_vel_threshold",               0.02)   # m/s; floor speed below this to exactly 0 to trigger PX4 P4
 
@@ -671,9 +671,12 @@ class RPPControllerNode(Node):
         # and EKF jump threshold — are derived from this value at runtime so the
         # operator never has to touch them.
         # Roads/large fields: 1.0 m/s  |  Sports fields/tight marking: 0.3–0.5 m/s
-        # 0.35 -> 0.50 (2026-08-01): field-test default. Braking from 0.5
-        # is 0.36 m — inside the 0.6 m approach zone, so no other param moves.
-        self.declare_parameter("mission_speed",                       0.50)  # m/s
+        # 0.35 -> 0.50 -> 0.70 (2026-08-01): field-test default, after
+        # RO_SPEED_LIM was raised in QGC (it clamped every run to 0.30 m/s).
+        # Braking from 0.7 is 0.70 m, so approach_velocity_scaling_dist moves
+        # 0.6 -> 0.9 with it — otherwise the goal ramp starts inside the
+        # stopping distance and the rover overshoots the endpoint.
+        self.declare_parameter("mission_speed",                       0.70)  # m/s
 
         # P4.2 — Deceleration limit used ONLY for braking-distance derivation.
         # Separate from max_linear_accel because the accel ramp is one-way
