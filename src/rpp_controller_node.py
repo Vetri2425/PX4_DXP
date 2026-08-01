@@ -309,6 +309,29 @@ class RPPControllerNode(Node):
         self.declare_parameter("closed_loop_min_travel_frac",         0.9)    # fraction of circumference required
         self.declare_parameter("approach_velocity_scaling_dist",      0.9)    # m
         self.declare_parameter("min_approach_linear_velocity",        0.1)
+        # ── Transit-extension handling (2026-08-01, from the 07-31 bag decode:
+        #    bags/31_07_2026/ANALYSIS_2026-08-01_EXTENSION_TERMINAL.md) ──
+        # transit_merge_max_len_m: a SHORT pure-transit run (all spray flags
+        #   OFF, length ≤ this) that is collinear with its neighbour fuses into
+        #   it even when the two classify to different tracking profiles. The
+        #   profile-mismatch guard in _merge_collinear_runs otherwise refused
+        #   every extension↔mark fuse (straight 5-pt extension = "segment",
+        #   curved 1000-pt mark = "smooth"), turning each perfectly collinear
+        #   0.00° boundary into a full stop+align — the rover double-stopped at
+        #   every mark start and entered paint from ~zero speed instead of at
+        #   cruise. 0 restores the old always-split behaviour.
+        # transit_runout_goal_tolerance_m: a run whose TAIL is unpainted
+        #   transit (aft extension / run-out) does not need 2 cm endpoint
+        #   precision — nothing is painted there. 182821/182524 spent 54–56 s
+        #   closing the last 8 cm of a 0.1 m run-out at sub-dead-band commands.
+        #   0 disables (endpoint precision everywhere).
+        # transit_runout_min_speed_m_s: never command 0 < v < this toward an
+        #   unpainted run-out — PX4 RO_SPEED_TH (~0.1 m/s) barely turns the
+        #   wheels below it. The few-cm coast past the relaxed tolerance lands
+        #   in unpainted ground by definition. 0 disables.
+        self.declare_parameter("transit_merge_max_len_m",             2.0)    # m
+        self.declare_parameter("transit_runout_goal_tolerance_m",     0.10)   # m
+        self.declare_parameter("transit_runout_min_speed_m_s",        0.10)   # m/s
         self.declare_parameter("p4_zero_vel_threshold",               0.02)   # m/s; floor speed below this to exactly 0 to trigger PX4 P4
 
         # Safety
@@ -1027,7 +1050,13 @@ class RPPControllerNode(Node):
             # PRE(OFF) -> MARK(ON) -> AFT(OFF) is one straight motion pass.
             # Preserve the per-point spray flags, but fuse collinear flag runs
             # so spray transitions do not create endpoint slowdown/reacquisition.
-            raw_runs = self._merge_collinear_runs(raw_runs, threshold)
+            raw_runs = self._merge_collinear_runs(
+                raw_runs,
+                threshold,
+                transit_merge_max_len_m=float(
+                    self.get_parameter("transit_merge_max_len_m").value
+                ),
+            )
         else:
             raw_runs = [(raw_pts, raw_flags)]
 
@@ -1549,10 +1578,29 @@ class RPPControllerNode(Node):
         return math.degrees(cls._heading_delta(h0, h1)) < threshold_deg
 
     @classmethod
+    def _is_short_transit_run(
+        cls,
+        pts: list[tuple[float, float]],
+        flags: list[bool],
+        max_len_m: float,
+    ) -> bool:
+        """A short pure-transit run (extension lead-in / run-out): all spray
+        flags OFF and total length ≤ max_len_m. Such a run has no geometry of
+        its own worth a profile identity — it exists only to carry the rover
+        on/off the mark at speed."""
+        return (
+            max_len_m > 0.0
+            and bool(flags)
+            and not any(flags)
+            and cls._pts_length(pts) <= max_len_m
+        )
+
+    @classmethod
     def _merge_collinear_runs(
         cls,
         runs: list[tuple[list[tuple[float, float]], list[bool]]],
         threshold_deg: float,
+        transit_merge_max_len_m: float = 0.0,
     ) -> list[tuple[list[tuple[float, float]], list[bool]]]:
         """Fuse collinear PRE/MARK/AFT flag runs without changing spray flags."""
         if len(runs) < 2:
@@ -1567,7 +1615,26 @@ class RPPControllerNode(Node):
                 cls._classify_auto_profile(prev_pts, threshold_deg)
                 == cls._classify_auto_profile(pts, threshold_deg)
             )
-            if same_profile and cls._runs_collinear(prev_pts, pts, threshold_deg):
+            # 2026-08-01 fix: a short pure-transit extension adopts its
+            # neighbour's profile rather than defending its own. The
+            # same_profile guard exists to keep two LONG runs of different
+            # character apart; applied to a ≤2 m straight lead-in it defeated
+            # this method's whole purpose ("fuse collinear flag runs so spray
+            # transitions do not create endpoint slowdown/reacquisition") —
+            # every extension↔mark boundary on 2026-07-31 was collinear to
+            # 0.00° yet produced a full stop+align at the mark start, and the
+            # aft run-out became a standalone endpoint-precision target
+            # (54 s terminal crawl). Classification runs AFTER this merge on
+            # the fused run, so a short straight tail cannot flip a curved
+            # mark's profile.
+            profile_ok = (
+                same_profile
+                or cls._is_short_transit_run(
+                    prev_pts, prev_flags, transit_merge_max_len_m
+                )
+                or cls._is_short_transit_run(pts, flags, transit_merge_max_len_m)
+            )
+            if profile_ok and cls._runs_collinear(prev_pts, pts, threshold_deg):
                 start = 0
                 if math.hypot(
                     pts[0][0] - prev_pts[-1][0],
@@ -3423,8 +3490,10 @@ class RPPControllerNode(Node):
         spray_active = self._segment_spray_active(seg_idx)
 
         goal_tol = float(self.get_parameter("xy_goal_tolerance").value)
+        # Fix 2: transit run-outs accept a relaxed endpoint tolerance.
+        goal_tol_eff = self._goal_tol_effective(goal_tol)
         min_travel = self._run_min_travel()
-        if final_segment and dist_to_corner <= goal_tol and self._path_travel_m >= min_travel:
+        if final_segment and dist_to_corner <= goal_tol_eff and self._path_travel_m >= min_travel:
             # Stop before switching across a real heading change. Collinear
             # spray transitions were already merged during path conditioning.
             if self._run_idx + 1 < len(self._runs):
@@ -3700,6 +3769,22 @@ class RPPControllerNode(Node):
             if dist_to_corner < approach_d:
                 scale = self._clamp(dist_to_corner / approach_d, 0.0, 1.0)
                 speed = min(speed, max(approach_v, max_v * scale))
+                # Fix 3 (2026-08-01): a sub-dead-band crawl toward an
+                # UNPAINTED run-out is unactuatable — PX4 RO_SPEED_TH
+                # (~0.1 m/s) barely turns the wheels below it; 182821 spent
+                # ~50 s closing 8 cm at 0.03–0.06 m/s. While still outside
+                # the (relaxed) tolerance, command at least the actuatable
+                # floor; the few-cm coast lands in unpainted ground.
+                runout_min = float(
+                    self.get_parameter("transit_runout_min_speed_m_s").value
+                )
+                if (
+                    runout_min > 0.0
+                    and self._run_tail_is_transit()
+                    and 0.0 < speed < runout_min
+                    and dist_to_corner > goal_tol_eff
+                ):
+                    speed = runout_min
                 self._segment_state = SegmentStateCode.PRE_CORNER_SLOWDOWN
 
         max_accel = float(self.get_parameter("max_linear_accel").value)
@@ -4169,7 +4254,8 @@ class RPPControllerNode(Node):
                 pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
             )
             return
-        if dist_to_goal <= goal_tol and self._path_travel_m >= min_travel:
+        # Fix 2 (2026-08-01): transit run-outs accept a relaxed tolerance.
+        if dist_to_goal <= self._goal_tol_effective(goal_tol) and self._path_travel_m >= min_travel:
             # End of the active run: advance to the next run (per-entity
             # profile switching). The next 20 ms cycle pivots via
             # _run_alignment_hold if needed, then tracks the new run. DONE
@@ -4858,6 +4944,25 @@ class RPPControllerNode(Node):
         msg = Bool()
         msg.data = bool(active)
         self._spray_active_pub.publish(msg)
+
+    def _run_tail_is_transit(self) -> bool:
+        """True when the ACTIVE run ends in unpainted transit (aft extension /
+        run-out). Endpoint precision there is cosmetic — nothing is painted —
+        so the run-out relaxations (tolerance + min actuatable speed) apply.
+        A run that ends ON a painted point keeps full precision."""
+        return bool(self._spray_flags) and not self._spray_flags[-1]
+
+    def _goal_tol_effective(self, goal_tol: float) -> float:
+        """Fix 2 (2026-08-01): relax the goal tolerance on transit run-outs.
+        182821/182524 spent 54–56 s closing the last 8 cm of a 0.1 m unpainted
+        run-out to the 2 cm xy_goal_tolerance at sub-dead-band commands."""
+        if self._run_tail_is_transit():
+            runout_tol = float(
+                self.get_parameter("transit_runout_goal_tolerance_m").value
+            )
+            if runout_tol > 0.0:
+                return max(goal_tol, runout_tol)
+        return goal_tol
 
     def _gate_spray(self, spray_active: bool, heading_err: float) -> bool:
         """P3/P7 valve heading gates (2026-08-01). Single choke point —

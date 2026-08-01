@@ -385,6 +385,31 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
         "min": 0.0,
         "max": 0.5,
     },
+    # ── Transit-extension handling (2026-08-01) ───────────────────────────────
+    "transit_merge_max_len_m": {
+        "type": "float",
+        "default": 2.0,
+        "group": "Transit Extensions",
+        "description": "A short pure-transit run (all flags OFF, len <= this) fuses into its collinear neighbour even across a profile-class mismatch — kills the stop at every extension<->mark boundary (07-31: double stop at each mark start). 0 = old always-split behaviour",
+        "min": 0.0,
+        "max": 10.0,
+    },
+    "transit_runout_goal_tolerance_m": {
+        "type": "float",
+        "default": 0.10,
+        "group": "Transit Extensions",
+        "description": "Relaxed endpoint tolerance when the run TAIL is unpainted transit (run-out). 07-31: 54-56 s spent closing 8 cm of a 0.1 m run-out to the 2 cm tolerance. 0 = full precision everywhere",
+        "min": 0.0,
+        "max": 0.5,
+    },
+    "transit_runout_min_speed_m_s": {
+        "type": "float",
+        "default": 0.10,
+        "group": "Transit Extensions",
+        "description": "Never command 0<v<this toward an unpainted run-out — below PX4 RO_SPEED_TH (~0.1) the wheels barely turn (mm/s creep). Coast past the relaxed tolerance lands in unpainted ground. 0 = disabled",
+        "min": 0.0,
+        "max": 0.5,
+    },
     # ── Spray valve heading gates (P3/P7, 2026-08-01) ─────────────────────────
     "spray_entry_max_heading_deg": {
         "type": "float",
