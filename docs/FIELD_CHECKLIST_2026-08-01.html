@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Field Checklist 2026-08-01 Rev 7 — Deploy + Fix Verification + BOTH-DIRECTION Tape + Backend A/B + QGC Cal + Ladder</title>
+<title>Field Checklist 2026-08-01 Rev 8 — Deploy + Fix Verification + BOTH-DIRECTION Tape + Backend A/B + QGC Cal + Ladder</title>
 <style>
   @page { size: A4 portrait; margin: 8mm; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -30,8 +30,8 @@
 <body><div class="page">
 
 <div class="hdr">
-  <h1>FIELD DAY 2026-08-01 — Rev 7 (endpoint-overshoot fix deployed)</h1>
-  <div class="meta">Deploy target: Jetson <span class="mono">@95403d3</span> · <b>app arm</b> <span class="mono">4dbfeab</span> (csv-workflow) · <b>backend arm</b> <span class="mono">24cb166</span> (preline-csv-flow)<br>
+  <h1>FIELD DAY 2026-08-01 — Rev 8 (session close: 6 fixes deployed &amp; bag-verified)</h1>
+  <div class="meta">Deploy target: Jetson <span class="mono">@1cb229f</span> · <b>app arm</b> <span class="mono">4dbfeab</span> (csv-workflow) · <b>backend arm</b> <span class="mono">24cb166</span> (preline-csv-flow)<br>
   Fix verification · <b>BOTH-DIRECTION tape</b> · Backend A/B (STILL OPEN) · QGC cal · Ladder 0.8→1.0</div>
 </div>
 
@@ -56,9 +56,21 @@
   <tr><td>V3 mark-start boundary (with 0.5 m pre-ext)</td><td>full stop + pivot</td><td><b>NO stop</b> — paint enters at ≈cruise</td><td></td></tr>
   <tr><td>V4 last-paint → DONE</td><td>54–56 s</td><td><b>≤ 5 s</b></td><td></td></tr>
   <tr><td>V5 marking RMS / max</td><td>0.69–1.07 / 5.9</td><td>≤ 0.9 / ≤ 4 cm</td><td></td></tr>
-  <tr><td><b>V7 endpoint overshoot</b> (NEW — deployed 16:14 @95403d3)</td><td><b>54.6 cm</b> past goal (stg_9ecf2985)</td><td><b>≤ 10 cm</b>, DONE latches, no e-stop needed</td><td></td></tr>
+  <tr><td><b>V7 endpoint overshoot</b></td><td><b>54.6 cm</b> past goal</td><td>≤ 10 cm, DONE latches</td><td><b>✅ −2.1 / −3.4 / −4.1 cm vs goal; +5.9…+7.9 cm past the PAINT end (off the wet line), n=3</b></td></tr>
+  <tr><td><b>V8 mission-start arrival</b> (NEW)</td><td>−7.4…−8.5 cm short</td><td>≤ 3 cm</td><td><b>✅ −1.3 / −1.9 / −2.4 cm, n=3</b></td></tr>
+  <tr><td><b>V9 meas-vs-cmd speed</b></td><td>+33 % (0.467 vs 0.350)</td><td>≤ 7 %</td><td><b>✅ ±6 % after RO_MAX_THR_SPEED=1.28</b></td></tr>
+  <tr><td><b>V10 pivot walk</b> (NEW — OPEN)</td><td>—</td><td>characterise</td><td><b>1.5–4.2 cm, n=19. Architectural, see above</b></td></tr>
 </table>
-<div class="crit"><b>⚠ NEW FIX IN THIS RUN — V7 is its only field evidence.</b> Bag <span class="mono">stg_9ecf2985</span> (15:47) overshot its endpoint by <b>54.6 cm</b> / 64.6 cm past the paint. Cause: the goal-approach ramp measured to the end of the CURRENT SEGMENT, so its 0.9 m zone was clipped to the 0.10 m run-out that <span class="mono">a54fd2d</span> fused in — the 2.337 m mark was driven at full command to within 6 cm of its end, entering the run-out at 0.79 m/s needing 55 cm to stop. <b>Now measured to the RUN END</b> (@<span class="mono">3e7e300</span>). Gated: 478 Jetson tests, and the regression tests verified to FAIL on the old code first. <b>Expect the last ~0.8 m of paint to be laid at decreasing speed</b> — unavoidable, and milder than the pre-<span class="mono">a54fd2d</span> full stop at the mark end. Preferred long-term: give the run-out real length (<span class="mono">aft_extension_m ≥ 0.9</span>) so braking happens on unpainted ground. <b>OFF SWITCH:</b> <span class="mono">endpoint_approach_run_remaining=false</span> (app params → Transit Extensions, or <span class="mono">ros2 param set</span>) restores the old per-segment measure exactly.</div>
+<div class="done"><b>✅ CLOSED THIS SESSION — all deployed, all bag-verified (n=3 valid runs @0.35, code 64c096b/1cb229f)</b><br>
+<b>1. Endpoint overshoot 57 → 10.9 cm</b> <span class="mono">3e7e300</span>: the goal-approach ramp measured to the CURRENT SEGMENT's end, so its 0.9 m zone was clipped to whatever the last segment was — the 0.10 m run-out. ⚠ <b>PRE-EXISTING, not an a54fd2d regression</b> (1ef5a94 reproduces it identically); reverting to "yesterday" made it WORSE (56–59 cm). Off switch <span class="mono">endpoint_approach_run_remaining=false</span>.<br>
+<b>2. Mission start −8 → −2 cm</b> and <b>endpoint now stops INSIDE the run-out</b> <span class="mono">64c096b</span>: <span class="mono">_run_tail_is_transit</span> was true for a run that paints NOWHERE, so the approach leg inherited the 0.10 m relaxed tolerance and stopped short of the paint start; and the tolerance EQUALLED the 0.10 m run-out, so the run-out could never be entered and the rover parked on the wet line end. Relaxation is now capped at half the measured tail.<br>
+<b>3. RO_MAX_THR_SPEED 0.96 → 1.28</b> (QGC): it is a CALIBRATION, not a limit — you RAISE it to go slower. Closed a <b>+33 % overspeed to ±6 %</b>; endpoint 11.4 → 6.0 cm, resting 5.1 → 3.1 cm. ⚠ <span class="mono">RO_SPEED_LIM</span> is NOT this knob (setting it 0.35 changed nothing).<br>
+<b>4. Analyser lied in BOTH directions</b> <span class="mono">b48df83</span>: §2 STOPS went blind whenever the rover rested past <span class="mono">DEPART_M</span> — i.e. <b>in proportion to the fault</b> (every run over 30 cm reported count=0/PASS) — and an empty list graded PASS; coast was capped near 30 cm on the endpoint; §6 counted latched MANUAL samples as OFFBOARD drops (9 phantoms were the ONLY reason a 54.6 cm overshoot run graded WARN instead of FAIL).<br>
+<b>5. min_spray_speed_mps</b> <span class="mono">1cb229f</span>: advertised "spray suppressed below this speed" and is <b>never read</b>. Not re-wired — a bare threshold caused 132 spurious valve fires; description now says INERT.<br>
+<b>6. Spray refusal reason + staged placement_mode</b> <span class="mono">d90174d</span>/<span class="mono">6b22835</span> exposed in the API.</div>
+
+<div class="crit"><b>🔄 PIVOT A/B RUN — 2/2/3 vs 3/4/5: STALL REPRODUCED, 8da5b18 VINDICATED.</b> Arm 2/2/3 (pre-8da5b18) gave a <b>23.4 s pivot with 15.1 s pinned under 4°</b>, heading oscillating 2.15–2.83° and never crossing 2.0° — the firmware stops turning at <span class="mono">RD_TRANS_TRN_DRV = 2.0°</span>, the exact angle the companion still required. <b>Restored to 3.0/4.0/5.0 and they must stay strictly ordered</b> (max() of equals relaxes nothing; the release cap min()s the band away).<br>
+⚠ <b>Tightening did NOT reduce the pivot walk</b> (2.76 → 2.88 cm) though exit error improved 2.28° → 1.51°. <b>Walk is NOT caused by the release tolerance.</b> The stalled pivot walked 0.29 cm in 15.4 s with 0.08 m/s commanded throughout — so the walk is not leaked commanded speed either. <b>Root cause is architectural:</b> PX4 derives heading from the velocity-vector bearing, so <b>rotation can only be bought with translation</b> — yaw-only does not turn this rover. The walk (1.5–4.2 cm over 19 pivots) is therefore likely IRREDUCIBLE, and any "reduce corner speed near zero error" fix would recreate the stall.</div>
 <ul>
   <li class="note">Run F1 then F2 = <b>SAME CSV, opposite direction</b> → V6: both runs paint the SAME line (app fitter now direction-invariant). <b>DO NOT overpaint or erase F1 — §4 measures F1 and F2 side by side.</b> If F1/F2 land on top of each other, offset F2's chalk row so both are readable</li>
 </ul>
@@ -121,6 +133,13 @@
 
 <div class="crit"><b>FALLBACKS — every new fix has an off switch, one at a time, note which:</b> endpoint overshoot or paint slows too early near line ends → <span class="mono">endpoint_approach_run_remaining=false</span> · boundary stop returns → <span class="mono">transit_merge_max_len_m=0</span> · endpoint overshoots painted lines → <span class="mono">transit_runout_goal_tolerance_m=0</span> + <span class="mono">…min_speed_m_s=0</span> · paint gap at line start → <span class="mono">spray_entry_max_heading_deg=0</span> · paint during spins → keep <span class="mono">spray_heading_cut_deg=30</span> · jump guard misbehaves → old sawtooth was survivable, note &amp; continue. <b>HARD RULES:</b> QGC changes ONLY the table above, log every value · no NTRIP disable · no code edits in field · pull ALL bundles to <span class="mono">bags/01_08_2026/</span> · jetson-tests must be green before first arm.</div>
 
-<div class="foot">Done = V1–V6 green at 0.70 · T1/T2 recorded (A/B finally has data) · post-cal overspeed ≤3 % · highest clean ladder step known · <b>§4 tape done on BOTH F1 and F2, ground/body split computed on the spot</b>. Evening: A/B decision · lever-arm vs placement call from the tape split · CLAUDE.md reconcile · merge. Rev 7 — 2026-08-01, Jetson @95403d3 · app arm 4dbfeab · backend arm 24cb166. §0 closed 15:33; endpoint-overshoot fix deployed 16:14 (V7).</div>
+<div class="foot"><b>NEXT MOVES — in order.</b>
+<b>1. Speed ladder 0.35 → 0.50 → 0.70.</b> Calibration is closed and both stop bugs are fixed, so the ladder is finally unblocked. ⚠ <span class="mono">mission_speed 0.35</span> and the 3 pivot params are RUNTIME-ONLY — an <span class="mono">rpp-pipeline</span> restart reverts mission_speed to 0.70. Re-apply after every restart.
+<b>2. §4 BOTH-DIRECTION TAPE — still the highest-value unrun item, owed 3 field days.</b> Nothing in the bags can substitute: it is the only thing that separates the ±2.2 cm body-fixed antenna offset from a placement error, and it blocks <span class="mono">EKF2_GPS_POS_Y</span> (live 0.0).
+<b>3. Valve opens at 0.018 m/s</b> — i.e. before the rover moves, reproduced on the current build. Needs a DISCRETE gate (as <span class="mono">spray_off_during_pivot</span> is); a speed threshold is what caused the 132 spurious fires.
+<b>4. Backend A/B (T1/T2) — never driven.</b> <span class="mono">field_test_03.csv</span> vs <span class="mono">Field_mission_03_clean.csv</span>; ⚠ their geo origins are ≈5.2 m apart so their local frames are NOT comparable — judge on paint-vs-stakes.
+<b>5. Audit <span class="mono">transit_runout_min_speed_m_s</span> (0.10)</b> against a real run-out length — the last unaudited run-out param, and the same shape as the two bugs fixed today.
+<b>6. Pivot walk:</b> decide COMPENSATE vs reduce-exposure. Open question only the rover can answer — <b>does yaw-only rotate in MANUAL?</b> If yes, a 30°/180° MANUAL pair separates antenna lever arm from velocity-vector translation; if no, the question is closed and the walk is accepted.
+Rev 8 — 2026-08-01 session close. Jetson @<span class="mono">1cb229f</span> · 482 src tests · 397 server tests · analyser re-verified against an independent raw-bag decode to 0.1 cm.</div>
 
 </div></body></html>
