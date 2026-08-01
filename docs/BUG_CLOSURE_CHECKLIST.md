@@ -87,6 +87,9 @@ shipped because a test's ground truth mirrored the bug it was testing.
   it whole.
 - **Closes when:** either compensated (feed-forward of the known walk into the approach stop
   target) or formally accepted with the extension prerequisite documented.
+- **Fix plan exists:** `docs/ALIGNED_ENTRY_PLAN.md` (E-series) — 3-pt aligned entry via a
+  staging point 1.2 m behind the mission start; moves the ~180° pivot into free space so
+  the walk never lands on the start point. ~10-line server change, RPP untouched.
 
 ### ☐ D2 — Approach-stop scatter 2–4 cm, direction-dependent
 - Same mission, same tolerance: stop error 1.25–3.76 cm across 8 approaches, direction varies
