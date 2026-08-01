@@ -386,6 +386,12 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
         "max": 0.5,
     },
     # ── Transit-extension handling (2026-08-01) ───────────────────────────────
+    "endpoint_approach_run_remaining": {
+        "type": "bool",
+        "default": True,
+        "group": "Transit Extensions",
+        "description": "Measure the goal-approach braking ramp against the along-run distance REMAINING to the run end, not to the current segment's end. The per-segment measure clipped the ~0.9 m ramp to the final segment's length — with a 0.10 m run-out fused in, stg_9ecf2985 overshot its endpoint by 54.6 cm. False = pre-2026-08-01 per-segment behaviour",
+    },
     "transit_merge_max_len_m": {
         "type": "float",
         "default": 2.0,

@@ -329,6 +329,15 @@ class RPPControllerNode(Node):
         #   unpainted run-out — PX4 RO_SPEED_TH (~0.1 m/s) barely turns the
         #   wheels below it. The few-cm coast past the relaxed tolerance lands
         #   in unpainted ground by definition. 0 disables.
+        # endpoint_approach_run_remaining: measure the goal-approach ramp
+        #   against the along-run distance REMAINING to the run end, instead of
+        #   the distance to the current segment's end. The old per-segment
+        #   measure clipped the ramp to the length of whatever the last segment
+        #   happened to be — with the 0.10 m run-out fused in by
+        #   transit_merge_max_len_m that left 0.10 m of a 0.9 m zone, and
+        #   stg_9ecf2985 overshot its endpoint by 54.6 cm. False restores the
+        #   pre-2026-08-01 per-segment behaviour (field off switch).
+        self.declare_parameter("endpoint_approach_run_remaining",     True)
         self.declare_parameter("transit_merge_max_len_m",             2.0)    # m
         self.declare_parameter("transit_runout_goal_tolerance_m",     0.10)   # m
         self.declare_parameter("transit_runout_min_speed_m_s",        0.10)   # m/s
@@ -3788,9 +3797,10 @@ class RPPControllerNode(Node):
         # degrades to exactly the previous final-segment behaviour rather
         # than to no endpoint braking at all.
         approach_ref = dist_to_corner if final_segment else float("inf")
-        remaining_along = self._run_remaining_along()
-        if remaining_along is not None:
-            approach_ref = min(approach_ref, remaining_along)
+        if bool(self.get_parameter("endpoint_approach_run_remaining").value):
+            remaining_along = self._run_remaining_along()
+            if remaining_along is not None:
+                approach_ref = min(approach_ref, remaining_along)
         if approach_ref < approach_d:
             scale = self._clamp(approach_ref / approach_d, 0.0, 1.0)
             speed = min(speed, max(approach_v, max_v * scale))

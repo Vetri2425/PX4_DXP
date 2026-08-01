@@ -91,16 +91,25 @@ FUSED = dict(
 )
 
 
-def test_brakes_while_still_on_the_mark_segment(node):
-    """0.80 m from the RUN END the rover must already be slowing.
+@pytest.mark.parametrize("remaining", [0.80, 0.60, 0.40, 0.25])
+def test_brakes_while_still_on_the_mark_segment(node, remaining):
+    """THE REGRESSION TEST. Braking must track the distance to the RUN END.
 
-    It is still on segment 0 here (0.70 m from the mark's own end), so the old
-    `final_segment` gate was False and this commanded full speed. That is the
-    bug: all braking was deferred to a 0.10 m segment.
+    At every one of these the rover is still on segment 0 — 0.15 m to 0.70 m
+    from the mark's own end — so the old `final_segment` gate was False and all
+    four commanded a flat 0.700 m/s. All braking was deferred to a 0.10 m
+    segment that cannot absorb it.
+
+    Pinning the ramp VALUE, not merely "less than cruise": the defect was which
+    distance was fed in, so the test has to prove the right one is.
     """
-    north = MARK_LEN + RUNOUT - 0.80
+    approach_d = max(0.9, MAX_V * MAX_V / (2.0 * 0.5) + 0.10)
+    north = MARK_LEN + RUNOUT - remaining
+    assert north < MARK_LEN, "must still be on the mark segment to discriminate"
     sp = _commanded_speed(node, north, **FUSED)
-    assert sp < MAX_V - 0.02, f"no deceleration 0.80 m from the run end: {sp:.3f} m/s"
+    assert sp == pytest.approx(MAX_V * remaining / approach_d, abs=0.02), (
+        f"{remaining:.2f} m from the run end: commanded {sp:.3f} m/s"
+    )
 
 
 def test_speed_falls_monotonically_across_the_segment_boundary(node):
@@ -162,6 +171,25 @@ def test_closed_run_is_not_throttled_at_its_seam(node):
                           flags=[True, True, True], seg_idx=0,
                           run_len=circ, closed=True)
     assert sp == pytest.approx(MAX_V, abs=1e-6), f"throttled at the seam: {sp:.3f}"
+
+
+def test_off_switch_restores_the_previous_behaviour(node):
+    """endpoint_approach_run_remaining=False must reproduce the old profile.
+
+    Every fix in this stack carries a field off switch and the checklist's
+    FALLBACKS section depends on it. Pinned by asserting the OLD (wrong)
+    number comes back, so a switch that silently does nothing fails here.
+    """
+    north = MARK_LEN + RUNOUT - 0.80
+    node.set_parameters([Parameter("endpoint_approach_run_remaining", value=False)])
+    try:
+        sp = _commanded_speed(node, north, **FUSED)
+        assert sp == pytest.approx(MAX_V, abs=1e-6), (
+            f"off switch did not restore per-segment braking: {sp:.3f} m/s"
+        )
+    finally:
+        node.set_parameters([Parameter("endpoint_approach_run_remaining", value=True)])
+    assert _commanded_speed(node, north, **FUSED) < MAX_V - 0.02, "switch did not re-enable"
 
 
 def test_degrades_to_the_old_measure_when_the_cache_is_unusable(node):
