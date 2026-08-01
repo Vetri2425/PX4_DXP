@@ -17,14 +17,29 @@ Not your job: PX4 firmware, waypoint gen, log analysis — those live on Mac GCS
 
 ## Service restart (narrowest scope)
 
-| Changed | Restart | Drops MAVROS? |
-|---|---|---|
-| `src/*.py` | `sudo systemctl restart rpp-pipeline` | No (~2s) |
-| `server/**` | `sudo systemctl restart rover-server` | No (~2s) |
-| `px4_start_service.sh`, pluginlist, NTRIP | `sudo systemctl restart px4-dxp` | Yes (~11s) |
-| `*.service` / new files | `./deploy.sh` (daemon-reload) | — |
+| Changed | Restart | Drops MAVROS? | Drops RTK? |
+|---|---|---|---|
+| `src/*.py` | `sudo systemctl restart rpp-pipeline` | No (~2s) | No |
+| `server/**` | `sudo systemctl restart rover-server` | No (~2s) | **YES — see below** |
+| `px4_start_service.sh`, pluginlist, NTRIP | `sudo systemctl restart px4-dxp` | Yes (~11s) | Yes |
+| `*.service` / new files | `./deploy.sh` (daemon-reload) | — | — |
 
 `rpp-pipeline PartOf=px4-dxp` — px4-dxp restart cascades down; not up.
+
+> ⚠ **Restarting `rover-server` KILLS the NTRIP stream.** The RTK client is a
+> *child process* of that service (`server/rtk_manager.py` spawns
+> `ntrip_rtcm_node.py`), so any `server/**` deploy silently drops the rover to
+> FLOAT with **no warning in the app**. Restart it immediately after:
+> `POST /api/rtk/ntrip/start` (caster `caster.emlid.com:2101`, mountpoint + creds
+> in `config/ntrip.env`). Session tokens are in-memory too — log in *after* the
+> restart or the call returns "Invalid or missing rover session".
+> `ntrip.service` is a **dead end**: it needs RTKLIB `str2str` and
+> `~/ntrip_stream.sh`, neither of which exists on this Jetson.
+
+> ⚠ **Check `armed` + mission state before restarting `rpp-pipeline`.** On
+> 2026-08-01 a restart was issued while the rover was mid-run in OFFBOARD at
+> 0.70 m/s; it aborted the run. Dropping setpoints in OFFBOARD is exactly what
+> trips the failsafe, and `NAV_RCL_ACT`/`NAV_DLL_ACT` are both **Disarm**.
 
 ## Critical impl rules
 
@@ -68,7 +83,7 @@ Not your job: PX4 firmware, waypoint gen, log analysis — those live on Mac GCS
 | | `RO_YAW_RATE_P` | 0.13 | was 0.17 |
 | | `RO_YAW_RATE_LIM` | **22** | was 90; **CLAUDE.md previously said 30 — wrong** |
 | | `RO_YAW_ACCEL_LIM` / `RO_YAW_DECEL_LIM` | 15 / 18 | was 25 / 34 |
-| Speed | `RO_MAX_THR_SPEED` | **0.96** | **previously documented as 0.9 — wrong** |
+| Speed | `RO_MAX_THR_SPEED` | **1.28** | **CALIBRATION, not a limit** — full-throttle speed. `throttle ≈ v_des / this`, so understating it makes every command too large. Was 0.96 ⇒ **+33 % overspeed** (0.35 cmd → 0.467 measured); set to 1.28 in QGC 2026-08-01 and the error closed to **±6 %**. You RAISE it to go slower. `RO_SPEED_LIM` is NOT this knob — it caps the *setpoint* and never binds while `mission_speed` is below it |
 | Heading | `EKF2_GPS_YAW_OFF` | **180.0** | dual antenna mounted REVERSED. A round number — assumed, not measured. See open bug B1 |
 | | `GPS_YAW_OFFSET` | **180.0** | driver-level twin of the above |
 | Antenna | `EKF2_GPS_POS_X/Y/Z` | 0 / 0 / −0.4 | **Y=0 asserts the antenna is on the centreline** — verify physically (bug B3) |
@@ -85,7 +100,7 @@ Not your job: PX4 firmware, waypoint gen, log analysis — those live on Mac GCS
 | | `COM_RC_IN_MODE` | 2 | |
 
 `PP_LOOKAHD_*` (0.7 / 0.6 / 2.0) exist but are **unused** — they drive PX4's own AUTO-mission pure pursuit, which this rover does not use (companion RPP over OFFBOARD velocity).
-- **FUTURE — SPD-T1 (backlog):** 1.0 m/s line / 0.6 m/s arc. Prereq: verify RoboClaw top speed vs `RO_MAX_THR_SPEED=0.96`.
+- **FUTURE — SPD-T1 (backlog):** 1.0 m/s line / 0.6 m/s arc. Prereq closed 2026-08-01: measured full-throttle speed is **~1.28 m/s** (`RO_MAX_THR_SPEED` now 1.28), so 1.0 m/s is within reach of the drivetrain.
 - Tracking profiles live: `tracking_profile=auto|segment|smooth`.
 - Phase 3 spray: **live on this tree** — `spray_controller_node.py` → PX4 AUX1 via cmd 187; `on_value=1.0` / `off_value=-1.0` (normalized). QGC: `PWM_AUX_FUNC1=301`, `PWM_AUX_MIN1=0`, `PWM_AUX_MAX1=15000` (verified 2026-07-22; raised from 3000 for flow — see spray PWM strength note), `PWM_AUX_DIS1=0`. Manual: `POST /api/spray/test`.
 - Plan doc on branch: `docs/OFFBOARD_POSITION_MODE_PLAN.md` (future position-mode stop architecture — not implemented in controller yet).
