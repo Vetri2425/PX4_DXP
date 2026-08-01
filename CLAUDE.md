@@ -60,7 +60,7 @@ Not your job: PX4 firmware, waypoint gen, log analysis — those live on Mac GCS
 - **Lineage still included:** BUG-T3 `510be9b` / BUG-T2 `1af51ac` / BUG-T1 `036f116` (validated 2026-06-15) + collinear momentum `cd44884` (2026-06-19).
 - **Tracking @0.35 m/s — shapes sub-2cm RMS (06-15 bags):** arc 1.46 / lshape 0.90 / square 0.87 / U-turn 1.06 cm.
 - **Arc (smooth RPP) — structural floor, DEFERRED:** velocity OFFBOARD discards `trajectory_setpoint.yawspeed`; pure-P → following err `≈ ω/RO_YAW_P`. `RO_YAW_P=1.5`. Companion `yaw_rate_feedback_gain` is a NO-OP in velocity mode.
-- **Frozen RPP corner-stop defaults (this tree):** `segment_slowdown_dist=0.50`, `segment_brake_velocity_cap_m_s=0.08`, `segment_min_corner_speed=0.08` (PRE_CORNER floor), `segment_endpoint_approach_speed=0.03` (final-segment only), `segment_heading_tolerance_deg=2.0`, `segment_stop_yaw_rate_threshold=0.05`, `segment_align_settle_s=0.20`, `segment_stop_dwell_s=0.30`. Also: `max_yaw_rate_body=0.45`, `a_lat_max=0.3`, `corner_smooth_radius_m=0.5`. **FCU params — verified from the QGC export `PX4_params/22-07-2026/` (880 params), NOT from memory.** Full set in that file; `PX4_DXP_Tracker.xlsx` → "PX4 FCU Params" is stale.
+- **Frozen RPP corner-stop defaults (this tree):** `segment_slowdown_dist=0.50`, `segment_brake_velocity_cap_m_s=0.08`, `segment_min_corner_speed=0.08` (PRE_CORNER floor), `segment_endpoint_approach_speed=0.03` (final-segment only), `segment_heading_tolerance_deg=2.0`, `segment_stop_yaw_rate_threshold=0.05`, `segment_align_settle_s=0.20`, `segment_stop_dwell_s=0.30`. Also: `max_yaw_rate_body=0.45`, `a_lat_max=0.3`, `corner_smooth_radius_m=0.5`. **FCU params — the table below was re-verified against the LIVE FCU on 2026-08-01** (`python3 tools/quick_params.py`, ~1.5 s for 40 params; MAVROS2 exposes every FCU param as a ROS param on `/mavros/param`). Every row matched except the two `EKF2_WENC_*` rows, which were wrong — **read the FCU, never this table from memory.** Latest QGC export `params/31_07_2026_6_08pm.params` agrees with the live values; `PX4_params/22-07-2026/` and `PX4_DXP_Tracker.xlsx` → "PX4 FCU Params" are both stale.
 
 | Group | Param | Value | Note |
 |---|---|---|---|
@@ -77,8 +77,8 @@ Not your job: PX4 firmware, waypoint gen, log analysis — those live on Mac GCS
 | | `RD_WHEEL_TRACK` | 0.470 | |
 | | `EKF2_WENC_RAD` | 0.1524 | 6 in |
 | Encoder fusion | `EKF2_WENC_CTRL` | 1 | enabled |
-| | `EKF2_WENC_NOISE` / `_LAT_N` | 0.1 / 0.1 | was 0.35 — **3.5× more trust in the encoder** |
-| | `EKF2_WENC_GATE` | 3 | PX4 default is 5.0 SD — tighter here |
+| | `EKF2_WENC_NOISE` / `_LAT_N` | **0.35 / 0.35** | **previously documented as 0.1/0.1 — wrong.** The "3.5× more trust in the encoder" claim built on that number is RETRACTED: the retune is not on the vehicle |
+| | `EKF2_WENC_GATE` | **5.0** | **previously documented as 3 — wrong.** 5.0 is the PX4 default, so the gate is **NOT** tightened here |
 | Cornering | `RD_TRANS_DRV_TRN` / `_TRN_DRV` | 0.70 / 0.0349 rad | drive→turn 40°, turn→drive 2° |
 | | `NAV_ACC_RAD` | 0.05 | |
 | Failsafe | `NAV_RCL_ACT` / `NAV_DLL_ACT` | 6 / 6 | **Disarm** on RC / datalink loss |
