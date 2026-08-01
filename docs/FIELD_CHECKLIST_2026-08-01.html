@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Field Checklist 2026-08-01 Rev 4 — Deploy + Fix Verification + Backend A/B + QGC Cal + Ladder</title>
+<title>Field Checklist 2026-08-01 Rev 5 — Deploy + Fix Verification + BOTH-DIRECTION Tape + Backend A/B + QGC Cal + Ladder</title>
 <style>
   @page { size: A4 portrait; margin: 8mm; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -30,12 +30,13 @@
 <body><div class="page">
 
 <div class="hdr">
-  <h1>FIELD DAY 2026-08-01 — Rev 4 (post 07-31 decode)</h1>
+  <h1>FIELD DAY 2026-08-01 — Rev 5 (post 07-31 decode)</h1>
   <div class="meta">Deploy target: Jetson <span class="mono">@a54fd2d</span> · app <span class="mono">4dbfeab</span> (csv-workflow)<br>
-  Fix verification · Backend A/B (STILL OPEN) · QGC cal · Ladder 0.8→1.0</div>
+  Fix verification · <b>BOTH-DIRECTION tape</b> · Backend A/B (STILL OPEN) · QGC cal · Ladder 0.8→1.0</div>
 </div>
 
 <div class="done"><b>✅ WON 07-31 (bag-verified):</b> ARM B field_test_02 @0.31: RMS <b>0.56</b>/2.61, 0 gaps · 86 m field_test_3: 0.65/2.86 · 8-run clean-vs-raw set driven · 0.53 m/s clean (0.70 held ≤0.77 RMS on 3 of 4 runs) · <b>3 root causes found &amp; fixed in code overnight</b>: jump-guard false trips @0.7 (10–21×/run), valve opens at 4–13° residual (≤8 cm painted), collinear-merge refusal (double stop at mark start + 54 s terminal crawl).</div>
+<div class="crit"><b>🌍 NEW 08-01 — GLOBAL decode (raw GNSS vs RS3 stakes, 8 runs):</b> global repeatability is excellent (<b>0.8 cm RMS</b>, two runs of one file) — but the antenna sits <b>±2.2 cm off the stakes with a sign that FLIPS by driving direction, 8/8 runs</b> ⇒ ~1.7 cm <b>body-fixed lever arm</b> (+1.05 cm ground-fixed). Not latency (flat 0.33→0.70 m/s). Per-stake miss 2.7 cm mean / 7.8 max. No scale error (0.02 cm/m). ⚠ Local xtrack (0.6 cm) and the analyzer's geometry-fidelity metric are <b>structurally blind</b> to this — the latter inverts its own placement transform. <b>§4 tape is now the deciding measurement of the day.</b></div>
 <div class="warn"><b>⏳ STILL PENDING from Rev 3:</b> <b>backend A/B never ran</b> (all 8 runs were app-planned — <span class="mono">field_test_03_verify</span> + <span class="mono">_clean_verify</span> still staged, untouched) · ground-truth tape NOT done (3rd day owed → blocks <span class="mono">EKF2_GPS_POS_Y</span>) · S3/S4 never reached (RO_SPEED_LIM was 0.3 till 18:10, then 0.7) · meas-vs-cmd gate FAILED at 0.7 (+9–10 % overspeed).</div>
 
 <h2>0 · DEPLOY FIRST — nothing drives before this <span class="t">~30 min</span></h2>
@@ -55,7 +56,7 @@
   <tr><td>V5 marking RMS / max</td><td>0.69–1.07 / 5.9</td><td>≤ 0.9 / ≤ 4 cm</td><td></td></tr>
 </table>
 <ul>
-  <li class="note">Run F1 then F2 = <b>SAME CSV, opposite direction</b> → V6: both runs paint the SAME line (app fitter now direction-invariant; tape 3 spots, expect ≤1 cm between the two paints)</li>
+  <li class="note">Run F1 then F2 = <b>SAME CSV, opposite direction</b> → V6: both runs paint the SAME line (app fitter now direction-invariant). <b>DO NOT overpaint or erase F1 — §4 measures F1 and F2 side by side.</b> If F1/F2 land on top of each other, offset F2's chalk row so both are readable</li>
 </ul>
 
 <h2>2 · BACKEND A/B — carried from Rev 3, still the open decision <span class="t">2 runs, ~25 min</span></h2>
@@ -82,10 +83,25 @@
   <li class="note">Judge each step on the <b>7–13 m kink section</b> (FM03 chainage) — lag-limited, it fails first. a_lat_max=0.3 already encodes straight 1.0 / R1.2→0.6 / R0.5→0.4 — do NOT hand-tier speeds</li>
 </ul>
 
-<h2>4 · GROUND TRUTH TAPE — 3rd day owed, DO NOT SKIP <span class="t">~20 min</span></h2>
+<h2>4 · GROUND-TRUTH TAPE — <b>BOTH DIRECTIONS</b>, highest-value item today <span class="t">~30 min · DO NOT SKIP</span></h2>
 <ul>
-  <li>Signed L/R paint-vs-chalk at ~12 stakes (best F run) + ~6 (best T run) + photos → feeds <span class="mono">EKF2_GPS_POS_Y</span> (the 2.2 cm B3 bias = biggest absolute error left)</li>
+  <li><b>Measure the SAME ≥12 stakes on BOTH F1 and F2.</b> Bags give the antenna to 0.8 cm; only tape gives the <b>paint</b>. Two directions is what splits body-fixed from ground-fixed — one direction alone cannot</li>
+  <li><b>Sign convention — use a FIXED ground reference, never "left/right of travel":</b> record <span class="mono">+ = paint is EAST of the chalk</span>, <span class="mono">− = WEST</span> (line runs ~N–S, brg 192°). Same convention for both runs or the arithmetic below is meaningless. Read to the mm, tape perpendicular to the line, photo each stake with the tape in frame</li>
+  <li><b>On the spot, per stake:</b> <span class="mono">ground-fixed = (F1 + F2)/2</span> · <span class="mono">body-fixed = (F1 − F2)/2</span>. Average over the 12 → two numbers that decide the fix</li>
 </ul>
+<table>
+  <tr><th>Outcome</th><th>Means</th><th>Action (evening, NOT in field)</th></tr>
+  <tr><td><b>body-fixed dominates</b> (|F1−F2|/2 &gt; 1 cm)</td><td>lever arm / nozzle mount — matches the ±2.2 cm antenna flip</td><td><span class="mono">EKF2_GPS_POS_Y</span> + nozzle offset migrated <b>TOGETHER</b>; §3.6 xtrack-gate fix FIRST</td></tr>
+  <tr><td><b>ground-fixed dominates</b> (|F1+F2|/2 &gt; 1 cm)</td><td>placement / EKF-origin frame offset</td><td>anchor + origin conversion audit — do NOT touch <span class="mono">GPS_POS_Y</span></td></tr>
+  <tr><td>both &lt; 1 cm</td><td>paint ≠ antenna; nozzle happens to cancel it</td><td>record and leave alone — do not "fix" a null</td></tr>
+</table>
+<table>
+  <tr><th>stake #</th><th>chainage m</th><th>F1 (→) cm E+</th><th>F2 (←) cm E+</th><th>(F1+F2)/2 ground</th><th>(F1−F2)/2 body</th></tr>
+  <tr><td colspan="6" style="height:13px"></td></tr>
+  <tr><td colspan="6" style="height:13px"></td></tr>
+  <tr><td colspan="6" style="height:13px"></td></tr>
+  <tr><td><b>MEAN of 12</b></td><td></td><td></td><td></td><td><b></b></td><td><b></b></td></tr>
+</table>
 
 <table>
   <tr><th>Run</th><th>Arm</th><th>Spd c/m</th><th>RMS/max</th><th>JUMP#</th><th>Entry cm</th><th>End s</th><th>Notes</th></tr>
@@ -99,6 +115,6 @@
 
 <div class="crit"><b>FALLBACKS — every new fix has an off switch, one at a time, note which:</b> boundary stop returns → <span class="mono">transit_merge_max_len_m=0</span> · endpoint overshoots painted lines → <span class="mono">transit_runout_goal_tolerance_m=0</span> + <span class="mono">…min_speed_m_s=0</span> · paint gap at line start → <span class="mono">spray_entry_max_heading_deg=0</span> · paint during spins → keep <span class="mono">spray_heading_cut_deg=30</span> · jump guard misbehaves → old sawtooth was survivable, note &amp; continue. <b>HARD RULES:</b> QGC changes ONLY the table above, log every value · no NTRIP disable · no code edits in field · pull ALL bundles to <span class="mono">bags/01_08_2026/</span> · jetson-tests must be green before first arm.</div>
 
-<div class="foot">Done = V1–V6 green at 0.70 · T1/T2 recorded (A/B finally has data) · post-cal overspeed ≤3 % · highest clean ladder step known · tape data in hand. Evening: A/B decision · <span class="mono">EKF2_GPS_POS_Y</span> from tape · CLAUDE.md reconcile · merge. Rev 4 — 2026-08-01, targets @a54fd2d + app 4dbfeab.</div>
+<div class="foot">Done = V1–V6 green at 0.70 · T1/T2 recorded (A/B finally has data) · post-cal overspeed ≤3 % · highest clean ladder step known · <b>§4 tape done on BOTH F1 and F2, ground/body split computed on the spot</b>. Evening: A/B decision · lever-arm vs placement call from the tape split · CLAUDE.md reconcile · merge. Rev 5 — 2026-08-01, targets @a54fd2d + app 4dbfeab.</div>
 
 </div></body></html>
