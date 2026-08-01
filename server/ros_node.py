@@ -226,6 +226,16 @@ class RosBridgeNode(Node):
         # from, so callers can distinguish "continuous" from "node not reporting".
         "spray_mode": None,
         "spray_mode_state": None,
+        # Safety gate as the spray NODE sees it. `spraying` alone cannot explain
+        # a dry pass: the valve stays shut both when the geometry says "no paint
+        # here" and when a gate refuses, and only the reason string tells the
+        # operator which. None until the node is first heard from.
+        "spray_safety_ok": None,
+        "spray_safety_reason": None,
+        "spray_fsm_state": None,
+        "spray_xtrack_error_m": None,
+        "spray_gps_fix_ok": None,
+        "spray_gps_fix_name": None,
     }
 
     def __init__(self) -> None:
@@ -769,9 +779,16 @@ class RosBridgeNode(Node):
     def _cb_spray_status(self, msg: String) -> None:
         """Mirror the node's mode + mode_state from /spray/status (JSON String).
 
-        The node is the sole author; we only read `mode` and `mode_state`. A
-        malformed payload is ignored (keep last-known-good) — never crash the
-        subscription over one bad frame.
+        The node is the sole author; we mirror `mode`/`mode_state` plus the
+        safety gate it reports. A malformed payload is ignored (keep
+        last-known-good) — never crash the subscription over one bad frame.
+
+        The safety fields exist because a shut valve is ambiguous. `spraying`
+        false means "no paint", but not WHY: the geometry may simply be dry, or
+        a gate (cross-track, GPS fix, OFFBOARD) may be refusing. `safety_reason`
+        is the node's own sentence and is passed through verbatim — it names the
+        gate and, for cross-track, whether the limit came from the ROS param or
+        a per-mission override, which is what the operator needs to know to act.
         """
         try:
             data = json.loads(msg.data)
@@ -783,6 +800,12 @@ class RosBridgeNode(Node):
             self._state["spray_mode"] = data.get("mode")
             ms = data.get("mode_state")
             self._state["spray_mode_state"] = ms if isinstance(ms, dict) else {}
+            self._state["spray_safety_ok"] = data.get("safety_ok")
+            self._state["spray_safety_reason"] = data.get("safety_reason")
+            self._state["spray_fsm_state"] = data.get("fsm_state")
+            self._state["spray_xtrack_error_m"] = data.get("xtrack_error_m")
+            self._state["spray_gps_fix_ok"] = data.get("gps_fix_ok")
+            self._state["spray_gps_fix_name"] = data.get("gps_fix_name")
 
     # ── Public API: spray manual override ────────────────────────────────────
 

@@ -291,6 +291,14 @@ async def spray_status():
             "hold_active": hold_active,
             # No ROS graph → the spray node is not reporting a mode.
             "mode": None,
+            # Unknown, not "fine" — the caller must be able to tell "the gate
+            # says OK" from "nobody is reporting a gate".
+            "safety_ok": None,
+            "safety_reason": None,
+            "fsm_state": None,
+            "xtrack_error_m": None,
+            "gps_fix_ok": None,
+            "gps_fix_name": None,
         }
     s = ros_node.get_state()
     resp = {
@@ -302,6 +310,19 @@ async def spray_status():
         # Live spray mode mirrored from the node's /spray/status. None means the
         # spray node has not been heard from (not "continuous").
         "mode": s.get("spray_mode"),
+        # Why the valve is shut, straight from the spray node. `spraying: false`
+        # is ambiguous on its own — dry geometry and a refusing gate look
+        # identical — so the reason string is the only thing that lets an
+        # operator tell "working as intended" from "it will not paint". Passed
+        # through VERBATIM: it names the gate and, for cross-track, whether the
+        # limit is the ROS param or a per-mission override. Do not reformat or
+        # summarise it downstream.
+        "safety_ok": s.get("spray_safety_ok"),
+        "safety_reason": s.get("spray_safety_reason"),
+        "fsm_state": s.get("spray_fsm_state"),
+        "xtrack_error_m": s.get("spray_xtrack_error_m"),
+        "gps_fix_ok": s.get("spray_gps_fix_ok"),
+        "gps_fix_name": s.get("spray_gps_fix_name"),
     }
     # Attach the mode-specific config the node is actually running, so the app
     # can show it without a separate call. Sourced from the node's mode_state

@@ -494,3 +494,62 @@ def test_spray_status_safe_defaults_without_ros(monkeypatch):
         assert resp["hold_active"] is False
 
     asyncio.run(run())
+
+
+def test_spray_status_passes_safety_reason_through_verbatim(monkeypatch):
+    """The gate's own sentence must reach the operator unaltered.
+
+    It names the gate AND the source of the limit — "(param)" is the node's ROS
+    default, "(mission)" a per-mission override — which is the whole point: an
+    operator who cannot tell which knob refused cannot fix it. Any reformatting
+    here would strip that, so the assertion is on the exact string.
+    """
+    reason = "xtrack error 0.062m gate trip>0.080m clear<=0.050m (mission)"
+    node = FakeNode({
+        "spraying": False,
+        "spray_safety_ok": False,
+        "spray_safety_reason": reason,
+        "spray_fsm_state": "OFF_CONFIRMED",
+        "spray_xtrack_error_m": 0.062,
+        "spray_gps_fix_ok": True,
+        "spray_gps_fix_name": "RTK_FIXED",
+    })
+    monkeypatch.setattr(main, "ros_node", node)
+
+    async def run():
+        resp = await spray_status()
+        assert resp["safety_ok"] is False
+        assert resp["safety_reason"] == reason
+        assert resp["fsm_state"] == "OFF_CONFIRMED"
+        assert resp["xtrack_error_m"] == 0.062
+        assert resp["gps_fix_ok"] is True
+        assert resp["gps_fix_name"] == "RTK_FIXED"
+
+    asyncio.run(run())
+
+
+def test_spray_status_safety_unknown_is_none_not_ok(monkeypatch):
+    """Never report "safe" for a node that has not spoken.
+
+    The spray node publishes /spray/status only once it is up. Defaulting these
+    to False/"" would render as a confident "gate OK" in the app; None lets the
+    caller say "unknown" instead of asserting something it does not know.
+    """
+    monkeypatch.setattr(main, "ros_node", FakeNode({"spraying": False}))
+
+    async def run():
+        resp = await spray_status()
+        assert resp["safety_ok"] is None
+        assert resp["safety_reason"] is None
+        assert resp["gps_fix_name"] is None
+
+    asyncio.run(run())
+
+    monkeypatch.setattr(main, "ros_node", None)
+
+    async def run_no_ros():
+        resp = await spray_status()
+        assert resp["safety_ok"] is None
+        assert resp["safety_reason"] is None
+
+    asyncio.run(run_no_ros())
