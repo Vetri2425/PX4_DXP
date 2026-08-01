@@ -906,6 +906,13 @@ class StagedMissionResponse(BaseModel):
     mission_id: str
     created_at: Optional[float] = None
     anchor: Optional[dict] = None
+    # Whether this mission re-binds to its surveyed GPS anchor at start, or is
+    # driven in whatever local frame the EKF origin happens to be in. It decides
+    # WHERE the rover paints, and a LOCAL_NED fallback shows no symptom in the
+    # app, so an inspection step that cannot see it cannot catch the fallback
+    # before the mission is loaded. Optional because artifacts staged before this
+    # field existed do not carry it; absent means "not recorded", not LOCAL_NED.
+    placement_mode: Optional[str] = None
     num_waypoints: int = 0
     waypoints: list[list[float]] = Field(default_factory=list)
     spray_flags: list[bool] = Field(default_factory=list)

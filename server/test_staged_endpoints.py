@@ -191,6 +191,38 @@ async def test_plan_and_stage_then_get_staged(tmp_path, monkeypatch):
                for r in staged.segment_runs)
 
 
+async def test_get_staged_reports_placement_mode(tmp_path, monkeypatch):
+    """The inspection step must be able to see WHERE the mission will drive.
+
+    The staged artifact records placement_mode, but the GET response dropped it
+    while documenting itself as "the exact staged mission artifact". A mission
+    that quietly staged LOCAL_NED drives against whatever the EKF origin happens
+    to be — a whole-mission misplacement with no symptom in the app — and the
+    verify-before-load step had no field to catch it on.
+
+    anchor-is-not-None currently implies GPS_SURVEYED because both derive from
+    origin_gps, but that is an implementation coincidence inside _stage_mission,
+    not a contract a client should be asked to infer.
+    """
+    _setup(tmp_path, monkeypatch)
+
+    surveyed = await path_route.plan_and_stage(
+        "square.dxf",
+        PathPlanRequest(source="square.dxf", origin_gps=[37.7749, -122.4194]),
+    )
+    staged = await path_route.get_staged_mission(surveyed.mission_summary.mission_id)
+    assert staged.placement_mode == "GPS_SURVEYED"
+
+    # No anchor supplied → the mission is local, and says so rather than
+    # leaving the client to infer it from a null anchor.
+    local = await path_route.plan_and_stage(
+        "square.dxf", PathPlanRequest(source="square.dxf")
+    )
+    staged_local = await path_route.get_staged_mission(local.mission_summary.mission_id)
+    assert staged_local.placement_mode == "LOCAL_NED"
+    assert staged_local.anchor is None
+
+
 async def test_staged_metadata_carries_source_detail_for_the_recorder(
     tmp_path, monkeypatch
 ):

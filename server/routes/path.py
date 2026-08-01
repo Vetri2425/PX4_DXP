@@ -2694,6 +2694,7 @@ async def get_staged_mission(mission_id: str):
         mission_id=staged.get("mission_id", safe_id),
         created_at=staged.get("created_at"),
         anchor=staged.get("anchor"),
+        placement_mode=staged.get("placement_mode"),
         num_waypoints=len(wp_out),
         waypoints=wp_out,
         spray_flags=[bool(f) for f in spray_flags],
