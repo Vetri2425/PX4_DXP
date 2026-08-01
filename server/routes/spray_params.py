@@ -163,7 +163,25 @@ SPRAY_PARAM_SCHEMA: dict[str, dict] = {
         "type": "float",
         "default": 0.05,
         "group": "Distance-Aware Spray",
-        "description": "Spray is suppressed when rover speed falls below this (m/s). Prevents static over-spray",
+        # 2026-08-01: this described a gate that DOES NOT EXIST. The text read
+        # "Spray is suppressed when rover speed falls below this" — but the
+        # speed gate was removed deliberately (see the param's declaration in
+        # src/spray_controller_node.py): a bare `speed < 0.05` collided with the
+        # frozen RPP corner speeds (brake cap 0.08, min corner 0.08, endpoint
+        # approach 0.03), so it dithered — 157 valve transitions where the
+        # geometry asked for 25 — and made endpoint approach structurally
+        # unsprayable. `test_min_spray_speed_param_is_inert` pins that it has no
+        # authority. A parameter that READS protective and is not is worse than
+        # a missing one: an operator checking params would believe they were
+        # covered. The value is retained only for the server/UI contract.
+        "description": (
+            "INERT — has no effect. Kept only for the settings contract. The "
+            "speed gate it names was removed (it dithered across the RPP corner "
+            "speeds: 157 valve fires where geometry asked for 25). Spraying "
+            "while stationary is suppressed by spray_off_during_pivot instead, "
+            "which is a discrete state and cannot dither. Slow means thin (flow "
+            "control), never off."
+        ),
         "min": 0.0,
         "max": 1.0,
     },

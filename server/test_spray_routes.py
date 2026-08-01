@@ -553,3 +553,32 @@ def test_spray_status_safety_unknown_is_none_not_ok(monkeypatch):
         assert resp["safety_reason"] is None
 
     asyncio.run(run_no_ros())
+
+
+def test_min_spray_speed_param_is_advertised_as_inert():
+    """The settings UI must not promise a gate that does not exist.
+
+    2026-08-01: this param's description read "Spray is suppressed when rover
+    speed falls below this (m/s). Prevents static over-spray". Nothing consumes
+    the value — the speed gate was removed deliberately because a bare
+    `speed < 0.05` dithered across the frozen RPP corner speeds (157 valve
+    transitions where the geometry asked for 25) and made the 0.03 m/s endpoint
+    approach structurally unsprayable. src/test_spray_pivot_gate.py pins that it
+    has no authority; this pins that we no longer TELL the operator otherwise.
+
+    A parameter that reads protective and is not is worse than a missing one.
+    """
+    from routes.spray_params import SPRAY_PARAM_SCHEMA
+
+    desc = SPRAY_PARAM_SCHEMA["min_spray_speed_mps"]["description"]
+    assert "INERT" in desc, "the inertness must be stated up front"
+    assert "suppressed when rover speed falls below" not in desc, (
+        "restored a description of a gate that does not exist"
+    )
+    # And it must point at what actually does the job.
+    assert "spray_off_during_pivot" in desc
+
+    # The one that IS live must keep describing a real gate, so the test cannot
+    # pass by blanket-neutering every description.
+    xtrack = SPRAY_PARAM_SCHEMA["max_xtrack_error_m"]["description"]
+    assert "suppressed" in xtrack.lower()

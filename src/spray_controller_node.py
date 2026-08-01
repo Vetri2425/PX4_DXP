@@ -731,6 +731,15 @@ class SprayControllerNode(Node):
         # transitions where the path geometry asked for 25 -- 132 spurious
         # fires, all of them explained by this one comparison. It also made
         # endpoint approach (0.03) structurally unsprayable.
+        # ⚠ INERT — DECLARED BUT NEVER READ. Nothing consumes this value; the
+        # only other mention in this file is the note at the old gate site. It
+        # is kept solely so the server/UI settings contract does not change, and
+        # `test_min_spray_speed_param_is_inert` pins that it has no authority.
+        # Do NOT wire it back up as a bare threshold — that is the exact change
+        # that produced the 132 spurious fires described above. If stationary
+        # spraying needs suppressing, use a DISCRETE signal (as
+        # spray_off_during_pivot does); a threshold on a quantity the rover
+        # deliberately crawls across will always dither.
         self.declare_parameter("min_spray_speed_mps", 0.05)
         # Replacement for the speed gate: suppress spray only while the rover
         # is pivoting in place, which is the actual thing we needed to avoid
