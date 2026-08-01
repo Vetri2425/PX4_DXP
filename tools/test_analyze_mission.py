@@ -20,6 +20,8 @@ import struct
 import sys
 import unittest
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import analyze_mission as am  # noqa: E402
 
@@ -707,3 +709,94 @@ class TestMarkingGate(unittest.TestCase):
 # suite happened to be run under pytest.
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ── 2026-08-01: the two defects that made the analyser lie in BOTH directions ──
+#
+# Bag stg_9ecf2985 (2026-08-01 15:47) overshot its endpoint by 54.6 cm and this
+# analyser reported "worst coast-past 0.0cm ... verdict PASS", while grading the
+# whole run WARN on nine OFFBOARD "drops" that never happened. The 51 tests above
+# all passed against that code, so neither defect had any coverage.
+
+def _overshoot_series(overshoot_m):
+    """Rover drives a 3 m north line, passes the endpoint, rests `overshoot_m`
+    past it — the exact shape that made the endpoint search run off the end."""
+    path = [(i * 0.1, 0.0) for i in range(31)]          # 0 .. 3.0 m north
+    s = am.Series()
+    s.path = list(path)
+    s.paths = [(0.0, list(path))]
+    driven = [(i * 0.02, 0.0) for i in range(int(3.0 / 0.02) + 1)]
+    n = 3.0
+    while n < 3.0 + overshoot_m:
+        n += 0.02
+        driven.append((n, 0.0))
+    driven += [(3.0 + overshoot_m, 0.0)] * 25           # comes to rest, stays there
+    s.pose = [(i * 0.05, nn, ee, 0.0) for i, (nn, ee) in enumerate(driven)]
+    s.seg = [(0.0, am.S_DONE, 0.0)]
+    return s
+
+
+def test_large_overshoot_is_measured_not_dropped():
+    """THE REGRESSION. Resting beyond DEPART_M must not delete the measurement.
+
+    The endpoint arrival used to anchor on "the last sample beyond DEPART_M";
+    when the rover RESTS past that, the final sample matched, the search index
+    ran off the end, and `continue` dropped the stop. Pinned well beyond
+    DEPART_M so a re-introduction cannot hide.
+    """
+    st = am.analyze_stops(_overshoot_series(0.55))
+    assert st["count"] == 1, f"stop was dropped: {st}"
+    assert st["endpoint_resting_cm"] == pytest.approx(55.0, abs=1.5)
+    assert st["worst_coast_cm"] == pytest.approx(55.0, abs=1.5), \
+        "coast must not be capped at DEPART_M on the endpoint"
+    assert st["verdict"] == "FAIL"
+
+
+def test_unmeasurable_stop_is_never_a_pass():
+    """A run that never reaches the point must read UNAVAILABLE, not PASS.
+
+    With no stops, worst_coast stays 0.0 and resting is None, so the verdict
+    expression produced a confident PASS out of an empty list.
+    """
+    path = [(i * 0.1, 0.0) for i in range(31)]
+    s = am.Series()
+    s.path = list(path); s.paths = [(0.0, list(path))]
+    s.pose = [(i * 0.05, i * 0.02, 0.0, 0.0) for i in range(50)]   # stops at 1 m of 3
+    st = am.analyze_stops(s)
+    assert st["count"] == 0
+    assert st["verdict"] == "UNAVAILABLE", "empty measurement must not grade PASS"
+    assert st["endpoint_measured"] is False
+    assert st["unmeasured"], "the skipped stop must be reported, not silent"
+
+
+def test_offboard_drops_count_transitions_not_samples():
+    """MAVROS republishes latched State; only a real edge is a drop.
+
+    Nine duplicate MANUAL samples BEFORE the rover ever entered OFFBOARD scored
+    nine 'drops' and were the sole reason a run graded WARN.
+    """
+    s = am.Series()
+    s.state = ([(0.30 + i * 0.001, "MANUAL", True) for i in range(9)]
+               + [(0.32, "OFFBOARD", True)]
+               + [(1.0 + i, "OFFBOARD", True) for i in range(27)])
+    h = am.analyze_health(s)
+    assert h["offboard_drops"] == 0, f"phantom drops: {h['events']}"
+    assert h["verdict"] == "PASS"
+
+
+def test_a_real_offboard_drop_is_still_caught():
+    """The fix must not blind the detector to the thing it exists for."""
+    s = am.Series()
+    s.state = ([(float(i), "OFFBOARD", True) for i in range(10)]
+               + [(10.0 + i, "HOLD", True) for i in range(5)]      # ONE real edge
+               + [(20.0 + i, "OFFBOARD", True) for i in range(5)])
+    h = am.analyze_health(s)
+    assert h["offboard_drops"] == 1, f"expected exactly one edge, got {h['events']}"
+    assert h["verdict"] == "WARN"
+
+
+def test_mode_change_while_disarmed_is_not_a_drop():
+    """Leaving OFFBOARD disarmed is the operator, not a failsafe."""
+    s = am.Series()
+    s.state = [(0.0, "OFFBOARD", False), (1.0, "MANUAL", False), (2.0, "MANUAL", False)]
+    assert am.analyze_health(s)["offboard_drops"] == 0

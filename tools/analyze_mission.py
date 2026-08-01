@@ -889,6 +889,7 @@ def analyze_stops(s: Series) -> dict:
         return {"available": False, "reason": "no pose samples"}
     rover = [(n, e) for (_t, n, e, _y) in s.pose]
     stops = []
+    unmeasured = []
     worst_coast = 0.0
     verts = s.path
     # A "stop" is a point where the rover is meant to halt: a corner (path
@@ -902,21 +903,42 @@ def analyze_stops(s: Series) -> dict:
         bn, be = verts[idx]
         dists = [math.hypot(n - bn, e - be) for (n, e) in rover]
         is_endpoint = (idx == last_idx)
-        # Arrival index. For the ENDPOINT this must be the arrival on the FINAL
+        # Arrival index = the START of the LAST contiguous run of samples inside
+        # the arrival band. For the ENDPOINT this must be the arrival on the FINAL
         # approach, not the first time the rover was ever near the point: on a
         # there-and-back shape the rover starts parked beside its own endpoint, so
-        # a first-ever match lands at t≈0 and every window below then spans the
-        # whole mission. Anchor to the last departure beyond DEPART_M first.
-        search_from = 0
-        if is_endpoint:
-            for i in range(len(dists) - 1, -1, -1):
-                if dists[i] > DEPART_M:
-                    search_from = i + 1
-                    break
-        i_arrive = next((i for i in range(search_from, len(dists))
-                         if dists[i] <= STOP_APPROACH_CM / 100.0), None)
+        # a first-ever match lands at t≈0 and every window below spans the whole
+        # mission.
+        #
+        # 2026-08-01: this used to anchor on "the last sample beyond DEPART_M",
+        # which SILENTLY DROPPED the stop whenever the rover came to rest further
+        # than DEPART_M past the point — i.e. exactly when the overshoot was
+        # worst. The final sample then satisfied the backward scan, search_from
+        # ran off the end of the array, i_arrive was None, and `continue` deleted
+        # the measurement. With the empty list the section reported
+        # "worst coast-past 0.0cm ... PASS". Measured on 2026-08-01: every run
+        # overshooting more than DEPART_M (+54.6, +56.2, -26.9 cm) reported
+        # count=0/PASS, while every run under it (+11.8, +9.7, +6.0 cm) reported
+        # the correct value. The analyser was blind in proportion to the fault.
+        #
+        # Taking the last contiguous in-band run keeps the there-and-back intent
+        # (the final pass wins) and also handles a pass-through: the rover enters
+        # the band, sails past, and `coast` is measured forward from that entry.
+        band = STOP_APPROACH_CM / 100.0
+        i_arrive = None
+        for i in range(len(dists) - 1, -1, -1):
+            if dists[i] <= band:
+                i_arrive = i
+            elif i_arrive is not None:
+                break  # walked off the front of the last in-band run
         if i_arrive is None:
-            continue  # never got close enough to call it a stop
+            # Genuinely never entered the band (e.g. an aborted run that stopped
+            # short). Record it as unmeasured rather than dropping it silently —
+            # a missing stop must not read as a clean one.
+            unmeasured.append({"vertex": idx, "is_endpoint": is_endpoint,
+                               "closest_cm": round(min(dists) * 100, 1),
+                               "reason": f"never within {STOP_APPROACH_CM:.0f} cm"})
+            continue
         # incoming travel direction (unit) into this stop — "past the corner" is
         # the forward projection along it. At a 90° corner the perpendicular
         # departure contributes ~0, so this isolates the true overshoot (unlike a
@@ -926,9 +948,19 @@ def analyze_stops(s: Series) -> dict:
         um = math.hypot(un, ue) or 1.0
         un, ue = un / um, ue / um
         # local window: from arrival until the rover clearly departs (> DEPART_M).
+        #
+        # A CORNER legitimately drives on to the next segment, so the window must
+        # close or `coast` just measures the next side. The ENDPOINT has no next
+        # segment — the rover is supposed to halt — so closing the window at
+        # DEPART_M silently CAPS the reported overshoot near 30 cm: bag
+        # stg_9ecf2985 coasted 54.8 cm and reported 29.8. Run the endpoint window
+        # to the end of the data so the headline number matches reality.
         j = i_arrive
-        while j < len(dists) and dists[j] <= DEPART_M:
-            j += 1
+        if is_endpoint:
+            j = len(dists)
+        else:
+            while j < len(dists) and dists[j] <= DEPART_M:
+                j += 1
         coast = 0.0
         for i in range(i_arrive, max(i_arrive + 1, j)):
             n, e = rover[i]
@@ -965,9 +997,19 @@ def analyze_stops(s: Series) -> dict:
     resting_cm = next((e["resting_cm"] for e in stops if e.get("is_endpoint")), None)
     resting_bad = resting_cm is not None and resting_cm > FINAL_STOP_MAX_CM
     verdict = ("FAIL" if (worst_coast > COAST_MAX_CM / 100.0 or resting_bad) else "PASS")
+    # Absence of evidence is not evidence of absence (same rule as §6 health).
+    # A stop the analyser could not measure must never render as a stop it
+    # measured and liked: with an empty list, worst_coast stays 0.0 and
+    # resting_cm is None, so the expression above produced a confident PASS.
+    if not stops:
+        verdict = "UNAVAILABLE"
+    elif unmeasured:
+        verdict = "PARTIAL" if verdict == "PASS" else verdict
     return {"available": True, "count": len(stops), "stops": stops,
+            "unmeasured": unmeasured,
             "worst_coast_cm": round(worst_coast * 100, 1),
             "endpoint_resting_cm": resting_cm,
+            "endpoint_measured": resting_cm is not None,
             "reached_done": saw_done, "verdict": verdict}
 
 
@@ -1021,10 +1063,25 @@ def analyze_spray(s: Series) -> dict:
 
 def analyze_health(s: Series) -> dict:
     events = []
-    # OFFBOARD drops — mode leaves OFFBOARD while armed
+    # OFFBOARD drops — a TRANSITION out of OFFBOARD while armed.
+    #
+    # 2026-08-01: this counted every SAMPLE whose mode != OFFBOARD, but MAVROS
+    # republishes the latched State, so a pre-mission MANUAL burst scored one
+    # "drop" per republish. Bag stg_9ecf2985 reported "OFFBOARD drops 9" from
+    # nine duplicate MANUAL samples at t=0.31 — all BEFORE the rover ever entered
+    # OFFBOARD at t=0.32, after which it held for the whole 28 s run. Those nine
+    # phantoms were the sole `worst_offenders` entry and the only reason the run
+    # graded WARN, while a real 54.6 cm endpoint overshoot graded PASS.
+    #
+    # Only a real OFFBOARD -> other edge counts, and only once armed: leaving
+    # OFFBOARD while disarmed is not a failsafe event, it is the operator.
+    prev_mode = None
     for (t, mode, armed) in s.state:
-        if armed and mode and mode != "OFFBOARD":
-            events.append({"t": round(t, 2), "kind": "offboard_drop", "detail": f"mode={mode}"})
+        if mode and armed and prev_mode == "OFFBOARD" and mode != "OFFBOARD":
+            events.append({"t": round(t, 2), "kind": "offboard_drop",
+                           "detail": f"OFFBOARD -> {mode}"})
+        if mode:
+            prev_mode = mode
     # setpoint-stream gaps > 0.5 s
     max_gap = 0.0
     gaps = 0
@@ -1652,8 +1709,17 @@ def _fmt_report(a: dict) -> str:
             extra = f"  resting {e['resting_cm']}cm" if "resting_cm" in e else ""
             line(f"   {tag:11s} closest {e['closest_cm']}cm  coast-past {e['coast_past_cm']}cm"
                  f"  dwell {e['dwell_s']}s{extra}")
+        for u in st.get("unmeasured", []):
+            tag = "endpoint" if u["is_endpoint"] else f"vertex {u['vertex']}"
+            line(f"   {tag:11s} NOT MEASURED — {u['reason']} (closest {u['closest_cm']}cm)")
+        if not st.get("stops"):
+            line(f"   ⚠ NO STOP WAS MEASURED — this is NOT a pass. The rover never")
+            line(f"     entered the {STOP_APPROACH_CM:.0f} cm band around any stop point,")
+            line(f"     or the run was aborted. Decode the bag before trusting anything here.")
+        rest = st.get("endpoint_resting_cm")
+        rest_s = f"{rest}cm" if rest is not None else "NOT MEASURED"
         line(f"   worst coast-past {st['worst_coast_cm']}cm  "
-             f"endpoint resting {st.get('endpoint_resting_cm')}cm  DONE={st['reached_done']}  "
+             f"endpoint resting {rest_s}  DONE={st['reached_done']}  "
              f"verdict {st['verdict']}  (coast ≤ {COAST_MAX_CM}cm, resting ≤ {FINAL_STOP_MAX_CM}cm)")
     else:
         line(f"   WARN — {st.get('reason', 'unavailable')}")
@@ -2036,6 +2102,12 @@ def analyze(root: str, survey_tol_cm: float | None = None,
     if _xt_block and _xt_block["rms_cm"] > XTRACK_PROD_CM:
         offenders.append(
             f"tracking RMS ({_xt_label}) {_xt_block['rms_cm']}cm > {XTRACK_PROD_CM}cm")
+    # An unmeasured stop is an offender in its own right — silence here is what
+    # let a 54.6 cm overshoot grade PASS on 2026-08-01.
+    if stops.get("available") and not stops.get("stops"):
+        offenders.append("NO stop measured — endpoint accuracy is UNKNOWN, not good")
+    elif stops.get("available") and stops.get("unmeasured"):
+        offenders.append(f"{len(stops['unmeasured'])} stop(s) not measured")
     if stops.get("available") and stops["worst_coast_cm"] > COAST_MAX_CM:
         offenders.append(f"coast-past {stops['worst_coast_cm']}cm > {COAST_MAX_CM}cm")
     if stops.get("available") and (stops.get("endpoint_resting_cm") or 0) > FINAL_STOP_MAX_CM:
