@@ -272,13 +272,17 @@ class RPPControllerNode(Node):
         # Tune mission_speed per job to further cap; this is the hw ceiling.
         self.declare_parameter("max_linear_vel",                      0.8)
         self.declare_parameter("min_linear_vel",                      0.15)
-        # 1.5 m arc baseline:
-        # k_path = 1/1.5 = 0.667 1/m, curvature floor below enforces
-        # Ld >= 0.35 / k_path = 0.525 m. Keep the explicit minimum aligned
-        # with that floor so the debugged Ld is stable and predictable.
-        self.declare_parameter("min_lookahead_dist",                  0.52)
+        # Field A/B 2026-08-01 (stg_30dd5bf8 / stg_a456f3a7): 0.35 + a 1.0 s
+        # lookahead_time make Ld genuinely speed-scaled — ~0.35 m during the
+        # entry accel ramp (converges the post-pivot offset inside the 0.5 m
+        # pre-extension) and v·1.0 at cruise. Line RMS 0.66–0.98 cm at 0.6 m/s
+        # vs 1.2–1.9 with the old constant 0.52/1.6 (pinned Ld = 0.56).
+        # Arcs are unaffected: the curvature floor below still enforces
+        # Ld >= 0.35 / k_path (0.525 m on the 1.5 m arc baseline), so this
+        # minimum only bites on straights and entry ramps.
+        self.declare_parameter("min_lookahead_dist",                  0.35)
         self.declare_parameter("max_lookahead_dist",                  1.0)
-        self.declare_parameter("lookahead_time",                      1.6)
+        self.declare_parameter("lookahead_time",                      1.0)
 
         # Curvature regulation — lateral acceleration constraint (P4.1)
         # v_lat_limit = sqrt(a_lat_max / |kappa|); physically correct form.
@@ -724,10 +728,12 @@ class RPPControllerNode(Node):
         # Roads/large fields: 1.0 m/s  |  Sports fields/tight marking: 0.3–0.5 m/s
         # 0.35 -> 0.50 -> 0.70 (2026-08-01): field-test default, after
         # RO_SPEED_LIM was raised in QGC (it clamped every run to 0.30 m/s).
-        # Braking from 0.7 is 0.70 m, so approach_velocity_scaling_dist moves
-        # 0.6 -> 0.9 with it — otherwise the goal ramp starts inside the
-        # stopping distance and the rover overshoots the endpoint.
-        self.declare_parameter("mission_speed",                       0.70)  # m/s
+        # Braking distance is derived dynamically from this speed, so
+        # approach_velocity_scaling_dist keeps its 0.9 m floor either way.
+        # Default 0.5 set 2026-08-01: the 0.35–0.6 band is field-validated
+        # (0.6 gave sub-1 cm line RMS with the speed-scaled lookahead above);
+        # 0.5 is the conservative middle until the 0.8 rung is tested.
+        self.declare_parameter("mission_speed",                       0.5)  # m/s
 
         # P4.2 — Deceleration limit used ONLY for braking-distance derivation.
         # Separate from max_linear_accel because the accel ramp is one-way
