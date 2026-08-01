@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Field Checklist 2026-08-02 Rev 1 — Deploy Upgrade_speed + Defaults Smoke + 0.8 Rung + THE TAPE + Spray Prep</title>
+<style>
+  @page { size: A4 portrait; margin: 8mm; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:#14171c;
+         font-size: 9.2px; line-height: 1.22; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .page { width: 194mm; height: 281mm; margin: 0 auto; display: flex; flex-direction: column; }
+  h1 { font-size: 12.5px; } h2 { font-size: 10px; background:#14171c; color:#fff; padding:2px 6px; margin:3px 0 2px; }
+  h2 .t { float:right; font-weight:400; font-size:8.6px; opacity:.85; }
+  .hdr { display:flex; justify-content:space-between; align-items:baseline; border-bottom:2px solid #14171c; padding-bottom:2px; }
+  .hdr .meta { font-size: 8.6px; text-align:right; }
+  .done { background:#e8f5e9; border:1px solid #2e7d32; padding:2px 5px; margin:2px 0; font-size:8.9px; }
+  ul { list-style:none; } li { margin:1px 0; padding-left:13px; position:relative; }
+  li::before { content:"☐"; position:absolute; left:0; font-size:10px; }
+  li.note::before { content:"→"; }
+  b.k { background:#eef; padding:0 3px; border-radius:2px; font-family:Menlo,monospace; font-size:8.5px; font-weight:600;}
+  table { width:100%; border-collapse:collapse; margin:2px 0; }
+  th,td { border:1px solid #999; padding:1px 3px; font-size:8.6px; text-align:left; }
+  th { background:#e8e8e8; }
+  .warn { background:#fff3cd; border:1px solid #d4a017; padding:2px 5px; margin:2px 0; font-size:8.9px; }
+  .crit { background:#fdecec; border:1px solid #c0392b; padding:2px 5px; margin:2px 0; font-size:8.9px; }
+  .foot { margin-top:auto; border-top:2px solid #14171c; padding-top:2px; font-size:8.4px; }
+  .mono { font-family:Menlo,monospace; font-size:8.3px; }
+</style>
+</head>
+<body><div class="page">
+
+<div class="hdr">
+  <h1>FIELD DAY 2026-08-02 — Rev 1 (after the sub-1 cm evening)</h1>
+  <div class="meta">Deploy target: Jetson → <b class="k">Upgrade_speed @cfbf5f3</b> (currently on deleted-branch checkout <span class="mono">@1cb229f</span>)<br>
+  Defaults smoke · 0.8 rung · <b>BOTH-DIRECTION TAPE (5th day — non-negotiable)</b> · spray-node prep</div>
+</div>
+
+<div class="done"><b>✅ WON 08-01 evening (bag-verified, n=3+3+3):</b> lookahead retune <span class="mono">minL 0.35 / Ltime 1.0</span> made L speed-adaptive → line RMS <b>0.66 / 0.66 / 0.98 cm @0.6 m/s</b> (was 1.2–1.9 @0.35), spray-ON <b>0.33–1.14 cm</b> off the surveyed stake, curve @0.6 RMS 1.56 (n=1, no regression) · encoder fusion OFF (<span class="mono">EKF2_WENC_CTRL=0</span>, small pivot win, no cost) · entry mechanism proven: at old constant L=0.56 the 0.5 m extension converged NOTHING · defaults promoted <span class="mono">cfbf5f3</span> = new <span class="mono">baseline_master</span>; branch <b class="k">Upgrade_speed</b> is active; GitHub default switched; <span class="mono">main</span> archived.</div>
+
+<div class="crit"><b>⚠ THE VEHICLE HAS NEVER RUN cfbf5f3.</b> Jetson is on the old fix-branch checkout with <b>runtime</b> params. Any <span class="mono">rpp-pipeline</span> restart before §0 reverts the live node to OLD defaults (0.52/1.6/0.70) and the sub-1 cm behaviour silently disappears. <b>Do §0 before touching anything else — including before re-staging missions.</b></div>
+
+<h2>0 · DEPLOY FIRST — Upgrade_speed on the Jetson <span class="t">~25 min, no driving</span></h2>
+<ul>
+  <li><b>Git:</b> <span class="mono">ssh flash@192.168.1.102 'cd ~/PX4_DXP && git fetch && git checkout Upgrade_speed && git log --oneline -1'</span> → must print <b class="k">cfbf5f3</b></li>
+  <li><b>Services:</b> <span class="mono">sudo systemctl restart px4-dxp</span> (cascades rpp-pipeline, ~11 s) → <span class="mono">sudo systemctl restart rover-server</span> → all three <span class="mono">active</span></li>
+  <li><b>NTRIP ritual (dies with every rover-server restart):</b> re-login in app (tokens die too) → <span class="mono">POST /api/rtk/ntrip/start</span> (caster.emlid.com:2101/MP23960, creds in <span class="mono">config/ntrip.env</span>) → outdoors: <b>RTK_FIXED before first arm</b>. <span class="mono">ntrip.service</span> is a dead end — never use it</li>
+  <li><b>Tests:</b> <b class="k">make jetson-tests</b> — the 482-test src suite has <b>NOT run on cfbf5f3</b>. Server suite passed on Mac (397)</li>
+  <li><b>Defaults readback (no runtime sets!):</b> <span class="mono">ros2 param get /rpp_controller min_lookahead_dist lookahead_time mission_speed</span> → <b>0.35 / 1.0 / 0.5</b>. If wrong → STOP, the deploy didn't take</li>
+  <li><b>V11 defaults smoke:</b> 1 run of the standard 3.3 m line, ZERO runtime params. Bag <span class="mono">debug[13]/[15]/[38]</span> = 0.35/1.0/0.5 · RMS ≤ 1.2 · entry ≤ 1.5 cm. <b>This closes D6 and unblocks the baseline_master merge confidence</b></li>
+</ul>
+
+<h2>1 · SPEED — finish the ladder <span class="t">6 runs, ~40 min</span></h2>
+<table>
+  <tr><th>Gate</th><th>Reference (08-01)</th><th>PASS today</th><th>✓</th></tr>
+  <tr><td>V12 0.5 (default) line ×3</td><td>0.35: 1.2–1.5 · 0.6: 0.66–0.98</td><td>RMS ≤ 1.1, entry ≤ 1.5 cm</td><td></td></tr>
+  <tr><td>V13 0.8 rung ×3 (runtime <span class="mono">mission_speed 0.8</span>)</td><td>untested — accel 0.91 m ≈ 2× pre-ext</td><td>characterise: entry offset, RMS, terminal wiggle; keep-or-cap decision vs 0.6</td><td></td></tr>
+  <tr><td>V14 terminal band (last 0.5 m painted, all runs)</td><td>−2…−3.7 cm @0.35 · smaller @0.6</td><td>record per speed — D3 lever decision needs this curve</td><td></td></tr>
+  <tr><td>V15 curve @0.5 default ×1 (bonus)</td><td>0.6 gave 1.56 (n=1)</td><td>≤ 1.8 — makes the curve clearance n=2</td><td></td></tr>
+</table>
+<ul>
+  <li class="note"><b>Judge 0.8 honestly:</b> paint opens at ~0.66 m/s still accelerating — an entry cost there is the speed's cost, not a config failure. Decision recorded in the register (D7)</li>
+  <li class="note">If any V13 run rings in the last 2 m worse than −4 cm while spraying → stop the ladder, 0.6 stays the ceiling, D3 gets priority</li>
+</ul>
+
+<h2>2 · THE TAPE — both directions, the deciding measurement <span class="t">~30 min, 5th day owed</span></h2>
+<div class="warn"><b>Nothing in any bag substitutes for this.</b> 08-01 signed-bias: NE runs lean right (4/4), SW runs scatter left-of-zero — both toward the <b>same SE ground side</b> (slope/antenna-lean, roll 2–3° constant). Local xtrack and the analyzer are structurally half-blind to it. Blocks <span class="mono">EKF2_GPS_POS_Y</span> (B3), closes or convicts B1's residual, and is B5 itself.</div>
+<ul>
+  <li>Paint the standard line N→S and S→N (separate chalk rows if they overlap), RTK_FIXED, extensions on</li>
+  <li>Tape BOTH runs against the stake line at 5+ stations each, <b>record signed offset + direction of travel</b></li>
+  <li>Body-fixed lever arm: sign flips with direction · ground-frame lean: sign fixed to the ground side · placement: both runs offset the same way vs stakes but agree with each other</li>
+  <li>While parked aligned on the line (before leaving): read heading vs surveyed bearing → B1 residual (target &lt;0.5°)</li>
+  <li class="note">Verdict → register: B5 closes; B3 gets a measured Y (enter in QGC on Mac, never from Jetson); B1 closes or gets a number</li>
+</ul>
+
+<h2>3 · SPRAY-NODE TUNING PREP <span class="t">~20 min, bench ok</span></h2>
+<ul>
+  <li>A6 gate: spray plan <b>Rev 4</b> must exist before any node code change (contract stale vs <span class="mono">6523a84</span>) — draft it from today's spray-ON/OFF numbers (0.33–2.04 cm vs stakes @0.6)</li>
+  <li>Measure nozzle forward + lateral offset from the antenna with the tape while the rover is stationary (B4 input; <b>do not</b> enter non-zero offsets before the §3.6 xtrack-gate fix)</li>
+  <li>C6 formal close: one deliberate pivot-adjacent spray check — valve must stay shut through the pivot (15/15 clean so far)</li>
+  <li>F4 only if time: extension-less 2-pt line ×2 — does the valve still open stationary? (165426 signature)</li>
+</ul>
+
+<h2>4 · CARRY RULES — read before the first arm</h2>
+<ul>
+  <li class="note"><b>Runtime params:</b> after §0, ZERO runtime sets are needed for 0.5. Only V13 uses one (<span class="mono">mission_speed 0.8</span>) — and the app's param push can silently revert it between missions (D5): <b>trust only the bag's debug[38]</b></li>
+  <li class="note"><b>Check <span class="mono">armed</span> before any restart</b> — restarting rpp-pipeline mid-OFFBOARD disarms via failsafe (NAV_RCL/DLL_ACT=6)</li>
+  <li class="note"><b>xy_goal_tolerance stays 0.02</b> — 0.01 deadlocked the paint-start boundary for 50 s (D4, bag 200257). Per-leg tolerance is a code task, not a field knob</li>
+  <li class="note">Staged missions expire in 1 h — stage at drive time; start by <span class="mono">mission_id</span>, never <span class="mono">path_name</span></li>
+  <li class="note">GPSRAW is 2–8 cm off <span class="mono">global</span> while moving — never gate or judge on it; never on <span class="mono">eph</span></li>
+</ul>
+
+<div class="foot">
+<b>FCU (QGC on Mac is source of truth; read live, never this sheet):</b> RO_MAX_THR_SPEED 1.28 (calibration — raise to go slower) · RO_SPEED_LIM 0.7 <b>⚠ raise to 0.9 before V13</b> · RO_YAW_P 1.5 · RO_YAW_RATE_LIM 22 · EKF2_GPS_YAW_OFF 180 · <b>EKF2_WENC_CTRL 0</b> (encoder off since 08-01) · PWM_AUX_MAX1 15000
+&nbsp;·&nbsp; <b>Bags:</b> Jetson <span class="mono">~/bags_jet/</span>, pull by stage id · analyse with <span class="mono">tools/analyze_mission.py</span> + skill <span class="mono">analyse-missions</span>
+&nbsp;·&nbsp; <b>Register:</b> <span class="mono">docs/BUG_CLOSURE_CHECKLIST.md</span> Rev 08-01 — D-series is today's targets (D6 §0 · D7 §1 · B5/B3/B1 §2 · A6/B4/C6/F4 §3)
+</div>
+
+</div></body>
+</html>
