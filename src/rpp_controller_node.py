@@ -3748,7 +3748,7 @@ class RPPControllerNode(Node):
             speed = max(min_corner_speed, max_v * scale)
             self._segment_state = SegmentStateCode.PRE_CORNER_SLOWDOWN
 
-        # Final-segment goal-approach deceleration.
+        # Goal-approach deceleration into the END OF THE RUN.
         # The corner slowdown above is gated to NON-final segments, so a
         # straight line used to drive at full speed into its endpoint B and
         # only zero velocity once within xy_goal_tolerance — arriving fast, it
@@ -3756,36 +3756,61 @@ class RPPControllerNode(Node):
         # (see _control) so the rover brakes to a low speed before B and stops
         # ON the point. This also tightens run-to-run corner overshoot, since
         # a run endpoint is a final segment too.
-        if final_segment:
-            max_decel = float(self.get_parameter("max_linear_decel").value)
-            # Run-endpoint floor (see param decl): lower than the smooth/arc
-            # min_approach_linear_velocity so the rover arrives slow enough for
-            # active braking to stop ON the corner point, not 4 cm past it.
-            approach_v = float(self.get_parameter("segment_endpoint_approach_speed").value)
-            approach_d = max(
-                float(self.get_parameter("approach_velocity_scaling_dist").value),
-                (max_v * max_v) / (2.0 * max_decel) + 0.10,
+        #
+        # 2026-08-01: measured against the distance remaining to the RUN END,
+        # not to the end of the CURRENT segment.
+        #
+        # `final_segment and dist_to_corner` silently clipped this deceleration
+        # zone to the length of whatever the last segment happened to be. That
+        # was harmless while the run-out was its own run, but a54fd2d fuses a
+        # short transit tail into the mark (correctly — it removed the double
+        # stop at every mark start), which made the 0.1 m run-out the final
+        # segment. approach_d is sized 0.9 m; the ramp got 0.1 m of it, so the
+        # 2.337 m mark ahead of it was driven at full command to within 6 cm of
+        # its end. Bag stg_9ecf2985 (2026-08-01 15:47): entered the run-out at
+        # 0.79 m/s and stopped 54.6 cm past the goal, 64.6 cm past the paint.
+        #
+        # The corner slowdown above is gated to NON-final segments and to a
+        # real heading change, so a collinear 0 deg mark->run-out joint raises
+        # nothing there either — the run end is the only thing that can.
+        max_decel = float(self.get_parameter("max_linear_decel").value)
+        # Run-endpoint floor (see param decl): lower than the smooth/arc
+        # min_approach_linear_velocity so the rover arrives slow enough for
+        # active braking to stop ON the corner point, not 4 cm past it.
+        approach_v = float(self.get_parameter("segment_endpoint_approach_speed").value)
+        approach_d = max(
+            float(self.get_parameter("approach_velocity_scaling_dist").value),
+            (max_v * max_v) / (2.0 * max_decel) + 0.10,
+        )
+        # Take the SMALLER of the two measures. Normally the along-run
+        # remaining distance is what fires (it crosses segment boundaries
+        # freely); if the progress cache is unusable it is None and this
+        # degrades to exactly the previous final-segment behaviour rather
+        # than to no endpoint braking at all.
+        approach_ref = dist_to_corner if final_segment else float("inf")
+        remaining_along = self._run_remaining_along()
+        if remaining_along is not None:
+            approach_ref = min(approach_ref, remaining_along)
+        if approach_ref < approach_d:
+            scale = self._clamp(approach_ref / approach_d, 0.0, 1.0)
+            speed = min(speed, max(approach_v, max_v * scale))
+            # Fix 3 (2026-08-01): a sub-dead-band crawl toward an
+            # UNPAINTED run-out is unactuatable — PX4 RO_SPEED_TH
+            # (~0.1 m/s) barely turns the wheels below it; 182821 spent
+            # ~50 s closing 8 cm at 0.03–0.06 m/s. While still outside
+            # the (relaxed) tolerance, command at least the actuatable
+            # floor; the few-cm coast lands in unpainted ground.
+            runout_min = float(
+                self.get_parameter("transit_runout_min_speed_m_s").value
             )
-            if dist_to_corner < approach_d:
-                scale = self._clamp(dist_to_corner / approach_d, 0.0, 1.0)
-                speed = min(speed, max(approach_v, max_v * scale))
-                # Fix 3 (2026-08-01): a sub-dead-band crawl toward an
-                # UNPAINTED run-out is unactuatable — PX4 RO_SPEED_TH
-                # (~0.1 m/s) barely turns the wheels below it; 182821 spent
-                # ~50 s closing 8 cm at 0.03–0.06 m/s. While still outside
-                # the (relaxed) tolerance, command at least the actuatable
-                # floor; the few-cm coast lands in unpainted ground.
-                runout_min = float(
-                    self.get_parameter("transit_runout_min_speed_m_s").value
-                )
-                if (
-                    runout_min > 0.0
-                    and self._run_tail_is_transit()
-                    and 0.0 < speed < runout_min
-                    and dist_to_corner > goal_tol_eff
-                ):
-                    speed = runout_min
-                self._segment_state = SegmentStateCode.PRE_CORNER_SLOWDOWN
+            if (
+                runout_min > 0.0
+                and self._run_tail_is_transit()
+                and 0.0 < speed < runout_min
+                and dist_to_corner > goal_tol_eff
+            ):
+                speed = runout_min
+            self._segment_state = SegmentStateCode.PRE_CORNER_SLOWDOWN
 
         max_accel = float(self.get_parameter("max_linear_accel").value)
         speed_before_accel = speed
@@ -4951,6 +4976,30 @@ class RPPControllerNode(Node):
         so the run-out relaxations (tolerance + min actuatable speed) apply.
         A run that ends ON a painted point keeps full precision."""
         return bool(self._spray_flags) and not self._spray_flags[-1]
+
+    def _run_remaining_along(self) -> float | None:
+        """Along-path distance from the rover to the END of the ACTIVE run.
+
+        Monotonic (built on ``_path_travel_m``), so it is immune to the two
+        traps a Euclidean dist-to-goal falls into: it does not read "nearly
+        there" at the seam of a closed loop, and once the rover overshoots the
+        final point it saturates at 0 instead of growing again and re-commanding
+        speed.
+
+        Returns None when the progress cache is unusable (no run installed,
+        zero-length run, or ``_path_s`` out of step with ``_path``). Callers
+        must then fall back to their previous per-segment measure — a broken
+        cache must never silently remove the deceleration they already had.
+        """
+        if not self._runs:
+            return None
+        run = self._runs[self._run_idx]
+        length = float(run.get("length") or 0.0)
+        if length <= 0.0:
+            return None
+        if not self._path_s or len(self._path_s) != len(self._path):
+            return None
+        return max(0.0, length - self._path_travel_m)
 
     def _goal_tol_effective(self, goal_tol: float) -> float:
         """Fix 2 (2026-08-01): relax the goal tolerance on transit run-outs.
