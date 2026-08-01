@@ -741,6 +741,10 @@ class RPPControllerNode(Node):
         # ------------------------------------------------------------------
         self._path: list[PoseStamped] = []
         self._spray_flags: list[bool] = []
+        # Unpainted-tail length of the active run, refreshed in _apply_run.
+        # 0.0 until a run is installed so the run-out relaxations stay OFF by
+        # default — the safe direction is full endpoint precision.
+        self._run_tail_transit_m: float = 0.0
         self._active_tracking_profile: str = "smooth"
         # Per-entity run queue (see _split_runs_by_flag / _apply_run)
         self._runs: list[dict] = []
@@ -2030,6 +2034,9 @@ class RPPControllerNode(Node):
         self._path_done = False
         self._completion_stop_pending = False   # D3: clear terminal-stop latch per run/path
         self._path_travel_m = 0.0   # reset along-path progress per run
+        # Length of the unpainted TAIL of this run, cached per run (the goal-
+        # tolerance relaxation is evaluated every control tick and this is O(n)).
+        self._run_tail_transit_m = self._measure_tail_transit_m()
         # P1.4 — reset hint so search starts from beginning of the run
         self._closest_seg_hint = 0
         # Closed loops have first ≈ last. A full nearest-segment scan at the loop
@@ -4980,12 +4987,43 @@ class RPPControllerNode(Node):
         msg.data = bool(active)
         self._spray_active_pub.publish(msg)
 
+    def _measure_tail_transit_m(self) -> float:
+        """Along-path length of the ACTIVE run's unpainted TAIL; 0.0 if none.
+
+        A run-out is an unpainted tail on a run that PAINTS. A run that paints
+        NOWHERE is not a run-out — it is a transit/approach leg, and its
+        endpoint is normally the point where paint BEGINS, which is the last
+        place that wants a relaxed tolerance. Returning 0.0 keeps it on full
+        endpoint precision.
+        """
+        flags = self._spray_flags
+        if not flags or flags[-1]:
+            return 0.0
+        last_paint = next((i for i in range(len(flags) - 1, -1, -1) if flags[i]), -1)
+        if last_paint < 0:
+            return 0.0          # nothing painted anywhere -> not a run-out
+        n = min(len(self._path), len(flags))
+        total = 0.0
+        for i in range(last_paint, n - 1):
+            a = self._path[i].pose.position
+            b = self._path[i + 1].pose.position
+            total += self._dist(a.x, a.y, b.x, b.y)
+        return total
+
     def _run_tail_is_transit(self) -> bool:
-        """True when the ACTIVE run ends in unpainted transit (aft extension /
-        run-out). Endpoint precision there is cosmetic — nothing is painted —
-        so the run-out relaxations (tolerance + min actuatable speed) apply.
-        A run that ends ON a painted point keeps full precision."""
-        return bool(self._spray_flags) and not self._spray_flags[-1]
+        """True when the ACTIVE run PAINTS and then ends in unpainted transit
+        (aft extension / run-out). Endpoint precision there is cosmetic — no
+        paint lands on it — so the run-out relaxations apply.
+
+        2026-08-01: this was `bool(flags) and not flags[-1]`, which is ALSO true
+        of a run that paints nowhere — i.e. the approach/transit leg that
+        carries the rover to the mission start. That leg inherited the 0.10 m
+        relaxed tolerance and stopped up to 10 cm SHORT of the mission start,
+        the one endpoint where precision matters most because it is where paint
+        begins. Measured: arrival degraded from 1.4 cm (41e8a22) to 7.4-8.5 cm
+        across three runs on b48df83.
+        """
+        return self._run_tail_transit_m > 0.0
 
     def _run_remaining_along(self) -> float | None:
         """Along-path distance from the rover to the END of the ACTIVE run.
@@ -5012,16 +5050,35 @@ class RPPControllerNode(Node):
         return max(0.0, length - self._path_travel_m)
 
     def _goal_tol_effective(self, goal_tol: float) -> float:
-        """Fix 2 (2026-08-01): relax the goal tolerance on transit run-outs.
-        182821/182524 spent 54–56 s closing the last 8 cm of a 0.1 m unpainted
-        run-out to the 2 cm xy_goal_tolerance at sub-dead-band commands."""
-        if self._run_tail_is_transit():
-            runout_tol = float(
-                self.get_parameter("transit_runout_goal_tolerance_m").value
-            )
-            if runout_tol > 0.0:
-                return max(goal_tol, runout_tol)
-        return goal_tol
+        """Relax the goal tolerance on a transit run-out — but never past HALF
+        of the run-out itself.
+
+        Fix 2 (2026-08-01): 182821/182524 spent 54-56 s closing the last 8 cm of
+        a 0.1 m unpainted run-out to the 2 cm xy_goal_tolerance at sub-dead-band
+        commands, so the tolerance was relaxed to 0.10 m.
+
+        2026-08-01 (later): 0.10 m is EXACTLY the standard run-out length
+        (`path_engine/engine.py`: `runout = aft_extension_m if extensions else
+        0.1`, floored at 0.1). A tolerance equal to the segment it guards means
+        that segment can never be entered — DONE latched the instant the rover
+        reached the mark end, the run-out was never driven, and the rover parked
+        ON the wet end of the line, the exact thing the run-out exists to
+        prevent. Measured on three b48df83 runs: rested +0.0 / +0.7 / +1.1 cm
+        from the paint end, 9-10 cm short of the goal.
+
+        Capping at half the tail makes it self-scaling: a 0.1 m run-out gets
+        0.05 m and is still half driven; a 0.9 m aft extension gets the full
+        0.10 m param. It cannot swallow the segment at any length.
+        """
+        tail = self._run_tail_transit_m
+        if tail <= 0.0:
+            return goal_tol
+        runout_tol = float(
+            self.get_parameter("transit_runout_goal_tolerance_m").value
+        )
+        if runout_tol <= 0.0:
+            return goal_tol
+        return max(goal_tol, min(runout_tol, 0.5 * tail))
 
     def _gate_spray(self, spray_active: bool, heading_err: float) -> bool:
         """P3/P7 valve heading gates (2026-08-01). Single choke point —

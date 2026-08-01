@@ -204,3 +204,62 @@ def test_degrades_to_the_old_measure_when_the_cache_is_unusable(node):
             node, MARK_LEN + 0.05, **{**FUSED, "seg_idx": 1}, **kwargs
         )
         assert sp_final_seg < MAX_V, f"lost endpoint braking with {kwargs}: {sp_final_seg:.3f}"
+
+
+# ── 2026-08-01 (later): the run-out relaxation applied where it must not ──────
+#
+# `_run_tail_is_transit` was `bool(flags) and not flags[-1]`, which is also true
+# of a run that paints NOWHERE — the approach leg that carries the rover to the
+# mission start. It inherited the 0.10 m relaxed tolerance and stopped 7.4-8.5 cm
+# short of the mission start (was 1.4 cm before). And 0.10 m is EXACTLY the
+# standard run-out length, so on the mark run the tolerance swallowed the whole
+# run-out: the rover parked ON the wet end of the line.
+
+def _install(node, path, flags):
+    """Install a run WITHOUT depending on the new helper existing.
+
+    These tests must discriminate on BEHAVIOUR, not on the presence of a new
+    method: against the unfixed controller they have to fail with the wrong
+    tolerance (0.10 where 0.02 is required), not with AttributeError.
+    """
+    node._path = [_pose(n, 0.0) for n, _ in path]
+    node._spray_flags = list(flags)
+    measure = getattr(node, "_measure_tail_transit_m", None)
+    node._run_tail_transit_m = measure() if measure else 0.0
+
+
+def test_approach_leg_keeps_full_endpoint_precision(node):
+    """A run that paints NOWHERE is not a run-out — no relaxation.
+
+    Its endpoint is where paint begins, the one place that most needs the 2 cm
+    tolerance.
+    """
+    _install(node, [(0.0, 0), (3.0, 0)], [False, False])
+    assert node._run_tail_is_transit() is False, "approach leg wrongly treated as a run-out"
+    assert node._goal_tol_effective(0.02) == pytest.approx(0.02), \
+        "approach leg must not inherit the run-out tolerance"
+
+
+def test_runout_relaxation_never_swallows_the_runout(node):
+    """The tolerance must stay under the segment it guards.
+
+    0.10 m tolerance on a 0.10 m run-out means DONE fires at the mark end and
+    the run-out is never entered.
+    """
+    _install(node, [(0.0, 0), (2.337, 0), (2.437, 0)], [True, True, False])
+    assert node._run_tail_is_transit() is True
+    tol = node._goal_tol_effective(0.02)
+    assert tol == pytest.approx(0.05, abs=1e-6), f"expected half the tail, got {tol}"
+    assert tol < 0.10, "tolerance must be INSIDE the 0.10 m run-out"
+
+
+def test_long_aft_extension_still_gets_the_full_param(node):
+    """Self-scaling: a 0.9 m run-out is long enough for the whole 0.10 m."""
+    _install(node, [(0.0, 0), (3.0, 0), (3.9, 0)], [True, True, False])
+    assert node._goal_tol_effective(0.02) == pytest.approx(0.10, abs=1e-6)
+
+
+def test_run_ending_on_paint_is_unchanged(node):
+    """A run that ends ON a painted point keeps the strict tolerance."""
+    _install(node, [(0.0, 0), (2.0, 0)], [True, True])
+    assert node._goal_tol_effective(0.02) == pytest.approx(0.02)
