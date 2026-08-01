@@ -2,93 +2,103 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Field Checklist 2026-08-01 — ARM B + Trajectory A/B + Speed Ladder (by 16:00)</title>
+<title>Field Checklist 2026-08-01 Rev 4 — Deploy + Fix Verification + Backend A/B + QGC Cal + Ladder</title>
 <style>
   @page { size: A4 portrait; margin: 8mm; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:#14171c;
-         font-size: 9.4px; line-height: 1.24; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+         font-size: 9.2px; line-height: 1.22; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   .page { width: 194mm; height: 281mm; margin: 0 auto; display: flex; flex-direction: column; }
-  h1 { font-size: 13px; } h2 { font-size: 10.2px; background:#14171c; color:#fff; padding:2px 6px; margin:4px 0 2px; }
-  h2 .t { float:right; font-weight:400; font-size:8.8px; opacity:.85; }
+  h1 { font-size: 12.5px; } h2 { font-size: 10px; background:#14171c; color:#fff; padding:2px 6px; margin:3px 0 2px; }
+  h2 .t { float:right; font-weight:400; font-size:8.6px; opacity:.85; }
   .hdr { display:flex; justify-content:space-between; align-items:baseline; border-bottom:2px solid #14171c; padding-bottom:2px; }
-  .hdr .meta { font-size: 8.8px; text-align:right; }
-  .done { background:#e8f5e9; border:1px solid #2e7d32; padding:2px 5px; margin:2px 0; font-size:9.1px; }
-  ul { list-style:none; } li { margin:1.2px 0; padding-left:13px; position:relative; }
+  .hdr .meta { font-size: 8.6px; text-align:right; }
+  .done { background:#e8f5e9; border:1px solid #2e7d32; padding:2px 5px; margin:2px 0; font-size:8.9px; }
+  ul { list-style:none; } li { margin:1px 0; padding-left:13px; position:relative; }
   li::before { content:"☐"; position:absolute; left:0; font-size:10px; }
   li.note::before { content:"→"; }
-  b.k { background:#eef; padding:0 3px; border-radius:2px; font-family:Menlo,monospace; font-size:8.7px; font-weight:600;}
+  b.k { background:#eef; padding:0 3px; border-radius:2px; font-family:Menlo,monospace; font-size:8.5px; font-weight:600;}
   table { width:100%; border-collapse:collapse; margin:2px 0; }
-  th,td { border:1px solid #999; padding:1.2px 3px; font-size:8.8px; text-align:left; }
+  th,td { border:1px solid #999; padding:1px 3px; font-size:8.6px; text-align:left; }
   th { background:#e8e8e8; }
-  .warn { background:#fff3cd; border:1px solid #d4a017; padding:2px 5px; margin:2px 0; font-size:9.1px; }
-  .crit { background:#fdecec; border:1px solid #c0392b; padding:2px 5px; margin:2px 0; font-size:9.1px; }
-  .log td { height:11px; }
-  .foot { margin-top:auto; border-top:2px solid #14171c; padding-top:2px; font-size:8.6px; }
-  .mono { font-family:Menlo,monospace; font-size:8.5px; }
+  .warn { background:#fff3cd; border:1px solid #d4a017; padding:2px 5px; margin:2px 0; font-size:8.9px; }
+  .crit { background:#fdecec; border:1px solid #c0392b; padding:2px 5px; margin:2px 0; font-size:8.9px; }
+  .foot { margin-top:auto; border-top:2px solid #14171c; padding-top:2px; font-size:8.4px; }
+  .mono { font-family:Menlo,monospace; font-size:8.3px; }
 </style>
 </head>
 <body><div class="page">
 
 <div class="hdr">
-  <h1>FIELD DAY 2026-08-01 — ALL TESTS COMPLETE BY <u>16:00</u></h1>
-  <div class="meta">Site: 13.1952, 80.2176 · Jetson <span class="mono">@dedf2b4</span> (468/468) · app <span class="mono">59b72ea</span><br>
-  ARM B · <b>Trajectory A/B (frontend vs backend)</b> · Speed ladder</div>
+  <h1>FIELD DAY 2026-08-01 — Rev 4 (post 07-31 decode)</h1>
+  <div class="meta">Deploy target: Jetson <span class="mono">@a54fd2d</span> · app <span class="mono">4dbfeab</span> (csv-workflow)<br>
+  Fix verification · Backend A/B (STILL OPEN) · QGC cal · Ladder 0.8→1.0</div>
 </div>
 
-<div class="done"><b>✅ DONE 07-31:</b> ARM A baseline (2× field_test_02: RMS 0.67/0.86, −2.2 cm B3 bias) · deploy @dedf2b4 + params verified · <b>backend mission `field_test_02_verify` STAGED on rover</b> (blend 8.5/11.1/2.5° ≤0.9 cm; 1431 wps). <b>Backend pre-test fix check: NONE NEEDED</b> — the 15.9° L-corner vertex is accepted as an A/B measurement point (spray trip 8 cm ≫ expected ~3–4 cm excursion); all path/fitter upgrades happen AFTER today completes, on today's evidence.</div>
+<div class="done"><b>✅ WON 07-31 (bag-verified):</b> ARM B field_test_02 @0.31: RMS <b>0.56</b>/2.61, 0 gaps · 86 m field_test_3: 0.65/2.86 · 8-run clean-vs-raw set driven · 0.53 m/s clean (0.70 held ≤0.77 RMS on 3 of 4 runs) · <b>3 root causes found &amp; fixed in code overnight</b>: jump-guard false trips @0.7 (10–21×/run), valve opens at 4–13° residual (≤8 cm painted), collinear-merge refusal (double stop at mark start + 54 s terminal crawl).</div>
+<div class="warn"><b>⏳ STILL PENDING from Rev 3:</b> <b>backend A/B never ran</b> (all 8 runs were app-planned — <span class="mono">field_test_03_verify</span> + <span class="mono">_clean_verify</span> still staged, untouched) · ground-truth tape NOT done (3rd day owed → blocks <span class="mono">EKF2_GPS_POS_Y</span>) · S3/S4 never reached (RO_SPEED_LIM was 0.3 till 18:10, then 0.7) · meas-vs-cmd gate FAILED at 0.7 (+9–10 % overspeed).</div>
 
-<h2>0 · PRE-FLIGHT <span class="t">~13:00, 20 min</span></h2>
+<h2>0 · DEPLOY FIRST — nothing drives before this <span class="t">~30 min</span></h2>
 <ul>
-  <li><b class="k">ntrip</b> STARTED (disabled on boot!) → <b>RTK_FIXED</b>, hrms ≤ 0.02 · services ×4 green · origin health OK · e-stop test · valve prime</li>
-  <li>Jetson @<b>dedf2b4</b> · app <b>59b72ea</b> · chalk crosses visible · staged list shows <span class="mono">field_test_02_verify</span></li>
+  <li>Jetson pull <b class="k">fix/field-findings-2026-07-30 @a54fd2d</b> → <b class="k">make jetson-tests</b> (expect ≥468; <b>6 new params — fixture staleness is the known failure mode, fix fixtures not code</b>) → restart <span class="mono">rpp-pipeline</span></li>
+  <li>Verify at ROS layer (<span class="mono">ros2 param get</span>): <span class="mono">transit_merge_max_len_m 2.0 · transit_runout_goal_tolerance_m 0.10 · transit_runout_min_speed_m_s 0.10 · spray_entry_max_heading_deg 5.0 · spray_heading_cut_deg 30 · mission_speed 0.70</span></li>
+  <li>Operator device: app build @<b class="k">4dbfeab</b> (direction-invariant fitter). ntrip STARTED → RTK_FIXED · services ×4 · e-stop · valve prime</li>
 </ul>
 
-<h2>1 · ARM B VALIDATION — frontend mission @ 0.35 <span class="t">~13:20, 40 min</span></h2>
-<ul>
-  <li>Re-plan SAME <span class="mono">field _test_02.csv</span> from app → <b>expect ZERO kink-blend warnings</b> → stage → <b>B1 dry run</b> (pivots ≤ ~5 s, clean zigzag end)</li>
-  <li><b>B2 + B3 paint, back-to-back NO pause</b> (bags from t=0, no TRUNCATED) · PASS: RMS ≤ 0.9, max ≤ 4, 0 gaps, endpoint ≤ 5 cm</li>
-</ul>
-
-<h2>2 · TRAJECTORY A/B — backend mission @ 0.35 <span class="t">~14:00, 30 min · params still at defaults</span></h2>
-<ul>
-  <li>Load the pre-staged <b class="k">field_test_02_verify</b> (backend dense-fit line: 5 bulges vs frontend 29) → <b>T1 paint run</b>, T2 repeat</li>
-  <li class="note"><b>WATCH the L-corner (chainage ~31 m)</b>: backend arm carries one 15.9° vertex — expect ≤ ~4 cm excursion, valve stays open (trip 8). Note behaviour either way — this IS the A/B data</li>
-  <li class="note">Decision inputs collected today, decided AFTER analysis: driven xtrack · painted line vs stakes AND vs smooth line · bulges/sign-flips of PAINT · corner behaviour. Do NOT decide in the field</li>
-</ul>
-
-<h2>3 · SPEED LADDER — frontend mission <span class="t">~14:40, 60 min</span></h2>
+<h2>1 · FIX VERIFICATION — field_test_03 raw, app-planned @0.70 <span class="t">2 runs, ~25 min</span></h2>
 <table>
-  <tr><th>Step</th><th>Mark speed (APP per-run)</th><th>Runtime params first (log!)</th><th>Advance gate</th><th>✓</th></tr>
-  <tr><td><b>S1</b></td><td>0.50</td><td>—</td><td rowspan="4">RMS ≤ 2 · max ≤ 4 · 0 gaps · endpoint ≤ 8 cm · meas speed within 7 % of cmd · line visibly continuous</td><td></td></tr>
-  <tr><td><b>S2</b></td><td>0.65</td><td><span class="mono">approach_velocity_scaling_dist=0.9</span></td><td></td></tr>
-  <tr><td><b>S3</b></td><td>0.80</td><td><span class="mono">approach…dist=1.2</span></td><td></td></tr>
-  <tr><td><b>S4</b></td><td>0.90 <i>if S3 clean</i></td><td><span class="mono">max_linear_vel=1.0 · approach…dist=1.5</span></td><td></td></tr>
+  <tr><th>Gate</th><th>Was (07-31)</th><th>PASS today</th><th>✓</th></tr>
+  <tr><td>V1 JUMP_SKIP count (state 5 in /rpp/debug)</td><td>10–21 per run</td><td><b>0</b> — no speed sawtooth</td><td></td></tr>
+  <tr><td>V2 first-metre painted xtrack</td><td>up to 8.0 cm</td><td>≤ 2 cm, valve opens ≤5° heading</td><td></td></tr>
+  <tr><td>V3 mark-start boundary (with 0.5 m pre-ext)</td><td>full stop + pivot</td><td><b>NO stop</b> — paint enters at ≈cruise</td><td></td></tr>
+  <tr><td>V4 last-paint → DONE</td><td>54–56 s</td><td><b>≤ 5 s</b></td><td></td></tr>
+  <tr><td>V5 marking RMS / max</td><td>0.69–1.07 / 5.9</td><td>≤ 0.9 / ≤ 4 cm</td><td></td></tr>
 </table>
 <ul>
-  <li class="note"><b>0.9 = HARD CEILING</b> (RO_MAX_THR_SPEED 0.96 saturates at 1.0 — QGC day later). Turns auto-regulate; don't hand-force. Paint thins to 44 % @0.8 — judge visibility separately (Phase E later). 1 run per step is OK if time-boxed; 2 preferred</li>
+  <li class="note">Run F1 then F2 = <b>SAME CSV, opposite direction</b> → V6: both runs paint the SAME line (app fitter now direction-invariant; tape 3 spots, expect ≤1 cm between the two paints)</li>
 </ul>
 
-<h2>4 · GROUND TRUTH <span class="t">~15:40, 20 min — do not skip</span></h2>
+<h2>2 · BACKEND A/B — carried from Rev 3, still the open decision <span class="t">2 runs, ~25 min</span></h2>
 <ul>
-  <li>Tape paint-vs-chalk at ~12 stakes on the BEST frontend run <b>and</b> ~6 stakes on a backend run (signed L/R + photos) — feeds B3 calibration AND the trajectory decision</li>
+  <li>Load pre-staged <b class="k">field_test_03_verify</b> (backend raw) → T1 paint @0.70 · then <b class="k">field_test_03_clean_verify</b> → T2</li>
+  <li class="note">Same ground as F1/F2 ⇒ direct arm comparison at last. Decide AFTER analysis (driven xtrack · paint vs 54 stakes · bulges/sign-flips), not in the field</li>
 </ul>
 
-<table class="log">
-  <tr><th>Run</th><th>Arm/spd</th><th>RMS/max cm</th><th>Spd c/m</th><th>Gaps?</th><th>End cm</th><th>Trunc?</th><th>Notes (corner! stall? zigzag?)</th></tr>
-  <tr><td>B1</td><td>F dry .35</td><td colspan="5">pivots ok? ____ end ok? ____</td><td></td></tr>
-  <tr><td>B2</td><td>F .35</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
-  <tr><td>B3</td><td>F .35</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
-  <tr><td>T1</td><td><b>BK .35</b></td><td></td><td></td><td></td><td></td><td></td><td>L-corner:</td></tr>
-  <tr><td>T2</td><td><b>BK .35</b></td><td></td><td></td><td></td><td></td><td></td><td>L-corner:</td></tr>
-  <tr><td>S1</td><td>F .50</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
-  <tr><td>S2</td><td>F .65</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
-  <tr><td>S3</td><td>F .80</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
-  <tr><td>S4</td><td>F .90</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<h2>3 · QGC CALIBRATION + LADDER 0.8 → 1.0 <span class="t">~45 min · QGC on Mac only</span></h2>
+<table>
+  <tr><th>QGC param</th><th>Now</th><th>Set to</th><th>Why / how</th></tr>
+  <tr><td class="mono">RO_MAX_THR_SPEED</td><td>0.96</td><td><b>MEASURED</b></td><td>manual FULL throttle 5 s straight, read GPS speed (expect ~1.1–1.2) — kills the +10 % overspeed</td></tr>
+  <tr><td class="mono">RD_MAX_THR_YAW_R</td><td>0.95</td><td><b>MEASURED</b></td><td>full-stick spin, read yaw rate (expect ~1.3–1.4) — weave showed FF over-driving 1.5×</td></tr>
+  <tr><td class="mono">RO_SPEED_LIM</td><td>0.7</td><td>1.05</td><td>ceiling just above mission max — unblocks S3/S4</td></tr>
+  <tr><td class="mono">RO_ACCEL_LIM / RO_DECEL_LIM</td><td>0.2 / 0.3</td><td>0.35 / 0.5</td><td>firmware is the binding ramp; braking from 1.0 needs the 0.5</td></tr>
+  <tr><td class="mono">RO_YAW_RATE_LIM</td><td>22°/s</td><td>40°/s</td><td>gentle arc 0.6@R1.2 needs 28.6°/s — 22 starves arcs. Watch pivot behaviour after (A/B)</td></tr>
+</table>
+<table>
+  <tr><th>Step</th><th>Speed</th><th>Companion params first</th><th>Advance gate</th><th>✓</th></tr>
+  <tr><td>S3</td><td>0.80</td><td><span class="mono">mission_speed=0.8 · approach…dist=1.2</span></td><td rowspan="2">RMS ≤ 2 · max ≤ 4 · 0 gaps · V1 still 0 · <b>meas within 7 % of cmd (post-cal!)</b> · endpoint ≤ 8 cm</td><td></td></tr>
+  <tr><td>S4</td><td>0.90–1.0</td><td><span class="mono">mission_speed=0.9→1.0 · max_linear_vel=1.0 · approach…dist=1.5</span></td><td></td></tr>
+</table>
+<ul>
+  <li class="note">Judge each step on the <b>7–13 m kink section</b> (FM03 chainage) — lag-limited, it fails first. a_lat_max=0.3 already encodes straight 1.0 / R1.2→0.6 / R0.5→0.4 — do NOT hand-tier speeds</li>
+</ul>
+
+<h2>4 · GROUND TRUTH TAPE — 3rd day owed, DO NOT SKIP <span class="t">~20 min</span></h2>
+<ul>
+  <li>Signed L/R paint-vs-chalk at ~12 stakes (best F run) + ~6 (best T run) + photos → feeds <span class="mono">EKF2_GPS_POS_Y</span> (the 2.2 cm B3 bias = biggest absolute error left)</li>
+</ul>
+
+<table>
+  <tr><th>Run</th><th>Arm</th><th>Spd c/m</th><th>RMS/max</th><th>JUMP#</th><th>Entry cm</th><th>End s</th><th>Notes</th></tr>
+  <tr><td>F1</td><td>app raw →</td><td>0.70/</td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>F2</td><td>app raw ←</td><td>0.70/</td><td></td><td></td><td></td><td></td><td>same line as F1?</td></tr>
+  <tr><td>T1</td><td><b>BK raw</b></td><td>0.70/</td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>T2</td><td><b>BK clean</b></td><td>0.70/</td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>S3</td><td>app</td><td>0.80/</td><td></td><td></td><td></td><td></td><td>kink section:</td></tr>
+  <tr><td>S4</td><td>app</td><td>0.9–1.0/</td><td></td><td></td><td></td><td></td><td>kink section:</td></tr>
 </table>
 
-<div class="crit"><b>FALLBACKS</b> (one at a time, note which): pivots → <span class="mono">2.0/2.0/3.0</span> · tracking → <span class="mono">use_imu_extrapolation=false</span> then <span class="mono">smooth_min_arc_ld_m=0.25</span> · spray → <span class="mono">xtrack_trip_error_m=0.0</span> · backend T-runs misbehave → abort T2, continue ladder (A/B still valid with n=1). <b>HARD RULES:</b> no FCU/QGC pushes · no NTRIP disable · no code edits · 0.9 ceiling absolute · pull ALL bundles to <span class="mono">bags/01_08_2026/</span> · restore <span class="mono">approach 0.6, max_linear_vel 0.8</span> before leaving.</div>
+<div class="crit"><b>FALLBACKS — every new fix has an off switch, one at a time, note which:</b> boundary stop returns → <span class="mono">transit_merge_max_len_m=0</span> · endpoint overshoots painted lines → <span class="mono">transit_runout_goal_tolerance_m=0</span> + <span class="mono">…min_speed_m_s=0</span> · paint gap at line start → <span class="mono">spray_entry_max_heading_deg=0</span> · paint during spins → keep <span class="mono">spray_heading_cut_deg=30</span> · jump guard misbehaves → old sawtooth was survivable, note &amp; continue. <b>HARD RULES:</b> QGC changes ONLY the table above, log every value · no NTRIP disable · no code edits in field · pull ALL bundles to <span class="mono">bags/01_08_2026/</span> · jetson-tests must be green before first arm.</div>
 
-<div class="foot">By 16:00: B2/B3 match ARM A · T1/T2 driven+painted recorded · highest clean ladder step known · tape data for both arms. Evening: bulge/sign-flip analysis of DRIVEN paths → frontend-vs-backend decision → then path upgrades, `EKF2_GPS_POS_Y` cal, CLAUDE.md reconcile, merge. Staged-OFF features stay OFF. Rev 3 — 08-01, @dedf2b4.</div>
+<div class="foot">Done = V1–V6 green at 0.70 · T1/T2 recorded (A/B finally has data) · post-cal overspeed ≤3 % · highest clean ladder step known · tape data in hand. Evening: A/B decision · <span class="mono">EKF2_GPS_POS_Y</span> from tape · CLAUDE.md reconcile · merge. Rev 4 — 2026-08-01, targets @a54fd2d + app 4dbfeab.</div>
 
 </div></body></html>
