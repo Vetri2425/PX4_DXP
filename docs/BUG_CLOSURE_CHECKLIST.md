@@ -147,6 +147,25 @@ shipped because a test's ground truth mirrored the bug it was testing.
 ### ☐ F4 — Spray start-delay vs speed A/B — only meaningful on extension-less missions now
   (with extensions the valve opens at cruise; 165426 showed stationary opening without them)
 
+### ☐ F5 — px4-dxp restart takes ~11 s; ~6–7 s of it is script overhead, not MAVROS
+- **Decomposition (from `px4_start_service.sh` structure; journal-verify before fixing):**
+  real MAVROS/FCU work ≈ 4–5 s; the rest is two unconditional `sleep 1`s (post-pkill
+  line ~199, post-free_port line ~130), a 1 Hz ready-poll that **spawns a fresh
+  Python+rclpy process per tick** (~0.5–1.5 s each on the Orin), `ros2 param set` via the
+  stale-after-restart CLI daemon in `apply_gcs_heartbeat`, a 1 s-tick flag poll, and one
+  more cold rclpy spawn for FCU validation.
+- **Why it matters:** the restart drops MAVROS + cascades rpp-pipeline; every second of it
+  is OFFBOARD/QGC-bridge outage, and the restart-during-mission hazard window scales with it.
+- **Fix (ranked):** (1) one persistent readiness helper — extend
+  `tools/ros2_mavros_health.py` to wait-for-node → retype heartbeat via rclpy param client
+  → confirm `connected`, single process, 0.1 s internal polling; (2) make both fixed sleeps
+  conditional on having actually killed/freed something; (3) 0.1 s flag-poll ticks;
+  (4) `sd_notify` READY + `Type=notify` so dependents start at true readiness (also
+  unlocks the disabled `WatchdogSec`). Expected ~11 s → ~4–5 s.
+- **Verify:** `journalctl -u px4-dxp` timestamps, before vs after, 3 restarts each,
+  rover disarmed. Numbers above are structural estimates until then.
+- **Closes when:** measured restart ≤ 6 s with FCU connected and all dependents healthy.
+
 ---
 
 ## Standing rules for any verification run
