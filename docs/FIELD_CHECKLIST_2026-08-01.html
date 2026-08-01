@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Field Checklist 2026-08-01 Rev 5 — Deploy + Fix Verification + BOTH-DIRECTION Tape + Backend A/B + QGC Cal + Ladder</title>
+<title>Field Checklist 2026-08-01 Rev 6 — Deploy + Fix Verification + BOTH-DIRECTION Tape + Backend A/B + QGC Cal + Ladder</title>
 <style>
   @page { size: A4 portrait; margin: 8mm; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -30,20 +30,22 @@
 <body><div class="page">
 
 <div class="hdr">
-  <h1>FIELD DAY 2026-08-01 — Rev 5 (post 07-31 decode)</h1>
-  <div class="meta">Deploy target: Jetson <span class="mono">@a54fd2d</span> · app <span class="mono">4dbfeab</span> (csv-workflow)<br>
+  <h1>FIELD DAY 2026-08-01 — Rev 6 (§0 closed on the bench)</h1>
+  <div class="meta">Deploy target: Jetson <span class="mono">@6b22835</span> · <b>app arm</b> <span class="mono">4dbfeab</span> (csv-workflow) · <b>backend arm</b> <span class="mono">24cb166</span> (preline-csv-flow)<br>
   Fix verification · <b>BOTH-DIRECTION tape</b> · Backend A/B (STILL OPEN) · QGC cal · Ladder 0.8→1.0</div>
 </div>
 
 <div class="done"><b>✅ WON 07-31 (bag-verified):</b> ARM B field_test_02 @0.31: RMS <b>0.56</b>/2.61, 0 gaps · 86 m field_test_3: 0.65/2.86 · 8-run clean-vs-raw set driven · 0.53 m/s clean (0.70 held ≤0.77 RMS on 3 of 4 runs) · <b>3 root causes found &amp; fixed in code overnight</b>: jump-guard false trips @0.7 (10–21×/run), valve opens at 4–13° residual (≤8 cm painted), collinear-merge refusal (double stop at mark start + 54 s terminal crawl).</div>
 <div class="crit"><b>🌍 NEW 08-01 — GLOBAL decode (raw GNSS vs RS3 stakes, 8 runs):</b> global repeatability is excellent (<b>0.8 cm RMS</b>, two runs of one file) — but the antenna sits <b>±2.2 cm off the stakes with a sign that FLIPS by driving direction, 8/8 runs</b> ⇒ ~1.7 cm <b>body-fixed lever arm</b> (+1.05 cm ground-fixed). Not latency (flat 0.33→0.70 m/s). Per-stake miss 2.7 cm mean / 7.8 max. No scale error (0.02 cm/m). ⚠ Local xtrack (0.6 cm) and the analyzer's geometry-fidelity metric are <b>structurally blind</b> to this — the latter inverts its own placement transform. <b>§4 tape is now the deciding measurement of the day.</b></div>
-<div class="warn"><b>⏳ STILL PENDING from Rev 3:</b> <b>backend A/B never ran</b> (all 8 runs were app-planned — <span class="mono">field_test_03_verify</span> + <span class="mono">_clean_verify</span> still staged, untouched) · ground-truth tape NOT done (3rd day owed → blocks <span class="mono">EKF2_GPS_POS_Y</span>) · S3/S4 never reached (RO_SPEED_LIM was 0.3 till 18:10, then 0.7) · meas-vs-cmd gate FAILED at 0.7 (+9–10 % overspeed).</div>
+<div class="warn"><b>⏳ STILL PENDING from Rev 3:</b> <b>backend A/B never ran</b> (all 8 runs were app-planned; the "still staged" arms had in fact expired — see §2) · ground-truth tape NOT done (3rd day owed → blocks <span class="mono">EKF2_GPS_POS_Y</span>) · S3/S4 never reached (RO_SPEED_LIM was 0.3 till 18:10, then 0.7) · meas-vs-cmd gate FAILED at 0.7 (+9–10 % overspeed).</div>
 
-<h2>0 · DEPLOY FIRST — nothing drives before this <span class="t">~30 min</span></h2>
+<h2>0 · DEPLOY FIRST — <span style="color:#0a0">DONE 15:33</span>, verified on the bench <span class="t">was ~30 min</span></h2>
 <ul>
-  <li>Jetson pull <b class="k">fix/field-findings-2026-07-30 @a54fd2d</b> → <b class="k">make jetson-tests</b> (expect ≥468; <b>6 new params — fixture staleness is the known failure mode, fix fixtures not code</b>) → restart <span class="mono">rpp-pipeline</span></li>
-  <li>Verify at ROS layer (<span class="mono">ros2 param get</span>): <span class="mono">transit_merge_max_len_m 2.0 · transit_runout_goal_tolerance_m 0.10 · transit_runout_min_speed_m_s 0.10 · spray_entry_max_heading_deg 5.0 · spray_heading_cut_deg 30 · mission_speed 0.70</span></li>
-  <li>Operator device: app build @<b class="k">4dbfeab</b> (direction-invariant fitter). ntrip STARTED → RTK_FIXED · services ×4 · e-stop · valve prime</li>
+  <li>✅ Jetson on <b class="k">fix/field-findings-2026-07-30 @6b22835</b> (past a54fd2d: + spray-reason exposure, + staged <span class="mono">placement_mode</span>) · <b class="k">make jetson-tests</b> <b>468 passed</b> — no fixture staleness · <span class="mono">px4-dxp · rover-server · rpp-pipeline</span> all active</li>
+  <li>✅ ROS layer read back live: <span class="mono">transit_merge_max_len_m 2.0 · transit_runout_goal_tolerance_m 0.1 · transit_runout_min_speed_m_s 0.1 · spray_entry_max_heading_deg 5.0 · spray_heading_cut_deg 30.0 · mission_speed 0.7</span> — all six match</li>
+  <li>✅ FCU §3 "Now" column re-read off the live FCU: <span class="mono">RO_MAX_THR_SPEED 0.96 · RD_MAX_THR_YAW_R 0.95 · RO_SPEED_LIM 0.7 · RO_ACCEL/DECEL 0.2/0.3 · RO_YAW_RATE_LIM 22</span> — table below is accurate, nothing drifted</li>
+  <li>⚠ <b>NTRIP dies with every <span class="mono">rover-server</span> restart</b> — the RTK stream is a CHILD of that service, so any <span class="mono">server/**</span> deploy silently drops you to FLOAT with no warning in the app. CLAUDE.md's restart table does not say this. Restart it after every deploy: <span class="mono">POST /api/rtk/ntrip/start</span> (caster.emlid.com:2101/MP23960, creds in <span class="mono">config/ntrip.env</span>). <b><span class="mono">ntrip.service</span> is a dead end</b> — it wants RTKLIB <span class="mono">str2str</span> + <span class="mono">~/ntrip_stream.sh</span>, neither of which exist on this box. Confirm <span class="mono">/api/rtk/status</span> reads <span class="mono">healthy:true</span> — it does now (ntrip, 1241 frames, 0.28 s age). Fix state indoors is FLOAT and means nothing; <b>RTK_FIXED is a gate to re-check outdoors, before the first arm</b></li>
+  <li>Operator device: <b>which arm?</b> §1 F1/F2 needs the <b>team app @4dbfeab</b> (plans the trajectory on-device). §2 T1/T2 needs the <b>backend app @24cb166</b> (sends the file to the rover and drives what the rover planned). Both flows now verified end-to-end against this rover — 12/12, CSV and geo-DXF, preview ≡ staged to 1e-9 with identical spray flags. e-stop · valve prime</li>
 </ul>
 
 <h2>1 · FIX VERIFICATION — field_test_03 raw, app-planned @0.70 <span class="t">2 runs, ~25 min</span></h2>
@@ -61,7 +63,9 @@
 
 <h2>2 · BACKEND A/B — carried from Rev 3, still the open decision <span class="t">2 runs, ~25 min</span></h2>
 <ul>
-  <li>Load pre-staged <b class="k">field_test_03_verify</b> (backend raw) → T1 paint @0.70 · then <b class="k">field_test_03_clean_verify</b> → T2</li>
+  <li><b>⚠ The Rev 3 file names no longer exist.</b> <span class="mono">field_test_03_verify</span> / <span class="mono">_clean_verify</span> are gone and staging is empty — staged missions live 1 h, so <b>nothing can be "pre-staged" ahead of a field day</b>. Stage at drive time from the app. Real pair on the rover: <b class="k">field_test_03.csv</b> (backend raw, 54 control pts) → T1 @0.70 · <b class="k">Field_mission_03_clean.csv</b> (backend clean, 40 pts) → T2</li>
+  <li>Both arms verified drivable through the app→backend flow on the bench 15:33 (preview → plan-and-stage → load-to-controller → start gate open, stopped short of start). Nothing left to discover before driving them</li>
+  <li class="note">⚠ <b>The two arms carry DIFFERENT geo origins</b> — raw <span class="mono">13.19589712, 80.21807199</span> vs clean <span class="mono">13.19594432, 80.21807768</span>, ≈5.2 m apart in north. Physically harmless (each is GPS_SURVEYED and re-binds to its own anchor, spans match to 1 cm) but <b>their local NED coordinates are NOT comparable</b> — comparing T1 vs T2 local xtrack directly compares two different frames. Judge the arms on paint-vs-stakes, or re-express both in one frame first</li>
   <li class="note">Same ground as F1/F2 ⇒ direct arm comparison at last. Decide AFTER analysis (driven xtrack · paint vs 54 stakes · bulges/sign-flips), not in the field</li>
 </ul>
 
@@ -115,6 +119,6 @@
 
 <div class="crit"><b>FALLBACKS — every new fix has an off switch, one at a time, note which:</b> boundary stop returns → <span class="mono">transit_merge_max_len_m=0</span> · endpoint overshoots painted lines → <span class="mono">transit_runout_goal_tolerance_m=0</span> + <span class="mono">…min_speed_m_s=0</span> · paint gap at line start → <span class="mono">spray_entry_max_heading_deg=0</span> · paint during spins → keep <span class="mono">spray_heading_cut_deg=30</span> · jump guard misbehaves → old sawtooth was survivable, note &amp; continue. <b>HARD RULES:</b> QGC changes ONLY the table above, log every value · no NTRIP disable · no code edits in field · pull ALL bundles to <span class="mono">bags/01_08_2026/</span> · jetson-tests must be green before first arm.</div>
 
-<div class="foot">Done = V1–V6 green at 0.70 · T1/T2 recorded (A/B finally has data) · post-cal overspeed ≤3 % · highest clean ladder step known · <b>§4 tape done on BOTH F1 and F2, ground/body split computed on the spot</b>. Evening: A/B decision · lever-arm vs placement call from the tape split · CLAUDE.md reconcile · merge. Rev 5 — 2026-08-01, targets @a54fd2d + app 4dbfeab.</div>
+<div class="foot">Done = V1–V6 green at 0.70 · T1/T2 recorded (A/B finally has data) · post-cal overspeed ≤3 % · highest clean ladder step known · <b>§4 tape done on BOTH F1 and F2, ground/body split computed on the spot</b>. Evening: A/B decision · lever-arm vs placement call from the tape split · CLAUDE.md reconcile · merge. Rev 6 — 2026-08-01, Jetson @6b22835 · app arm 4dbfeab · backend arm 24cb166. §0 closed on the bench 15:33.</div>
 
 </div></body></html>
