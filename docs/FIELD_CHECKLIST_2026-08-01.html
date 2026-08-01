@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Field Checklist 2026-08-01 Rev 6 — Deploy + Fix Verification + BOTH-DIRECTION Tape + Backend A/B + QGC Cal + Ladder</title>
+<title>Field Checklist 2026-08-01 Rev 7 — Deploy + Fix Verification + BOTH-DIRECTION Tape + Backend A/B + QGC Cal + Ladder</title>
 <style>
   @page { size: A4 portrait; margin: 8mm; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -30,8 +30,8 @@
 <body><div class="page">
 
 <div class="hdr">
-  <h1>FIELD DAY 2026-08-01 — Rev 6 (§0 closed on the bench)</h1>
-  <div class="meta">Deploy target: Jetson <span class="mono">@6b22835</span> · <b>app arm</b> <span class="mono">4dbfeab</span> (csv-workflow) · <b>backend arm</b> <span class="mono">24cb166</span> (preline-csv-flow)<br>
+  <h1>FIELD DAY 2026-08-01 — Rev 7 (endpoint-overshoot fix deployed)</h1>
+  <div class="meta">Deploy target: Jetson <span class="mono">@95403d3</span> · <b>app arm</b> <span class="mono">4dbfeab</span> (csv-workflow) · <b>backend arm</b> <span class="mono">24cb166</span> (preline-csv-flow)<br>
   Fix verification · <b>BOTH-DIRECTION tape</b> · Backend A/B (STILL OPEN) · QGC cal · Ladder 0.8→1.0</div>
 </div>
 
@@ -56,7 +56,9 @@
   <tr><td>V3 mark-start boundary (with 0.5 m pre-ext)</td><td>full stop + pivot</td><td><b>NO stop</b> — paint enters at ≈cruise</td><td></td></tr>
   <tr><td>V4 last-paint → DONE</td><td>54–56 s</td><td><b>≤ 5 s</b></td><td></td></tr>
   <tr><td>V5 marking RMS / max</td><td>0.69–1.07 / 5.9</td><td>≤ 0.9 / ≤ 4 cm</td><td></td></tr>
+  <tr><td><b>V7 endpoint overshoot</b> (NEW — deployed 16:14 @95403d3)</td><td><b>54.6 cm</b> past goal (stg_9ecf2985)</td><td><b>≤ 10 cm</b>, DONE latches, no e-stop needed</td><td></td></tr>
 </table>
+<div class="crit"><b>⚠ NEW FIX IN THIS RUN — V7 is its only field evidence.</b> Bag <span class="mono">stg_9ecf2985</span> (15:47) overshot its endpoint by <b>54.6 cm</b> / 64.6 cm past the paint. Cause: the goal-approach ramp measured to the end of the CURRENT SEGMENT, so its 0.9 m zone was clipped to the 0.10 m run-out that <span class="mono">a54fd2d</span> fused in — the 2.337 m mark was driven at full command to within 6 cm of its end, entering the run-out at 0.79 m/s needing 55 cm to stop. <b>Now measured to the RUN END</b> (@<span class="mono">3e7e300</span>). Gated: 478 Jetson tests, and the regression tests verified to FAIL on the old code first. <b>Expect the last ~0.8 m of paint to be laid at decreasing speed</b> — unavoidable, and milder than the pre-<span class="mono">a54fd2d</span> full stop at the mark end. Preferred long-term: give the run-out real length (<span class="mono">aft_extension_m ≥ 0.9</span>) so braking happens on unpainted ground. <b>OFF SWITCH:</b> <span class="mono">endpoint_approach_run_remaining=false</span> (app params → Transit Extensions, or <span class="mono">ros2 param set</span>) restores the old per-segment measure exactly.</div>
 <ul>
   <li class="note">Run F1 then F2 = <b>SAME CSV, opposite direction</b> → V6: both runs paint the SAME line (app fitter now direction-invariant). <b>DO NOT overpaint or erase F1 — §4 measures F1 and F2 side by side.</b> If F1/F2 land on top of each other, offset F2's chalk row so both are readable</li>
 </ul>
@@ -117,8 +119,8 @@
   <tr><td>S4</td><td>app</td><td>0.9–1.0/</td><td></td><td></td><td></td><td></td><td>kink section:</td></tr>
 </table>
 
-<div class="crit"><b>FALLBACKS — every new fix has an off switch, one at a time, note which:</b> boundary stop returns → <span class="mono">transit_merge_max_len_m=0</span> · endpoint overshoots painted lines → <span class="mono">transit_runout_goal_tolerance_m=0</span> + <span class="mono">…min_speed_m_s=0</span> · paint gap at line start → <span class="mono">spray_entry_max_heading_deg=0</span> · paint during spins → keep <span class="mono">spray_heading_cut_deg=30</span> · jump guard misbehaves → old sawtooth was survivable, note &amp; continue. <b>HARD RULES:</b> QGC changes ONLY the table above, log every value · no NTRIP disable · no code edits in field · pull ALL bundles to <span class="mono">bags/01_08_2026/</span> · jetson-tests must be green before first arm.</div>
+<div class="crit"><b>FALLBACKS — every new fix has an off switch, one at a time, note which:</b> endpoint overshoot or paint slows too early near line ends → <span class="mono">endpoint_approach_run_remaining=false</span> · boundary stop returns → <span class="mono">transit_merge_max_len_m=0</span> · endpoint overshoots painted lines → <span class="mono">transit_runout_goal_tolerance_m=0</span> + <span class="mono">…min_speed_m_s=0</span> · paint gap at line start → <span class="mono">spray_entry_max_heading_deg=0</span> · paint during spins → keep <span class="mono">spray_heading_cut_deg=30</span> · jump guard misbehaves → old sawtooth was survivable, note &amp; continue. <b>HARD RULES:</b> QGC changes ONLY the table above, log every value · no NTRIP disable · no code edits in field · pull ALL bundles to <span class="mono">bags/01_08_2026/</span> · jetson-tests must be green before first arm.</div>
 
-<div class="foot">Done = V1–V6 green at 0.70 · T1/T2 recorded (A/B finally has data) · post-cal overspeed ≤3 % · highest clean ladder step known · <b>§4 tape done on BOTH F1 and F2, ground/body split computed on the spot</b>. Evening: A/B decision · lever-arm vs placement call from the tape split · CLAUDE.md reconcile · merge. Rev 6 — 2026-08-01, Jetson @6b22835 · app arm 4dbfeab · backend arm 24cb166. §0 closed on the bench 15:33.</div>
+<div class="foot">Done = V1–V6 green at 0.70 · T1/T2 recorded (A/B finally has data) · post-cal overspeed ≤3 % · highest clean ladder step known · <b>§4 tape done on BOTH F1 and F2, ground/body split computed on the spot</b>. Evening: A/B decision · lever-arm vs placement call from the tape split · CLAUDE.md reconcile · merge. Rev 7 — 2026-08-01, Jetson @95403d3 · app arm 4dbfeab · backend arm 24cb166. §0 closed 15:33; endpoint-overshoot fix deployed 16:14 (V7).</div>
 
 </div></body></html>
