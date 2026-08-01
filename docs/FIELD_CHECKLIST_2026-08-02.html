@@ -47,6 +47,7 @@
   <li><b>Tests:</b> <b class="k">make jetson-tests</b> — the 482-test src suite has <b>NOT run on cfbf5f3</b>. Server suite passed on Mac (397)</li>
   <li><b>Defaults readback (no runtime sets!):</b> <span class="mono">ros2 param get /rpp_controller min_lookahead_dist lookahead_time mission_speed</span> → <b>0.35 / 1.0 / 0.5</b>. If wrong → STOP, the deploy didn't take</li>
   <li><b>V11 defaults smoke:</b> 1 run of the standard 3.3 m line, ZERO runtime params. Bag <span class="mono">debug[13]/[15]/[38]</span> = 0.35/1.0/0.5 · RMS ≤ 1.2 · entry ≤ 1.5 cm. <b>This closes D6 and unblocks the baseline_master merge confidence</b></li>
+  <li><b>E2 bench (aligned entry, no driving):</b> stage the line with the rover parked past the end → start → <span class="mono">/path</span> first publish has <b>3 points</b>, middle = wp0 − 1.2 m along the mark direction (log line says "via staging"). Park ON the start → entry still skips. Off-switch: <span class="mono">ROVER_ENTRY_STAGING=0</span> in the service env</li>
 </ul>
 
 <h2>1 · SPEED — finish the ladder <span class="t">6 runs, ~40 min</span></h2>
@@ -60,6 +61,7 @@
 <ul>
   <li class="note"><b>Judge 0.8 honestly:</b> paint opens at ~0.66 m/s still accelerating — an entry cost there is the speed's cost, not a config failure. Decision recorded in the register (D7)</li>
   <li class="note">If any V13 run rings in the last 2 m worse than −4 cm while spraying → stop the ladder, 0.6 stays the ceiling, D3 gets priority</li>
+  <li><b>E3 aligned-entry A/B (n=3, same line @0.5–0.6, deployed by §0):</b> gates vs 12-bag baseline — pre-align pivot <b>140–180° → ≤30°</b>, duration <b>7–13 s → ≤3 s</b>, pivot walk at wp0 <b>0.6–4.8 → ≤1 cm</b>, spray-ON vs stake <b>≤1.5 cm every run</b>, mark RMS no regression. Baseline arm = yesterday's 20:3x/20:5x bags (today's runs all have staging active after §0). Anti-parallel parking pivots AT the staging point — that is the design working, not a bug</li>
 </ul>
 
 <h2>2 · THE TAPE — both directions, the deciding measurement <span class="t">~30 min, 5th day owed</span></h2>

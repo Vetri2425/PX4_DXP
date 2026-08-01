@@ -1,6 +1,8 @@
 # Aligned Runtime Entry — Plan (E-series)
 
-**Status:** PROPOSED 2026-08-02 · not implemented · no field time spent
+**Status:** **E1 IMPLEMENTED 2026-08-02** (`_entry_leg_points` + wiring in `start_async`,
+8 new unit tests, server suite 405 green; env knobs `ROVER_ENTRY_STAGING` /
+`ROVER_ENTRY_STAGING_DIST_M`) · E2 bench + E3 field A/B scheduled for the 08-02 field day
 **Owner surface:** `server/offboard_controller.py::start_async` ONLY (frontend trajectory,
 path engine, and RPP are untouched)
 **Attacks:** register **D1** (pivot walk at the mission start) and **D2** (approach-stop

@@ -167,10 +167,14 @@ def test_surveyed_start_publishes_live_ekf_points():
         assert ctrl.state == MissionState.ENTRY
         name, entry_pts, entry_flags = node.calls[0]
         assert name == "publish_path"
-        # Entry leg = [live pose, first placed point]; spray OFF.
+        # E1 aligned entry: the rover is parked PAST the line start (N=7.46 vs
+        # wp0 N=5.19, mark runs +N), so the entry routes via a staging point
+        # 1.2 m behind wp0 along the mark direction and arrives collinear.
+        assert len(entry_pts) == 3
         assert entry_pts[0] == pytest.approx((7.4629, -0.9070), abs=1e-3)  # live pose
-        assert entry_pts[1] == pytest.approx((5.192, -0.910), abs=0.02)    # entry target
-        assert entry_flags == [False, False]
+        assert entry_pts[1] == pytest.approx((3.992, -0.910), abs=0.02)    # staging
+        assert entry_pts[2] == pytest.approx((5.192, -0.910), abs=0.02)    # entry target
+        assert entry_flags == [False, False, False]
         # The full marking path (live-placed) is stashed for phase 2.
         assert ctrl._entry_marking_pts[0] == pytest.approx((5.192, -0.910), abs=0.02)
         # Source resident path remains anchor-relative (not mutated).
@@ -222,6 +226,58 @@ def test_surveyed_start_skips_entry_when_on_first_point():
         assert pts[0] == pytest.approx((5.1945, -0.9095), abs=0.02)
     finally:
         offboard_module.SETPOINT_STREAM_GRACE_S = old_grace
+
+
+# ── E1: aligned-entry staging geometry (docs/ALIGNED_ENTRY_PLAN.md) ──────────
+# _entry_leg_points is pure geometry; these pin the staging placement for
+# parked positions all around the mission start, plus every degenerate fallback.
+
+# Mission start at (5.0, -1.0), mark running due north: u = (1, 0).
+_E1_PATH = [(5.0, -1.0), (5.05, -1.0), (6.0, -1.0)]
+_E1_STAGING = (5.0 - offboard_module.ENTRY_STAGING_DIST_M, -1.0)  # (3.8, -1.0)
+
+
+@pytest.mark.parametrize(
+    "live",
+    [
+        (7.5, -1.0),    # parked past the line end (anti-parallel arrival today)
+        (5.0, 2.0),     # parked to the east, perpendicular approach
+        (5.0, -4.0),    # parked to the west, perpendicular approach
+        (3.0, 1.5),     # behind but well off-axis (~37 deg > 20 deg skip cone)
+    ],
+)
+def test_entry_leg_routes_via_staging(live):
+    pts = offboard_module._entry_leg_points(live, _E1_PATH)
+    assert len(pts) == 3
+    assert pts[0] == live
+    assert pts[1] == pytest.approx(_E1_STAGING, abs=1e-9)
+    assert pts[2] == (5.0, -1.0)
+
+
+def test_entry_leg_skips_staging_when_chord_arrives_aligned():
+    # Parked 3 m behind the start, 0.5 m off-axis: chord bearing ~9.5 deg off
+    # the mark direction — inside the 20 deg cone, so the plain chord is used.
+    pts = offboard_module._entry_leg_points((2.0, -0.5), _E1_PATH)
+    assert pts == [(2.0, -0.5), (5.0, -1.0)]
+
+
+def test_entry_leg_skips_staging_when_parked_at_staging_point():
+    live = (_E1_STAGING[0] + 0.1, _E1_STAGING[1] + 0.3)
+    pts = offboard_module._entry_leg_points(live, _E1_PATH)
+    assert pts == [live, (5.0, -1.0)]
+
+
+def test_entry_leg_degenerate_path_falls_back_to_chord():
+    # All placed points within 1 cm of wp0 → no direction → plain chord.
+    degenerate = [(5.0, -1.0), (5.004, -1.0), (5.0, -1.004)]
+    pts = offboard_module._entry_leg_points((8.0, 2.0), degenerate)
+    assert pts == [(8.0, 2.0), (5.0, -1.0)]
+
+
+def test_entry_leg_off_switch_restores_plain_chord(monkeypatch):
+    monkeypatch.setattr(offboard_module, "ENTRY_STAGING_ENABLED", False)
+    pts = offboard_module._entry_leg_points((7.5, -1.0), _E1_PATH)
+    assert pts == [(7.5, -1.0), (5.0, -1.0)]
 
 
 def test_clear_mission_resets_resident_state():

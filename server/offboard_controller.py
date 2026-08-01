@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import math
+import os
 from collections import deque
 from typing import Any, Optional
 
@@ -48,6 +49,62 @@ STOP_ALLOWED_STATES = {
 # the entry leg and publish the marking path directly (degenerate entry —
 # e.g. LOCAL_NED auto-origin places wp0 at the rover). Metres.
 ENTRY_SKIP_DIST_M = 0.20
+# E1 (aligned entry, docs/ALIGNED_ENTRY_PLAN.md): route the entry leg via a
+# staging point this far BEHIND the mission start, along the mark's own
+# direction, so any large turn happens in free space and the final leg arrives
+# collinear with the mark. Field baseline without it: the rover arrives
+# 140-180 deg wrong and pivots 7-13 s ON the start point, walking 0.6-4.8 cm.
+ENTRY_STAGING_ENABLED = os.environ.get("ROVER_ENTRY_STAGING", "1").lower() not in (
+    "0", "false", "no",
+)
+ENTRY_STAGING_DIST_M = float(os.environ.get("ROVER_ENTRY_STAGING_DIST_M", "1.2"))
+# If the rover is already behind the start AND its straight chord to it is
+# within this many degrees of the mark direction, the plain 2-pt entry
+# arrives aligned by itself — a staging detour would add nothing.
+ENTRY_STAGING_ALIGNED_SKIP_DEG = 20.0
+
+
+def _entry_leg_points(
+    live: tuple[float, float], placed_pts: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """E1: entry-leg geometry for a two-phase surveyed start.
+
+    Returns [live, staging, wp0] where staging = wp0 - d*u and u is the placed
+    path's initial direction — or the plain [live, wp0] chord when a staging
+    point cannot help (disabled, degenerate path, or the chord already arrives
+    aligned). Pure geometry; the caller owns spray/must-hit flags.
+    """
+    p0 = (float(placed_pts[0][0]), float(placed_pts[0][1]))
+    direct = [live, p0]
+    if not ENTRY_STAGING_ENABLED:
+        return direct
+    # Mark direction from the first placed point that is measurably away from
+    # wp0 (staged paths are ~5 cm spaced; 1 cm rejects duplicate points).
+    u = None
+    for q in placed_pts[1:]:
+        dn, de = q[0] - p0[0], q[1] - p0[1]
+        seg = math.hypot(dn, de)
+        if seg > 0.01:
+            u = (dn / seg, de / seg)
+            break
+    if u is None:
+        return direct
+    rel_n, rel_e = live[0] - p0[0], live[1] - p0[1]
+    behind = (rel_n * u[0] + rel_e * u[1]) < 0.0
+    chord = math.hypot(rel_n, rel_e)
+    if behind and chord > 1e-6:
+        # Direction the rover would travel on the plain chord: live -> wp0.
+        cos_align = (-rel_n * u[0] - rel_e * u[1]) / chord
+        if cos_align >= math.cos(math.radians(ENTRY_STAGING_ALIGNED_SKIP_DEG)):
+            return direct
+    staging = (
+        p0[0] - ENTRY_STAGING_DIST_M * u[0],
+        p0[1] - ENTRY_STAGING_DIST_M * u[1],
+    )
+    # Parked essentially at the staging point: the chord is the aligned leg.
+    if math.hypot(live[0] - staging[0], live[1] - staging[1]) < 0.5:
+        return direct
+    return [live, staging, p0]
 ABORT_NOOP_STATES = {
     MissionState.IDLE,
     MissionState.COMPLETED,
@@ -438,18 +495,26 @@ class OffboardController:
                     self._entry_marking_must_hit = (
                         list(must_hit_to_publish) if must_hit_to_publish else None
                     )
-                    publish_pts = [
-                        (float(live_n), float(live_e)),
-                        (float(tgt_n), float(tgt_e)),
-                    ]
-                    publish_flags = [False, False]   # entry leg is spray-OFF
-                    # Both entry-leg points are live geometry, not survey intent.
-                    publish_must_hit = [False, False]
+                    # E1: aligned entry — route via a staging point behind the
+                    # mission start so the rover arrives collinear with the mark
+                    # (docs/ALIGNED_ENTRY_PLAN.md). Falls back to the plain
+                    # 2-pt chord in the degenerate cases.
+                    publish_pts = _entry_leg_points(
+                        (float(live_n), float(live_e)), pts_to_publish
+                    )
+                    # Entry leg is spray-OFF; all its points are live geometry,
+                    # not survey intent.
+                    publish_flags = [False] * len(publish_pts)
+                    publish_must_hit = [False] * len(publish_pts)
+                    via = (
+                        f" via staging ({publish_pts[1][0]:+.3f}N,{publish_pts[1][1]:+.3f}E)"
+                        if len(publish_pts) == 3 else ""
+                    )
                     self._log_entry(
                         "info",
                         f"entry leg: ({live_n:+.3f}N,{live_e:+.3f}E) → first point "
-                        f"({tgt_n:+.3f}N,{tgt_e:+.3f}E), "
-                        f"{math.hypot(tgt_n - live_n, tgt_e - live_e):.2f} m, spray OFF",
+                        f"({tgt_n:+.3f}N,{tgt_e:+.3f}E){via}, "
+                        f"{math.hypot(tgt_n - live_n, tgt_e - live_e):.2f} m direct, spray OFF",
                     )
 
             armed_here = False
