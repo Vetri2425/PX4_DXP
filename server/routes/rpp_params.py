@@ -91,7 +91,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "min_lookahead_dist": {
         "type": "float",
-        "default": 0.35,
+        "default": 0.52,
         "group": "RPP Geometry",
         "description": "Minimum lookahead distance (m)",
         "min": 0.1,
@@ -107,7 +107,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "lookahead_time": {
         "type": "float",
-        "default": 1.0,
+        "default": 1.6,
         "group": "RPP Geometry",
         "description": "Lookahead time (s); used for closed-loop velocity-scaled L_d",
         "min": 0.1,
@@ -475,7 +475,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "mission_speed": {
         "type": "float",
-        "default": 0.5,
+        "default": 0.70,
         "group": "Mission Control",
         "description": "Operator-facing mission speed (m/s). Single knob per job. 1.0 for roads, 0.3-0.5 for fields",
         "min": 0.0,
