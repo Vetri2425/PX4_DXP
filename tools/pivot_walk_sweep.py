@@ -26,13 +26,22 @@ SAFETY
 * Zeroes velocity on every exit path including Ctrl-C.
 * Rover spins in place: a ~1 m clear radius is enough.
 
-CONFLICTING PUBLISHER
----------------------
-rpp-pipeline also publishes /mavros/setpoint_velocity/cmd_vel. Stop it first or
-the two fight:
-    sudo systemctl stop rpp-pipeline      # check `armed` is false first
-    ...run this sweep...
-    sudo systemctl start rpp-pipeline
+DO NOT STOP rpp-pipeline
+------------------------
+Measured 2026-08-03: with rpp-pipeline fully running and no mission active, the
+setpoint topic has ZERO publishers and zero traffic. twist_to_setpoint only
+registers once the controller actually commands motion, so an idle pipeline does
+not contend with this sweep. Leave it running.
+
+It also cannot be stopped: `systemctl stop rpp-pipeline` is immediately followed
+by `Starting RPP Controller Pipeline...` in the same second (WantedBy=
+rover-server.service), and `systemctl mask` fails because the unit is a symlink
+into the repo. Stopping rover-server instead would kill the NTRIP child process
+and drop RTK to FLOAT -- which destroys the cm-level measurement this sweep
+exists to make.
+
+The one real hazard is starting a MISSION while the sweep runs: that wakes
+twist_to_setpoint and two publishers then fight over the rover. Don't.
 
 USAGE
     python3 tools/pivot_walk_sweep.py                 # full 10-angle ladder
