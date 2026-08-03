@@ -84,8 +84,8 @@ Not your job: PX4 firmware, waypoint gen, log analysis — those live on Mac GCS
 | | `RO_YAW_RATE_LIM` | **22** | was 90; **CLAUDE.md previously said 30 — wrong** |
 | | `RO_YAW_ACCEL_LIM` / `RO_YAW_DECEL_LIM` | 15 / 18 | was 25 / 34 |
 | Speed | `RO_MAX_THR_SPEED` | **1.28** | **CALIBRATION, not a limit** — full-throttle speed. `throttle ≈ v_des / this`, so understating it makes every command too large. Was 0.96 ⇒ **+33 % overspeed** (0.35 cmd → 0.467 measured); set to 1.28 in QGC 2026-08-01 and the error closed to **±6 %**. You RAISE it to go slower. `RO_SPEED_LIM` is NOT this knob — it caps the *setpoint* and never binds while `mission_speed` is below it |
-| Heading | `EKF2_GPS_YAW_OFF` | **180.0** | dual antenna mounted REVERSED. A round number — assumed, not measured. See open bug B1 |
-| | `GPS_YAW_OFFSET` | **180.0** | driver-level twin of the above |
+| Heading | `GPS_YAW_OFFSET` | **180.0** | **the ACTIVE knob** (audit 2026-08-03): driver subtracts it, exactly cancelling the hardcoded +180° master-front flip in `nmea.cpp` → net raw UM982 baseline heading (antennas mounted REVERSED). Round number — assumed, not measured (bug B1) |
+| | `EKF2_GPS_YAW_OFF` | **180.0** | **DEAD CODE on this setup** — EKF2 only applies it when the driver's `heading_offset` is NaN, and the driver always publishes a finite one. Changing it does nothing; tune `GPS_YAW_OFFSET` instead |
 | Antenna | `EKF2_GPS_POS_X/Y/Z` | 0 / 0 / −0.4 | **Y=0 asserts the antenna is on the centreline** — verify physically (bug B3) |
 | Wheels | `RBCLW_COUNTS_REV` | 148000 | one value for BOTH wheels (bug B2) |
 | | `RBCLW_QPPS_MAX` | 182655 | |
@@ -105,6 +105,7 @@ Not your job: PX4 firmware, waypoint gen, log analysis — those live on Mac GCS
 - Phase 3 spray: **live on this tree** — `spray_controller_node.py` → PX4 AUX1 via cmd 187; `on_value=1.0` / `off_value=-1.0` (normalized). QGC: `PWM_AUX_FUNC1=301`, `PWM_AUX_MIN1=0`, `PWM_AUX_MAX1=15000` (verified 2026-07-22; raised from 3000 for flow — see spray PWM strength note), `PWM_AUX_DIS1=0`. Manual: `POST /api/spray/test`.
 - Plan doc on branch: `docs/OFFBOARD_POSITION_MODE_PLAN.md` (future position-mode stop architecture — not implemented in controller yet).
 - robot_localization fusion: not pursued (EKF2 wheel-encoder fusion supersedes).
+- **GNSS/manual-mode/encoder firmware audit 2026-08-03:** full findings + patch backlog in `docs/FIRMWARE_PENDING_PATCHES.md`. Highlights: heading dropout **stops `/mavros/global_position/*` entirely** (always-landed patch clears yaw-align — §C1); `gps2/raw`, `gps_rtk/rtk_baseline`, `gp_origin` **never publish on this setup — normal, not a fault** (`gp_origin` needs MAV_CMD_REQUEST_MESSAGE 49); NTRIP has **no autostart** after a rover-server restart; manual-mode steering has **no smoothing and no param can add it** (`RO_YAW_EXPO`-family consumed only by dead code); the deployed firmware tree is **`~/px4-rover-build` (v1.16.2 + overlay)** — never audit the fork's `main` checkout.
 
 ### Active focus (from this baseline)
 1. **Path engine + trajectory planning** — mission/path generation, segment splitting, corner handling
