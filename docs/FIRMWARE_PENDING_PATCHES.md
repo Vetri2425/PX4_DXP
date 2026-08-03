@@ -406,3 +406,40 @@ the inter-epoch margin — treat as required for a durable 1 cm.
    fix + F7 units + F8 `-m config` + §A serial fixes (A1/A2).
 4. **Then:** raise `min_lookahead_dist` 0.55–0.70 (swing), add xtrack integrator
    (D4) or `RD_CRAB_OFF` (crab), re-enable WENC, field-validate the ladder.
+
+### E5. Evening verification results (08-03 night, bags/d1_verify_20260803)
+- **D1/D7 field-verified**: 6/6 pivots released clean (no chatter), run entries
+  0.39/0.74 cm (vs 2.4 baseline); walk DURING pivot persists (−1.4…−3.4 cm,
+  firmware-side as predicted).
+- **Command law verified EXACT in every phase** (transit/pre/mark/aft):
+  recomputed pursuit vs published cmd = 0.06–0.34° RMS, zero speed-cap
+  violations. Companion is closed; remaining error is plant/estimate.
+- Mark RMS 1.35/1.77/2.08 cm (2 PASS, 1 marginal). Phase pattern: run = one
+  half-cycle of the slow swing (enter left from pivot → finish right);
+  **aft-ext always drifts body-RIGHT (+2–4 cm)** = the same body-fixed defect
+  that biases mark's tail (+1.1…+1.8 mean).
+- **Swing = TWO components**: slow 0.16–0.18 Hz (loop, λ 1.6–1.9 m) + fast
+  λ 0.88–0.95 m ≈ WHEEL CIRCUMFERENCE (0.958 m). Pattern is BODY-fixed, not
+  ground-fixed (opp-direction anti-correlation −0.44…−0.83). 0.5 m/s rung
+  separates wheel-locked vs loop-locked.
+- **Crab re-measured: ~1° and SIGN-FLIPS with direction** (not 2.8°) —
+  re-measure per direction before investing in RD_CRAB_OFF.
+- **NEW controller item D15**: lookahead point collapses to 0.6–2 cm at the 5
+  conditioned-vertex handovers (two sit AT the spray boundaries) — transient
+  gain spike; guard = floor the rover→lookahead distance at handovers.
+- Conditioning verified: 81 wp @5.4 cm → 6 vtx, 0.00 cm deviation; segment
+  profile used for ALL phases incl. transit. Not a source of phase differences.
+- Minor open: 21:34 aft endgame had a 3 s window of 63° cmd-vs-law deviation
+  (endpoint/hold branch?) — one look at its seg-state sequence, low priority.
+
+### E6. Morning checklist 08-04 (in order)
+1. FC remount → centreline; ideally directly over axle midpoint (all offsets 0),
+   else measure d → `EKF2_IMU_POS_X=+d`; re-verify `EKF2_GPS_POS_Z=−0.4`.
+2. QGC: `EKF2_GPS_P_NOISE=0.015`, `EKF2_GPS_V_NOISE=0.05`.
+3. Firmware batch build+flash: F2 `EKF2_GPS_YAW_N` + F5 at_rest/in_air + F7
+   s_variance units + F8 `-m config` + A1/A2 RoboClaw serial.
+4. After F2 lands: `RO_YAW_RATE_TH 1.0→0.5`.
+5. Field: re-run 1_Aug-II both directions @0.35 (before/after remount compare:
+   body-right drift + pivot walk + crab per direction), then 0.5 m/s rung
+   (wheel-ripple separator + the ≤2 cm curve+straight close-out gate).
+6. GNSS serial check via `GPS_DUMP_COMM=1` (fractional-second GGA, AGRICA rates).
