@@ -46,7 +46,11 @@ def node():
     rclpy.init(args=["--ros-args", "-p", "require_rtk_fix:=false"])
     from rpp_controller_node import RPPControllerNode
     n = RPPControllerNode()
-    n.set_parameters([Parameter("max_linear_vel", value=MAX_V)])
+    # Pin BOTH halves of the effective ceiling min(max_linear_vel, mission_speed):
+    # this test reproduces a 0.7 m/s run and must not drift with the node's
+    # mission_speed default (0.7 -> 0.5 at cfbf5f3 broke exactly that).
+    n.set_parameters([Parameter("max_linear_vel", value=MAX_V),
+                      Parameter("mission_speed", value=MAX_V)])
     yield n
     n.destroy_node()
     rclpy.shutdown()
