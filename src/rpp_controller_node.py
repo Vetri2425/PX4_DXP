@@ -662,6 +662,18 @@ class RPPControllerNode(Node):
         # min(), so a cap at/below the timeout band silently re-disables the
         # watchdog (the 2026-07-30 stall had 3.0 capping a 2.0/2.0 pair).
         self.declare_parameter("segment_pivot_release_max_deg",        5.0)    # deg
+        # D1 (2026-08-03 estimation audit): pivot-to-intercept. The corner stop
+        # leaves the rover up to segment_corner_acceptance_radius (+ brake
+        # overshoot) short of the vertex, and the old pivot target was the next
+        # LEG DIRECTION — computed with no reference to where the rover
+        # actually stopped — so the release gate deliberately preserved that
+        # lateral offset (measured: the 2.4 cm pivot walk). Aim the pivot at a
+        # point pivot_intercept_dist_m ahead on the new leg FROM THE CURRENT
+        # POSITION instead: the same heading gate then nulls cross-track and
+        # heading together. With zero offset the intercept bearing equals the
+        # leg direction exactly, so already-aligned pivots are unchanged.
+        self.declare_parameter("pivot_to_intercept_enabled", True)
+        self.declare_parameter("pivot_intercept_dist_m", 0.35)   # m along new leg
         # Connector absorption (Part A): adjacent apex waypoints can leave a
         # sub-threshold "connector" segment (e.g. 8 cm) between two real legs.
         # If it survives into run-splitting it becomes its own pivot target and
@@ -2280,7 +2292,8 @@ class RPPControllerNode(Node):
             self._publish_velocity(brake_n, brake_e)
             self._publish_yaw_rate(0.0)
             self._publish_debug(
-                cross_track=0.0, heading_err=0.0, lookahead=dist_to_goal,
+                cross_track=self._debug_xtrack(pos_n, pos_e),
+                heading_err=0.0, lookahead=dist_to_goal,
                 speed=math.hypot(brake_n, brake_e), kappa=0.0,
                 dist_goal=dist_to_goal, pose_age_ms=pose_age_s * 1000.0,
                 state=StateCode.TRACKING, l_d_raw=float("nan"),
@@ -2306,7 +2319,8 @@ class RPPControllerNode(Node):
                 self._publish_velocity(0.0, 0.0)
                 self._publish_yaw_rate(0.0)
                 self._publish_debug(
-                    cross_track=0.0, heading_err=0.0, lookahead=dist_to_goal,
+                    cross_track=self._debug_xtrack(pos_n, pos_e),
+                    heading_err=0.0, lookahead=dist_to_goal,
                     speed=0.0, kappa=0.0, dist_goal=dist_to_goal,
                     pose_age_ms=pose_age_s * 1000.0, state=StateCode.TRACKING,
                     l_d_raw=float("nan"), kappa_speed=0.0, yaw_rate=0.0,
@@ -2323,7 +2337,8 @@ class RPPControllerNode(Node):
                 self._publish_velocity(0.0, 0.0)
                 self._publish_yaw_rate(0.0)
                 self._publish_debug(
-                    cross_track=0.0, heading_err=0.0, lookahead=dist_to_goal,
+                    cross_track=self._debug_xtrack(pos_n, pos_e),
+                    heading_err=0.0, lookahead=dist_to_goal,
                     speed=0.0, kappa=0.0, dist_goal=dist_to_goal,
                     pose_age_ms=pose_age_s * 1000.0, state=StateCode.TRACKING,
                     l_d_raw=float("nan"), kappa_speed=0.0, yaw_rate=0.0,
@@ -2412,7 +2427,8 @@ class RPPControllerNode(Node):
         self._publish_velocity(vel_n, vel_e)
         self._publish_yaw_rate(0.0)
         self._publish_debug(
-            cross_track=0.0, heading_err=0.0, lookahead=dist_to_goal,
+            cross_track=self._debug_xtrack(pos_n, pos_e),
+            heading_err=0.0, lookahead=dist_to_goal,
             speed=abs(v_cmd), kappa=0.0, dist_goal=dist_to_goal,
             pose_age_ms=pose_age_s * 1000.0, state=StateCode.TRACKING,
             l_d_raw=float("nan"), kappa_speed=0.0, yaw_rate=0.0,
@@ -2461,7 +2477,7 @@ class RPPControllerNode(Node):
         self._publish_velocity(brake_n, brake_e)
         self._publish_yaw_rate(0.0)
         self._publish_debug(
-            cross_track=0.0,
+            cross_track=self._debug_xtrack(pos_n, pos_e),
             heading_err=heading_err,
             lookahead=dist_to_goal,
             speed=brake_speed,
@@ -2545,7 +2561,7 @@ class RPPControllerNode(Node):
         self._publish_velocity(brake_n, brake_e)
         self._publish_yaw_rate(0.0)
         self._publish_debug(
-            cross_track=0.0,
+            cross_track=self._debug_xtrack(pos_n, pos_e),
             heading_err=0.0,
             lookahead=dist_to_goal,
             speed=math.hypot(brake_n, brake_e),
@@ -2649,7 +2665,10 @@ class RPPControllerNode(Node):
             self._run_align_pending = False
             return False
 
-        target_heading = math.atan2(b.y - a.y, b.x - a.x)
+        leg_heading = math.atan2(b.y - a.y, b.x - a.x)
+        target_heading = self._pivot_intercept_heading(
+            pos_n, pos_e, a, b, leg_heading
+        )
         heading_err = self._angle_wrap(target_heading - yaw_ned)
         heading_tol = math.radians(
             float(self.get_parameter("segment_heading_tolerance_deg").value)
@@ -2712,7 +2731,7 @@ class RPPControllerNode(Node):
             self._publish_velocity(brake_n, brake_e)
             self._publish_yaw_rate(0.0)
             self._publish_debug(
-                cross_track=0.0,
+                cross_track=self._debug_xtrack(pos_n, pos_e),
                 heading_err=heading_err,
                 lookahead=float("nan"),
                 speed=math.hypot(brake_n, brake_e),
@@ -2746,7 +2765,7 @@ class RPPControllerNode(Node):
                 self._publish_velocity(brake_n, brake_e)
                 self._publish_yaw_rate(0.0)
                 self._publish_debug(
-                    cross_track=0.0,
+                    cross_track=self._debug_xtrack(pos_n, pos_e),
                     heading_err=heading_err,
                     lookahead=float("nan"),
                     speed=math.hypot(brake_n, brake_e),
@@ -2781,7 +2800,7 @@ class RPPControllerNode(Node):
         self._publish_velocity(v_n, v_e)
         self._publish_yaw_rate(0.0)
         self._publish_debug(
-            cross_track=0.0,
+            cross_track=self._debug_xtrack(pos_n, pos_e),
             heading_err=heading_err,
             lookahead=float("nan"),
             speed=corner_speed,
@@ -2959,6 +2978,55 @@ class RPPControllerNode(Node):
         signed_e = cross_z / seg_len
         dist_to_end_along = (1.0 - t) * seg_len
         return t, foot_n, foot_e, signed_e, dist_to_end_along
+
+    def _pivot_intercept_heading(
+        self, pos_n: float, pos_e: float, a, b, leg_heading: float
+    ) -> float:
+        """D1: pivot target = bearing from the CURRENT position to an intercept
+        point on the leg a->b, so the pivot-release heading gate nulls the
+        lateral offset the corner stop left behind instead of preserving it.
+
+        The intercept sits pivot_intercept_dist_m beyond the rover's own
+        projection onto the leg (clamped to b), mirroring how TRACK's pure
+        pursuit chases the same leg after release. Falls back to the plain leg
+        direction when disabled, on degenerate geometry, or when the intercept
+        is so close that the bearing would be dominated by pose noise. With the
+        rover exactly on the leg the intercept bearing equals leg_heading, so
+        aligned pivots are byte-identical to the old behaviour.
+        """
+        if not bool(self.get_parameter("pivot_to_intercept_enabled").value):
+            return leg_heading
+        d_int = float(self.get_parameter("pivot_intercept_dist_m").value)
+        dx = b.x - a.x
+        dy = b.y - a.y
+        seg_sq = dx * dx + dy * dy
+        if d_int <= 0.0 or seg_sq < 1e-12:
+            return leg_heading
+        seg_len = math.sqrt(seg_sq)
+        t_foot = self._clamp(
+            ((pos_n - a.x) * dx + (pos_e - a.y) * dy) / seg_sq, 0.0, 1.0
+        )
+        t_int = min(t_foot + d_int / seg_len, 1.0)
+        int_n = a.x + t_int * dx
+        int_e = a.y + t_int * dy
+        d_to_int = self._dist(pos_n, pos_e, int_n, int_e)
+        if d_to_int < max(0.05, 0.25 * d_int):
+            return leg_heading
+        return math.atan2(int_e - pos_e, int_n - pos_n)
+
+    def _debug_xtrack(self, pos_n: float, pos_e: float) -> float:
+        """D7: real signed cross-track for the debug emits inside stop / pivot /
+        dwell holds, which previously published a literal 0.0 and hid the pivot
+        walk from /rpp/debug and every bag analysis built on it. Projects onto
+        the active segment (segment 0 during a run-alignment hold — _apply_run
+        resets _segment_idx). Debug-only; never feeds control.
+        """
+        if len(self._path) < 2:
+            return 0.0
+        _, _, _, signed_e, _ = self._project_onto_segment(
+            pos_n, pos_e, self._segment_idx
+        )
+        return signed_e
 
     def _path_curvature_at(self, seg_idx: int, baseline_m: float = 0.0) -> float:
         """Estimate path curvature at the projection foot (Menger curvature).
@@ -3552,7 +3620,10 @@ class RPPControllerNode(Node):
             path_corner_deg = abs(self._segment_angle_deg(seg_idx))
             threshold_deg = float(self.get_parameter("segment_corner_threshold_deg").value)
             c = self._path[seg_idx + 2].pose.position
-            target_heading = math.atan2(c.y - b.y, c.x - b.x)
+            leg_heading = math.atan2(c.y - b.y, c.x - b.x)
+            target_heading = self._pivot_intercept_heading(
+                pos_n, pos_e, b, c, leg_heading
+            )
             heading_err = self._angle_wrap(target_heading - yaw_ned)
             timed_out = self._corner_stop_complete and self._pivot_timed_out(
                 math.radians(path_corner_deg)

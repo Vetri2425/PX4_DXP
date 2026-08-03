@@ -306,6 +306,20 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
         "min": 0.1,
         "max": 45.0,
     },
+    "pivot_to_intercept_enabled": {
+        "type": "bool",
+        "default": True,
+        "group": "Tracking Profile",
+        "description": "D1 (2026-08-03): pivot target = bearing from the actual stop position to a point pivot_intercept_dist_m ahead on the new leg, so the release gate nulls the corner-stop offset (the 2.4 cm pivot walk) instead of preserving it. False = pre-08-03 leg-direction pivot",
+    },
+    "pivot_intercept_dist_m": {
+        "type": "float",
+        "default": 0.35,
+        "group": "Tracking Profile",
+        "description": "Intercept distance along the new leg for pivot-to-intercept (m). Smaller = stronger offset correction per released degree; 0.35 matches the production lookahead floor",
+        "min": 0.1,
+        "max": 2.0,
+    },
     "segment_stop_speed_threshold": {
         "type": "float",
         "default": 0.02,
