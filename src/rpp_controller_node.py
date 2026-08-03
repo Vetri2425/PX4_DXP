@@ -272,13 +272,21 @@ class RPPControllerNode(Node):
         # Tune mission_speed per job to further cap; this is the hw ceiling.
         self.declare_parameter("max_linear_vel",                      0.8)
         self.declare_parameter("min_linear_vel",                      0.15)
-        # 1.5 m arc baseline:
-        # k_path = 1/1.5 = 0.667 1/m, curvature floor below enforces
-        # Ld >= 0.35 / k_path = 0.525 m. Keep the explicit minimum aligned
-        # with that floor so the debugged Ld is stable and predictable.
-        self.declare_parameter("min_lookahead_dist",                  0.52)
+        # Field-validated on STRAIGHTS 2026-08-03 (3.3 m line, 3 runs at
+        # mission_speed 0.35 -> Ld = clamp(1.0*0.35, 0.35, 1.0) = 0.35 m):
+        # marking RMS 1.82 / 1.52 / 0.88 cm, 3/3 pass. The same line at 0.60
+        # (Ld 0.60) gave 1.14 / 2.28 / 1.94 and one failure.
+        #
+        # CAVEAT — this is a straight-line result only. The previous 0.52 was
+        # deliberately aligned with the 1.5 m arc curvature floor
+        # (k_path = 1/1.5 = 0.667 1/m => Ld >= 0.35 / k_path = 0.525 m) so the
+        # debugged Ld stayed stable on arcs. At 0.35 that alignment is gone and
+        # the curvature floor, not this minimum, will set Ld on tight arcs.
+        # Arc behaviour is UNVALIDATED at these values — re-check before
+        # running curved geometry in production.
+        self.declare_parameter("min_lookahead_dist",                  0.35)
         self.declare_parameter("max_lookahead_dist",                  1.0)
-        self.declare_parameter("lookahead_time",                      1.6)
+        self.declare_parameter("lookahead_time",                      1.0)
 
         # Curvature regulation — lateral acceleration constraint (P4.1)
         # v_lat_limit = sqrt(a_lat_max / |kappa|); physically correct form.
@@ -724,10 +732,17 @@ class RPPControllerNode(Node):
         # Roads/large fields: 1.0 m/s  |  Sports fields/tight marking: 0.3–0.5 m/s
         # 0.35 -> 0.50 -> 0.70 (2026-08-01): field-test default, after
         # RO_SPEED_LIM was raised in QGC (it clamped every run to 0.30 m/s).
-        # Braking from 0.7 is 0.70 m, so approach_velocity_scaling_dist moves
-        # 0.6 -> 0.9 with it — otherwise the goal ramp starts inside the
-        # stopping distance and the rover overshoots the endpoint.
-        self.declare_parameter("mission_speed",                       0.70)  # m/s
+        #
+        # 2026-08-03: default drops 0.70 -> 0.35, the only config that passed
+        # marking on all three runs of the day (RMS 1.82 / 1.52 / 0.88 cm).
+        # 0.60 gave 1.78 cm mean with one failure; the "run straights at 0.6"
+        # recommendation was tested head-to-head and lost.
+        #
+        # Braking from 0.35 is ~0.18 m, well inside approach_velocity_scaling_dist
+        # (0.9, sized for 0.70). That is conservative, not unsafe — the goal ramp
+        # simply starts earlier than it needs to. Revisit the scaling distance
+        # only if the endpoint approach becomes objectionably slow.
+        self.declare_parameter("mission_speed",                       0.35)  # m/s
 
         # P4.2 — Deceleration limit used ONLY for braking-distance derivation.
         # Separate from max_linear_accel because the accel ramp is one-way
