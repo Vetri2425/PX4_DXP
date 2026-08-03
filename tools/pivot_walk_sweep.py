@@ -26,12 +26,17 @@ SAFETY
 * Zeroes velocity on every exit path including Ctrl-C.
 * Rover spins in place: a ~1 m clear radius is enough.
 
-DO NOT STOP rpp-pipeline
-------------------------
-Measured 2026-08-03: with rpp-pipeline fully running and no mission active, the
-setpoint topic has ZERO publishers and zero traffic. twist_to_setpoint only
-registers once the controller actually commands motion, so an idle pipeline does
-not contend with this sweep. Leave it running.
+rpp-pipeline MUST BE RUNNING
+----------------------------
+This sweep publishes /rpp/velocity_ned and relies on the pipeline's
+twist_to_setpoint node to bridge it to /mavros/setpoint_raw/local at 50 Hz.
+Stop the pipeline and NOTHING reaches PX4 — the sweep will appear to run and the
+rover will never move.
+
+There is no contention: with no mission active the rpp_controller publishes
+nothing on /rpp/velocity_ned, so this sweep is the only source. twist_to_setpoint
+streams continuously (zeros when idle), which also satisfies PX4's requirement
+for >=2 Hz setpoints before OFFBOARD will engage.
 
 It also cannot be stopped: `systemctl stop rpp-pipeline` is immediately followed
 by `Starting RPP Controller Pipeline...` in the same second (WantedBy=
@@ -62,7 +67,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
-from geometry_msgs.msg import PoseStamped, TwistStamped
+from geometry_msgs.msg import PoseStamped, Vector3Stamped
+from std_msgs.msg import Float32
 from mavros_msgs.msg import State
 
 # --- must mirror the controller ------------------------------------------
@@ -112,8 +118,22 @@ class PivotSweep(Node):
                                durability=DurabilityPolicy.TRANSIENT_LOCAL,
                                history=HistoryPolicy.KEEP_LAST)
 
+        # Publish into the PRODUCTION path, exactly as rpp_controller_node does:
+        #   /rpp/velocity_ned (Vector3Stamped, frame local_ned, x=v_n y=v_e)
+        #   /rpp/yaw_rate_body (Float32; CORNER_ALIGN publishes 0.0)
+        # twist_to_setpoint then streams PositionTarget on
+        # /mavros/setpoint_raw/local at 50 Hz in FRAME_LOCAL_NED, and falls back
+        # to ZERO velocity if our input goes stale (input_max_age_s) — a
+        # fail-stop we get for free.
+        #
+        # An earlier version published TwistStamped on
+        # /mavros/setpoint_velocity/cmd_vel with frame_id "base_link" (following
+        # the CLAUDE.md line "Velocity: /mavros/setpoint_velocity/cmd_vel").
+        # That is NOT the path this rover uses: the rover crept 4.8 cm BACKWARD
+        # and rotated 0.1 deg before timing out (2026-08-03 18:34 run).
         self._vel_pub = self.create_publisher(
-            TwistStamped, "/mavros/setpoint_velocity/cmd_vel", 10)
+            Vector3Stamped, "/rpp/velocity_ned", 10)
+        self._yawrate_pub = self.create_publisher(Float32, "/rpp/yaw_rate_body", 10)
         self.create_subscription(PoseStamped, "/mavros/local_position/pose",
                                  self._pose_cb, pose_qos)
         self.create_subscription(State, "/mavros/state", self._state_cb, state_qos)
@@ -137,13 +157,14 @@ class PivotSweep(Node):
 
     def _tick(self):
         v_n, v_e = self._cmd
-        m = TwistStamped()
+        m = Vector3Stamped()
         m.header.stamp = self.get_clock().now().to_msg()
-        m.header.frame_id = "base_link"
-        m.twist.linear.x = v_e        # NED -> ENU
-        m.twist.linear.y = v_n
-        m.twist.linear.z = 0.0
+        m.header.frame_id = "local_ned"   # twist_to_setpoint expected_input_frame
+        m.vector.x = v_n
+        m.vector.y = v_e
+        m.vector.z = 0.0
         self._vel_pub.publish(m)
+        self._yawrate_pub.publish(Float32(data=0.0))   # CORNER_ALIGN sends 0.0
 
     # ---- helpers ---------------------------------------------------------
     def hold(self, seconds: float):
