@@ -87,9 +87,12 @@ shipped because a test's ground truth mirrored the bug it was testing.
   it whole.
 - **Closes when:** either compensated (feed-forward of the known walk into the approach stop
   target) or formally accepted with the extension prerequisite documented.
-- **Fix plan exists:** `docs/ALIGNED_ENTRY_PLAN.md` (E-series) — 3-pt aligned entry via a
-  staging point 1.2 m behind the mission start; moves the ~180° pivot into free space so
-  the walk never lands on the start point. ~10-line server change, RPP untouched.
+- **Fix attempt E1 FAILED IN THE FIELD 2026-08-03 — small accident, feature disabled.**
+  The staging detour (`docs/ALIGNED_ENTRY_PLAN.md`) sent the rover past wp0 into
+  unplanned ground when parked down-line; operator e-stopped; minor collision. Disabled
+  via `ROVER_ENTRY_STAGING=0` drop-in on the Jetson. Do NOT re-enable without the plan's
+  §8 conditions (app route preview + operator consent + corridor guard). D1 itself
+  remains open; the extension+lookahead mitigation is the only active treatment.
 
 ### ☐ D2 — Approach-stop scatter 2–4 cm, direction-dependent
 - Same mission, same tolerance: stop error 1.25–3.76 cm across 8 approaches, direction varies

@@ -1,8 +1,33 @@
 # Aligned Runtime Entry — Plan (E-series)
 
-**Status:** **E1 IMPLEMENTED 2026-08-02** (`_entry_leg_points` + wiring in `start_async`,
-8 new unit tests, server suite 405 green; env knobs `ROVER_ENTRY_STAGING` /
-`ROVER_ENTRY_STAGING_DIST_M`) · E2 bench + E3 field A/B scheduled for the 08-02 field day
+**Status:** **DISABLED IN THE FIELD 2026-08-03 AFTER AN ACCIDENT — do not re-enable
+without the §8 redesign.** E1 implemented 08-02 (`099a9a2` tree, server suite 405
+green); first field run 08-03 (bag `stg_553075d4_132652`): geometry executed exactly
+as designed — and that was the problem.
+
+## 8. FIELD FAILURE 2026-08-03 — design flaw, not an implementation bug
+
+The rover was parked **down-line of the mission start** (on the mark's side). The
+staging detour therefore ran **past wp0 into ground beyond the line start** — ground
+the old 2-pt entry never enters. The operator (correctly) read "it missed the stop
+point", e-stopped 1 s before the staging corner stop (bag shows dist-to-corner
+0.001 m at e-stop), and the rover had a **small accident in the unplanned corridor**.
+
+Root design flaw: §5 risk 1 claimed the staging corridor is "the same ground the
+rover was about to drive anyway." **False when parked down-line** — exactly the
+anti-parallel case the feature was built for. The maneuver needs ground clearance
+the system cannot see and the operator was never asked about.
+
+Disabled via systemd drop-in `/etc/systemd/system/rover-server.service.d/entry-staging.conf`
+(`ROVER_ENTRY_STAGING=0`). Code stays in tree; unit tests keep it honest.
+
+**Re-enable requires ALL of:**
+1. App draws the full entry route (including the staging detour) BEFORE start, and
+   the operator explicitly confirms it — the detour must never be a surprise.
+2. A conservative auto-guard: staging only when the detour corridor stays within
+   ground the mission already traverses (e.g. within the staged path's bounding
+   hull + margin); otherwise fall back to the plain chord and accept the pivot.
+3. E3 gates re-run from scratch.
 **Owner surface:** `server/offboard_controller.py::start_async` ONLY (frontend trajectory,
 path engine, and RPP are untouched)
 **Attacks:** register **D1** (pivot walk at the mission start) and **D2** (approach-stop
