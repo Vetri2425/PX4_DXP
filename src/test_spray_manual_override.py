@@ -322,6 +322,13 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "off_pwm_us": _Param(0),
         "on_pwm_us": _Param(1800),
         "spray_enabled": _Param(True),
+        # Projection continuity (2026-08-04) — SHIPPED defaults, so the fixture
+        # exercises the production configuration rather than a bypass. The
+        # 1.0 m reacquire floor means any deliberate teleport in a test still
+        # falls back to the old global scan.
+        "projection_window_back_m": _Param(0.5),
+        "projection_window_fwd_m": _Param(2.0),
+        "projection_reacquire_dist_m": _Param(1.0),
     }
     node.get_parameter = lambda name: node._params[name]
     node._clock = _Clock()
@@ -336,6 +343,9 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._manual_state_pub = _Pub()
     node._status_pub = _StringPub()
     node._desired_raw = False
+    # Last path station for the projection-continuity window; None = acquire
+    # globally, which is what a freshly-built node must do.
+    node._proj_prev_s = None
     node._candidate = None
     node._candidate_count = 0
     node._desired_debounced = False
