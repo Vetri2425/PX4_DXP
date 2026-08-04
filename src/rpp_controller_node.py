@@ -578,11 +578,6 @@ class RPPControllerNode(Node):
         # ~0.05 m/s (floor + overshoot) so drift is <1 cm, without touching the
         # non-extension square's within-run corners or arc approaches.
         self.declare_parameter("segment_endpoint_approach_speed",      0.03)   # m/s
-        # Floor for any NON-ZERO speed command while ground remains to cover.
-        # PX4 RO_SPEED_TH = 0.10 m/s; below it the wheels barely turn, so a
-        # command in (0, 0.10) strands the rover instead of creeping it. Keep
-        # this at or above the FCU value. 0 disables (A/B arm).
-        self.declare_parameter("min_actuatable_speed_m_s",             0.10)   # m/s
         self.declare_parameter("segment_corner_acceptance_radius",     0.05)
         # Pivot exit tolerance. MUST sit strictly ABOVE the firmware's
         # RD_TRANS_TRN_DRV stop angle (2.0° as flown): the firmware stops
@@ -4008,30 +4003,6 @@ class RPPControllerNode(Node):
             ):
                 speed = runout_min
             self._segment_state = SegmentStateCode.PRE_CORNER_SLOWDOWN
-
-        # ---- DEAD-BAND GUARD (2026-08-04) --------------------------------
-        # PX4 RO_SPEED_TH is 0.10 m/s. A command in 0 < v < RO_SPEED_TH is not
-        # a slow creep, it is NO MOTION — the wheels barely turn — so the rover
-        # strands wherever the ramp happened to put it and the segment never
-        # advances. Every stall chased on 2026-08-04 was this one shape:
-        #   * 5 cm short of a corner, commanded 0.010-0.030 m/s (clamp bug);
-        #   * 17.5 cm short of a corner for 36 s, commanded 0.068 m/s
-        #     (bag stg_c648f04a: max(0.03, 0.35*0.175/0.9) = 0.068 < 0.10);
-        # both ended in an operator e-stop, and hand-pushing the rover a few cm
-        # made it resume instantly.
-        #
-        # transit_runout_min_speed_m_s already did exactly this, but only for an
-        # unpainted run-out (_run_tail_is_transit). The dead-band is a property
-        # of the drivetrain, not of what the tail happens to be, so apply it
-        # wherever we still have ground to cover. Inside the goal tolerance we
-        # deliberately leave the command alone — that is where a stop belongs,
-        # and the corner-stop / p4 zero-snap paths own it.
-        #
-        # Set 0 to disable (A/B arm). Keep it at or above the FCU's
-        # RO_SPEED_TH; lowering it re-creates the stall.
-        act_min = float(self.get_parameter("min_actuatable_speed_m_s").value)
-        if act_min > 0.0 and 0.0 < speed < act_min and dist_to_corner > goal_tol_eff:
-            speed = act_min
 
         max_accel = float(self.get_parameter("max_linear_accel").value)
         speed_before_accel = speed
