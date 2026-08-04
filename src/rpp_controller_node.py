@@ -324,7 +324,16 @@ class RPPControllerNode(Node):
         # NOTE at mission_speed 0.35 with lookahead_time 1.0 the raw request is
         # 0.35 m, so this floor still binds 100% of the time => Ld is exactly
         # this value, keeping each rung a clean single-variable test.
-        self.declare_parameter("min_lookahead_dist",                  0.52)
+        #
+        # ROLLED BACK 0.52 -> 0.35 on 2026-08-04. The ladder was validated on
+        # STRAIGHT LINES only, and rung 2 was never run on curved or
+        # multi-run geometry. The square that finally completed (167/167 pts,
+        # 1.15 cm marking RMS) did so at 0.35, so that is the value with
+        # evidence behind it on the geometry that matters. Rungs 1 and 2 bought
+        # a measurable drop in commanded course swing (-20 %, matching the 1/Ld
+        # prediction) but NO improvement in mark RMS, so nothing is lost by
+        # returning to the validated default.
+        self.declare_parameter("min_lookahead_dist",                  0.35)
         self.declare_parameter("max_lookahead_dist",                  1.0)
         self.declare_parameter("lookahead_time",                      1.0)
 
@@ -4002,7 +4011,37 @@ class RPPControllerNode(Node):
         # degrades to exactly the previous final-segment behaviour rather
         # than to no endpoint braking at all.
         approach_ref = dist_to_corner if final_segment else float("inf")
-        if bool(self.get_parameter("endpoint_approach_run_remaining").value):
+        # FINAL RUN ONLY (2026-08-04). The along-run measure exists to brake
+        # into the MISSION endpoint; applying it at every internal run boundary
+        # is what broke multi-run geometry.
+        #
+        # A 2x2 square installs as SEVEN internal runs (294 pts -> 30 wp), each
+        # ~3 m, and every corner connector is a run boundary. approach_d is
+        # floored at approach_velocity_scaling_dist = 0.9 m while the physical
+        # need at 0.35 m/s and 0.5 m/s^2 is only v^2/2a + 0.1 = 0.22 m — so the
+        # last 0.9 m of EVERY run, ~30 % of it, was ramped down to
+        # segment_endpoint_approach_speed. Two failures follow:
+        #   1. throughput — seven connectors x 0.9 m of crawl;
+        #   2. deadlock — that floor (0.03) sits ABOVE
+        #      segment_stop_speed_threshold (0.02), and the run-alignment hold
+        #      at the next run will not release until measured speed drops
+        #      below it, with its timeout firing only on STALE velocity. The
+        #      rover braked forever; _control_segment_profile was never entered
+        #      again (1465/1465 ticks, offline replay of bag stg_1e79599d).
+        # Field A/B 2026-08-04: with the along-run measure off, the same square
+        # completed 167/167 points at 1.15 cm marking RMS; with it on, three
+        # runs died at 20/35/37 % coverage and one latched the valve open for
+        # 78 % of a 24 s run.
+        #
+        # Intermediate boundaries keep the per-segment measure, which is
+        # bounded by the segment length and cannot produce a long crawl. The
+        #54.6 cm endpoint overshoot 3e7e300 fixed was a single-run line, i.e.
+        # the final run, so that fix is preserved exactly where it was needed.
+        if (
+            bool(self.get_parameter("endpoint_approach_run_remaining").value)
+            and self._runs
+            and self._run_idx >= len(self._runs) - 1
+        ):
             remaining_along = self._run_remaining_along()
             if remaining_along is not None:
                 approach_ref = min(approach_ref, remaining_along)

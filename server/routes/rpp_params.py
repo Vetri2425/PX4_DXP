@@ -95,8 +95,10 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
         # Was stale at 0.52 while the controller default was 0.35; corrected to
         # the live default on 2026-08-04 (Ld ladder — see the controller
         # comment for the evidence). Rung 2: 0.45 -> 0.52, the arc-aligned
-        # value (1.5 m arc curvature floor demands Ld >= 0.525).
-        "default": 0.52,
+        # value (1.5 m arc curvature floor demands Ld >= 0.525). ROLLED BACK to
+        # 0.35 on 2026-08-04 - the ladder was validated on straight lines only
+        # and the completing square ran at 0.35.
+        "default": 0.35,
         "group": "RPP Geometry",
         "description": "Minimum lookahead distance (m)",
         "min": 0.1,
