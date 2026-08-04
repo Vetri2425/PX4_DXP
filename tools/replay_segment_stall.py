@@ -66,7 +66,7 @@ class _Cap:
         return self.messages[-1] if self.messages else None
 
 
-def replay(bundle, t_from=None, t_to=None, stride=1):
+def replay(bundle, t_from=None, t_to=None, print_every=1):
     am = _load_am()
     bag, _ = am._find_bag_dir(bundle)
     s = am.collect(bag)
@@ -126,9 +126,11 @@ def replay(bundle, t_from=None, t_to=None, stride=1):
         print(hdr); print("-" * len(hdr))
 
         prev_seg = None
+        prev_run = None
+        run_switches = []
         first_backward = None
         rows = 0
-        for i in range(0, len(s.pose), stride):
+        for i in range(len(s.pose)):
             t, n, e, yaw = s.pose[i]
             rel = t - t0
             if t_from is not None and rel < t_from:
@@ -154,8 +156,11 @@ def replay(bundle, t_from=None, t_to=None, stride=1):
             if prev_seg is not None and seg < prev_seg and first_backward is None:
                 first_backward = (rel, prev_seg, seg)
             prev_seg = seg
+            if prev_run is not None and run_i != prev_run:
+                run_switches.append((rel, prev_run, run_i))
+            prev_run = run_i
 
-            if rows < 400:
+            if i % print_every == 0 and rows < 500:
                 print("%8.2f %6d %5d %5d %8.3f %10.3f %10s %10.3f"
                       % (rel, int(getattr(node, "_segment_state", -1)), run_i, seg,
                          proj_t, travel,
@@ -163,6 +168,11 @@ def replay(bundle, t_from=None, t_to=None, stride=1):
                 rows += 1
 
         print()
+        print("RUN SWITCHES: %s" % (
+            ", ".join("t=%.1f %d->%d" % x for x in run_switches) or "NONE"))
+        print("final run %s seg %s state %s" % (
+            getattr(node, "_run_idx", -1), getattr(node, "_segment_idx", -1),
+            int(getattr(node, "_segment_state", -1))))
         if first_backward:
             print("FIRST BACKWARD segment index: t=%.2f s  %d -> %d"
                   % first_backward)
@@ -178,9 +188,12 @@ def main():
     ap.add_argument("bundle")
     ap.add_argument("--from", dest="t_from", type=float, default=None)
     ap.add_argument("--to", dest="t_to", type=float, default=None)
-    ap.add_argument("--stride", type=int, default=1)
+    ap.add_argument("--print-every", type=int, default=1,
+                    help="decimate PRINTING only; every pose is always ticked, "
+                         "because skipping poses makes the position delta trip "
+                         "the EKF jump guard and every cycle is discarded")
     a = ap.parse_args()
-    raise SystemExit(replay(a.bundle, a.t_from, a.t_to, max(1, a.stride)))
+    raise SystemExit(replay(a.bundle, a.t_from, a.t_to, max(1, a.print_every)))
 
 
 if __name__ == "__main__":
