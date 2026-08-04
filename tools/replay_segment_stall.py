@@ -22,7 +22,9 @@ No rover and no ROS graph needed, but rclpy must import — run it on the Jetson
 from __future__ import annotations
 
 import argparse
+import collections
 import importlib.util
+import linecache
 import math
 import os
 import sys
@@ -54,6 +56,32 @@ def _enu_pose(north, east, yaw_ned):
     return msg
 
 
+# --- branch tracer -------------------------------------------------------
+# Records which line each call to a target function RETURNS from, plus the
+# locals at that moment. Zero risk: it observes the controller, never edits it.
+_TRACE = {"target": None, "exit": None, "locals": {}, "hits": collections.Counter()}
+
+
+def _local_trace(frame, event, arg):
+    if event == "return":
+        _TRACE["exit"] = frame.f_lineno
+        _TRACE["hits"][frame.f_lineno] += 1
+        keep = ("seg_idx", "n_pts", "dist_to_corner", "corner_angle",
+                "final_segment", "heading_err", "dist_to_end_along", "speed",
+                "t", "seg_len", "pose_age_s", "dist_to_goal")
+        _TRACE["locals"] = {
+            k: v for k, v in frame.f_locals.items()
+            if k in keep and isinstance(v, (int, float, bool))
+        }
+    return _local_trace
+
+
+def _tracer(frame, event, arg):
+    if event == "call" and frame.f_code.co_name == _TRACE["target"]:
+        return _local_trace
+    return None
+
+
 class _Cap:
     def __init__(self):
         self.messages = []
@@ -66,7 +94,7 @@ class _Cap:
         return self.messages[-1] if self.messages else None
 
 
-def replay(bundle, t_from=None, t_to=None, print_every=1):
+def replay(bundle, t_from=None, t_to=None, print_every=1, trace_fn=None):
     am = _load_am()
     bag, _ = am._find_bag_dir(bundle)
     s = am.collect(bag)
@@ -154,11 +182,18 @@ def replay(bundle, t_from=None, t_to=None, print_every=1):
                 tw.twist.linear.y = float(vels[j][2])   # ENU North
                 node._vel_cb(tw)
             node._pose_cb(_enu_pose(n, e, yaw))
+            if trace_fn:
+                _TRACE["target"] = trace_fn
+                _TRACE["exit"] = None
+                sys.settrace(_tracer)
             try:
                 node._control_loop()
             except Exception as exc:                     # noqa: BLE001
                 print("tick raised %s: %s" % (type(exc).__name__, exc))
                 raise
+            finally:
+                if trace_fn:
+                    sys.settrace(None)
 
             seg = getattr(node, "_segment_idx", -1)
             run_i = getattr(node, "_run_idx", -1)
@@ -183,6 +218,15 @@ def replay(bundle, t_from=None, t_to=None, print_every=1):
                          "None" if remain is None else "%.3f" % remain, dist_end))
                 rows += 1
 
+        if trace_fn:
+            src = os.path.join(os.path.dirname(_HERE), "src",
+                               "rpp_controller_node.py")
+            print()
+            print("=== %s: where each tick RETURNS ===" % trace_fn)
+            for ln, cnt in _TRACE["hits"].most_common(8):
+                code = linecache.getline(src, ln).strip()
+                print("  line %-6d x%-6d | %s" % (ln, cnt, code[:96]))
+            print("  locals at last return: %s" % _TRACE["locals"])
         print()
         print("RUN SWITCHES: %s" % (
             ", ".join("t=%.1f %d->%d" % x for x in run_switches) or "NONE"))
@@ -208,8 +252,12 @@ def main():
                     help="decimate PRINTING only; every pose is always ticked, "
                          "because skipping poses makes the position delta trip "
                          "the EKF jump guard and every cycle is discarded")
+    ap.add_argument("--trace", dest="trace_fn", default=None,
+                    help="function name to trace return-points of, "
+                         "e.g. _control_segment_profile")
     a = ap.parse_args()
-    raise SystemExit(replay(a.bundle, a.t_from, a.t_to, max(1, a.print_every)))
+    raise SystemExit(replay(a.bundle, a.t_from, a.t_to,
+                            max(1, a.print_every), a.trace_fn))
 
 
 if __name__ == "__main__":
