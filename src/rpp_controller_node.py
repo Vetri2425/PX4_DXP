@@ -890,6 +890,8 @@ class RPPControllerNode(Node):
         self._corner_stop_entered: RclTime | None = None      # when CORNER_STOP began
         self._corner_stop_settle_since: RclTime | None = None # speed+yaw-rate both OK since
         self._corner_stop_complete: bool = False               # stop confirmed; pivoting now
+        # One-shot latch so the approach-floor clamp warns once, not at 50 Hz.
+        self._endpoint_approach_clamp_warned: bool = False
         self._pivot_started: RclTime | None = None             # when CORNER_ALIGN actuation began
         self._pivot_timeout_warned: bool = False
         self._pivot_turn_angle_rad: float = 0.0                # corner magnitude this pivot must cover
@@ -3989,7 +3991,7 @@ class RPPControllerNode(Node):
         # Run-endpoint floor (see param decl): lower than the smooth/arc
         # min_approach_linear_velocity so the rover arrives slow enough for
         # active braking to stop ON the corner point, not 4 cm past it.
-        approach_v = float(self.get_parameter("segment_endpoint_approach_speed").value)
+        approach_v = self._endpoint_approach_speed()
         approach_d = max(
             float(self.get_parameter("approach_velocity_scaling_dist").value),
             (max_v * max_v) / (2.0 * max_decel) + 0.10,
@@ -4999,6 +5001,60 @@ class RPPControllerNode(Node):
         self._pivot_timeout_warned = False
         self._pivot_turn_angle_rad = 0.0
         self._align_settle_since = None
+
+    def _endpoint_approach_speed(self) -> float:
+        """Commanded creep speed near a run end, clamped BELOW the speed at
+        which a stop can be confirmed.
+
+        THE DEADLOCK THIS PREVENTS (2026-08-04, bag stg_1e79599d, 2x2 square).
+        `_run_alignment_hold` will not release until `_corner_stop_satisfied()`
+        sees ground speed under `segment_stop_speed_threshold` (0.02 m/s) for
+        `segment_stop_dwell_s`, and by explicit design its timeout fires ONLY on
+        STALE velocity — fresh-but-still-moving never advances. Meanwhile the
+        goal-approach ramp commands a floor of
+        `segment_endpoint_approach_speed` (0.03 m/s). 0.03 > 0.02, so the
+        controller commanded a creep it simultaneously refused to accept as
+        stopped, and the hold became unbounded.
+
+        Offline replay of that bag through the real node (see
+        tools/replay_segment_stall.py): `_control_loop_impl` returned at the
+        alignment-hold line on 1465 of 1465 ticks, `_corner_stop_satisfied`
+        returned False on all of them with velocity FRESH, and
+        `_control_segment_profile` was never entered once — so the segment
+        index never advanced, `_path_travel_m` stayed 0.000, and the mission
+        died at ~36 % coverage.
+
+        Why a straight line never showed it: the 294-point square installs as 7
+        internal runs, so the hold runs at every corner connector; a line has
+        one run. And why the baseline is clean: `_corner_stop_satisfied`,
+        `_corner_brake_velocity`, `_vel_is_fresh` and the three stop thresholds
+        are BYTE-IDENTICAL to cd44884. What changed is the arrival speed —
+        3e7e300 (2026-08-01) removed the `final_segment` gate from the ramp, so
+        the 0.03 m/s floor now applies at every run boundary instead of only at
+        the very end of the last one.
+
+        The invariant is what matters, not the numbers: a commanded floor at or
+        above the confirmation threshold is unsatisfiable by construction. Half
+        the threshold leaves margin for the dwell to accumulate against noise.
+        """
+        configured = float(
+            self.get_parameter("segment_endpoint_approach_speed").value
+        )
+        stop_thresh = float(
+            self.get_parameter("segment_stop_speed_threshold").value
+        )
+        ceiling = 0.5 * stop_thresh
+        if configured <= ceiling:
+            return configured
+        if not self._endpoint_approach_clamp_warned:
+            self._endpoint_approach_clamp_warned = True
+            self.get_logger().warn(
+                "segment_endpoint_approach_speed %.3f m/s >= "
+                "segment_stop_speed_threshold %.3f m/s — the corner/run stop "
+                "could never be confirmed. Clamping the commanded floor to "
+                "%.3f m/s." % (configured, stop_thresh, ceiling)
+            )
+        return ceiling
 
     def _corner_stop_satisfied(self) -> bool:
         """True once the rover is confirmed physically stopped at the corner.
