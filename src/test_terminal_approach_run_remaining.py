@@ -50,7 +50,15 @@ def node():
     # this test reproduces a 0.7 m/s run and must not drift with the node's
     # mission_speed default (0.7 -> 0.5 at cfbf5f3 broke exactly that).
     n.set_parameters([Parameter("max_linear_vel", value=MAX_V),
-                      Parameter("mission_speed", value=MAX_V)])
+                      Parameter("mission_speed", value=MAX_V),
+                      # This whole file exercises the ALONG-RUN measure, which
+                      # stopped being the default on 2026-08-04 (it strands the
+                      # rover at every internal run boundary on multi-run
+                      # geometry — see the declaration). The feature still
+                      # exists and is still correct for a single-run line, so
+                      # the tests opt into it explicitly rather than relying on
+                      # a default they no longer own.
+                      Parameter("endpoint_approach_run_remaining", value=True)])
     yield n
     n.destroy_node()
     rclpy.shutdown()
