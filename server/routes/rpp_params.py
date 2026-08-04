@@ -91,7 +91,11 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "min_lookahead_dist": {
         "type": "float",
-        "default": 0.52,
+        # Kept in sync with declare_parameter in src/rpp_controller_node.py.
+        # Was stale at 0.52 while the controller default was 0.35; corrected to
+        # the live default 0.45 on 2026-08-04 (Ld ladder — see the controller
+        # comment for the commanded-wobble evidence behind the change).
+        "default": 0.45,
         "group": "RPP Geometry",
         "description": "Minimum lookahead distance (m)",
         "min": 0.1,

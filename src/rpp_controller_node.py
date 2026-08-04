@@ -272,19 +272,39 @@ class RPPControllerNode(Node):
         # Tune mission_speed per job to further cap; this is the hw ceiling.
         self.declare_parameter("max_linear_vel",                      0.8)
         self.declare_parameter("min_linear_vel",                      0.15)
-        # Field-validated on STRAIGHTS 2026-08-03 (3.3 m line, 3 runs at
-        # mission_speed 0.35 -> Ld = clamp(1.0*0.35, 0.35, 1.0) = 0.35 m):
-        # marking RMS 1.82 / 1.52 / 0.88 cm, 3/3 pass. The same line at 0.60
-        # (Ld 0.60) gave 1.14 / 2.28 / 1.94 and one failure.
+        # 0.35 -> 0.45 on 2026-08-04. THE WOBBLE IS COMMANDED, NOT PHYSICAL:
+        # ULog log_500/501 vs bag showed the RPP course command oscillating
+        # +-4.1 deg while the ACHIEVED yaw oscillated only +-2.4 deg (ratio
+        # 0.73, lag 0.40-0.50 s) — the plant low-passes the command, it does
+        # not add to it. Steering authority used was 2.5% (no saturation, no
+        # deadband chatter), so actuation is not the source either. The loop:
+        #   xtrack 2.39 cm / Ld 0.34 m -> atan = 3.99 deg predicted course
+        #   swing; measured commanded peak 4.12 deg. Match to 0.1 deg.
+        # => loop gain ~1.7 deg of course command per CENTIMETRE of xtrack,
+        #    against a 0.45 s plant lag = marginal phase margin = limit cycle.
+        # Raising Ld is the direct gain reduction (gain = 1/Ld).
         #
-        # CAVEAT — this is a straight-line result only. The previous 0.52 was
-        # deliberately aligned with the 1.5 m arc curvature floor
+        # Why this is only now safe: the 2026-08-03 result that Ld 0.60 was
+        # WORSE (1.14 / 2.28 / 1.94, one failure) was measured with a 2.8 deg
+        # crab, where e_ss = Ld*tan(beta) grows with Ld. After the 08-04 FC
+        # remount the crab collapsed to <=0.4 deg (and lost its
+        # direction-antisymmetry — it was a lever-arm artifact), so at Ld 0.7
+        # the standing offset is ~0.5 cm instead of ~3.4 cm. That penalty term
+        # is effectively gone; the old A/B does not transfer.
+        #
+        # NOTE at mission_speed 0.35 with lookahead_time 1.0 the raw request is
+        # 0.35 m, so this floor BINDS 100% of the time => Ld is exactly this
+        # value. That makes each rung a clean single-variable test.
+        # LADDER (2 runs each, ULog + bag, A/B on commanded-vs-achieved course
+        # swing and xtrack RMS): 0.45 -> then 0.52 or 0.56. NOT yet decided.
+        #
+        # CAVEAT — straight-line result only. 0.52 was deliberately aligned
+        # with the 1.5 m arc curvature floor
         # (k_path = 1/1.5 = 0.667 1/m => Ld >= 0.35 / k_path = 0.525 m) so the
-        # debugged Ld stayed stable on arcs. At 0.35 that alignment is gone and
-        # the curvature floor, not this minimum, will set Ld on tight arcs.
-        # Arc behaviour is UNVALIDATED at these values — re-check before
-        # running curved geometry in production.
-        self.declare_parameter("min_lookahead_dist",                  0.35)
+        # debugged Ld stayed stable on arcs. Below that the curvature floor,
+        # not this minimum, sets Ld on tight arcs. Arc behaviour is
+        # UNVALIDATED — re-check before running curved geometry in production.
+        self.declare_parameter("min_lookahead_dist",                  0.45)
         self.declare_parameter("max_lookahead_dist",                  1.0)
         self.declare_parameter("lookahead_time",                      1.0)
 
