@@ -289,7 +289,40 @@ def _project_onto_path(
     model: SprayPathModel,
     point_n: float,
     point_e: float,
+    prev_s: Optional[float] = None,
+    window_back_m: float = 0.0,
+    window_fwd_m: float = 0.0,
+    reacquire_dist_m: float = 0.0,
 ) -> Optional[SprayProjection]:
+    """Nearest point on the path, optionally CONSTRAINED to a window around the
+    previous projection.
+
+    Why the window exists (2026-08-04). A run `/path` can double back on
+    itself: the engine emits the approach leg and the marked leg in ONE message,
+    and on an out-and-back line the two legs sit centimetres apart. This
+    function used to re-scan every segment from scratch each tick and take the
+    globally nearest one, with no memory — so "nearest" flip-flopped between the
+    two legs and the reported station teleported.
+
+    Measured on bag stg_d8a4f2ad (110 pts, 8.52 m, direction reversal at segment
+    29, MARK vertices 34..104 = s 4.721..8.024). The reported station jumped
+    between s=1.67 and s=7.54 while the rover was still on the approach leg, and
+    the MARK flag did not settle true until s=5.10 — i.e. 41 cm past its own
+    boundary. Same mechanism produced 1-3 cm paint gaps mid-mark (4-8 valve
+    edges where there should be 2) and one run that never sprayed at all.
+
+    The safety xtrack gate is what kept those spurious early flags off the
+    ground; it is load-bearing and must not be loosened.
+
+    With `prev_s` supplied, the search is restricted to segments overlapping
+    [prev_s - window_back_m, prev_s + window_fwd_m]. If nothing in that window
+    is within `reacquire_dist_m`, we fall back to a global scan so a genuine
+    relocalisation (EKF jump, operator repositioning) can still re-acquire.
+    prev_s=None (path just loaded) is always a global scan.
+
+    Passing prev_s=None / zero windows reproduces the pre-fix behaviour exactly
+    and is the A/B arm.
+    """
     if not model.points:
         return None
     if len(model.points) == 1:
@@ -304,42 +337,67 @@ def _project_onto_path(
             current_flag=model.flags[0],
         )
 
-    best: Optional[SprayProjection] = None
-    best_dist = float("inf")
-    for i in range(len(model.points) - 1):
-        a_n, a_e = model.points[i]
-        b_n, b_e = model.points[i + 1]
-        d_n = b_n - a_n
-        d_e = b_e - a_e
-        seg_len_sq = d_n * d_n + d_e * d_e
-        if seg_len_sq <= 1e-12:
-            t = 0.0
-            proj_n, proj_e = a_n, a_e
-            seg_len = 0.0
-        else:
-            t = ((point_n - a_n) * d_n + (point_e - a_e) * d_e) / seg_len_sq
-            t = max(0.0, min(1.0, t))
-            proj_n = a_n + t * d_n
-            proj_e = a_e + t * d_e
-            seg_len = math.sqrt(seg_len_sq)
+    def _scan(indices) -> tuple[Optional[SprayProjection], float]:
+        best: Optional[SprayProjection] = None
+        best_dist = float("inf")
+        for i in indices:
+            a_n, a_e = model.points[i]
+            b_n, b_e = model.points[i + 1]
+            d_n = b_n - a_n
+            d_e = b_e - a_e
+            seg_len_sq = d_n * d_n + d_e * d_e
+            if seg_len_sq <= 1e-12:
+                t = 0.0
+                proj_n, proj_e = a_n, a_e
+                seg_len = 0.0
+            else:
+                t = ((point_n - a_n) * d_n + (point_e - a_e) * d_e) / seg_len_sq
+                t = max(0.0, min(1.0, t))
+                proj_n = a_n + t * d_n
+                proj_e = a_e + t * d_e
+                seg_len = math.sqrt(seg_len_sq)
 
-        dist = math.hypot(point_n - proj_n, point_e - proj_e)
-        # Equal-distance ties happen exactly at shared vertices. Prefer the
-        # later segment so a TRANSIT->MARK vertex is considered MARK, and a
-        # MARK->TRANSIT vertex is considered TRANSIT.
-        if dist < best_dist - 1e-12 or abs(dist - best_dist) <= 1e-12:
-            current_flag = model.flags[i + 1] if t >= 1.0 - 1e-12 else model.flags[i]
-            best_dist = dist
-            best = SprayProjection(
-                segment_index=i,
-                t=t,
-                proj_n=proj_n,
-                proj_e=proj_e,
-                s=model.cumulative_s[i] + t * seg_len,
-                xtrack_error_m=dist,
-                current_flag=current_flag,
-            )
-    return best
+            dist = math.hypot(point_n - proj_n, point_e - proj_e)
+            # Equal-distance ties happen exactly at shared vertices. Prefer the
+            # later segment so a TRANSIT->MARK vertex is considered MARK, and a
+            # MARK->TRANSIT vertex is considered TRANSIT.
+            if dist < best_dist - 1e-12 or abs(dist - best_dist) <= 1e-12:
+                current_flag = (
+                    model.flags[i + 1] if t >= 1.0 - 1e-12 else model.flags[i]
+                )
+                best_dist = dist
+                best = SprayProjection(
+                    segment_index=i,
+                    t=t,
+                    proj_n=proj_n,
+                    proj_e=proj_e,
+                    s=model.cumulative_s[i] + t * seg_len,
+                    xtrack_error_m=dist,
+                    current_flag=current_flag,
+                )
+        return best, best_dist
+
+    n_seg = len(model.points) - 1
+    windowed = (
+        prev_s is not None
+        and (window_back_m > 0.0 or window_fwd_m > 0.0)
+    )
+    if windowed:
+        lo = prev_s - max(0.0, window_back_m)
+        hi = prev_s + max(0.0, window_fwd_m)
+        # A segment is a candidate when its [s_start, s_end] overlaps [lo, hi].
+        idx = [
+            i for i in range(n_seg)
+            if model.cumulative_s[i + 1] >= lo and model.cumulative_s[i] <= hi
+        ]
+        if idx:
+            best, best_dist = _scan(idx)
+            # Only trust the window while it actually explains where we are.
+            if best is not None and (
+                reacquire_dist_m <= 0.0 or best_dist <= reacquire_dist_m
+            ):
+                return best
+    return _scan(range(n_seg))[0]
 
 
 def _next_boundary(
@@ -474,6 +532,16 @@ def _make_spray_decision(
     # pose exactly as before (frozen). A bool → RPP is the arrival authority for
     # the meter's current target: True iff /rpp/milestone AT_POINT fired for it.
     rpp_at_point_gate: Optional[bool] = None,
+    # Projection continuity (2026-08-04). See _project_onto_path: a run /path
+    # that doubles back on itself makes a memoryless nearest-segment search
+    # flip between the two legs, which delayed the MARK flag by up to 41 cm and
+    # punched gaps mid-mark. Threaded like xtrack_tripped: caller passes the
+    # previous station in and stores projection.s back out. Zero windows
+    # reproduce the pre-fix behaviour exactly (A/B arm).
+    prev_projection_s: Optional[float] = None,
+    projection_window_back_m: float = 0.0,
+    projection_window_fwd_m: float = 0.0,
+    projection_reacquire_dist_m: float = 0.0,
 ) -> SprayDecision:
     projection: Optional[SprayProjection] = None
     boundary: Optional[SprayBoundary] = None
@@ -524,7 +592,13 @@ def _make_spray_decision(
         )
 
     if model is not None and nozzle_n is not None and nozzle_e is not None:
-        projection = _project_onto_path(model, nozzle_n, nozzle_e)
+        projection = _project_onto_path(
+            model, nozzle_n, nozzle_e,
+            prev_s=prev_projection_s,
+            window_back_m=projection_window_back_m,
+            window_fwd_m=projection_window_fwd_m,
+            reacquire_dist_m=projection_reacquire_dist_m,
+        )
     new_xtrack_tripped = False
     if projection is not None:
         boundary = _next_boundary(model, projection.s, projection.current_flag)
@@ -787,6 +861,23 @@ class SprayControllerNode(Node):
         # cycling if error oscillates fast across both levels. Keep small: every
         # extra tenth of a second tripped is ~3.5 cm of unpainted line at cruise.
         self.declare_parameter("xtrack_gate_min_off_s", 0.2)
+        # Projection continuity window (2026-08-04). A run /path can carry the
+        # approach leg and the marked leg in one message; on an out-and-back
+        # line the two legs sit centimetres apart and a memoryless
+        # nearest-segment search flips between them (measured: station jumping
+        # 1.67 <-> 7.54 m, MARK flag 41 cm late, 1-3 cm gaps mid-mark, one run
+        # that never sprayed). Restrict the search to a window around the last
+        # station. Back window covers reverse creep and jitter; forward window
+        # must exceed the furthest the nozzle can advance between ticks with
+        # margin (50 Hz at 0.35 m/s is ~7 mm, so 2.0 m is ~280x headroom and
+        # still far short of the ~3.8 m leg spacing that caused the confusion).
+        # Set both to 0 to restore the pre-fix global search (A/B arm).
+        self.declare_parameter("projection_window_back_m", 0.5)
+        self.declare_parameter("projection_window_fwd_m", 2.0)
+        # If nothing in the window is within this distance, fall back to a
+        # global scan so a real relocalisation can still re-acquire. Must stay
+        # well above normal cross-track (cm) and below the leg spacing.
+        self.declare_parameter("projection_reacquire_dist_m", 1.0)
         self.declare_parameter("pose_timeout_s", 0.5)
         self.declare_parameter("velocity_timeout_s", 0.5)
         # ── Phase B: RTK / GPS fix-quality gate (plan §7.6) ──────────────────
@@ -893,6 +984,9 @@ class SprayControllerNode(Node):
         # the trip edge, fed back into _make_spray_decision each tick.
         self._xtrack_tripped: bool = False
         self._xtrack_trip_mono: Optional[float] = None
+        # Last path station, so the next projection stays on the same leg of a
+        # doubled-back path. None = acquire globally (fresh path / no fix yet).
+        self._proj_prev_s: Optional[float] = None
         # Per-mission xtrack gate from session_config (R3). Stashed separately
         # because _path_cb overwrites _session_config with a continuous geometry
         # mirror (same reason _dash_config is stashed). None → ROS param.
@@ -1185,6 +1279,9 @@ class SprayControllerNode(Node):
         # tracking state, so path arrival onto a spray-flagged vertex 0 cannot
         # open the valve before the rover is actually driving the line.
         self._tracking_seen_since_path_load = False
+        # A new path invalidates the previous station — the next projection must
+        # acquire globally rather than snap to a window of the OLD geometry.
+        self._proj_prev_s = None
         points = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
         # position.z is a bitfield: bit0 = spray ON, bit1 = must-hit vertex.
         # MUST bit-test, not `> 0.5`: a spray-OFF must-hit point encodes as 2.0
@@ -1660,7 +1757,20 @@ class SprayControllerNode(Node):
             rpp_boundary_kind=rpp_boundary_kind,
             rpp_dist_to_boundary_m=rpp_dist_m,
             rpp_at_point_gate=rpp_at_point_gate,
+            prev_projection_s=self._proj_prev_s,
+            projection_window_back_m=float(
+                self.get_parameter("projection_window_back_m").value
+            ),
+            projection_window_fwd_m=float(
+                self.get_parameter("projection_window_fwd_m").value
+            ),
+            projection_reacquire_dist_m=float(
+                self.get_parameter("projection_reacquire_dist_m").value
+            ),
         )
+        # Carry the station forward so the next tick's search stays on this leg.
+        if decision.projection is not None:
+            self._proj_prev_s = decision.projection.s
         # P0-2: advance the hysteresis latch. Stamp the rising edge so the
         # min-off dwell measures from the trip, not from every tripped tick.
         if decision.xtrack_tripped and not self._xtrack_tripped:
