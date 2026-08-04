@@ -495,7 +495,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "mission_speed": {
         "type": "float",
-        "default": 0.70,
+        "default": 0.50,
         "group": "Mission Control",
         "description": "Operator-facing mission speed (m/s). Single knob per job. 1.0 for roads, 0.3-0.5 for fields",
         "min": 0.0,

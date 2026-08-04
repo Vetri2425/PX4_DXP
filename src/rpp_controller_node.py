@@ -781,7 +781,7 @@ class RPPControllerNode(Node):
         # (0.9, sized for 0.70). That is conservative, not unsafe — the goal ramp
         # simply starts earlier than it needs to. Revisit the scaling distance
         # only if the endpoint approach becomes objectionably slow.
-        self.declare_parameter("mission_speed",                       0.35)  # m/s
+        self.declare_parameter("mission_speed",                       0.50)  # m/s
 
         # P4.2 — Deceleration limit used ONLY for braking-distance derivation.
         # Separate from max_linear_accel because the accel ramp is one-way
