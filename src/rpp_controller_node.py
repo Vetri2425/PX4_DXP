@@ -345,7 +345,26 @@ class RPPControllerNode(Node):
         #   transit_merge_max_len_m that left 0.10 m of a 0.9 m zone, and
         #   stg_9ecf2985 overshot its endpoint by 54.6 cm. False restores the
         #   pre-2026-08-01 per-segment behaviour (field off switch).
-        self.declare_parameter("endpoint_approach_run_remaining",     True)
+        #
+        #   DEFAULT FLIPPED TO FALSE 2026-08-04 after field evidence that True
+        #   breaks MULTI-RUN geometry. A 2x2 square installs as SEVEN internal
+        #   runs (294 pts -> 30 wp) and every corner connector is a run
+        #   boundary; approach_d is floored at approach_velocity_scaling_dist
+        #   = 0.9 m while the physical need at 0.35 m/s is only 0.22 m, so the
+        #   last 0.9 m of EVERY run was ramped to
+        #   segment_endpoint_approach_speed. That floor (0.03) is under PX4
+        #   RO_SPEED_TH (0.10), so the rover parked ~5 cm short of each corner
+        #   point, could not reach the 0.02 m xy_goal_tolerance that lets the
+        #   segment advance, and the mission died. Hand-pushing it inside
+        #   0.02 m advanced it instantly.
+        #     True  : 20% / 35% / 37% coverage, one run latched the valve open
+        #             for 78% of 24 s
+        #     False : three consecutive squares at 100% coverage, marking RMS
+        #             1.15 / 1.15 / 1.01 cm, every pivot completing
+        #   The 54.6 cm overshoot this was built for was a SINGLE-run line, so
+        #   set it True per-mission if you are running one long straight and
+        #   want the run-end braking. It is wrong as a global default.
+        self.declare_parameter("endpoint_approach_run_remaining",     False)
         self.declare_parameter("transit_merge_max_len_m",             2.0)    # m
         self.declare_parameter("transit_runout_goal_tolerance_m",     0.10)   # m
         self.declare_parameter("transit_runout_min_speed_m_s",        0.10)   # m/s
