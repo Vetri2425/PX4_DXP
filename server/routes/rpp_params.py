@@ -93,9 +93,10 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
         "type": "float",
         # Kept in sync with declare_parameter in src/rpp_controller_node.py.
         # Was stale at 0.52 while the controller default was 0.35; corrected to
-        # the live default 0.45 on 2026-08-04 (Ld ladder — see the controller
-        # comment for the commanded-wobble evidence behind the change).
-        "default": 0.45,
+        # the live default on 2026-08-04 (Ld ladder — see the controller
+        # comment for the evidence). Rung 2: 0.45 -> 0.52, the arc-aligned
+        # value (1.5 m arc curvature floor demands Ld >= 0.525).
+        "default": 0.52,
         "group": "RPP Geometry",
         "description": "Minimum lookahead distance (m)",
         "min": 0.1,

@@ -298,13 +298,33 @@ class RPPControllerNode(Node):
         # LADDER (2 runs each, ULog + bag, A/B on commanded-vs-achieved course
         # swing and xtrack RMS): 0.45 -> then 0.52 or 0.56. NOT yet decided.
         #
-        # CAVEAT — straight-line result only. 0.52 was deliberately aligned
-        # with the 1.5 m arc curvature floor
-        # (k_path = 1/1.5 = 0.667 1/m => Ld >= 0.35 / k_path = 0.525 m) so the
-        # debugged Ld stayed stable on arcs. Below that the curvature floor,
-        # not this minimum, sets Ld on tight arcs. Arc behaviour is
-        # UNVALIDATED — re-check before running curved geometry in production.
-        self.declare_parameter("min_lookahead_dist",                  0.45)
+        # RUNG 2 (2026-08-04 pm): 0.45 -> 0.52, the ARC-ALIGNED value. A 1.5 m
+        # arc has k_path = 1/1.5 = 0.667 1/m, so the curvature floor demands
+        # Ld >= 0.35 / k_path = 0.525 m. Below that the curvature floor — not
+        # this minimum — silently sets Ld on tight arcs, which makes curve runs
+        # uninterpretable. 0.52 puts the two back in agreement before curve
+        # testing. (0.56 has no such anchor and costs more phase-lead margin
+        # for no measured benefit.)
+        #
+        # What rung 1 (0.35 -> 0.45) actually bought, measured: commanded
+        # course swing -20% (4.12 -> 3.36 deg pk, matching the predicted 1/Ld
+        # scaling), yaw error RMS 1.17 -> 0.97 deg. What it did NOT buy: mark
+        # RMS was unchanged (1.05/1.58 -> 1.17/1.40). That is the evidence the
+        # limit cycle was never the dominant error term — the loop is chasing
+        # a disturbance, not generating one.
+        #
+        # ⚠ COST that rises with Ld: the steady-state offset from any residual
+        # crab is e_ss = Ld*tan(beta), so a longer lookahead sits FURTHER off
+        # the line. Mark offset went +0.35 cm at Ld 0.35 -> +0.73..+1.07 cm at
+        # 0.45. A body-fixed heading-reference error of +0.72 deg was confirmed
+        # on 2026-08-04 (13 runs, both directions, 3.9 sigma vs the camber
+        # hypothesis) — fix GPS_YAW_OFFSET 180 -> 180.72 before reading too
+        # much into any offset measured at this rung.
+        #
+        # NOTE at mission_speed 0.35 with lookahead_time 1.0 the raw request is
+        # 0.35 m, so this floor still binds 100% of the time => Ld is exactly
+        # this value, keeping each rung a clean single-variable test.
+        self.declare_parameter("min_lookahead_dist",                  0.52)
         self.declare_parameter("max_lookahead_dist",                  1.0)
         self.declare_parameter("lookahead_time",                      1.0)
 
