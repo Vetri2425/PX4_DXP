@@ -284,7 +284,7 @@ class RPPControllerNode(Node):
         # the curvature floor, not this minimum, will set Ld on tight arcs.
         # Arc behaviour is UNVALIDATED at these values — re-check before
         # running curved geometry in production.
-        self.declare_parameter("min_lookahead_dist",                  0.35)
+        self.declare_parameter("min_lookahead_dist",                  0.52)
         self.declare_parameter("max_lookahead_dist",                  1.0)
         self.declare_parameter("lookahead_time",                      1.0)
 
