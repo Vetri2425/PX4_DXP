@@ -578,6 +578,24 @@ class RPPControllerNode(Node):
         # ~0.05 m/s (floor + overshoot) so drift is <1 cm, without touching the
         # non-extension square's within-run corners or arc approaches.
         self.declare_parameter("segment_endpoint_approach_speed",      0.03)   # m/s
+        # [STOP-LATCH 2026-08-04] Field A/B candidate — default OFF until the
+        # field test decides. The dead-band census (15 bags) showed every stop
+        # approach dwells 2-9 s commanding inside PX4's RO_SPEED_TH dead-band
+        # (0 < cmd < 0.10): wheels then either stall (strand, stg_c8e867b9),
+        # creep past the stop (stg_6de3fcce: cmd re-grew 0.030->0.107 after
+        # the point — the law is continuous in distance, the stop is an
+        # unstable equilibrium), or crawl. The latch enforces the invariant
+        # cmd ∈ {0} ∪ [min_actuatable, vmax] on the segment DRIVE path:
+        # >= min_actuatable while approaching, hard 0 once within capture
+        # distance (position latch — distance regrowth cannot re-enter the
+        # speed law), one actuated nudge if the rover rests short of capture.
+        # The CORNER_ALIGN pivot creep is intentionally untouched: in PX4
+        # velocity mode the pivot IS driven by the velocity vector
+        # (RD_TRANS_DRV_TRN spot-turn), so zeroing it would kill pivots.
+        self.declare_parameter("stop_latch_enabled",                    False)
+        self.declare_parameter("stop_latch_min_actuatable_m_s",         0.10)  # = RO_SPEED_TH
+        self.declare_parameter("stop_latch_capture_dist_m",             0.02)
+        self.declare_parameter("stop_latch_release_dist_m",             0.20)
         self.declare_parameter("segment_corner_acceptance_radius",     0.05)
         # Pivot exit tolerance. MUST sit strictly ABOVE the firmware's
         # RD_TRANS_TRN_DRV stop angle (2.0° as flown): the firmware stops
@@ -864,6 +882,8 @@ class RPPControllerNode(Node):
         self._completion_stop_pending: bool = False
         self._segment_idx: int = 0
         self._segment_state: SegmentStateCode = SegmentStateCode.INACTIVE
+        # [STOP-LATCH] captured-at-stop flag; see _stop_latch_filter
+        self._stop_latched: bool = False
         # CORNER_STOP / pivot-watchdog state (shared by the segment corner and
         # run-transition pivots — only one corner is active at a time).
         self._corner_stop_entered: RclTime | None = None      # when CORNER_STOP began
@@ -2001,6 +2021,8 @@ class RPPControllerNode(Node):
         # Mission-level resets; per-run state is reset inside _apply_run.
         # P0.1 — reset last speed so L_d bootstraps cleanly on new path
         self._last_speed_cmd = 0.0
+        # [STOP-LATCH] a new mission clears any captured stop
+        self._stop_latched = False
         # R2 — first tick after path load must use nominal 1/CONTROL_HZ, not a
         # dt that spans the whole conditioning/load wall time.
         self._last_tick = None
@@ -3619,6 +3641,52 @@ class RPPControllerNode(Node):
             next_n = self._path[i].pose.position.x
             next_e = self._path[i].pose.position.y
 
+    def _stop_latch_filter(self, speed: float, stop_dist: float) -> float:
+        """[STOP-LATCH 2026-08-04] Enforce cmd ∈ {0} ∪ [min_actuatable, vmax]
+        on the segment DRIVE command (see the param block for the field
+        evidence). Semantics:
+
+        * not latched, 0 < speed < threshold:
+            - within capture distance of the stop -> CAPTURE: latch and
+              command hard 0. The latch is positional — once captured,
+              distance regrowth (creep past the point) can never re-enter
+              the speed law and re-accelerate the rover away (the
+              stg_6de3fcce 0.030->0.107 surge).
+            - otherwise -> command the actuatable threshold instead of an
+              unactuatable crawl (this is NOT the reverted dd5e4dc blanket
+              floor: the hard-zero capture below replaces the taper's
+              stopping role, so braking authority is never lost).
+        * latched:
+            - a drive demand with the stop far behind/ahead (> release
+              distance, i.e. the mission moved to the next segment/run)
+              -> release and relaunch at >= threshold, skipping the
+              dead-band portion of the accel ramp.
+            - resting SHORT of capture (outside capture distance, rover
+              measured stationary, law still demanding motion) -> one
+              actuated nudge at threshold; recaptured on arrival. Discrete
+              nudges replace continuous creep.
+            - else -> hold hard 0.
+        """
+        if not bool(self.get_parameter("stop_latch_enabled").value):
+            return speed
+        th = float(self.get_parameter("stop_latch_min_actuatable_m_s").value)
+        cap = float(self.get_parameter("stop_latch_capture_dist_m").value)
+        rel = float(self.get_parameter("stop_latch_release_dist_m").value)
+        if self._stop_latched:
+            if speed > 0.0 and stop_dist > rel:
+                self._stop_latched = False
+                return max(speed, th)
+            if (speed > 0.0 and stop_dist > cap
+                    and self._measured_speed() < 0.02):
+                return th          # nudge toward the point; stays latched
+            return 0.0
+        if speed <= 0.0 or speed >= th:
+            return speed
+        if stop_dist <= cap:
+            self._stop_latched = True
+            return 0.0
+        return th
+
     def _control_segment_profile(
         self,
         pos_n: float,
@@ -4012,6 +4080,19 @@ class RPPControllerNode(Node):
         p4_floor = float(self.get_parameter("p4_zero_vel_threshold").value)
         if speed < p4_floor and speed_before_accel < p4_floor and self._last_speed_cmd > 0.0:
             speed = 0.0
+        # [STOP-LATCH] applied AFTER the accel ramp so relaunch lifts the
+        # ramp's sub-dead-band tail to the actuatable threshold. The stop
+        # reference is the distance to a REAL intended stop: the corner when
+        # a corner slowdown/approach is active, the run end on the final
+        # segment — never a collinear pass-through vertex (PRE_CORNER only
+        # fires above segment_corner_threshold_deg, so circles are immune).
+        latch_ref = (
+            dist_to_corner
+            if (final_segment
+                or self._segment_state == SegmentStateCode.PRE_CORNER_SLOWDOWN)
+            else float("inf")
+        )
+        speed = self._stop_latch_filter(speed, latch_ref)
         self._last_speed_cmd = speed
 
         yaw_rate_body = yaw_gain * theta_e if use_ff_yaw_rate else 0.0

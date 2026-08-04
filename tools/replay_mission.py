@@ -426,6 +426,13 @@ def replay(bundle, t_from=None, t_to=None, print_every=10,
         else:
             print("  clean — no anomalies detected")
 
+        # invariant metric: drive commands inside PX4's dead-band
+        band = [r for r in rows if r["cmd_v"] == r["cmd_v"] and 1e-3 < r["cmd_v"] < RO_SPEED_TH]
+        zero = [r for r in rows if r["cmd_v"] == r["cmd_v"] and r["cmd_v"] <= 1e-3]
+        print("invariant: cmd in dead-band (0,%.2f): %.1f%% of ticks | exact-zero: %.1f%%"
+              % (RO_SPEED_TH, 100.0 * len(band) / max(1, len(rows)),
+                 100.0 * len(zero) / max(1, len(rows))))
+
         # coverage + end state
         moved = [r for r in rows if r["meas_v"] == r["meas_v"] and r["meas_v"] > 0.05]
         print("\nend    : run %s seg %s state %s | ticks %d | moving %.0f%% "
