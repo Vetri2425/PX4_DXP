@@ -76,14 +76,21 @@ def replay(bundle, t_from=None, t_to=None, print_every=1):
     if not runs:
         print("no /path in bundle"); return 1
     _t, pts = runs[0]
+    # Velocity is a REQUIRED input: the corner-stop / advance logic reads
+    # _measured_speed(), so a replay without it sits in TRACK_SEGMENT forever
+    # and never reproduces the real corner behaviour.
+    vels = []
+    for _tp, _m, _ts in am.read_bag(bag):
+        if _tp == "/mavros/local_position/velocity_local":
+            vels.append((_ts, _m["lx"], _m["ly"]))
     z = s.path_z or [0.0] * len(pts)
     print("bundle : %s" % bundle)
     print("path   : %d points, along-length %.3f m"
           % (len(pts), sum(math.hypot(pts[i + 1][0] - pts[i][0],
                                       pts[i + 1][1] - pts[i][1])
                            for i in range(len(pts) - 1))))
-    print("poses  : %d samples over %.1f s"
-          % (len(s.pose), s.pose[-1][0] - s.pose[0][0]))
+    print("poses  : %d samples over %.1f s   velocity samples: %d"
+          % (len(s.pose), s.pose[-1][0] - s.pose[0][0], len(vels)))
 
     import rclpy
     rclpy.init(args=["--ros-args", "-p", "require_rtk_fix:=false"])
@@ -92,6 +99,8 @@ def replay(bundle, t_from=None, t_to=None, print_every=1):
         from nav_msgs.msg import Path
         from mavros_msgs.msg import GPSRAW
         from test_smoke_rpp_controller import _make_path_pose
+        from geometry_msgs.msg import TwistStamped
+        import bisect as _bisect
 
         node = RPPControllerNode()
         for attr in ("_vel_pub", "_yaw_rate_pub", "_dbg_pub", "_segment_dbg_pub",
@@ -137,6 +146,13 @@ def replay(bundle, t_from=None, t_to=None, print_every=1):
                 continue
             if t_to is not None and rel > t_to:
                 break
+            if vels:
+                j = _bisect.bisect_left([v[0] for v in vels], t)
+                j = max(0, min(j, len(vels) - 1))
+                tw = TwistStamped()
+                tw.twist.linear.x = float(vels[j][1])   # ENU East
+                tw.twist.linear.y = float(vels[j][2])   # ENU North
+                node._vel_cb(tw)
             node._pose_cb(_enu_pose(n, e, yaw))
             try:
                 node._control_loop()
