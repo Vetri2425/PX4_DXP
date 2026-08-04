@@ -433,9 +433,31 @@ the inter-epoch margin — treat as required for a durable 1 cm.
   (endpoint/hold branch?) — one look at its seg-state sequence, low priority.
 
 ### E6. Morning checklist 08-04 (in order)
-1. FC remount → centreline; ideally directly over axle midpoint (all offsets 0),
-   else measure d → `EKF2_IMU_POS_X=+d`; re-verify `EKF2_GPS_POS_Z=−0.4`.
-2. QGC: `EKF2_GPS_P_NOISE=0.015`, `EKF2_GPS_V_NOISE=0.05`.
+1. ✅ **DONE 08-04.** FC remounted: lateral offset now physically ZERO, FC sits
+   100–105 mm FORWARD of the master antenna. `EKF2_IMU_POS_X=0.100` set,
+   `_Y=_Z=0`, `EKF2_GPS_POS_*` untouched at 0/0/−0.4. Verified live on the FC.
+   ⇒ body origin ≡ master antenna ≡ axle midpoint ≡ rotation centre ≡ nozzle;
+   the reported position IS the paint point. Confirmed against the deployed tree
+   that `EKF2_IMU_POS_*` is the correct lever and is **not reboot-required**:
+   `output_predictor.h getLatLonAlt()` returns
+   `_global_ref + (pos − R_to_earth·_imu_pos_body)` (position at body origin,
+   not at the IMU), velocity likewise via `ang_rate % _imu_pos_body`; applied on
+   parameter update in `EKF2.cpp` (`set_imu_offset`).
+   ⚠ **OWED — pivot sign check, before any field run:** arm, one slow ~180°
+   in-place pivot, watch `/mavros/local_position/pose`. <1 cm wander = correct;
+   ~20 cm circle = sign flipped (offset doubling instead of cancelling).
+2. ✅ **DONE 08-04.** `EKF2_GPS_P_NOISE=0.015`, `EKF2_GPS_V_NOISE=0.05` — both
+   verified live.
+   🚨 **Param-verification trap found today:** `/mavros/param`'s ROS-parameter
+   mirror is populated once at MAVROS plugin init and does NOT track later FCU
+   changes. After a QGC edit, `ros2 param get /mavros/param X` and
+   `tools/quick_params.py` both return the PRE-EDIT value, and
+   `ros2 service call /mavros/param/pull "{force_pull: true}"` reports
+   `success=True, param_received=881` **without fixing it** — it refreshes
+   MAVROS's internal cache, not the ROS mirror. This produced a false
+   "the params did not land on the FC" verdict this morning. **Only a
+   `px4-dxp` restart refreshes the mirror; a param read is valid only if
+   px4-dxp restarted AFTER the last QGC write.**
 3. Firmware batch build+flash: F2 `EKF2_GPS_YAW_N` + F5 at_rest/in_air + F7
    s_variance units + F8 `-m config` + A1/A2 RoboClaw serial.
 4. After F2 lands: `RO_YAW_RATE_TH 1.0→0.5`.
