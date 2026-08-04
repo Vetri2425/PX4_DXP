@@ -567,6 +567,100 @@ class TestGyroNoiseGate(unittest.TestCase):
 
 
 # ----------------------------------------------------------------------
+# CSV export
+# ----------------------------------------------------------------------
+class TestCsvExport(unittest.TestCase):
+    """The CSVs are only useful if they can be joined back together."""
+
+    def _u(self):
+        t = np.arange(0, 20, 0.1)
+
+        class U(_StubUlog):
+            path = "stub.ulg"
+
+            def has(self, *names):
+                return all(n in self.d for n in names)
+
+        u = U()
+        n = len(t)
+        u.d = {
+            "rover_rate_setpoint": {"timestamp": t * 1e6,
+                                    "yaw_rate_setpoint": np.sin(t)},
+            "rover_rate_status": {"timestamp": t * 1e6,
+                                  "adjusted_yaw_rate_setpoint": np.sin(t),
+                                  "measured_yaw_rate": 1.1 * np.sin(t),
+                                  "pid_yaw_rate_integral": np.zeros(n)},
+            "rover_steering_setpoint": {"timestamp": t * 1e6,
+                                        "normalized_speed_diff": 0.1 * np.sin(t)},
+            "actuator_motors": {"timestamp": t * 1e6,
+                                "control[0]": 0.3 + 0.1 * np.sin(t),
+                                "control[1]": 0.3 - 0.1 * np.sin(t)},
+        }
+        u.t = lambda name: u.d[name]["timestamp"] / 1e6
+        u.mode_mask = lambda tt: np.ones(len(tt), bool)
+        u.yaw_rate_chain = lambda: abu.UlogSide.yaw_rate_chain(u)
+        u.speed_chain = lambda: {}
+        return u
+
+    def test_every_ulog_csv_carries_an_epoch_column_for_joining(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            abu.export_csv(d, self._u(), None, offset=1_000_000.0)
+            for f in os.listdir(d):
+                if not f.startswith("ulog__"):
+                    continue
+                with open(os.path.join(d, f)) as fh:
+                    head = fh.readline().strip().split(",")
+                self.assertEqual(head[:2], ["t_boot_s", "t_epoch_s"], f)
+
+    def test_epoch_timestamps_keep_full_precision(self):
+        """%g would render 1785830534.5 as 1.78583e+09 and destroy the join key."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            abu.export_csv(d, self._u(), None, offset=1_785_830_527.0)
+            with open(os.path.join(d, "joint_50hz.csv")) as fh:
+                fh.readline()
+                first = fh.readline().split(",")[1]
+        self.assertNotIn("e+", first)
+        self.assertGreater(float(first), 1.7e9)
+        self.assertIn(".", first)
+
+    def test_the_joint_table_carries_the_whole_chain(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            abu.export_csv(d, self._u(), None, offset=1_000_000.0)
+            with open(os.path.join(d, "joint_50hz.csv")) as fh:
+                head = fh.readline().strip().split(",")
+        for col in ("px4_yaw_rate_sp", "px4_yaw_rate_measured",
+                    "px4_speed_diff_cmd", "motor_left", "motor_right",
+                    "motor_diff", "motor_common"):
+            self.assertIn(col, head, "the chain must reach the motors")
+
+    def test_the_motor_differential_equals_the_steering_command(self):
+        """Round-trips the fork sign convention through the export."""
+        import tempfile
+        import csv as _csv
+        with tempfile.TemporaryDirectory() as d:
+            abu.export_csv(d, self._u(), None, offset=1_000_000.0)
+            rows = list(_csv.DictReader(open(os.path.join(d, "joint_50hz.csv"))))
+        got = [(float(r["motor_diff"]), float(r["px4_speed_diff_cmd"]))
+               for r in rows if r["motor_diff"] and r["px4_speed_diff_cmd"]]
+        self.assertGreater(len(got), 50)
+        for diff, cmd in got:
+            self.assertAlmostEqual(diff, cmd, places=6)
+
+    def test_an_unaligned_export_leaves_the_epoch_column_empty(self):
+        """No offset means no join key -- it must be blank, not a fake number."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            abu.export_csv(d, self._u(), None, offset=None)
+            with open(os.path.join(d, "ulog__actuator_motors.csv")) as fh:
+                fh.readline()
+                row = fh.readline().strip().split(",")
+        self.assertEqual(row[1], "")
+
+
+# ----------------------------------------------------------------------
 # regression guards against claims the tool used to make
 # ----------------------------------------------------------------------
 def _source():

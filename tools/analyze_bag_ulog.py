@@ -56,6 +56,7 @@ as WITHHELD with the reason, and never reaches the .params file.
 from __future__ import annotations
 
 import argparse
+import csv
 import glob
 import json
 import math
@@ -255,6 +256,20 @@ class UlogSide:
             out["S3_measured"] = (tt, s["measured_yaw_rate"])
             if "pid_yaw_rate_integral" in s:
                 out["integral"] = (tt, s["pid_yaw_rate_integral"])
+        if self.has("rover_steering_setpoint"):
+            # B9: the differential CHANNEL command, normalised [-1, 1].
+            out["B9_speed_diff"] = (
+                self.t("rover_steering_setpoint"),
+                self.d["rover_steering_setpoint"]["normalized_speed_diff"])
+        if self.has("actuator_motors"):
+            # B10: what actually left the mixer. Fork convention:
+            # control[0] = LEFT = thr + d, control[1] = RIGHT = thr - d.
+            a = self.d["actuator_motors"]
+            ta = self.t("actuator_motors")
+            out["B10_motor_left"] = (ta, a["control[0]"])
+            out["B10_motor_right"] = (ta, a["control[1]"])
+            out["B10_motor_diff"] = (ta, 0.5 * (a["control[0]"] - a["control[1]"]))
+            out["B10_motor_common"] = (ta, 0.5 * (a["control[0]"] + a["control[1]"]))
         if self.has("vehicle_angular_velocity"):
             a = self.d["vehicle_angular_velocity"]
             out["S4_gyro"] = (self.t("vehicle_angular_velocity"), a["xyz[2]"])
@@ -1291,6 +1306,213 @@ class Recommender:
         return len(rows)
 
 
+def export_csv(out_dir, U, B, offset, hz=50.0):
+    """Dump everything, twice: per-topic at native rate, and one joint table.
+
+    Per-topic files are what `ulog2csv` gives you, with one addition that makes
+    them worth having here: every ULog file carries a `t_epoch` column computed
+    from the measured clock offset, so it can be joined to the bag directly
+    without redoing the alignment.
+
+    The joint table is the whole chain on one uniform grid: what the RPP
+    commanded, what PX4 made of it, what left the mixer, and what the vehicle
+    actually did. Resampled with a zero-order hold, which is what a control
+    loop actually sees between samples.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    written = []
+
+    def hold(sig, grid_t):
+        t, y = sig
+        t = np.asarray(t, float)
+        if len(t) == 0:
+            return np.full(len(grid_t), np.nan)
+        i = np.clip(np.searchsorted(t, grid_t, side="right") - 1, 0, len(y) - 1)
+        out = np.asarray(y, float)[i]
+        out[grid_t < t[0]] = np.nan
+        return out
+
+    # ---- per-topic, native rate -------------------------------------
+    for name, data in sorted(U.d.items()):
+        keys = [k for k in data.keys() if k != "timestamp"]
+        if not keys:
+            continue
+        t_boot = data["timestamp"] / 1e6
+        path = os.path.join(out_dir, "ulog__%s.csv" % name)
+        with open(path, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["t_boot_s", "t_epoch_s"] + keys)
+            cols = [np.asarray(data[k], float) for k in keys]
+            for i in range(len(t_boot)):
+                w.writerow(["%.6f" % t_boot[i],
+                            "%.6f" % (t_boot[i] + offset) if offset else "",
+                            *["%.6g" % c[i] for c in cols]])
+        written.append(path)
+
+    if B is not None:
+        for name, series, cols in (
+                ("pose", B.s.pose, ["n", "e", "yaw_ned"]),
+                ("vel_cmd_ned", B.s.vel_cmd, ["v_n", "v_e"]),
+                ("vel_meas", B.s.vel_meas, ["speed"]),
+                ("yaw_rate_cmd", B.s.yaw_rate, ["yaw_rate_body"]),
+                ("segment_debug", B.s.seg, ["state", "heading_err"]),
+                ("spray_state", B.s.spray_state, ["on"]),
+                ("setpoint", B.s.setpoint, ["type_mask"])):
+            if not series:
+                continue
+            path = os.path.join(out_dir, "bag__%s.csv" % name)
+            with open(path, "w", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(["t_epoch_s"] + cols)
+                for row in series:
+                    w.writerow(["%.6f" % row[0]]
+                               + ["%.6g" % float(v) for v in row[1:1 + len(cols)]])
+            written.append(path)
+        if B.dbg is not None:
+            path = os.path.join(out_dir, "bag__rpp_debug.csv")
+            with open(path, "w", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(["t_epoch_s"] + ["d%02d_%s" % (i, RPP_DEBUG_NAMES.get(i, ""))
+                                            for i in range(B.dbg.shape[1])])
+                for i in range(len(B.dbg_t)):
+                    w.writerow(["%.6f" % B.dbg_t[i]]
+                               + ["%.6g" % v for v in B.dbg[i]])
+            written.append(path)
+
+    # ---- the joint table --------------------------------------------
+    yc = U.yaw_rate_chain()
+    sc = U.speed_chain()
+    lo = max(s[0][0] for s in yc.values())
+    hi = min(s[0][-1] for s in yc.values())
+    gb = np.arange(lo, hi, 1.0 / hz)                 # boot seconds
+    ge = gb + offset if offset else np.full(len(gb), np.nan)
+
+    cols = [("t_boot_s", gb), ("t_epoch_s", ge)]
+    # --- what the RPP commanded (outside loop, companion side) ---
+    if B is not None and offset:
+        for key, label in (("S0_vel_n", "rpp_cmd_vel_n"),
+                           ("S0_vel_e", "rpp_cmd_vel_e"),
+                           ("S0_speed_cmd", "rpp_cmd_speed"),
+                           ("S0_bearing_cmd", "rpp_cmd_bearing_ned"),
+                           ("S0_yaw_rate_cmd", "rpp_cmd_yaw_rate_UNUSED_BY_PX4"),
+                           ("rpp_xtrack", "rpp_xtrack_own"),
+                           ("rpp_lookahead", "rpp_lookahead")):
+            if key in B.sig:
+                cols.append((label, hold(B.sig[key], ge)))
+        if B.s.pose:
+            p = np.asarray(B.s.pose, float)
+            for j, label in ((1, "pose_n"), (2, "pose_e"), (3, "pose_yaw_ned")):
+                cols.append((label, hold((p[:, 0], p[:, j]), ge)))
+        if B.seg_t is not None:
+            cols.append(("seg_state", hold((B.seg_t, B.seg_state), ge)))
+        if B.s.spray_state:
+            sp = np.asarray([(r[0], float(bool(r[1]))) for r in B.s.spray_state], float)
+            cols.append(("spray_on", hold((sp[:, 0], sp[:, 1]), ge)))
+    # --- what PX4 made of it (outer heading loop) ---
+    for key, label in (("B3_bearing", "px4_bearing_sp"),
+                       ("B4_yaw_sp", "px4_yaw_sp"),
+                       ("B5_yaw_adj", "px4_yaw_sp_adj"),
+                       ("B5_yaw_meas", "px4_yaw_measured"),
+                       # --- inner rate loop ---
+                       ("S1_cmd_rx", "px4_yaw_rate_sp"),
+                       ("S2_adjusted", "px4_yaw_rate_sp_adj"),
+                       ("S3_measured", "px4_yaw_rate_measured"),
+                       ("S4_gyro", "gyro_yaw_rate"),
+                       # --- actuator ---
+                       ("B9_speed_diff", "px4_speed_diff_cmd"),
+                       ("B10_motor_left", "motor_left"),
+                       ("B10_motor_right", "motor_right"),
+                       ("B10_motor_diff", "motor_diff"),
+                       ("B10_motor_common", "motor_common"),
+                       # --- achieved ---
+                       ("S5_wheels", "wheel_implied_yaw_rate"),
+                       ("S5_wheel_speed", "wheel_speed_mean")):
+        if key in yc:
+            cols.append((label, hold(yc[key], gb)))
+    for key, label in (("S2_adjusted", "px4_speed_sp_adj"),
+                       ("S3_measured", "px4_speed_measured"),
+                       ("S2_throttle_implied", "throttle_implied_speed"),
+                       ("S6_estimate", "ekf_speed")):
+        if key in sc:
+            cols.append((label, hold(sc[key], gb)))
+    if U.has("rover_throttle_setpoint"):
+        cols.append(("px4_throttle_sp",
+                     hold((U.t("rover_throttle_setpoint"),
+                           U.d["rover_throttle_setpoint"]["throttle_body_x"]), gb)))
+    cols.append(("offboard_armed", U.mode_mask(gb).astype(float)))
+
+    path = os.path.join(out_dir, "joint_%dhz.csv" % int(hz))
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        names = [c[0] for c in cols]
+        w.writerow(names)
+        arrs = [np.asarray(c[1], float) for c in cols]
+        # epoch seconds need ~10 significant digits before the decimal point;
+        # %g would render them as 1.78583e+09 and destroy the join key.
+        fmt = ["%.6f" if n.startswith("t_") else "%.6g" for n in names]
+        for i in range(len(gb)):
+            w.writerow(["" if not np.isfinite(a[i]) else f % a[i]
+                        for a, f in zip(arrs, fmt)])
+    written.append(path)
+
+    with open(os.path.join(out_dir, "README.txt"), "w") as fh:
+        fh.write(_CSV_README % dict(
+            ulog=U.path, offset=("%.6f" % offset) if offset else "NOT ALIGNED",
+            hz=int(hz), n=len(written)))
+    return written
+
+
+RPP_DEBUG_NAMES = {
+    0: "xtrack_m", 1: "heading_err_rad", 2: "lookahead_m", 3: "speed_cmd",
+    4: "kappa", 5: "dist_to_goal", 6: "pose_age_ms", 7: "state_code",
+    8: "ld_raw_m", 9: "kappa_speed", 10: "yaw_rate_cmd", 38: "mission_speed",
+    39: "spray_active", 40: "profile_code",
+}
+
+_CSV_README = """CSV export from tools/analyze_bag_ulog.py
+=========================================
+source ulog : %(ulog)s
+clock offset: t_epoch = t_boot + %(offset)s
+files       : %(n)d
+
+ulog__<topic>.csv   one per uORB topic, NATIVE rate (this is what ulog2csv
+                    gives you). The extra t_epoch_s column is computed from the
+                    measured clock offset above, so these join to the bag files
+                    directly -- no need to redo the alignment.
+bag__<name>.csv     companion-side topics, native rate, already in epoch time.
+joint_%(hz)dhz.csv      the whole chain on one uniform grid, zero-order hold.
+
+THE CHAIN, in joint order
+-------------------------
+  rpp_cmd_vel_n/e         what the companion commanded (NED velocity vector)
+  rpp_cmd_bearing_ned     its bearing -- THIS is what PX4 steers from
+  rpp_cmd_yaw_rate_...    published, but PX4 DISCARDS it in velocity mode
+  px4_bearing_sp          PX4's decode of the commanded bearing
+  px4_yaw_sp / _adj       heading setpoint, before and after limiting
+  px4_yaw_measured        achieved heading      -> OUTER LOOP error is
+                                                   px4_yaw_sp_adj - px4_yaw_measured
+  px4_yaw_rate_sp         = RO_YAW_P * that error, clamped
+  px4_yaw_rate_sp_adj     after the accel/decel slew
+  px4_yaw_rate_measured   achieved yaw rate     -> INNER LOOP error is
+                                                   px4_yaw_rate_sp_adj - measured
+  px4_speed_diff_cmd      the differential CHANNEL command, normalised
+  motor_left / motor_right   what left the mixer (fork: L = thr+d, R = thr-d)
+  motor_diff              (L-R)/2, equals px4_speed_diff_cmd unless clipped
+  motor_common            (L+R)/2, the throttle after the second slew
+  wheel_implied_yaw_rate  (v_L - v_R)/RD_WHEEL_TRACK from the encoders
+  gyro_yaw_rate           the IMU, pre dead-band
+
+CONVENTIONS
+-----------
+  all angles rad, NED, CW positive. Yaw rates rad/s, CW positive.
+  cross-track + = RIGHT of travel.
+  motor commands normalised [-1, 1]; positive diff = RIGHT turn (fork sign).
+  px4_yaw_rate_measured is DEAD-BANDED by RO_YAW_RATE_TH; gyro_yaw_rate is not.
+  px4_speed_measured is DEAD-BANDED by RO_SPEED_TH.
+  Empty cell = no sample yet on that channel at that time.
+"""
+
+
 def targets_report(geo_stats, U, fw, B):
     """Section 12: are we at target, and is the target even verifiable here?"""
     print("\n12. TARGETS")
@@ -1618,7 +1840,7 @@ def routing_report(U, B):
 # report
 # ----------------------------------------------------------------------
 def analyse(ulog_path, bag_path=None, fig_path=None, emit_params=None,
-            json_path=None):
+            json_path=None, csv_dir=None):
     U = UlogSide(ulog_path)
     print("=" * 108)
     print("ROVER CLOSED-LOOP TUNING DIAGNOSTIC")
@@ -1770,6 +1992,39 @@ def analyse(ulog_path, bag_path=None, fig_path=None, emit_params=None,
         if a in R and b in R:
             print(Link(label, grid, R[a], R[b], "d/s", drive).row(R2D))
 
+    # 7c: the actuator end of the chain, in its own units. These are normalised
+    # motor commands [-1, 1], not rates, so they get a value table rather than a
+    # gain table -- a gain from rad/s into a normalised command is not a number
+    # anyone can act on.
+    if "B9_speed_diff" in R:
+        print("\n   7c. DIFFERENTIAL CHANNEL AND MOTOR OUTPUT (normalised [-1, 1])")
+        print("   %-34s %8s %8s %8s %8s" % ("", "mean", "sd", "min", "max"))
+        for key, label in (("B9_speed_diff", "commanded speed-diff (FF+PID)"),
+                           ("B10_motor_diff", "achieved diff (L-R)/2"),
+                           ("B10_motor_common", "common-mode throttle (L+R)/2"),
+                           ("B10_motor_left", "motor LEFT  control[0]"),
+                           ("B10_motor_right", "motor RIGHT control[1]")):
+            if key not in R:
+                continue
+            v = R[key][drive & np.isfinite(R[key])]
+            if len(v) < 20:
+                continue
+            print("     %-32s %8.4f %8.4f %8.4f %8.4f"
+                  % (label, np.mean(v), np.std(v), np.min(v), np.max(v)))
+        if "B9_speed_diff" in R and "B10_motor_diff" in R:
+            m = drive & np.isfinite(R["B9_speed_diff"]) & np.isfinite(R["B10_motor_diff"])
+            if m.sum() > 20:
+                d = R["B10_motor_diff"][m] - R["B9_speed_diff"][m]
+                print("     commanded -> achieved differential: max |error| %.5f"
+                      % np.max(np.abs(d)))
+                print("       (the mixer takes saturation out of THROTTLE, never out")
+                print("        of the differential, so these agree unless clipped)")
+        sat = drive & (np.abs(R.get("B10_motor_left", np.zeros(len(grid)))) >= 0.999)
+        sat |= drive & (np.abs(R.get("B10_motor_right", np.zeros(len(grid)))) >= 0.999)
+        if drive.sum():
+            print("     motor rail saturation: %.1f%% of driving ticks"
+                  % (100 * sat.sum() / drive.sum()))
+
     # A scale error and a transient overshoot both show up as gain > 1 over the
     # whole run, but they mean different things and have different fixes. Split
     # on how fast the setpoint is moving.
@@ -1895,6 +2150,11 @@ def analyse(ulog_path, bag_path=None, fig_path=None, emit_params=None,
         n = rcm.emit_params(emit_params)
         print("\n   wrote %d parameter change(s) to %s" % (n, emit_params))
     targets_report(geo_stats, U, fw, B)
+
+    if csv_dir:
+        files = export_csv(csv_dir, U, B, offset)
+        print("\n   wrote %d CSV file(s) to %s (see README.txt there)"
+              % (len(files), csv_dir))
 
     if json_path:
         blob = {
@@ -2218,6 +2478,8 @@ def main():
     ap.add_argument("--ulog-dir", help="directory of .ulg files to auto-match")
     ap.add_argument("--fig", help="write a chain figure here")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--csv-dir", metavar="DIR",
+                    help="dump every topic to CSV (native rate, with a\nt_epoch column) plus one time-aligned joint table")
     ap.add_argument("--json", metavar="FILE",
                     help="write the results as JSON for programmatic use")
     ap.add_argument("--bag-dir", help="root of bag bundles, for the sweep")
@@ -2245,7 +2507,7 @@ def main():
         a.ulog = auto_match(a.bag, a.ulog_dir)
     if not a.ulog:
         ap.error("need --ulog or (--bag and --ulog-dir)")
-    analyse(a.ulog, a.bag, a.fig, a.emit_params, a.json)
+    analyse(a.ulog, a.bag, a.fig, a.emit_params, a.json, a.csv_dir)
     return 0
 
 
