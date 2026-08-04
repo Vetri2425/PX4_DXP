@@ -327,9 +327,40 @@ def _p_gpsraw(d):
     sats = r.u8()
     r.i32()                                              # alt_ellipsoid (mm)
     h_acc = r.u32(); v_acc = r.u32()                     # mm
-    return {"fix_type": fix, "lat": lat * 1e-7, "lon": lon * 1e-7,
-            "alt": alt * 1e-3, "eph": eph, "epv": epv, "vel": vel, "cog": cog,
-            "sats": sats, "h_acc": h_acc * 1e-3, "v_acc": v_acc * 1e-3}
+    out = {"fix_type": fix, "lat": lat * 1e-7, "lon": lon * 1e-7,
+           "alt": alt * 1e-3, "eph": eph, "epv": epv, "vel": vel, "cog": cog,
+           "sats": sats, "h_acc": h_acc * 1e-3, "v_acc": v_acc * 1e-3,
+           "yaw": None, "hdg_acc": None}
+    # ---- dual-antenna heading (2026-08-04) ------------------------------
+    # The remaining fields are vel_acc, hdg_acc, yaw, dgps_numch, dgps_age.
+    # `yaw` is the receiver's OWN dual-antenna baseline heading and `hdg_acc`
+    # its self-reported accuracy — the only heading in the bag that is not
+    # downstream of EKF2. Without them, checking the heading REFERENCE (is
+    # GPS_YAW_OFFSET's round 180.000 actually right?) needs a hand-exported
+    # ULog, which is why it kept being deferred.
+    #   hdg_acc: degE5   yaw: cdeg, 0 = NOT AVAILABLE, 36000 = north
+    # Measured 2026-08-04: hdg_acc 85219 => 0.85 deg, i.e. the receiver claims
+    # ~0.9 deg while EKF2 assumes a hardcoded 0.1 rad = 5.73 deg (see F2).
+    # Decode cross-validated against the ULog's independent sensor_gps stream:
+    # hdg_acc 0.962 deg here vs heading_accuracy 0.951 deg there, and
+    # `yaw` tracks EKF yaw to a 0.4-1.5 deg median on straight runs.
+    #
+    # ⚠ DO NOT USE `cog` AS A COURSE REFERENCE at marking speed. Same bags,
+    # same samples: cog sits 13 deg off the true course and jitters +-4 deg
+    # sample to sample (219 deg reported against a real 232 deg), because
+    # Doppler course is degenerate at 0.35 m/s. `yaw` over the same samples is
+    # steady to 0.3 deg. Derive course from pose deltas, never from cog.
+    #
+    # Wrapped because older mavros builds truncate the message here.
+    try:
+        r.u32()                                          # vel_acc (mm/s)
+        hdg_acc = r.u32()                                # degE5
+        yaw_cdeg = r.u16()                               # cdeg, 0 = unavailable
+        out["hdg_acc"] = hdg_acc * 1e-5
+        out["yaw"] = None if yaw_cdeg == 0 else (yaw_cdeg * 1e-2) % 360.0
+    except (IndexError, struct.error):
+        pass
+    return out
 
 
 def _p_navsatfix(d):
@@ -584,6 +615,7 @@ class Series:
         self.statustext = []      # (t, severity, text)
         self.gps = []             # (t, fix_type)
         self.gps_raw = []         # (t, lat, lon, sats, h_acc) — receiver's own fix (GPSRAW, ~5 Hz, EKF-independent)
+        self.gps_yaw = []         # (t, yaw_deg, hdg_acc_deg) — receiver's own dual-antenna heading, EKF-independent
         self.raw_fix = []         # (t, lat, lon, alt) — receiver's own fix (raw/fix NavSatFix, denser, EKF-independent)
         self.global_fix = []      # (t, lat, lon, alt) — EKF WGS84 position (= ekf_origin + local NED; NOT independent)
         self.path_z = None        # z bitfield of the kept /path (bit1 = must-hit)
@@ -646,6 +678,9 @@ def collect(bag_dir: str) -> Series:
             # receiver's own position — guard the (0,0) no-fix placeholder
             if abs(m["lat"]) <= 90.0 and not (m["lat"] == 0.0 and m["lon"] == 0.0):
                 s.gps_raw.append((t, m["lat"], m["lon"], m["sats"], m["h_acc"]))
+            # receiver's own dual-antenna heading, EKF-independent
+            if m.get("yaw") is not None:
+                s.gps_yaw.append((t, m["yaw"], m.get("hdg_acc")))
         elif topic == "/mavros/global_position/raw/fix":
             if m["lat"] == m["lat"] and abs(m["lat"]) <= 90.0 \
                     and not (m["lat"] == 0.0 and m["lon"] == 0.0):
