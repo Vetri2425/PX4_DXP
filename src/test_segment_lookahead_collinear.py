@@ -153,6 +153,10 @@ class TestExactReduction(unittest.TestCase):
     """threshold 0.0 must reproduce the pre-fix geometry bit-for-bit."""
 
     def test_zero_threshold_matches_legacy_everywhere(self):
+        # extend_past_end=False: this asserts the exact reduction of the
+        # COLLINEAR-crossing A/B arm. The D15 endpoint extension (2026-08-04)
+        # is a separate feature with its own flag and deliberately does NOT
+        # reduce to legacy at the path end — that clipping was the bug.
         for path in (FIELD_PATH, CORNER_PATH):
             h = _Holder(path)
             for seg_idx in range(len(path) - 1):
@@ -161,7 +165,8 @@ class TestExactReduction(unittest.TestCase):
                 for frac in (0.0, 0.1, 0.5, 0.9, 1.0):
                     for l_d in (0.05, 0.3, 0.56, 2.0):
                         fn, fe = a[0] + un * L * frac, a[1] + ue * L * frac
-                        got = h._segment_lookahead_point(seg_idx, fn, fe, l_d, 0.0)
+                        got = h._segment_lookahead_point(
+                            seg_idx, fn, fe, l_d, 0.0, False)
                         want = _legacy(h, seg_idx, fn, fe, l_d)
                         with self.subTest(seg=seg_idx, frac=frac, l_d=l_d):
                             self.assertAlmostEqual(got[0], want[0], places=9)
@@ -182,11 +187,29 @@ class TestExactReduction(unittest.TestCase):
 
 class TestTerminationAndDegenerateInput(unittest.TestCase):
     def test_walk_stops_at_path_end(self):
+        """Pre-D15 behaviour, retained under the A/B arm only.
+
+        Pinning the aim point at the last vertex is what made the effective
+        lookahead decay to 0.024-0.062 m during terminal braking (measured
+        2026-08-04) and blew up the steering gain. With the fix ON the aim
+        point is extended along the final bearing instead; see
+        test_endpoint_lookahead.py.
+        """
         h = _Holder(FIELD_PATH)
         last = FIELD_PATH[-1]
-        lh = h._segment_lookahead_point(4, last[0], last[1], 50.0, TOL_DEG)
+        lh = h._segment_lookahead_point(4, last[0], last[1], 50.0, TOL_DEG, False)
         self.assertAlmostEqual(lh[0], last[0], places=9)
         self.assertAlmostEqual(lh[1], last[1], places=9)
+
+    def test_walk_extends_past_path_end_when_enabled(self):
+        """D15: the aim point must stay l_d away, not collapse onto the rover."""
+        h = _Holder(FIELD_PATH)
+        last = FIELD_PATH[-1]
+        prev = FIELD_PATH[-2]
+        un, ue, _L = _unit(prev, last)
+        lh = h._segment_lookahead_point(4, last[0], last[1], 0.45, TOL_DEG, True)
+        self.assertAlmostEqual(lh[0], last[0] + un * 0.45, places=9)
+        self.assertAlmostEqual(lh[1], last[1] + ue * 0.45, places=9)
 
     def test_single_point_path_returns_that_point(self):
         h = _Holder([(1.0, 2.0)])
