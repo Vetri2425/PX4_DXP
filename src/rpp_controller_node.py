@@ -520,6 +520,14 @@ class RPPControllerNode(Node):
         # is the A/B arm if a regression appears. Set it as a default, not at
         # runtime: runtime params on this node are lost on restart.
         self.declare_parameter("segment_lookahead_cross_collinear_deg",  5.0)
+        # D15 (2026-08-04): hold the lookahead point `l_d` ahead even after the
+        # path runs out, by extending past the final vertex along the final
+        # bearing. Without it the aim point pins to the endpoint and the ACTUAL
+        # lookahead decays to 0.024-0.062 m on arrival (measured), so steering
+        # gain (∝ 1/L) explodes and the rover swings ~18 deg while braking on a
+        # straight hop. Affects STEERING only — stopping still comes from the
+        # goal-approach decel and xy_goal_tolerance. False = pre-fix A/B arm.
+        self.declare_parameter("segment_endpoint_lookahead_extend",      True)
         # Segment-mode simplification keeps a "collinear" vertex anyway if it
         # sits more than this far off the straight run (metric Douglas-Peucker
         # test). Stops near-straight must-hit points (a few cm off, only ~3 deg)
@@ -2856,10 +2864,12 @@ class RPPControllerNode(Node):
         foot_e: float,
         l_d: float,
         max_junction_deg: float,
+        extend_past_end: bool = True,
     ) -> tuple[float, float]:
         """Place the lookahead point `l_d` ahead of the foot along the path,
         crossing a vertex only while the turn there is collinear to within
-        `max_junction_deg`. Stops at the first real corner, or at path end.
+        `max_junction_deg`. Stops at the first real corner, or (unless
+        `extend_past_end`) at path end.
 
         Why this exists — segment mode used to clip the lookahead at the
         current segment's end:
@@ -2905,6 +2915,46 @@ class RPPControllerNode(Node):
         by construction (they exceed the threshold and terminate the walk), so
         the blast radius is paths carrying flag/must-hit anchors on a straight
         run — i.e. any marked line with extensions.
+
+        ---- D15, PATH END (2026-08-04) --------------------------------------
+        The collinear walk above fixed vertex clipping, but the PATH END was
+        still clipped: `_segment_angle_deg` returns NaN at the final vertex, so
+        the corner branch fired and the aim point pinned to the endpoint. The
+        aim point then stops moving while the rover keeps closing on it, so the
+        ACTUAL lookahead distance decays to zero on every arrival.
+
+        Measured 2026-08-04 (bags stg_8644443e 12:53/12:54, ULog log_5/log_6),
+        on the 2-point TRANSIT hop, seg state TRACK throughout — no vertex
+        ambiguity:
+
+            t=19.1 s  v 0.254  L_actual 0.452 m
+            t=22.0 s  v 0.107  L_actual 0.217 m
+            t=24.3 s  v 0.051  L_actual 0.062 m     (run2 reached 0.024 m)
+
+        Pure-pursuit steering gain goes as 1/L, so at L = 0.024 m ONE
+        CENTIMETRE of cross-track commands ~23 deg of course change. The ULog
+        shows exactly that: the yaw setpoint deliberately swung -17.8 / -18.2
+        deg during the terminal braking of a STRAIGHT hop, measured yaw
+        followed to within 1-5 deg, and steering used only 3.9-4.5 % authority
+        — the vehicle was obeying an unreasonable command, not slipping. Net
+        effect: a repeatable lateral walk on arrival (-3.61 / -2.62 / -1.41 /
+        -1.35 / +0.09 cm across five runs) that D1 then has to clean up, and a
+        resting position 0.1-3.2 cm off line.
+
+        Raising `min_lookahead_dist` CANNOT fix this: past the final vertex
+        there is no more path to walk, so the floor is unreachable. Going
+        0.35 -> 0.45 on 2026-08-04 made the arrival walk WORSE, not better.
+
+        The end of a path is not a corner. There is no geometry beyond it to
+        steer wrongly into, so clipping buys nothing. We extend the aim point
+        past the final vertex along the final bearing instead, which holds the
+        steering gain finite all the way in. Stopping is NOT affected: speed
+        comes from the goal-approach deceleration and
+        `segment_endpoint_approach_speed`, and termination from
+        `xy_goal_tolerance` — this conditions STEERING only.
+
+        `extend_past_end=False` restores the pre-fix geometry exactly and is
+        the A/B arm.
         """
         n_pts = len(self._path)
         if n_pts < 2:
@@ -2924,8 +2974,27 @@ class RPPControllerNode(Node):
                 f = remaining / seg_rem
                 return pn + (b.x - pn) * f, pe + (b.y - pe) * f
 
-            # The lookahead outruns this segment. Crossing the vertex at
-            # cur+1 is only legitimate when it is not a corner.
+            # The lookahead outruns this segment. If cur+1 is the FINAL vertex
+            # there is no corner to protect and nothing to cross into — extend
+            # past it along the final bearing so the steering gain stays
+            # finite. Checked before the corner branch because
+            # _segment_angle_deg is NaN here and would otherwise clip.
+            if extend_past_end and cur + 2 >= n_pts:
+                ux, uy = b.x - pn, b.y - pe
+                norm = math.hypot(ux, uy)
+                if norm <= 1e-9:
+                    # Sitting on the endpoint: fall back to the final
+                    # segment's own direction so the bearing stays defined.
+                    prev = self._path[max(0, n_pts - 2)].pose.position
+                    ux, uy = b.x - prev.x, b.y - prev.y
+                    norm = math.hypot(ux, uy)
+                if norm > 1e-9:
+                    f = (remaining - seg_rem) / norm
+                    return b.x + ux * f, b.y + uy * f
+                return b.x, b.y
+
+            # Crossing the vertex at cur+1 is only legitimate when it is not
+            # a corner.
             if max_junction_deg <= 0.0:
                 return b.x, b.y
             angle = self._segment_angle_deg(cur)
@@ -3830,6 +3899,7 @@ class RPPControllerNode(Node):
         lh_n, lh_e = self._segment_lookahead_point(
             seg_idx, foot_n, foot_e, l_d,
             float(self.get_parameter("segment_lookahead_cross_collinear_deg").value),
+            bool(self.get_parameter("segment_endpoint_lookahead_extend").value),
         )
 
         dn = lh_n - pos_n
