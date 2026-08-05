@@ -696,3 +696,19 @@ def test_the_model_is_documented_as_fork_plus_overlay_not_stock():
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def test_the_sweep_cannot_emit_a_param_every_run_withheld():
+    """The sweep used to aggregate raw fits and bypass the per-run gates.
+
+    That let --sweep --emit-params write RO_MAX_THR_SPEED while every single
+    run had withheld it. The sweep must route through Recommender like the
+    single-run path does.
+    """
+    src = _source()
+    i = src.index("def sweep(")
+    j = src.index("def _tracking_heading_rms")
+    body = src[i:j]
+    assert "Recommender(" in body, "sweep must build recommendations, not raw fits"
+    assert "accepted" in body, "sweep must track which params each run accepted"
+    assert "WITHHELD" in body, "sweep must be able to withhold a param"

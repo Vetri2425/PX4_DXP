@@ -2323,7 +2323,15 @@ def sweep(ulog_dir, bag_root=None, emit_params=None):
         if "OFFBOARD" not in U.mode_summary():
             print("%-12s  %s -> skipped (not an OFFBOARD run)" % (name, U.mode_summary()))
             continue
-        o = PlantID(U).fit()
+        pid_run = PlantID(U)
+        o = pid_run.fit()
+        # Route through the SAME gates as the single-run path. Aggregating raw
+        # fits here would let the sweep emit a parameter that every individual
+        # run withheld -- which it did for RO_MAX_THR_SPEED until this was fixed.
+        rec_run = Reconstruction(U)
+        rec_run.run()
+        accepted = {r.param for r in Recommender(U, rec_run, pid_run).build()
+                    if np.isfinite(r.rec) and abs(r.rec - r.now) > 1e-6}
         bag = ""
         w = U.window_utc()
         if w:
@@ -2335,7 +2343,7 @@ def sweep(ulog_dir, bag_root=None, emit_params=None):
                     for k in ("RD_MAX_THR_YAW_R", "RO_MAX_THR_SPEED",
                               "RD_WHEEL_TRACK", "RO_YAW_P", "RO_YAW_RATE_P"))
         rows.append(dict(name=name, bag=bag, hdg=hdg, cfg=cfg,
-                         params=dict(U.params), **o))
+                         accepted=accepted, params=dict(U.params), **o))
         print("%-12s %-30s %7.4f %7.3f %8.3f %8.3f %7s %7d"
               % (name, bag[:30], o.get("G", float("nan")),
                  o.get("A_mid", float("nan")), o.get("R_opt", float("nan")),
@@ -2392,6 +2400,14 @@ def sweep(ulog_dir, bag_root=None, emit_params=None):
             for key, pname, cur in (("R_opt", "RD_MAX_THR_YAW_R", fw.R_yaw),
                                     ("K_thr", "RO_MAX_THR_SPEED", fw.K_spd)):
                 if key not in agg:
+                    continue
+                n_ok = sum(1 for r in rows if pname in r.get("accepted", ()))
+                if n_ok < len(rows):
+                    fh.write("# %s: WITHHELD -- accepted by only %d of %d runs;\n"
+                             "#   see the per-run report for the reason.\n"
+                             % (pname, n_ok, len(rows)))
+                    print("  %s: WITHHELD from the params file (accepted by %d/%d "
+                          "runs)" % (pname, n_ok, len(rows)))
                     continue
                 m, sd, lo, hi = agg[key]
                 fh.write("# %s: %.3f -> %.3f  (mean of %d runs, sd %.3f, "
