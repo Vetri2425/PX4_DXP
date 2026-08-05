@@ -293,6 +293,8 @@ def _project_onto_path(
     window_back_m: float = 0.0,
     window_fwd_m: float = 0.0,
     reacquire_dist_m: float = 0.0,
+    heading_rad: Optional[float] = None,
+    direction_gate_cos: float = 0.0,
 ) -> Optional[SprayProjection]:
     """Nearest point on the path, optionally CONSTRAINED to a window around the
     previous projection.
@@ -320,8 +322,27 @@ def _project_onto_path(
     relocalisation (EKF jump, operator repositioning) can still re-acquire.
     prev_s=None (path just loaded) is always a global scan.
 
+    Why the window alone is not enough (2026-08-05). The window is SPATIAL, so
+    on an out-and-back path where the two legs sit centimetres apart it cannot
+    separate them: both are inside [prev_s - back, prev_s + fwd], and "nearest"
+    is decided by a couple of millimetres of lateral noise. Measured on bag
+    stg_46ba8830: the station jumped 4.45 -> 5.05 in one step with ZERO samples
+    in between, straddling the MARK boundary at s=4.770, so current_flag never
+    saw the boundary and the valve opened 29.7 cm inside the mark. Four of
+    eighteen runs lost 23-40 cm of line this way, with RTK fixed, safety_ok
+    true and xtrack under 2.2 cm throughout - nothing in telemetry flagged it.
+
+    Distance cannot disambiguate coincident legs, but DIRECTION can: the two
+    legs have opposite bearings and the vehicle heading says which one it is
+    on. With `heading_rad` supplied and `direction_gate_cos` > 0, segments
+    whose unit direction has cos(angle to heading) below the threshold are
+    rejected before the nearest-segment comparison. Fallback is layered so the
+    gate can never strand the projection: direction-filtered window -> plain
+    window -> global scan.
+
     Passing prev_s=None / zero windows reproduces the pre-fix behaviour exactly
-    and is the A/B arm.
+    and is the A/B arm; direction_gate_cos=0.0 disables the direction gate
+    alone, leaving the window behaviour untouched.
     """
     if not model.points:
         return None
@@ -337,7 +358,16 @@ def _project_onto_path(
             current_flag=model.flags[0],
         )
 
-    def _scan(indices) -> tuple[Optional[SprayProjection], float]:
+    gate_active = (
+        heading_rad is not None
+        and direction_gate_cos > 0.0
+        and math.isfinite(heading_rad)
+    )
+    if gate_active:
+        head_n = math.cos(heading_rad)
+        head_e = math.sin(heading_rad)
+
+    def _scan(indices, use_direction_gate: bool = False):
         best: Optional[SprayProjection] = None
         best_dist = float("inf")
         for i in indices:
@@ -346,6 +376,13 @@ def _project_onto_path(
             d_n = b_n - a_n
             d_e = b_e - a_e
             seg_len_sq = d_n * d_n + d_e * d_e
+            if use_direction_gate and seg_len_sq > 1e-12:
+                # Reject segments running against the vehicle. On coincident
+                # out-and-back legs this is the only signal that separates
+                # them; lateral distance is noise at that point.
+                inv = 1.0 / math.sqrt(seg_len_sq)
+                if (d_n * inv) * head_n + (d_e * inv) * head_e < direction_gate_cos:
+                    continue
             if seg_len_sq <= 1e-12:
                 t = 0.0
                 proj_n, proj_e = a_n, a_e
@@ -391,13 +428,41 @@ def _project_onto_path(
             if model.cumulative_s[i + 1] >= lo and model.cumulative_s[i] <= hi
         ]
         if idx:
+            # Layered fallback: the direction gate may legitimately eliminate
+            # every candidate (pivoting on the spot, reversing), so it is only
+            # ever a preference, never a trap.
+            if gate_active:
+                best, best_dist = _scan(idx, use_direction_gate=True)
+                if best is not None and (
+                    reacquire_dist_m <= 0.0 or best_dist <= reacquire_dist_m
+                ):
+                    return best
             best, best_dist = _scan(idx)
             # Only trust the window while it actually explains where we are.
             if best is not None and (
                 reacquire_dist_m <= 0.0 or best_dist <= reacquire_dist_m
             ):
                 return best
+    if gate_active:
+        best, best_dist = _scan(range(n_seg), use_direction_gate=True)
+        if best is not None and (
+            reacquire_dist_m <= 0.0 or best_dist <= reacquire_dist_m
+        ):
+            return best
     return _scan(range(n_seg))[0]
+
+
+def _direction_gate_cos(gate_deg: float) -> float:
+    """Half-angle in degrees -> cos threshold for the projection direction gate.
+
+    <=0 or >=180 disables the gate (returns 0.0, which _project_onto_path
+    treats as off). 90 deg -> 0.0 would collide with "disabled", so the
+    disabled sentinel is checked first and 90 deg maps to a tiny positive
+    threshold: reject anything that opposes the heading at all.
+    """
+    if gate_deg <= 0.0 or gate_deg >= 180.0:
+        return 0.0
+    return max(1e-6, math.cos(math.radians(gate_deg)))
 
 
 def _next_boundary(
@@ -542,6 +607,10 @@ def _make_spray_decision(
     projection_window_back_m: float = 0.0,
     projection_window_fwd_m: float = 0.0,
     projection_reacquire_dist_m: float = 0.0,
+    # Direction gate (2026-08-05). The spatial window cannot separate the two
+    # legs of an out-and-back path; vehicle heading can. 0.0 disables, leaving
+    # the window behaviour byte-for-byte. See _project_onto_path.
+    projection_direction_gate_cos: float = 0.0,
 ) -> SprayDecision:
     projection: Optional[SprayProjection] = None
     boundary: Optional[SprayBoundary] = None
@@ -598,6 +667,8 @@ def _make_spray_decision(
             window_back_m=projection_window_back_m,
             window_fwd_m=projection_window_fwd_m,
             reacquire_dist_m=projection_reacquire_dist_m,
+            heading_rad=yaw,
+            direction_gate_cos=projection_direction_gate_cos,
         )
     new_xtrack_tripped = False
     if projection is not None:
@@ -878,6 +949,20 @@ class SprayControllerNode(Node):
         # global scan so a real relocalisation can still re-acquire. Must stay
         # well above normal cross-track (cm) and below the leg spacing.
         self.declare_parameter("projection_reacquire_dist_m", 1.0)
+        # Direction gate (2026-08-05). Half-angle, degrees, about the vehicle
+        # heading; segments outside it are rejected before the nearest-segment
+        # comparison. 0 disables. 90 accepts anything not actively opposing the
+        # vehicle, which is what separates the two legs of an out-and-back path
+        # -- the spatial window cannot, because both legs are inside it. Four of
+        # eighteen runs on 2026-08-05 lost 23-40 cm of line to that ambiguity.
+        #
+        # DEFAULT 0.0 (INERT) until an offline replay reproduces the measured
+        # baseline. The first harness attempt did not: its gate-OFF arm scored
+        # 114849 at 330 cm late when the field bag shows it 2 cm EARLY, so it
+        # was not modelling _proj_prev_s seeding or the 10 Hz nozzle feed. A
+        # treatment arm means nothing while the control arm is wrong. Do not
+        # raise this on the vehicle until that replay is faithful.
+        self.declare_parameter("projection_direction_gate_deg", 0.0)
         self.declare_parameter("pose_timeout_s", 0.5)
         self.declare_parameter("velocity_timeout_s", 0.5)
         # ── Phase B: RTK / GPS fix-quality gate (plan §7.6) ──────────────────
@@ -1766,6 +1851,11 @@ class SprayControllerNode(Node):
             ),
             projection_reacquire_dist_m=float(
                 self.get_parameter("projection_reacquire_dist_m").value
+            ),
+            projection_direction_gate_cos=_direction_gate_cos(
+                float(
+                    self.get_parameter("projection_direction_gate_deg").value
+                )
             ),
         )
         # Carry the station forward so the next tick's search stays on this leg.

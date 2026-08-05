@@ -329,6 +329,10 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "projection_window_back_m": _Param(0.5),
         "projection_window_fwd_m": _Param(2.0),
         "projection_reacquire_dist_m": _Param(1.0),
+        # Direction gate (2026-08-05) — SHIPPED default is 0.0 (inert) until an
+        # offline replay reproduces the measured field baseline, so the fixture
+        # mirrors that and the existing expectations stay valid.
+        "projection_direction_gate_deg": _Param(0.0),
     }
     node.get_parameter = lambda name: node._params[name]
     node._clock = _Clock()
