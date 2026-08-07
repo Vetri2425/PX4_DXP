@@ -624,12 +624,27 @@ class RPPControllerNode(Node):
         # PX4 quits at exactly the angle RPP still requires it to cross.
         # 2026-07-30 bags: 6/6 pivots stalled 8-14 s pinned at ~2.5°, escaping
         # only on EKF yaw noise (P0-1). 3.0° accepts before the firmware quits.
-        # 2026-08-07 JUNE-15 RESTORE: 3.0 -> 2.0 (the 06-15 value).
-        # ⚠ HIGHEST-RISK ITEM IN THE RESTORE SET. 3.0 was set by `8da5b18`
-        #   because 2.0 collides with the firmware stop angle RD_TRANS_TRN_DRV
-        #   (0.0349 rad = 2.0°, unchanged since June). If pivots hang 8-14 s
-        #   pinned near 2.5°, put this back to 3.0 FIRST — before touching
-        #   anything else in the set.
+        # 2.0 — OPERATOR'S DECISION 2026-08-07, held deliberately. Keep it.
+        #
+        # First of the pivot-release triple
+        #   segment_heading_tolerance_deg / _timeout_heading_tolerance_deg /
+        #   _pivot_release_max_deg
+        # so the live config is 2/4/5. Context, not an argument to change it:
+        #
+        # 2026-08-03 nine bags, one 3.30 m line, same operator and hour:
+        #   0.35 m/s, Ld 0.35, 3/4/5   1.82 / 1.52 / 0.88  -> 1.41 cm
+        #   0.60 m/s, Ld 0.60, 3/4/5   1.14 / 2.28 / 1.94  -> 1.78 cm
+        #   0.60 m/s, Ld 0.60, 2/3/3   2.99 / 2.23 / 3.19  -> 2.80 cm
+        # Those two arms differ in speed AND lookahead as well as the triple,
+        # so they do not isolate this parameter — 2/4/5 was never run.
+        # Recorded mechanism for the tight arm: it releases tight and then
+        # drifts +1.30 deg over the next 2 s (3/4/5: +0.08 / -0.60).
+        #
+        # 2.0 sits ON the firmware stop angle RD_TRANS_TRN_DRV (0.0349 rad).
+        # It does NOT stall: the 07-30 stall was 2/2/3, where max(2.0, 2.0)
+        # made the watchdog a no-op. At 2/4/5 the watchdog still relaxes to a
+        # real 4.0 deg escape. Five 08-07 runs at 2/4/5 completed with 100%
+        # traversal and no hung pivot.
         self.declare_parameter("segment_heading_tolerance_deg",        2.0)
         self.declare_parameter("segment_yaw_rate_gain",                1.5)
         # P3/P7 valve heading gates (2026-08-01, from the 07-31 bag decode —
