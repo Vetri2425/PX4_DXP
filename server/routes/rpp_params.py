@@ -314,7 +314,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "pivot_to_intercept_enabled": {
         "type": "bool",
-        "default": False,
+        "default": True,
         "group": "Tracking Profile",
         "description": "D1 (2026-08-03): pivot target = bearing from the actual stop position to a point pivot_intercept_dist_m ahead on the new leg, so the release gate nulls the corner-stop offset (the 2.4 cm pivot walk) instead of preserving it. False = pre-08-03 leg-direction pivot",
     },

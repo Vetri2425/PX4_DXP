@@ -746,9 +746,21 @@ class RPPControllerNode(Node):
         # POSITION instead: the same heading gate then nulls cross-track and
         # heading together. With zero offset the intercept bearing equals the
         # leg direction exactly, so already-aligned pivots are unchanged.
-        # 2026-08-07 JUNE-15 RESTORE: True -> False. D1 (`81eca04`) postdates
-        # 06-15 and is still field-unverified.
-        self.declare_parameter("pivot_to_intercept_enabled", False)
+        # 2026-08-07: BACK to True. 946791f turned it off as part of the
+        # June-15 restore purely because D1 postdates 06-15 — no measurement.
+        # The five 08-07 runs are the first data with it off, and they say the
+        # ENTRY error is the whole problem:
+        #
+        #   leg           entry     crosses    overshoot   settled sd
+        #   out          -2.0..-3.5   0.5-1.1 m  +2.0..+4.3   0.37-0.77 cm
+        #   back (pivot) -5.5..-6.6   1.3-1.4 m  --           0.75-1.31 cm
+        #
+        # Settled sd is already June-grade (June = 0.37). The rover simply
+        # starts 1.7-6.6 cm off the line and spends 1.5-2 m converging, with
+        # one overshoot — which on a 4 m line consumes half the line and reads
+        # as a swing. The WORST entries are the legs straight out of the 180
+        # turnaround, which is exactly what D1 aims the pivot to fix.
+        self.declare_parameter("pivot_to_intercept_enabled", True)
         self.declare_parameter("pivot_intercept_dist_m", 0.35)   # m along new leg
         # Connector absorption (Part A): adjacent apex waypoints can leave a
         # sub-threshold "connector" segment (e.g. 8 cm) between two real legs.
