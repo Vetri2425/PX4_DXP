@@ -531,9 +531,23 @@ class RPPControllerNode(Node):
         # gain (∝ 1/L) explodes and the rover swings ~18 deg while braking on a
         # straight hop. Affects STEERING only — stopping still comes from the
         # goal-approach decel and xy_goal_tolerance. False = pre-fix A/B arm.
-        # 2026-08-07 JUNE-15 RESTORE: True -> False. D15 postdates 06-15; the
-        # June lookahead clipped at the segment end. Re-enable after the A/B.
-        self.declare_parameter("segment_endpoint_lookahead_extend",      False)
+        # 2026-08-07: STAYS True. Briefly flipped to False as part of the
+        # June-15 restore, then MEASURED and reverted the same day.
+        #
+        # Probed on the real 3.17 m straight bags/jetson_backlog_20260805/
+        # stg_e7b68c30_..._164610 with Ld = 0.56, effective lookahead L_actual:
+        #
+        #   s (m)      ext=True    ext=False
+        #   2.95       0.560       0.219
+        #   3.05       0.560       0.119
+        #   3.14       0.560       0.029   <- 19.5x steering-gain spike
+        #
+        # Steering gain goes as 1/L, so False re-creates a terminal lateral
+        # walk over the last ~35 cm of every straight — inside the paint.
+        # June did not escape this either; it simply SPLIT the same line into
+        # 2 runs x 2 waypoints and stopped at the boundary. On today's fused
+        # single run (a54fd2d) the extension is what holds the gain finite.
+        self.declare_parameter("segment_endpoint_lookahead_extend",      True)
         # Segment-mode simplification keeps a "collinear" vertex anyway if it
         # sits more than this far off the straight run (metric Douglas-Peucker
         # test). Stops near-straight must-hit points (a few cm off, only ~3 deg)

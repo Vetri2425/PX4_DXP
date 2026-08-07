@@ -308,7 +308,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "segment_endpoint_lookahead_extend": {
         "type": "bool",
-        "default": False,
+        "default": True,
         "group": "Tracking Profile",
         "description": "D15 (2026-08-04): hold the lookahead l_d ahead past the end of the path by extending along the final bearing, instead of pinning the aim point to the last vertex. Without it the effective lookahead decays to ~0.02-0.06 m on arrival and steering gain (1/L) explodes — measured 18 deg of commanded swing while braking on a straight hop. Steering only; stopping is unaffected. False = pre-08-04 behaviour",
     },
