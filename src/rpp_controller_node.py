@@ -286,7 +286,9 @@ class RPPControllerNode(Node):
         # running curved geometry in production.
         self.declare_parameter("min_lookahead_dist",                  0.52)
         self.declare_parameter("max_lookahead_dist",                  1.0)
-        self.declare_parameter("lookahead_time",                      1.0)
+        # 2026-08-07 JUNE-15 RESTORE: 1.0 -> 1.6. The 06-15 bags (straights
+        # 0.37-0.52 cm RMS) ran 1.6; effective Ld 0.56 m vs 0.52 m today.
+        self.declare_parameter("lookahead_time",                      1.6)
 
         # Curvature regulation — lateral acceleration constraint (P4.1)
         # v_lat_limit = sqrt(a_lat_max / |kappa|); physically correct form.
@@ -315,7 +317,10 @@ class RPPControllerNode(Node):
         self.declare_parameter("close_loop_threshold_m",              0.15)   # endpoint gap → "closed"
         self.declare_parameter("close_loop_min_len_m",                1.0)    # only guard runs longer than this
         self.declare_parameter("closed_loop_min_travel_frac",         0.9)    # fraction of circumference required
-        self.declare_parameter("approach_velocity_scaling_dist",      0.9)    # m
+        # 2026-08-07 JUNE-15 RESTORE: 0.9 -> 0.6. The 0.9 came from `1ef5a94`
+        # for a 0.70 m/s rung that never shipped; at 0.35 m/s the physical
+        # need is v^2/2a + 0.1 = 0.22 m, so 0.9 ramps ~30% of every run.
+        self.declare_parameter("approach_velocity_scaling_dist",      0.6)    # m
         self.declare_parameter("min_approach_linear_velocity",        0.1)
         # ── Transit-extension handling (2026-08-01, from the 07-31 bag decode:
         #    bags/31_07_2026/ANALYSIS_2026-08-01_EXTENSION_TERMINAL.md) ──
@@ -526,7 +531,9 @@ class RPPControllerNode(Node):
         # gain (∝ 1/L) explodes and the rover swings ~18 deg while braking on a
         # straight hop. Affects STEERING only — stopping still comes from the
         # goal-approach decel and xy_goal_tolerance. False = pre-fix A/B arm.
-        self.declare_parameter("segment_endpoint_lookahead_extend",      True)
+        # 2026-08-07 JUNE-15 RESTORE: True -> False. D15 postdates 06-15; the
+        # June lookahead clipped at the segment end. Re-enable after the A/B.
+        self.declare_parameter("segment_endpoint_lookahead_extend",      False)
         # Segment-mode simplification keeps a "collinear" vertex anyway if it
         # sits more than this far off the straight run (metric Douglas-Peucker
         # test). Stops near-straight must-hit points (a few cm off, only ~3 deg)
@@ -603,7 +610,13 @@ class RPPControllerNode(Node):
         # PX4 quits at exactly the angle RPP still requires it to cross.
         # 2026-07-30 bags: 6/6 pivots stalled 8-14 s pinned at ~2.5°, escaping
         # only on EKF yaw noise (P0-1). 3.0° accepts before the firmware quits.
-        self.declare_parameter("segment_heading_tolerance_deg",        3.0)
+        # 2026-08-07 JUNE-15 RESTORE: 3.0 -> 2.0 (the 06-15 value).
+        # ⚠ HIGHEST-RISK ITEM IN THE RESTORE SET. 3.0 was set by `8da5b18`
+        #   because 2.0 collides with the firmware stop angle RD_TRANS_TRN_DRV
+        #   (0.0349 rad = 2.0°, unchanged since June). If pivots hang 8-14 s
+        #   pinned near 2.5°, put this back to 3.0 FIRST — before touching
+        #   anything else in the set.
+        self.declare_parameter("segment_heading_tolerance_deg",        2.0)
         self.declare_parameter("segment_yaw_rate_gain",                1.5)
         # P3/P7 valve heading gates (2026-08-01, from the 07-31 bag decode —
         # bags/31_07_2026/ANALYSIS_2026-07-31_CONTROLLER_POSTFIX.md):
@@ -678,7 +691,9 @@ class RPPControllerNode(Node):
         # speed) must be within tolerance for segment_align_settle_s before the
         # state machine advances. Prevents premature exit while the rover is
         # still spinning or drifting.
-        self.declare_parameter("segment_align_settle_s",               0.20)   # s
+        # 2026-08-07 JUNE-15 RESTORE: 0.20 -> 0.10 (the 06-15 value; 0.20
+        # arrived with `9d0d2e9` on 06-18, after the reference bags).
+        self.declare_parameter("segment_align_settle_s",               0.10)   # s
         self.declare_parameter("segment_align_speed_threshold",        0.02)   # m/s (release gate)
         # Pivot watchdog: after this long, relax the heading tolerance but
         # still require yaw-rate settling. Never launch onto the next line
@@ -717,7 +732,9 @@ class RPPControllerNode(Node):
         # POSITION instead: the same heading gate then nulls cross-track and
         # heading together. With zero offset the intercept bearing equals the
         # leg direction exactly, so already-aligned pivots are unchanged.
-        self.declare_parameter("pivot_to_intercept_enabled", True)
+        # 2026-08-07 JUNE-15 RESTORE: True -> False. D1 (`81eca04`) postdates
+        # 06-15 and is still field-unverified.
+        self.declare_parameter("pivot_to_intercept_enabled", False)
         self.declare_parameter("pivot_intercept_dist_m", 0.35)   # m along new leg
         # Connector absorption (Part A): adjacent apex waypoints can leave a
         # sub-threshold "connector" segment (e.g. 8 cm) between two real legs.
@@ -741,7 +758,10 @@ class RPPControllerNode(Node):
         # controller steers on late. Closing it is the difference between a
         # 3.7 cm and a ~2 cm worst-case curve transient in the lag-model sim.
         # Set false to restore the pre-07-31 behaviour as the A/B arm.
-        self.declare_parameter("use_imu_extrapolation",               True)
+        # 2026-08-07 JUNE-15 RESTORE: True -> False (P2.4 `1d80190` postdates
+        # 06-15). This is the documented A/B arm; the comment above describes
+        # the True side.
+        self.declare_parameter("use_imu_extrapolation",               False)
         # Cap on how far past pose_max_age_s we'll trust extrapolation.
         # 0.10 s + the existing 0.20 s pose_max_age = 300 ms total budget.
         self.declare_parameter("imu_max_extrap_age_s",                0.10)
@@ -799,7 +819,10 @@ class RPPControllerNode(Node):
         # (0.9, sized for 0.70). That is conservative, not unsafe — the goal ramp
         # simply starts earlier than it needs to. Revisit the scaling distance
         # only if the endpoint approach becomes objectionably slow.
-        self.declare_parameter("mission_speed",                       0.50)  # m/s
+        # 2026-08-07 JUNE-15 RESTORE: 0.50 -> 0.35. The 06-15 reference bags
+        # ran 0.35 (measured 0.378 m/s on straights). 0.50 was the 08-04 rung
+        # (`bca2b2e`); leaving it would silently invalidate the comparison.
+        self.declare_parameter("mission_speed",                       0.35)  # m/s
 
         # P4.2 — Deceleration limit used ONLY for braking-distance derivation.
         # Separate from max_linear_accel because the accel ramp is one-way

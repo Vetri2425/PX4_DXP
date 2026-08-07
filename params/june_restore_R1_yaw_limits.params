@@ -1,0 +1,21 @@
+# Onboard parameters for Vehicle 1
+#
+# JUNE-15 RESTORE — RUNG 1 of 3: yaw rate/accel LIMITS only
+#
+# Restores the 2026-06-15 yaw-loop envelope. RO_YAW_RATE_P is deliberately
+# LEFT at 0.13 in this rung — limits first, gain second, so the two effects
+# are separable in the bags.
+#
+# Baseline being changed FROM (verified in PX4_Logs/sdcard_20260805/2026-08-05/15_07_24.ulg):
+#   RO_YAW_RATE_LIM  22   RO_YAW_ACCEL_LIM 15   RO_YAW_DECEL_LIM 18
+# Target values are the 2026-06-15 snapshot (log_234_2026-6-15-11-15-56.ulg).
+#
+# DO NOT also revert: EKF2_*, RO_MAX_THR_SPEED, RD_MAX_THR_YAW_R,
+# RO_YAW_RATE_TH, NAV_*/COM_*. Those are proven gains or physical geometry.
+#
+# Load in QGC on the Mac. Never push FCU params from the Jetson.
+#
+# Vehicle-Id Component-Id Name Value Type
+1	1	RO_YAW_RATE_LIM	30	9
+1	1	RO_YAW_ACCEL_LIM	25	9
+1	1	RO_YAW_DECEL_LIM	34	9

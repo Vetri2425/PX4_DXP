@@ -1,0 +1,20 @@
+# Onboard parameters for Vehicle 1
+#
+# JUNE-15 RESTORE — RUNG 2 of 3: nominal June gain
+#
+# Apply ON TOP of RUNG 1. Restores RO_YAW_RATE_P to its literal 2026-06-15
+# value.
+#
+# ⚠ This does NOT restore June's LOOP gain. In June the plant over-delivered
+#   ~12% (RD_MAX_THR_YAW_R = 0.95, plant G = 1.12), so the effective gain was
+#   0.17 x 1.12 = 0.190. Today RD_MAX_THR_YAW_R = 1.14 and G = 1.00, so 0.17
+#   gives 0.170 — about 10% short of June. Rung 3 closes that.
+#
+# Measure BEFORE going to rung 3. Overshoot is the failure mode from here on:
+# you are raising gain into a plant that is now correctly scaled.
+#
+# Vehicle-Id Component-Id Name Value Type
+1	1	RO_YAW_RATE_LIM	30	9
+1	1	RO_YAW_ACCEL_LIM	25	9
+1	1	RO_YAW_DECEL_LIM	34	9
+1	1	RO_YAW_RATE_P	0.17	9

@@ -149,7 +149,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "approach_velocity_scaling_dist": {
         "type": "float",
-        "default": 0.9,
+        "default": 0.6,
         "group": "Goal Handling",
         "description": "Distance from goal where approach speed scaling begins (m)",
         "min": 0.0,
@@ -308,13 +308,13 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "segment_endpoint_lookahead_extend": {
         "type": "bool",
-        "default": True,
+        "default": False,
         "group": "Tracking Profile",
         "description": "D15 (2026-08-04): hold the lookahead l_d ahead past the end of the path by extending along the final bearing, instead of pinning the aim point to the last vertex. Without it the effective lookahead decays to ~0.02-0.06 m on arrival and steering gain (1/L) explodes — measured 18 deg of commanded swing while braking on a straight hop. Steering only; stopping is unaffected. False = pre-08-04 behaviour",
     },
     "pivot_to_intercept_enabled": {
         "type": "bool",
-        "default": True,
+        "default": False,
         "group": "Tracking Profile",
         "description": "D1 (2026-08-03): pivot target = bearing from the actual stop position to a point pivot_intercept_dist_m ahead on the new leg, so the release gate nulls the corner-stop offset (the 2.4 cm pivot walk) instead of preserving it. False = pre-08-03 leg-direction pivot",
     },
@@ -360,7 +360,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "segment_align_settle_s": {
         "type": "float",
-        "default": 0.20,
+        "default": 0.10,
         "group": "Tracking Profile",
         "description": "Continuous heading/yaw-rate/speed dwell before leaving alignment (s)",
         "min": 0.0,
@@ -385,7 +385,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     # ── Latency Closure (P2.4) ────────────────────────────────────────────────
     "use_imu_extrapolation": {
         "type": "bool",
-        "default": True,
+        "default": False,
         "group": "Latency Closure",
         "description": "Enable velocity-based pose extrapolation to close MAVROS pose latency (default ON since 2026-07-31)",
     },
@@ -525,7 +525,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "mission_speed": {
         "type": "float",
-        "default": 0.50,
+        "default": 0.35,
         "group": "Mission Control",
         "description": "Operator-facing mission speed (m/s). Single knob per job. 1.0 for roads, 0.3-0.5 for fields",
         "min": 0.0,

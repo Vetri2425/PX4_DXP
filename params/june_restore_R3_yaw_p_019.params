@@ -1,0 +1,22 @@
+# Onboard parameters for Vehicle 1
+#
+# JUNE-15 RESTORE — RUNG 3 of 3: loop-gain-matched
+#
+# Apply ONLY if rung 2 improved the straights but did not reach target.
+#
+# Derivation — loop gain is RO_YAW_RATE_P x plant_G:
+#     June   0.17 x 1.12 = 0.190   (RD_MAX_THR_YAW_R 0.95, 12% over-rotation)
+#     today  0.13 x 1.00 = 0.130   (RD_MAX_THR_YAW_R 1.14, G verified 1.00)
+#     match  0.190 / 1.00 = 0.19
+#
+# STOP HERE. Do not go above 0.19 without a new plant measurement — the 12%
+# figure came from ULog fits with R = 0.95 and does not extrapolate.
+#
+# Abort signal: straight-line crossing rate above ~0.5/s with amplitude
+# RISING = the loop is now too hot. Fall back to rung 2.
+#
+# Vehicle-Id Component-Id Name Value Type
+1	1	RO_YAW_RATE_LIM	30	9
+1	1	RO_YAW_ACCEL_LIM	25	9
+1	1	RO_YAW_DECEL_LIM	34	9
+1	1	RO_YAW_RATE_P	0.19	9
