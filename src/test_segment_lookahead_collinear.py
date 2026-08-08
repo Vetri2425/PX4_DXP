@@ -41,6 +41,7 @@ RPP = _boot.RPP
 
 class _Holder:
     _segment_lookahead_point = RPP._segment_lookahead_point
+    _corner_clip = RPP._corner_clip
     _segment_angle_deg = RPP._segment_angle_deg
     _dist = staticmethod(RPP._dist)
     _heading_delta = classmethod(RPP._heading_delta.__func__)

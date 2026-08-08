@@ -373,6 +373,44 @@ class RPPControllerNode(Node):
         self.declare_parameter("transit_merge_max_len_m",             2.0)    # m
         self.declare_parameter("transit_runout_goal_tolerance_m",     0.10)   # m
         self.declare_parameter("transit_runout_min_speed_m_s",        0.10)   # m/s
+        # [ENDPOINT CAPTURE 2026-08-08] Second, BOUNDED arrival predicate.
+        # `xy_goal_tolerance` is the ONLY way into _hold_before_run_advance /
+        # _hold_at_completion (3895, 4701). Miss it and there is no recovery
+        # at all: the rover keeps the D15 extended aim point, drives THROUGH
+        # the run end, `approach_ref` (raw Euclidean, 4194) grows again as it
+        # moves away, the `approach_ref < approach_d` gate falls open, and the
+        # speed law re-accelerates the rover away from the stop until a human
+        # e-stops it. 5 of 9 bags on 2026-08-08 did exactly this
+        # (ee3cd136/8c8f8f4b/61c55360/666c3418/11bc8916): closest approach
+        # 2.1-3.8 cm, then 33-48 cm of regrowth at 0.03->0.21-0.29 m/s, every
+        # one ended by the operator. 8c8f8f4b was SPRAYING throughout its
+        # entire 47.6 cm runaway.
+        # Root cause of the MISS: the approach pins speed at
+        # `segment_endpoint_approach_speed` (0.03), under PX4 RO_SPEED_TH, so
+        # steering authority collapses and cross-track walks ~4 cm over the
+        # last 0.6 m. The miss is almost entirely PERPENDICULAR (along-track
+        # at closest approach measured -0.4 cm), so the rover crosses the
+        # run-end plane beside the point rather than stopping on it.
+        # This accepts arrival once the rover has PROVABLY crossed the run-end
+        # plane (along-track progress, via the already-monotonic-and-
+        # saturating `_run_remaining_along()` — never re-triggers on the
+        # Euclidean regrowth that causes the runaway) with a BOUNDED lateral
+        # residual, and routes it into the same two stop handlers used today.
+        # It never touches the speed law — the 2026-08-04 square stall
+        # (documented above at `endpoint_approach_run_remaining`) lived
+        # entirely in the speed ramp's start distance, which this doesn't
+        # touch, and it stays False regardless of this flag.
+        #   past_m    : along-track crossing margin required before accepting
+        #               — proof of a genuine overshoot, not of parking short
+        #               (a stall short of the point is stop-latch's job,
+        #               deliberately not covered here).
+        #   max_miss_m: hard bound on an accepted miss. Measured recoveries
+        #               are 2.4-4.1 cm perpendicular; 0.10 m leaves >2x
+        #               headroom while still refusing anything the next run's
+        #               D1 pivot-to-intercept entry couldn't null out.
+        self.declare_parameter("endpoint_capture_recover_enabled",    False)  # A/B arm
+        self.declare_parameter("endpoint_capture_past_m",             0.02)   # m
+        self.declare_parameter("endpoint_capture_max_miss_m",         0.10)   # m
         self.declare_parameter("p4_zero_vel_threshold",               0.02)   # m/s; floor speed below this to exactly 0 to trigger PX4 P4
 
         # Safety
@@ -548,6 +586,25 @@ class RPPControllerNode(Node):
         # 2 runs x 2 waypoints and stopped at the boundary. On today's fused
         # single run (a54fd2d) the extension is what holds the gain finite.
         self.declare_parameter("segment_endpoint_lookahead_extend",      True)
+        # Real corners pin the lookahead aim exactly at the vertex (by design
+        # -- must not steer toward next-leg geometry before the pivot). As
+        # the rover closes, L_actual -> ||rover - vertex|| -> 0, and since
+        # segment-mode steering is a velocity bearing to the aim point
+        # (heading = atan2(aim - pos)), bearing sensitivity to cross-track
+        # goes as 1/L -- the same mechanism as the endpoint case above, just
+        # never fixed for intermediate corners. Field evidence 2026-08-08
+        # (9 runs, live rover): every corner where peak |xtrack| during
+        # PRE_CORNER_SLOWDOWN exceeded ~2.7 cm took 5.5-6.9 s to actually
+        # latch into CORNER_STOP (worst: dist_to_corner grazed 3.62 cm then
+        # receded to 40.58 cm before locking in 6 s later) vs <=1.0 s when
+        # peak xtrack stayed under ~1.6 cm -- a bearing-gain-spike signature,
+        # not noise. True = extend the aim past the corner along the
+        # INCOMING segment's own tangent only (never the outgoing leg, so
+        # this cannot pre-rotate the rover toward the exit heading the way
+        # extending into the next leg would). False restores exact pre-fix
+        # geometry -- the A/B arm; keep False until replay-validated against
+        # the bags above.
+        self.declare_parameter("segment_corner_lookahead_extend",       False)
         # Segment-mode simplification keeps a "collinear" vertex anyway if it
         # sits more than this far off the straight run (metric Douglas-Peucker
         # test). Stops near-straight must-hit points (a few cm off, only ~3 deg)
@@ -2950,11 +3007,13 @@ class RPPControllerNode(Node):
         l_d: float,
         max_junction_deg: float,
         extend_past_end: bool = True,
+        extend_past_corner: bool = False,
     ) -> tuple[float, float]:
         """Place the lookahead point `l_d` ahead of the foot along the path,
         crossing a vertex only while the turn there is collinear to within
-        `max_junction_deg`. Stops at the first real corner, or (unless
-        `extend_past_end`) at path end.
+        `max_junction_deg`. Stops at the first real corner (or extends past
+        it along the INCOMING tangent only, see `extend_past_corner` below),
+        or (unless `extend_past_end`) at path end.
 
         Why this exists — segment mode used to clip the lookahead at the
         current segment's end:
@@ -3040,6 +3099,27 @@ class RPPControllerNode(Node):
 
         `extend_past_end=False` restores the pre-fix geometry exactly and is
         the A/B arm.
+
+        ---- Corner extension, D15's mechanism applied to real corners -----
+        A real corner pins the aim exactly at the vertex, by design — see
+        the "why this exists" note above. But as the rover closes, the
+        ACTUAL Euclidean lookahead (computed by the caller from the rover's
+        real position, not this function's return value) decays toward
+        zero, and since segment-mode steering is a velocity bearing to the
+        aim point, bearing sensitivity to cross-track goes as 1/L — the
+        exact D15 mechanism, just never fixed here. `extend_past_corner`
+        extends the aim past the vertex along the INCOMING segment's own
+        tangent by exactly `remaining` (never the outgoing leg — this
+        carries zero next-leg information, so it cannot pre-rotate the
+        rover toward the exit heading, unlike walking across the vertex
+        the way the collinear case above does). Guarded by `seg_rem <=
+        1e-9`: once the rover's foot has reached or passed the vertex,
+        extending would aim ahead of an already-arrived rover and drive it
+        away, stalling the corner-acceptance latch — that case still pins
+        to the vertex exactly as before. `extend_past_corner=False`
+        restores exact pre-fix geometry and is this arm's A/B default.
+        Independent of `extend_past_end`: NaN (path-end) is excluded from
+        this arm explicitly so the two compose without cross-coupling.
         """
         n_pts = len(self._path)
         if n_pts < 2:
@@ -3083,9 +3163,16 @@ class RPPControllerNode(Node):
             if max_junction_deg <= 0.0:
                 return b.x, b.y
             angle = self._segment_angle_deg(cur)
-            # NaN means cur+1 is the last vertex — nothing left to cross into.
+            # NaN means cur+1 is the last vertex — nothing left to cross
+            # into, and it's the endpoint arm's case, not this one:
+            # math.isfinite(angle) excludes it so the two A/B arms never
+            # cross-couple (extend_past_end=False must stay byte-identical
+            # regardless of extend_past_corner).
             if not (abs(angle) <= max_junction_deg):
-                return b.x, b.y
+                return self._corner_clip(
+                    pn, pe, b, remaining, seg_rem,
+                    extend_past_corner and math.isfinite(angle),
+                )
 
             remaining -= seg_rem
             pn, pe = b.x, b.y
@@ -3093,6 +3180,37 @@ class RPPControllerNode(Node):
 
         last = self._path[n_pts - 1].pose.position
         return last.x, last.y
+
+    def _corner_clip(
+        self,
+        pn: float,
+        pe: float,
+        b,
+        remaining: float,
+        seg_rem: float,
+        tangent_extend: bool,
+    ) -> tuple[float, float]:
+        """Real corner: never cross into the next leg. Without extension,
+        pin to the vertex (pre-fix geometry, A/B arm). With extension, hold
+        the aim `remaining` ahead along the INCOMING tangent — direction
+        `(b - pn)`, valid because `pn` here is always either the caller's
+        projection foot or a path vertex, both of which lie exactly on the
+        incoming segment's line, so this direction never inherits lateral
+        pose noise even when `seg_rem` is a few mm — so L_actual cannot
+        collapse to `||rover - b||` and 1/L bearing sensitivity stays
+        bounded by ~1/l_min instead of diverging.
+
+        `seg_rem <= 1e-9`: the rover's foot has already reached or passed
+        the vertex (`_project_onto_segment` clamps t to 1 on overshoot).
+        Extending here would aim ahead of an already-arrived rover and
+        drive it away from the corner, stalling the acceptance latch — pin
+        to the vertex instead, preserving today's overshoot-recovery arc
+        exactly.
+        """
+        if not tangent_extend or seg_rem <= 1e-9:
+            return b.x, b.y
+        f = (remaining - seg_rem) / seg_rem
+        return b.x + (b.x - pn) * f, b.y + (b.y - pe) * f
 
     def _project_onto_segment(self, pos_n: float, pos_e: float, seg_idx: int):
         n_pts = len(self._path)
@@ -3812,7 +3930,14 @@ class RPPControllerNode(Node):
         # Fix 2: transit run-outs accept a relaxed endpoint tolerance.
         goal_tol_eff = self._goal_tol_effective(goal_tol)
         min_travel = self._run_min_travel()
-        if final_segment and dist_to_corner <= goal_tol_eff and self._path_travel_m >= min_travel:
+        if (
+            final_segment
+            and self._path_travel_m >= min_travel
+            and (
+                dist_to_corner <= goal_tol_eff
+                or self._endpoint_capture_recovered(pos_n, pos_e, dist_to_corner)
+            )
+        ):
             # Stop before switching across a real heading change. Collinear
             # spray transitions were already merged during path conditioning.
             if self._run_idx + 1 < len(self._runs):
@@ -4031,6 +4156,7 @@ class RPPControllerNode(Node):
             seg_idx, foot_n, foot_e, l_d,
             float(self.get_parameter("segment_lookahead_cross_collinear_deg").value),
             bool(self.get_parameter("segment_endpoint_lookahead_extend").value),
+            bool(self.get_parameter("segment_corner_lookahead_extend").value),
         )
 
         dn = lh_n - pos_n
@@ -4617,7 +4743,10 @@ class RPPControllerNode(Node):
             )
             return
         # Fix 2 (2026-08-01): transit run-outs accept a relaxed tolerance.
-        if dist_to_goal <= self._goal_tol_effective(goal_tol) and self._path_travel_m >= min_travel:
+        if self._path_travel_m >= min_travel and (
+            dist_to_goal <= self._goal_tol_effective(goal_tol)
+            or self._endpoint_capture_recovered(pos_n, pos_e, dist_to_goal)
+        ):
             # End of the active run: advance to the next run (per-entity
             # profile switching). The next 20 ms cycle pivots via
             # _run_alignment_hold if needed, then tracks the new run. DONE
@@ -5399,6 +5528,78 @@ class RPPControllerNode(Node):
         if runout_tol <= 0.0:
             return goal_tol
         return max(goal_tol, min(runout_tol, 0.5 * tail))
+
+    def _endpoint_capture_recovered(
+        self, pos_n: float, pos_e: float, dist_to_goal: float
+    ) -> bool:
+        """Second, BOUNDED arrival test: the rover drove THROUGH the run end
+        without ever entering the tolerance ball. See the param declaration
+        for `endpoint_capture_recover_enabled` for the field evidence.
+
+        Three independent conditions, all required:
+
+        1. ALONG-RUN progress says the run is finished. `_run_remaining_along`
+           is monotonic and saturates at 0 on overshoot (unlike Euclidean
+           `dist_to_goal`, which is what causes the runaway in the first
+           place), so a closed-loop seam, an out-and-back fold, or a pass
+           near a LATER run's endpoint cannot fake it. `None` (progress cache
+           unusable) REFUSES — never guess an arrival.
+        2. The rover has physically crossed the end plane by `past_m`,
+           measured on the final segment's own tangent. This is the evidence
+           of an overshoot as opposed to a stall short of the point (that
+           case is stop-latch's job, not this one), and it is monotone while
+           the rover drives forward, so once true it stays true.
+        3. The PERPENDICULAR residual is bounded by `max_miss_m`. Perp is the
+           right quantity, not `dist_to_goal`: once past the plane, Euclidean
+           distance grows with the along-track term, so bounding on it would
+           revoke the recovery exactly as the rover runs away. Perp is frozen
+           at the crossing and is what the next run's entry pivot (D1
+           pivot-to-intercept) has to null out.
+        """
+        if not bool(self.get_parameter("endpoint_capture_recover_enabled").value):
+            return False
+        if len(self._path) < 2:
+            return False
+
+        goal_tol_eff = self._goal_tol_effective(
+            float(self.get_parameter("xy_goal_tolerance").value)
+        )
+        remaining = self._run_remaining_along()
+        if remaining is None or remaining > goal_tol_eff:
+            return False
+
+        a = self._path[-2].pose.position
+        b = self._path[-1].pose.position
+        un, ue = b.x - a.x, b.y - a.y
+        seg = math.hypot(un, ue)
+        if seg < 1e-6:
+            return False
+        un /= seg
+        ue /= seg
+        dn, de = pos_n - b.x, pos_e - b.y
+        along = dn * un + de * ue
+        perp = abs(dn * ue - de * un)
+
+        if along <= float(self.get_parameter("endpoint_capture_past_m").value):
+            return False
+
+        max_miss = float(self.get_parameter("endpoint_capture_max_miss_m").value)
+        if perp > max_miss:
+            self.get_logger().error(
+                f"endpoint capture: crossed the run end {along * 100:.1f} cm "
+                f"past it but {perp * 100:.1f} cm off line (bound "
+                f"{max_miss * 100:.1f} cm) — NOT accepting arrival",
+                throttle_duration_sec=2.0,
+            )
+            return False
+
+        self.get_logger().warn(
+            f"endpoint capture RECOVERED: never entered the "
+            f"{goal_tol_eff * 100:.1f} cm ball; stopping {dist_to_goal * 100:.1f} cm "
+            f"from the run end ({along * 100:.1f} cm past, {perp * 100:.1f} cm off line)",
+            throttle_duration_sec=1.0,
+        )
+        return True
 
     def _gate_spray(self, spray_active: bool, heading_err: float) -> bool:
         """P3/P7 valve heading gates (2026-08-01). Single choke point —
