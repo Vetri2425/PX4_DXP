@@ -644,7 +644,14 @@ class RPPControllerNode(Node):
         # See docs/RUNTIME_ENTRY_VELOCITY_PLAN.md §4 D2.
         self.declare_parameter("entry_prealign_enabled",              True)
         self.declare_parameter("segment_slowdown_dist",               0.50)
-        self.declare_parameter("segment_min_corner_speed",             0.08)
+        # Was 0.08 — strictly BELOW PX4's RO_SPEED_TH (0.10, see
+        # stop_latch_min_actuatable_m_s below). Replay of the 2026-08-08 field
+        # bags (stg_d5b895d5, stg_b8d9b7d5) caught the controller pinned at
+        # cmd=0.080 for seconds at a time (rem frozen, meas~0) at run-boundary
+        # corner transitions where this floor gates the command — PX4 never
+        # actuates a sub-threshold command, so the rover just sits there.
+        # 0.12 clears RO_SPEED_TH with margin.
+        self.declare_parameter("segment_min_corner_speed",             0.12)
         # Final-segment (run-endpoint) goal-approach floor. A per-line PRE/AFT
         # run ends AT a corner, so the rover must arrive slow enough for active
         # braking to stop it within the corner point. The old endpoint floor was

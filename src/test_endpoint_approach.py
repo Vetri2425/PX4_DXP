@@ -38,8 +38,8 @@ def main():
         # ---- decoupling: the three approach floors are distinct params -------
         assert node.get_parameter("segment_endpoint_approach_speed").value == 0.03, "endpoint floor default 0.03"
         assert node.get_parameter("min_approach_linear_velocity").value == 0.1, "smooth/arc floor unchanged (0.10)"
-        assert node.get_parameter("segment_min_corner_speed").value == 0.08, "within-run corner floor unchanged (0.08)"
-        print("PASS decoupling: endpoint=0.03, smooth/arc=0.10, within-run-corner=0.08 are separate")
+        assert node.get_parameter("segment_min_corner_speed").value == 0.12, "within-run corner floor now 0.12 (was 0.08, below RO_SPEED_TH)"
+        print("PASS decoupling: endpoint=0.03, smooth/arc=0.10, within-run-corner=0.12 are separate")
 
         # ---- functional: the endpoint floor controls final-segment speed -----
         captured = {}
