@@ -408,7 +408,14 @@ class RPPControllerNode(Node):
         #               are 2.4-4.1 cm perpendicular; 0.10 m leaves >2x
         #               headroom while still refusing anything the next run's
         #               D1 pivot-to-intercept entry couldn't null out.
-        self.declare_parameter("endpoint_capture_recover_enabled",    False)  # A/B arm
+        # Was a default-False A/B arm. Promoted to default True 2026-08-08:
+        # replay-validated 5/5 catches on the field runaways with zero false
+        # positives on 3/3 clean captures (9-bag matrix), then field-tested
+        # live via runtime override — but a runtime `ros2 param set` does NOT
+        # survive an rpp-pipeline restart, and one silently reverted it back
+        # to False mid-session without anyone noticing until the next check.
+        # The default itself now carries the fix so a restart can't undo it.
+        self.declare_parameter("endpoint_capture_recover_enabled",    True)
         self.declare_parameter("endpoint_capture_past_m",             0.02)   # m
         self.declare_parameter("endpoint_capture_max_miss_m",         0.10)   # m
         self.declare_parameter("p4_zero_vel_threshold",               0.02)   # m/s; floor speed below this to exactly 0 to trigger PX4 P4
