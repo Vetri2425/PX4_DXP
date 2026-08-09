@@ -70,6 +70,11 @@ FCU_PARAM_NAMES = [
     # manifest cannot prove which tuning actually ran.
     "EKF2_GPS_P_NOISE", "EKF2_WENC_NOISE", "EKF2_WENC_LAT_N", "EKF2_WENC_GATE",
     "EKF2_GPS_YAW_OFF",
+    # F2 v2 provenance (2026-08-09): the gain/gate pair under test plus the
+    # fixed normalised gate they interact with — the 08-05 v1 A/B was
+    # unidentifiable from its own artifacts because EKF2_GPS_YAW_N wasn't
+    # captured here.
+    "EKF2_GPS_YAW_N", "EKF2_GPS_YAW_G", "EKF2_HDG_GATE",
 ]
 # The RPP tuning block lives in /rpp/debug[11..38] (see rpp_controller_node.py).
 # index -> readable label, so the manifest names each number.
