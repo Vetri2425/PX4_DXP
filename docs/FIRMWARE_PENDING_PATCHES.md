@@ -1,7 +1,10 @@
 # Firmware Pending / Patches
 
 > Task list for the PX4 fork (`Vetri2425/PX4-Autopilot`, branch `main`, reviewed @ `4152220`).
-> Findings from code review 2026-08-03. **Nothing here is implemented** — this is the backlog.
+> Findings from code review 2026-08-03. This was originally "nothing here is implemented" —
+> **A4 and A5 landed 2026-08-07/08-08 and are flashed + field-verified** (see their entries
+> below and `CLAUDE.md`'s Firmware provenance table). Everything else in this file is
+> still an unimplemented backlog.
 > Rules: firmware is built via CI overlay on stock v1.16.2, flashed from the Mac via QGC.
 > Never edit firmware on the Jetson; never push FCU params from the Jetson.
 
@@ -37,20 +40,45 @@ and `EKF2_WENC_CTRL=0` on the vehicle today.
 - **Patch:** consecutive-failure counters, rate-limited error print, link-health
   exposure (e.g. field on `wheel_encoders` or status pub).
 
-### A4. Timestamping / delay
+### A4. ✅ CLOSED 2026-08-08 — Timestamping / delay
 - `hrt_absolute_time()` stamped **after** all three blocking `select()` reads
   (`Roboclaw.cpp:265`); cmd 18/19 measure over a trailing 1/300 s window.
 - **Patch:** stamp before the first read; measure and raise `EKF2_WENC_DELAY`
   (yaml default 5 ms understates true latency).
+- **Landed:** `1d82e616f8` (`fix(roboclaw): timestamp encoder read before the
+  UART transactions`) — captures `hrt_absolute_time()` before the three
+  `receiveTransaction()` calls instead of after, closing a window of up to
+  ~264 ms of unbounded jitter (worst during pivots, where A5 matters most).
+  `EKF2_WENC_DELAY` retune left optional — the sign of the residual bias
+  flips, so the existing 5 ms now over-compensates by roughly the
+  transaction window (~0.005 m/s error against `EKF2_WENC_LAT_N=0.1`).
+  Flashed in `wenc-final_1d82e616`, live since 2026-08-08 afternoon.
 
-### A5. Fusion model — lever-arm compensation (attacks the measured pivot walk)
+### A5. ✅ CLOSED 2026-08-07 — Fusion model — lever-arm compensation (attacks the measured pivot walk)
 - Fuser observes `(v_fwd, 0, 0)` raw (`wheel_encoder_fusion.cpp:70`). The zero-lateral
   constraint is only valid at the driven-axle midpoint; at the IMU it is wrong by
   `ω × r` in any turn. The EV body-vel path does this correctly (`ev_vel.h:52-54`).
 - Field evidence: stationary-pivot 1.06 cm sinusoid = lever arm, measured 08-03;
-  pivot walk 4.6 cm is the largest unaddressed error-budget term.
+  pivot walk 4.6 cm is the largest unaddressed error-budget term. Re-confirmed
+  08-07 as the root cause of the pivot-position-circle bug (r ≈ `EKF2_IMU_POS_X`).
 - **Patch:** add `EKF2_WENC_POS_X/Y/Z`, subtract `ω × (sensor_pos − imu_pos)`,
   mirroring the EV code. Requires physically measuring Cube-to-axle offset.
+- **Landed:** `255453d967` (`fix(ekf2): correct IMU lever arm in wheel-encoder
+  velocity fusion`) — takes the wheel encoders' reference point as the
+  body/axle origin (zero offset by convention) rather than adding new params,
+  computes `vel_offset_body = ω × (−imu_pos_body)` from `imu_sample` each
+  cycle, subtracts it from the raw `(v_fwd, 0, 0)` measurement before fusion.
+  Entirely in body frame (`fuseBodyFrameVelocity`), no earth-frame rotation
+  needed. EKF2 replay A/B (log_257/log_258) at commit time: fitted pivot
+  drift radius 0.104→0.024 m and 0.070→0.009 m.
+- **Field-verified 2026-08-09**, flashed in `wenc-final_1d82e616` (live since
+  2026-08-08 afternoon): pivot-window drift-radius analysis across all 34
+  ulogs in `PX4_Logs/WENC_FIX_PATCHES_AUG_08/{first,second,third,fourth}_run/`
+  vs the 2026-08-05 pre-flash baseline (`PX4_Logs/pre_run/`, `PX4_Logs/post_run/`),
+  same methodology both sides (near-stationary + high-yaw-rate windows in
+  `estimator_local_position`): median max wobble radius **1.52 cm → 0.50 cm**,
+  median mean radius 0.88 cm → 0.27 cm, median net walk 2.02 cm → 0.83 cm.
+  n=44 pre-fix pivots, n=105 post-fix pivots.
 
 ### A6. Fusion model — no-slip constraint applied unconditionally
 - This rover pivots in place (counter-rotating wheels + scrubbing caster) — exactly
@@ -94,8 +122,11 @@ and `EKF2_WENC_CTRL=0` on the vehicle today.
 - Maybe consider odometry (delta-position from counts) instead of 1/300 s speed window —
   bigger refactor, only after A1–A9.
 
-**Recommended order:** A1+A2 (else fusing nothing) → A5+A6 (the two measured
-artifacts) → A9 (safety) → params A12 → the rest.
+**Recommended order:** ~~A1+A2 (else fusing nothing) → A5+A6 (the two measured~~
+~~artifacts)~~ — **A5 (+ A4 timestamping) done 2026-08-07/08-08, field-verified
+2026-08-09.** Remaining: A1+A2 (serial desync still open — WENC still fuses
+nothing when the RoboClaw link desyncs) → A6 (no-slip constraint still
+unconditional during pivots) → A9 (safety) → params A12 → the rest.
 
 ---
 
@@ -305,13 +336,55 @@ deliver 1 cm RMS xtrack, no swing, ≤1° sustained heading?
 — at the physical floor of a 1.5 cm RTK receiver at 5 Hz, zero margin).**
 
 ### E1. Firmware findings (F-series)
-- **F2 🔴 HARD BLOCKER: GNSS yaw obs noise is hardcoded `0.1 rad` (5.7°) with NO
-  param** (`common.h:357` `gnss_heading_noise`, used `gnss_yaw_control.cpp:139,230`
-  via `fmaxf(yaw_acc, …)` — discards the UM982's real ~0.35° by 11–20×).
+- **F2 ✅ CODE LANDED + BUILD-VERIFIED 2026-08-09 (not yet flashed) — GNSS yaw obs
+  noise is hardcoded `0.1 rad` (5.7°) with NO param** (`common.h:357`
+  `gnss_heading_noise`, used `gnss_yaw_control.cpp:139,230` via
+  `fmaxf(yaw_acc, …)` — discards the UM982's real ~0.35° by 11–20×).
   Steady-state estimator heading σ = **1.46°** (τ≈3.1 s to absorb a heading step)
-  → ≤1° is impossible at the ESTIMATOR, before any control. Patch: bind to new
-  `EKF2_GPS_YAW_N`, set ~0.01 → σ 0.28°, τ 0.31 s. **The single number that
-  decides the heading spec.**
+  → ≤1° is impossible at the ESTIMATOR, before any control. **The single number
+  that decides the heading spec.**
+  First attempt (v1, `45f576bd`, 08-05) bound `EKF2_GPS_YAW_N` alone and set it
+  to 0.03 in the field — the gain improved (σ 5.73°→1.72°) but the accept/reject
+  gate (`EKF2_HDG_GATE·√(P+R)`) shrank with it, rejecting 17.5%/24.3% of heading
+  updates during pivots, clearing `yaw_align` 3×, and force-resetting yaw on the
+  7 s aiding timeout — the field wobble. Reverted same day.
+  **F2 v2** (`015c67484e` + comment fix `a6e9e12e2a`, both on `main`) adds a
+  second param, `EKF2_GPS_YAW_G` — an absolute innovation floor in radians that
+  force-accepts a rejected update if its innovation is still under the floor.
+  One-way: can only rescue, never discard, an update. Both params default to
+  stock behaviour (`YAW_N=0.1`, `YAW_G=0.0` disabled), so the flash is
+  behaviour-neutral until tuned. `gnss_yaw_control.cpp` and a new
+  `params_gnss_yaw.yaml` had to be re-anchored onto stock v1.16.2 and added to
+  `build_rover.yml`'s overlay list — neither file was ever on it before (v1
+  never needed `gnss_yaw_control.cpp`; its `params_gnss.yaml` overlay was on an
+  abandoned branch, not an ancestor of current `main`).
+  **Verified, not assumed** (artifacts in `/Users/dyx_a1/Vetri/f2v2_replay/`):
+  CI build `31306374824` — **success**, artifact saved locally as
+  `PX4_Firmware/gnss-yaw_015c6748/`. Param dump — both params present at
+  defaults. Neutrality replay — `estimator_aid_src_gnss_yaw` at defaults is
+  decision-identical (0 diff on `fused`/`innovation_rejected`) across all 6
+  logs tested (4× 08-08 + both 08-05 failure recordings); continuous-value
+  jitter ≤0.17° is reproducible replay-start noise, never flips a decision.
+  120-cell parameter sweep (5×`YAW_N` × 4×`YAW_G` × 6 logs, `sweep.csv`) with
+  the fix active reproduces the v1 failure shape at `YAW_G=0` (rejection rate
+  climbs monotonically as `YAW_N` drops: 0.69%→9.23% on the hardest log,
+  `log312`) and confirms the floor fixes it — **except one non-monotonic dead
+  cell**: `YAW_N=0.05, YAW_G=0.175` fails on `log312` alone (2.49% rejected,
+  5.04 s longest run, 1 `yaw_align` drop — every gate breached) while both
+  `YAW_N=0.1` (gate wide enough unaided) and `YAW_N≤0.03` (floor rescues
+  cleanly, down to 0.1% residual) pass clean at the same floor. Cause: at
+  `YAW_N=0.05` this log's peak rejected innovations sit at 13.07°, just above
+  the 10° (`0.175 rad`) floor; at `YAW_N≤0.03` the tighter R keeps innovations
+  smaller even though the raw (unfloored) gate is narrower, so the same floor
+  rescues nearly everything. **Field sequence correction: skip `YAW_N=0.05`
+  entirely, go `YAW_N=0.013, YAW_G=0.175` directly** (0.03/0.02/0.013 are all
+  equally clean in the sweep; 0.013 is the value where the receiver's own
+  reported accuracy finally wins per §E1 above).
+  **Remaining before flash — none are code**: tape-measure `EKF2_IMU_POS_X`
+  (referenced by the lever-arm fix, A5, not F2), test outdoors with a real 3D
+  fix (replay is open-loop and can't validate live GNSS behaviour), and don't
+  change `EKF2_WENC_CTRL` in the same window as this A/B (§7 of the original
+  brief — one variable at a time).
 - **F1: `EKF2_HEAD_NOISE` is a NO-OP here** — binds to `mag_heading_noise`
   (`EKF2.cpp:140`). Delete from config mentally.
 - **F3 (corrected to LIVE params): heading-control deadband =
@@ -402,8 +475,10 @@ the inter-epoch margin — treat as required for a durable 1 cm.
    `EKF2_GPS_V_NOISE=0.05`, later `RO_YAW_RATE_TH=0.5` (only after F2 patch).
 2. **Companion (small diffs):** D1 pivot-to-intercept → D7 real xtrack in debug →
    D3 latency bias → D6 A/B → D10 tol 0.003.
-3. **Firmware patch batch (one flash):** F2 `EKF2_GPS_YAW_N` + F5/C1 in_air-vs-at_rest
-   fix + F7 units + F8 `-m config` + §A serial fixes (A1/A2).
+3. **Firmware patch batch (one flash):** ~~F2 `EKF2_GPS_YAW_N`~~ **F2 code landed
+   + build/replay-verified 2026-08-09, see §E1 — not yet flashed, batch with
+   the rest below** + F5/C1 in_air-vs-at_rest fix + F7 units + F8 `-m config` +
+   §A serial fixes (A1/A2).
 4. **Then:** raise `min_lookahead_dist` 0.55–0.70 (swing), add xtrack integrator
    (D4) or `RD_CRAB_OFF` (crab), re-enable WENC, field-validate the ladder.
 
@@ -458,9 +533,13 @@ the inter-epoch margin — treat as required for a durable 1 cm.
    "the params did not land on the FC" verdict this morning. **Only a
    `px4-dxp` restart refreshes the mirror; a param read is valid only if
    px4-dxp restarted AFTER the last QGC write.**
-3. Firmware batch build+flash: F2 `EKF2_GPS_YAW_N` + F5 at_rest/in_air + F7
+3. Firmware batch build+flash: ~~F2 `EKF2_GPS_YAW_N`~~ **F2 v2 code landed +
+   verified 2026-08-09 (§E1), not yet flashed** + F5 at_rest/in_air + F7
    s_variance units + F8 `-m config` + A1/A2 RoboClaw serial.
-4. After F2 lands: `RO_YAW_RATE_TH 1.0→0.5`.
+4. ~~After F2 lands: `RO_YAW_RATE_TH 1.0→0.5`~~ — **already done, independently
+   of F2, 2026-08-05** (deadband limit-cycle fix — see `CLAUDE.md`'s FCU param
+   table, `RO_YAW_RATE_LIM`/`RO_YAW_RATE_P` history). This line predates that
+   and is stale.
 5. Field: re-run 1_Aug-II both directions @0.35 (before/after remount compare:
    body-right drift + pivot walk + crab per direction), then 0.5 m/s rung
    (wheel-ripple separator + the ≤2 cm curve+straight close-out gate).
