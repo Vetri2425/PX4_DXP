@@ -700,22 +700,22 @@ class RPPControllerNode(Node):
         # First of the pivot-release triple
         #   segment_heading_tolerance_deg / _timeout_heading_tolerance_deg /
         #   _pivot_release_max_deg
-        # so the live config is 2/4/5. Context, not an argument to change it:
+        # Live default as of 2026-08-11 pivot_release_fix_param: 2/3/3
+        # (was 2/4/5). Strict aim stays 2.0; timeout band and hard max both 3.0.
         #
         # 2026-08-03 nine bags, one 3.30 m line, same operator and hour:
         #   0.35 m/s, Ld 0.35, 3/4/5   1.82 / 1.52 / 0.88  -> 1.41 cm
         #   0.60 m/s, Ld 0.60, 3/4/5   1.14 / 2.28 / 1.94  -> 1.78 cm
         #   0.60 m/s, Ld 0.60, 2/3/3   2.99 / 2.23 / 3.19  -> 2.80 cm
         # Those two arms differ in speed AND lookahead as well as the triple,
-        # so they do not isolate this parameter — 2/4/5 was never run.
+        # so they do not isolate this parameter.
         # Recorded mechanism for the tight arm: it releases tight and then
         # drifts +1.30 deg over the next 2 s (3/4/5: +0.08 / -0.60).
         #
         # 2.0 sits ON the firmware stop angle RD_TRANS_TRN_DRV (0.0349 rad).
         # It does NOT stall: the 07-30 stall was 2/2/3, where max(2.0, 2.0)
-        # made the watchdog a no-op. At 2/4/5 the watchdog still relaxes to a
-        # real 4.0 deg escape. Five 08-07 runs at 2/4/5 completed with 100%
-        # traversal and no hung pivot.
+        # made the watchdog a no-op. At 2/3/3 the watchdog still relaxes to a
+        # real 3.0 deg escape (strict 2.0 → timeout/max 3.0).
         self.declare_parameter("segment_heading_tolerance_deg",        2.0)
         self.declare_parameter("segment_yaw_rate_gain",                1.5)
         # P3/P7 valve heading gates (2026-08-01, from the 07-31 bag decode —
@@ -791,9 +791,9 @@ class RPPControllerNode(Node):
         # speed) must be within tolerance for segment_align_settle_s before the
         # state machine advances. Prevents premature exit while the rover is
         # still spinning or drifting.
-        # 2026-08-07 JUNE-15 RESTORE: 0.20 -> 0.10 (the 06-15 value; 0.20
-        # arrived with `9d0d2e9` on 06-18, after the reference bags).
-        self.declare_parameter("segment_align_settle_s",               0.10)   # s
+        # 2026-08-11 pivot_release_fix_param: 0.10 -> 0.20 (longer settle before
+        # TRACK; field straight 0.8 runs showed residual he jump at release).
+        self.declare_parameter("segment_align_settle_s",               0.20)   # s
         self.declare_parameter("segment_align_speed_threshold",        0.02)   # m/s (release gate)
         # Pivot watchdog: after this long, relax the heading tolerance but
         # still require yaw-rate settling. Never launch onto the next line
@@ -803,7 +803,8 @@ class RPPControllerNode(Node):
         # segment_heading_tolerance_deg or the watchdog is a no-op:
         # max(tol, timeout_tol) relaxes nothing when both are equal — which is
         # exactly how every 2026-07-30 pivot stall escaped only on EKF drift.
-        self.declare_parameter("segment_timeout_heading_tolerance_deg", 4.0)   # deg
+        # 2026-08-11 pivot_release_fix_param: 4.0 -> 3.0 (triple now 2/3/3).
+        self.declare_parameter("segment_timeout_heading_tolerance_deg", 3.0)   # deg
         # Angle-aware pivot watchdog (Part B): a fixed timeout is wrong for a
         # corner whose magnitude varies. The rover spot-turns at a roughly
         # constant rate, so the budget scales with the corner angle:
@@ -817,11 +818,12 @@ class RPPControllerNode(Node):
         # Hard release gate: never launch onto the next leg while the heading
         # error to that leg exceeds this, regardless of timeout. Backstops the
         # relaxed timeout band so a mis-set tolerance cannot release a large
-        # residual error into forward TRACK acceleration. MUST sit above
+        # residual error into forward TRACK acceleration. MUST be >=
         # segment_timeout_heading_tolerance_deg — this cap is applied with
-        # min(), so a cap at/below the timeout band silently re-disables the
+        # min(), so a cap below the timeout band silently re-disables the
         # watchdog (the 2026-07-30 stall had 3.0 capping a 2.0/2.0 pair).
-        self.declare_parameter("segment_pivot_release_max_deg",        5.0)    # deg
+        # 2026-08-11 pivot_release_fix_param: 5.0 -> 3.0 (triple now 2/3/3).
+        self.declare_parameter("segment_pivot_release_max_deg",        3.0)    # deg
         # D1 (2026-08-03 estimation audit): pivot-to-intercept. The corner stop
         # leaves the rover up to segment_corner_acceptance_radius (+ brake
         # overshoot) short of the vertex, and the old pivot target was the next

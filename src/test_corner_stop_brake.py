@@ -36,11 +36,11 @@ def main():
         # ---- default params (per the patch) -------------------------------
         assert node.get_parameter("segment_heading_tolerance_deg").value == 2.0, "strict aim must stay 2°"
         assert node.get_parameter("segment_pivot_release_max_deg").value == 3.0, "hard release ceiling 3°"
-        assert node.get_parameter("segment_timeout_heading_tolerance_deg").value == 2.0, "precision timeout must stay 2°"
+        assert node.get_parameter("segment_timeout_heading_tolerance_deg").value == 3.0, "timeout band 3°"
         assert node.get_parameter("segment_align_settle_s").value == 0.20
         assert node.get_parameter("segment_brake_velocity_cap_m_s").value == 0.08
         assert node.get_parameter("segment_align_speed_threshold").value == 0.02
-        print("PASS params: aim=2° release_max=3° timeout_tol=2° settle=0.20 brake_cap=0.08")
+        print("PASS params: aim=2° release_max=3° timeout_tol=3° settle=0.20 brake_cap=0.08")
 
         # ---- TEST 4: braking command opposes motion, capped ----------------
         P(segment_brake_velocity_cap_m_s=0.08, segment_stop_speed_threshold=0.02)
