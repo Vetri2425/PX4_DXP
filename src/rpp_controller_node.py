@@ -270,7 +270,9 @@ class RPPControllerNode(Node):
         # arc_fix_18 validated: 0.8 with a_lat_max=0.3 constrains arc speed to
         # sqrt(0.3/kappa). For R=1.5m kappa=0.667 → 0.671 m/s effective speed.
         # Tune mission_speed per job to further cap; this is the hw ceiling.
-        self.declare_parameter("max_linear_vel",                      0.8)
+        # 2026-08-13: 0.8 -> 1.0 so a 1.0 m/s mission_speed is not silently
+        # clipped by the ceiling.
+        self.declare_parameter("max_linear_vel",                      1.0)
         self.declare_parameter("min_linear_vel",                      0.15)
         # Field-validated on STRAIGHTS 2026-08-03 (3.3 m line, 3 runs at
         # mission_speed 0.35 -> Ld = clamp(1.0*0.35, 0.35, 1.0) = 0.35 m):
@@ -936,7 +938,10 @@ class RPPControllerNode(Node):
         # 2026-08-07 JUNE-15 RESTORE: 0.50 -> 0.35. The 06-15 reference bags
         # ran 0.35 (measured 0.378 m/s on straights). 0.50 was the 08-04 rung
         # (`bca2b2e`); leaving it would silently invalidate the comparison.
-        self.declare_parameter("mission_speed",                       0.35)  # m/s
+        # 2026-08-13: 0.35 -> 1.0 for the 1 m/s field rung. Effective speed is
+        # min(max_linear_vel, mission_speed); both must be 1.0 or the ceiling
+        # wins.
+        self.declare_parameter("mission_speed",                       1.0)  # m/s
 
         # P4.2 — Deceleration limit used ONLY for braking-distance derivation.
         # Separate from max_linear_accel because the accel ramp is one-way

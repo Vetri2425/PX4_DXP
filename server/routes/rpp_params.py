@@ -75,7 +75,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     # ── RPP Geometry ───────────────────────────────────────────────────────────
     "max_linear_vel": {
         "type": "float",
-        "default": 0.8,
+        "default": 1.0,
         "group": "RPP Geometry",
         "description": "Hardware ceiling for linear velocity (m/s)",
         "min": 0.0,
@@ -525,7 +525,7 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     },
     "mission_speed": {
         "type": "float",
-        "default": 0.35,
+        "default": 1.0,
         "group": "Mission Control",
         "description": "Operator-facing mission speed (m/s). Single knob per job. 1.0 for roads, 0.3-0.5 for fields",
         "min": 0.0,
