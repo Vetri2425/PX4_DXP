@@ -847,7 +847,9 @@ class SprayControllerNode(Node):
         self.declare_parameter("use_distance_aware_spray", True)
         self.declare_parameter("nozzle_forward_offset_m", 0.0)
         self.declare_parameter("nozzle_lateral_offset_m", 0.0)
-        self.declare_parameter("solenoid_open_delay_s", 0.10)
+        # 2026-08-13 field spray timing test: visible paint starts remained
+        # late at 0.5-1.0 m/s while OFF timing was clean. Advance ON only.
+        self.declare_parameter("solenoid_open_delay_s", 0.18)
         self.declare_parameter("solenoid_close_delay_s", 0.05)
         # Legacy V2 name kept so old launch overrides do not fail. New code
         # uses explicit ON/OFF margins below to avoid shortening MARK tails.

@@ -129,7 +129,7 @@ SPRAY_PARAM_SCHEMA: dict[str, dict] = {
     },
     "solenoid_open_delay_s": {
         "type": "float",
-        "default": 0.10,
+        "default": 0.18,
         "group": "Distance-Aware Spray",
         "description": "Spray ON is commanded this many seconds early to compensate solenoid/pump open lag",
         "min": 0.0,
