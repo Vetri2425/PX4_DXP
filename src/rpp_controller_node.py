@@ -427,7 +427,7 @@ class RPPControllerNode(Node):
         # before DONE: brake from measured speed, correct signed along-track
         # residual, and use a small endpoint-vector correction if cross-track is
         # still outside the arrival band. It is intentionally final-run only.
-        self.declare_parameter("segment_precise_endpoint_stop_enabled", False)
+        self.declare_parameter("segment_precise_endpoint_stop_enabled", True)
         self.declare_parameter("segment_endpoint_arrival_tolerance_m",  0.02)  # m, along-track
         self.declare_parameter("segment_endpoint_cross_tolerance_m",    0.02)  # m, lateral
         self.declare_parameter("segment_endpoint_max_correction_m",     0.15)  # m, bounded servo envelope
