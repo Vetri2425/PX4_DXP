@@ -420,6 +420,21 @@ class RPPControllerNode(Node):
         self.declare_parameter("endpoint_capture_recover_enabled",    True)
         self.declare_parameter("endpoint_capture_past_m",             0.02)   # m
         self.declare_parameter("endpoint_capture_max_miss_m",         0.10)   # m
+        # Segment final endpoint precision (default OFF). The legacy final stop
+        # confirms only "physically stopped"; if the rover crosses the endpoint
+        # at speed, that can mean stopped metres past the coordinate. When this
+        # A/B flag is enabled, the final run enters a bounded endpoint servo
+        # before DONE: brake from measured speed, correct signed along-track
+        # residual, and use a small endpoint-vector correction if cross-track is
+        # still outside the arrival band. It is intentionally final-run only.
+        self.declare_parameter("segment_precise_endpoint_stop_enabled", False)
+        self.declare_parameter("segment_endpoint_arrival_tolerance_m",  0.02)  # m, along-track
+        self.declare_parameter("segment_endpoint_cross_tolerance_m",    0.02)  # m, lateral
+        self.declare_parameter("segment_endpoint_max_correction_m",     0.15)  # m, bounded servo envelope
+        self.declare_parameter("segment_endpoint_precise_decel_m_s2",   0.35)  # m/s²
+        self.declare_parameter("segment_endpoint_trigger_margin_m",     0.10)  # m, latency/model margin
+        self.declare_parameter("segment_endpoint_creep_speed",          0.10)  # m/s, clears PX4 RO_SPEED_TH
+        self.declare_parameter("segment_endpoint_precise_max_s",        8.0)   # s, stopped timeout backstop
         self.declare_parameter("p4_zero_vel_threshold",               0.02)   # m/s; floor speed below this to exactly 0 to trigger PX4 P4
 
         # Safety
@@ -1022,6 +1037,10 @@ class RPPControllerNode(Node):
         # flips false, control falls through to tracking, and it drives away
         # (bag 2026-07-10_20-07 Line_2m: reached at 4 mm, ran 1.08 m past).
         self._completion_stop_pending: bool = False
+        # Segment final endpoint precise-stop state. Default-inert unless
+        # segment_precise_endpoint_stop_enabled is true; reset per mission/run.
+        self._segment_endpoint_stop_active: bool = False
+        self._segment_endpoint_stop_start_ns: int | None = None
         self._segment_idx: int = 0
         self._segment_state: SegmentStateCode = SegmentStateCode.INACTIVE
         # [STOP-LATCH] captured-at-stop flag; see _stop_latch_filter
@@ -2165,6 +2184,8 @@ class RPPControllerNode(Node):
         self._last_speed_cmd = 0.0
         # [STOP-LATCH] a new mission clears any captured stop
         self._stop_latched = False
+        self._segment_endpoint_stop_active = False
+        self._segment_endpoint_stop_start_ns = None
         # R2 — first tick after path load must use nominal 1/CONTROL_HZ, not a
         # dt that spans the whole conditioning/load wall time.
         self._last_tick = None
@@ -2251,6 +2272,8 @@ class RPPControllerNode(Node):
         )
         self._path_done = False
         self._completion_stop_pending = False   # D3: clear terminal-stop latch per run/path
+        self._segment_endpoint_stop_active = False
+        self._segment_endpoint_stop_start_ns = None
         self._path_travel_m = 0.0   # reset along-path progress per run
         # Length of the unpainted TAIL of this run, cached per run (the goal-
         # tolerance relaxation is evaluated every control tick and this is O(n)).
@@ -2626,6 +2649,184 @@ class RPPControllerNode(Node):
             spray_active=False,
         )
         return False
+
+    def _segment_endpoint_precise_stop_tick(
+        self,
+        pos_n: float,
+        pos_e: float,
+        yaw_ned: float,
+        pose_age_s: float,
+        dist_to_goal: float,
+    ) -> bool:
+        """Final-run endpoint precision overlay.
+
+        Default OFF. When enabled, this is the segment-mode twin of the point
+        precise-stop helper, but aimed at the run's final endpoint. It fixes the
+        specific completion bug where endpoint capture/goal tolerance can route
+        into _hold_at_completion only after the rover has already crossed the
+        point; a pure brake then confirms "stopped" wherever the rover rests.
+
+        Returns True when this tick has published a stop/correction command.
+        Returns False to let the legacy completion/tracking path proceed.
+        """
+        if not bool(self.get_parameter("segment_precise_endpoint_stop_enabled").value):
+            return False
+        if self._run_idx + 1 < len(self._runs):
+            return False
+        if len(self._path) < 2:
+            return False
+
+        a = self._path[-2].pose.position
+        b = self._path[-1].pose.position
+        un, ue = b.x - a.x, b.y - a.y
+        seg_len = math.hypot(un, ue)
+        if seg_len < 1e-6:
+            return False
+        un /= seg_len
+        ue /= seg_len
+
+        # residual: + means endpoint ahead on final segment, - means overshot.
+        dn = b.x - pos_n
+        de = b.y - pos_e
+        residual = dn * un + de * ue
+        cross = (pos_n - b.x) * ue - (pos_e - b.y) * un
+        radial = math.hypot(dn, de)
+
+        along_tol = float(self.get_parameter("segment_endpoint_arrival_tolerance_m").value)
+        cross_tol = float(self.get_parameter("segment_endpoint_cross_tolerance_m").value)
+        correction_limit = float(self.get_parameter("segment_endpoint_max_correction_m").value)
+        speed = self._measured_speed()
+        decel = float(self.get_parameter("segment_endpoint_precise_decel_m_s2").value)
+        trigger = (
+            pstop.feedforward_trigger_distance(speed, decel, along_tol)
+            + float(self.get_parameter("segment_endpoint_trigger_margin_m").value)
+        )
+
+        # Negative residual is already past the end plane, so it must engage.
+        # Positive residual engages only once braking distance says normal RPP
+        # tracking should yield to endpoint precision.
+        if not self._segment_endpoint_stop_active and residual > trigger:
+            return False
+
+        if not self._segment_endpoint_stop_active:
+            self._reset_corner_pivot_state()
+            self._segment_endpoint_stop_active = True
+            self._segment_endpoint_stop_start_ns = self.get_clock().now().nanoseconds
+
+        stopped = self._corner_stop_satisfied()
+        if abs(residual) <= along_tol and abs(cross) <= cross_tol and stopped:
+            self._segment_endpoint_stop_active = False
+            self._segment_endpoint_stop_start_ns = None
+            self._completion_stop_pending = True
+            self._hold_at_completion(
+                pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
+            )
+            return True
+
+        max_s = float(self.get_parameter("segment_endpoint_precise_max_s").value)
+        if (
+            max_s > 0.0
+            and self._segment_endpoint_stop_start_ns is not None
+            and (self.get_clock().now().nanoseconds - self._segment_endpoint_stop_start_ns) * 1e-9 >= max_s
+            and stopped
+        ):
+            self.get_logger().warn(
+                f"segment endpoint precise stop timeout: accepting best position "
+                f"(along={residual * 100.0:.1f} cm, cross={cross * 100.0:.1f} cm)",
+                throttle_duration_sec=2.0,
+            )
+            self._segment_endpoint_stop_active = False
+            self._segment_endpoint_stop_start_ns = None
+            self._completion_stop_pending = True
+            self._hold_at_completion(
+                pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
+            )
+            return True
+
+        self._segment_state = SegmentStateCode.CORNER_STOP
+        self._last_speed_cmd = 0.0
+
+        if radial > correction_limit and abs(cross) > cross_tol:
+            self.get_logger().warn(
+                f"segment endpoint precise stop: lateral miss outside correction "
+                f"envelope (along={residual * 100.0:.1f} cm, "
+                f"cross={cross * 100.0:.1f} cm, limit={correction_limit * 100.0:.1f} cm)",
+                throttle_duration_sec=2.0,
+            )
+            brake_n, brake_e = self._corner_brake_velocity(yaw_ned)
+            self._publish_velocity(brake_n, brake_e)
+            self._publish_yaw_rate(0.0)
+            self._publish_debug(
+                cross_track=cross,
+                heading_err=0.0,
+                lookahead=dist_to_goal,
+                speed=math.hypot(brake_n, brake_e),
+                kappa=0.0,
+                dist_goal=dist_to_goal,
+                pose_age_ms=pose_age_s * 1000.0,
+                state=StateCode.TRACKING,
+                l_d_raw=float("nan"),
+                kappa_speed=0.0,
+                yaw_rate=0.0,
+                spray_active=False,
+            )
+            return True
+
+        needs_lateral_correction = abs(cross) > cross_tol and radial <= correction_limit
+        profile_dist = radial if needs_lateral_correction else abs(residual)
+
+        if stopped and radial > max(along_tol, cross_tol):
+            creep = float(self.get_parameter("segment_endpoint_creep_speed").value)
+            speed_mag = creep
+        else:
+            cap = max(speed, float(self.get_parameter("segment_endpoint_creep_speed").value))
+            speed_mag = pstop.feedforward_brake_speed(
+                max(0.0, profile_dist), decel, cap
+            )
+
+        if radial < 1e-6 or radial > max(correction_limit, along_tol, cross_tol):
+            # If the endpoint is too far laterally, avoid an aggressive diagonal
+            # chase. Reverse/forward along the segment is still safe and bounded.
+            sign = 1.0 if residual >= 0.0 else -1.0
+            dir_n, dir_e = sign * un, sign * ue
+        elif needs_lateral_correction:
+            # Correct the Sonnet-reviewed gap: when along residual is nearly
+            # zero but lateral error remains, point the creep at the endpoint
+            # coordinate instead of commanding a near-zero along-track crawl.
+            dir_n, dir_e = dn / radial, de / radial
+        else:
+            sign = 1.0 if residual >= 0.0 else -1.0
+            dir_n, dir_e = sign * un, sign * ue
+
+        v_n = speed_mag * dir_n
+        v_e = speed_mag * dir_e
+        self._publish_velocity(v_n, v_e)
+        self._publish_yaw_rate(0.0)
+        self._publish_debug(
+            cross_track=cross,
+            heading_err=0.0,
+            lookahead=dist_to_goal,
+            speed=math.hypot(v_n, v_e),
+            kappa=0.0,
+            dist_goal=dist_to_goal,
+            pose_age_ms=pose_age_s * 1000.0,
+            state=StateCode.TRACKING,
+            l_d_raw=float("nan"),
+            kappa_speed=0.0,
+            yaw_rate=0.0,
+            spray_active=False,
+        )
+        self._publish_segment_debug(
+            SegmentStateCode.CORNER_STOP,
+            max(0, len(self._path) - 2),
+            max(0.0, residual),
+            dist_to_goal,
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            0.0,
+        )
+        return True
 
     def _hold_before_run_advance(
         self,
@@ -3951,6 +4152,19 @@ class RPPControllerNode(Node):
         # Fix 2: transit run-outs accept a relaxed endpoint tolerance.
         goal_tol_eff = self._goal_tol_effective(goal_tol)
         min_travel = self._run_min_travel()
+        # Precision hook inside segment control: this runs after the current
+        # tick's projection/path-progress update, so it catches final approach
+        # with fresh along-path state. The outer control-loop hook below exists
+        # separately to prevent the generic goal check from bypassing this
+        # precision overlay before segment control is entered.
+        if (
+            final_segment
+            and self._path_travel_m >= min_travel
+        ):
+            if self._segment_endpoint_precise_stop_tick(
+                pos_n, pos_e, yaw_ned, pose_age_s, dist_to_corner
+            ):
+                return
         if (
             final_segment
             and self._path_travel_m >= min_travel
@@ -4763,6 +4977,19 @@ class RPPControllerNode(Node):
                 pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
             )
             return
+        if (
+            self._active_tracking_profile == "segment"
+            and self._run_idx + 1 >= len(self._runs)
+            and self._path_travel_m >= min_travel
+        ):
+            # Pre-goal precision guard for segment final runs. The generic goal
+            # check below can otherwise route straight into _hold_at_completion
+            # before _control_segment_profile gets a chance to run its fresher
+            # projection-based endpoint precision hook.
+            if self._segment_endpoint_precise_stop_tick(
+                pos_n, pos_e, yaw_ned, pose_age_s, dist_to_goal
+            ):
+                return
         # Fix 2 (2026-08-01): transit run-outs accept a relaxed tolerance.
         if self._path_travel_m >= min_travel and (
             dist_to_goal <= self._goal_tol_effective(goal_tol)
