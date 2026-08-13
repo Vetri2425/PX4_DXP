@@ -95,6 +95,13 @@ class TestIntegrityAndManifest(unittest.TestCase):
 
 
 class TestParamParsers(unittest.TestCase):
+    def test_ros2_param_parse_bool_numeric_and_string(self):
+        self.assertIs(bar._parse_ros2_param_value("true\n"), True)
+        self.assertIs(bar._parse_ros2_param_value("false\n"), False)
+        self.assertEqual(bar._parse_ros2_param_value("6\n"), 6)
+        self.assertAlmostEqual(bar._parse_ros2_param_value("0.05\n"), 0.05)
+        self.assertEqual(bar._parse_ros2_param_value("'continuous'\n"), "continuous")
+
     def test_fcu_param_parse(self, ):
         # ParamGet responses: one real, one integer, one failure.
         responses = {
@@ -133,6 +140,30 @@ class TestParamParsers(unittest.TestCase):
         self.assertTrue(out["captured"])
         self.assertAlmostEqual(out["values"]["max_yaw_rate_body"], 0.45)
         self.assertAlmostEqual(out["values"]["mission_speed"], 0.35)
+
+    def test_spray_param_block_parse(self):
+        responses = {
+            "solenoid_open_delay_s": "0.18",
+            "flow_modulation_enabled": "true",
+            "spray_min_fix_type": "6",
+        }
+        orig = bar._run
+        orig_names = bar.SPRAY_PARAM_NAMES
+        bar.SPRAY_PARAM_NAMES = [
+            "solenoid_open_delay_s",
+            "flow_modulation_enabled",
+            "spray_min_fix_type",
+        ]
+        bar._run = lambda cmd, timeout=5.0: responses.get(cmd[-1], "")
+        try:
+            out = bar._spray_param_block()
+        finally:
+            bar._run = orig
+            bar.SPRAY_PARAM_NAMES = orig_names
+        self.assertTrue(out["captured"])
+        self.assertAlmostEqual(out["values"]["solenoid_open_delay_s"], 0.18)
+        self.assertIs(out["values"]["flow_modulation_enabled"], True)
+        self.assertEqual(out["values"]["spray_min_fix_type"], 6)
 
 
 class TestRetention(unittest.TestCase):

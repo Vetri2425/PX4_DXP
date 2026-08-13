@@ -92,6 +92,34 @@ RPP_DEBUG_PARAM_LABELS = {
     34: "yaw_rate_feedback_gain", 35: "max_yaw_rate_body",
     36: "max_linear_accel", 37: "max_linear_decel", 38: "mission_speed",
 }
+SPRAY_PARAM_NAMES = [
+    # Boundary timing / placement provenance for physical paint start-stop.
+    "use_distance_aware_spray",
+    "nozzle_forward_offset_m",
+    "nozzle_lateral_offset_m",
+    "solenoid_open_delay_s",
+    "solenoid_close_delay_s",
+    "anticipatory_margin_m",
+    "on_overspray_margin_m",
+    "off_overspray_margin_m",
+    "terminal_off_epsilon_m",
+    "terminal_off_speed_mps",
+    # Flow tuning provenance for speed-based nozzle output.
+    "flow_modulation_enabled",
+    "min_flow_value",
+    "rated_marking_speed_mps",
+    "max_flow_slew_per_s",
+    # Safety/gating knobs that can explain missing or shortened paint.
+    "min_spray_speed_mps",
+    "spray_off_during_pivot",
+    "consume_rpp_progress",
+    "progress_timeout_s",
+    "max_xtrack_error_m",
+    "xtrack_trip_error_m",
+    "spray_require_rtk_fix",
+    "spray_min_fix_type",
+    "spray_max_hrms_m",
+]
 # Services whose active-state is recorded in the manifest environment block.
 WATCH_SERVICES = ["rover-server", "rpp-pipeline", "px4-dxp", "bag-autorecord"]
 
@@ -330,19 +358,28 @@ def _environment() -> dict:
 
 
 def _parse_ros2_param_value(out: str | None):
-    """Parse `ros2 param get --hide-type` output → int | float | None."""
+    """Parse `ros2 param get --hide-type` output → bool | int | float | str | None."""
     if not out:
         return None
     token = out.strip().splitlines()[-1].strip()
     if not token or "not set" in out.lower() or "error" in out.lower():
         return None
+    if (
+        "response:" in out.lower()
+        or "paramget_response" in out.lower()
+        or "success=" in out.lower()
+    ):
+        return None
+    lower = token.lower()
+    if lower in {"true", "false"}:
+        return lower == "true"
     try:
         return int(token)
     except ValueError:
         try:
             return float(token)
         except ValueError:
-            return None
+            return token.strip("'\"")
 
 
 def _fcu_params() -> dict:
@@ -417,6 +454,25 @@ def _rpp_param_block() -> dict:
     for idx, label in RPP_DEBUG_PARAM_LABELS.items():
         values[label] = (round(arr[idx], 6) if idx < len(arr) else None)
     return {"captured": bool(values) and len(arr) > 38, "values": values}
+
+
+def _spray_param_block() -> dict:
+    """Best-effort snapshot of spray timing/flow params from /spray_controller."""
+    values: dict = {}
+    missing: list = []
+    for name in SPRAY_PARAM_NAMES:
+        val = _parse_ros2_param_value(_run(
+            ["ros2", "param", "get", "--hide-type", "/spray_controller", name],
+            timeout=2.0,
+        ))
+        if val is None:
+            missing.append(name)
+        values[name] = val
+    return {
+        "captured": bool(values) and len(missing) < len(SPRAY_PARAM_NAMES),
+        "missing": missing,
+        "values": values,
+    }
 
 
 def _loaded_path_identity() -> dict:
@@ -782,6 +838,7 @@ class Recorder:
             },
             "as_run_config": {
                 "rpp_params": _rpp_param_block(),   # RPP publishing now — capture live
+                "spray_params": _spray_param_block(),  # timing/flow provenance
                 "fcu_params": {"captured": False, "values": {}},  # filled at finalise
                 "recorder": {
                     "topics": ("ALL" if RECORD_ALL else TOPICS),
