@@ -295,8 +295,10 @@ class RPPControllerNode(Node):
         # Curvature regulation — lateral acceleration constraint (P4.1)
         # v_lat_limit = sqrt(a_lat_max / |kappa|); physically correct form.
         # Replaces the old linear R/min_radius scaling.
-        # At a_lat_max=0.3: R=1m→0.55m/s, R=0.5m→0.39m/s, R=0.3m→0.30m/s.
-        self.declare_parameter("a_lat_max",                           0.3)   # m/s²
+        # 2026-08-14 curve field-test default: keep mission_speed at 1.0 m/s
+        # and let preview curvature reduce speed. a_lat_max=0.06 gives roughly
+        # R=5m→0.55m/s, R=2m→0.35m/s before the 0.30 m/s floor.
+        self.declare_parameter("a_lat_max",                           0.06)  # m/s²
         self.declare_parameter("regulated_linear_scaling_min_speed",  0.3)
 
         # Goal handling

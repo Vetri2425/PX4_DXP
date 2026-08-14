@@ -116,9 +116,9 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     # ── Curvature Regulation (P4.1) ────────────────────────────────────────────
     "a_lat_max": {
         "type": "float",
-        "default": 0.3,
+        "default": 0.06,
         "group": "Curvature Regulation",
-        "description": "Lateral acceleration constraint (m/s²). v ≤ sqrt(a_lat / |κ|)",
+        "description": "Lateral acceleration constraint (m/s²). v ≤ sqrt(a_lat / |κ|). Field-test default keeps 1 m/s on straights and slows curves.",
         "min": 0.05,
         "max": 2.0,
     },
