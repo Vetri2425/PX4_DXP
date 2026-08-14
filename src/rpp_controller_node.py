@@ -295,10 +295,10 @@ class RPPControllerNode(Node):
         # Curvature regulation — lateral acceleration constraint (P4.1)
         # v_lat_limit = sqrt(a_lat_max / |kappa|); physically correct form.
         # Replaces the old linear R/min_radius scaling.
-        # 2026-08-14 curve field-test default: keep mission_speed at 1.0 m/s
-        # and let preview curvature reduce speed. a_lat_max=0.06 gives roughly
-        # R=5m→0.55m/s, R=2m→0.35m/s before the 0.30 m/s floor.
-        self.declare_parameter("a_lat_max",                           0.06)  # m/s²
+        # 2026-08-14 curve field-test v2: keep mission_speed at 1.0 m/s,
+        # reduce tighter curves toward the 0.30 m/s floor, and validate that
+        # post-curve swing improves with the slower accel ramp below.
+        self.declare_parameter("a_lat_max",                           0.04)  # m/s²
         self.declare_parameter("regulated_linear_scaling_min_speed",  0.3)
 
         # Goal handling
@@ -932,7 +932,7 @@ class RPPControllerNode(Node):
         # stop/re-plan. Decel is intentionally NOT limited — the P4 floor
         # relies on instantaneous step-to-zero to trigger PX4 P4 yaw freeze
         # at the goal. Set to 0.0 to disable.
-        self.declare_parameter("max_linear_accel",                    0.35)  # m/s²
+        self.declare_parameter("max_linear_accel",                    0.20)  # m/s²
 
         # P4.2 — Mission speed (operator-facing, set per job via ros2 param set)
         # This is the single knob the operator touches. It is capped by

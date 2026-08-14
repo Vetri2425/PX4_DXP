@@ -116,10 +116,10 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     # ── Curvature Regulation (P4.1) ────────────────────────────────────────────
     "a_lat_max": {
         "type": "float",
-        "default": 0.06,
+        "default": 0.04,
         "group": "Curvature Regulation",
-        "description": "Lateral acceleration constraint (m/s²). v ≤ sqrt(a_lat / |κ|). Field-test default keeps 1 m/s on straights and slows curves.",
-        "min": 0.05,
+        "description": "Lateral acceleration constraint (m/s²). v ≤ sqrt(a_lat / |κ|). Field-test v2 slows tight curves harder.",
+        "min": 0.03,
         "max": 2.0,
     },
     "regulated_linear_scaling_min_speed": {
@@ -517,9 +517,9 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
     # ── Mission Control (P4.2) ──────────────────────────────────────────────────
     "max_linear_accel": {
         "type": "float",
-        "default": 0.35,
+        "default": 0.20,
         "group": "Mission Control",
-        "description": "Acceleration ramp limit (m/s²). Caps speed increase per cycle. 0 disables",
+        "description": "Acceleration ramp limit (m/s²). Caps speed increase per cycle; field-test v2 softens post-curve ramp-up. 0 disables",
         "min": 0.0,
         "max": 5.0,
     },
