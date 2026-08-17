@@ -967,6 +967,14 @@ class RPPControllerNode(Node):
         # can realistically stop. Default matches max_linear_accel.
         self.declare_parameter("max_linear_decel",                    0.5)  # m/s²
 
+        # Straighten-Before-Sprint (Patch 1): gate UPWARD acceleration behind
+        # heading and curvature alignment so rover does not sprint out of turns
+        # while still rotated or actively curving.
+        self.declare_parameter("accel_gate_heading_full_deg",         2.0)   # deg: full accel allowed below this
+        self.declare_parameter("accel_gate_heading_none_deg",         5.0)   # deg: no accel allowed above this
+        self.declare_parameter("accel_gate_curv_full",                0.05)  # 1/m: full accel allowed below this (R >= 20m)
+        self.declare_parameter("accel_gate_curv_none",                0.15)  # 1/m: no accel allowed above this (R <= 6.7m)
+
         # ------------------------------------------------------------------
         # Internal state
         # ------------------------------------------------------------------
@@ -1523,6 +1531,47 @@ class RPPControllerNode(Node):
     @staticmethod
     def _clamp(value: float, lo: float, hi: float) -> float:
         return max(lo, min(hi, value))
+
+    @staticmethod
+    def _alignment_accel_scale(
+        heading_error_rad: float,
+        curvature_m_inv: float,
+        full_accel_heading_deg: float = 2.0,
+        no_accel_heading_deg: float = 5.0,
+        full_accel_curvature: float = 0.05,
+        no_accel_curvature: float = 0.15,
+    ) -> float:
+        """Return an acceleration multiplier [0.0..1.0] based on path alignment.
+
+        Both heading and curvature must settle before full acceleration is allowed.
+        Only scales UPWARD acceleration; never impedes deceleration.
+        """
+        heading_error_deg = math.degrees(abs(heading_error_rad))
+        abs_curvature = abs(curvature_m_inv)
+
+        if no_accel_heading_deg <= full_accel_heading_deg:
+            heading_scale = 1.0 if heading_error_deg <= full_accel_heading_deg else 0.0
+        elif heading_error_deg <= full_accel_heading_deg:
+            heading_scale = 1.0
+        elif heading_error_deg >= no_accel_heading_deg:
+            heading_scale = 0.0
+        else:
+            heading_scale = (no_accel_heading_deg - heading_error_deg) / (
+                no_accel_heading_deg - full_accel_heading_deg
+            )
+
+        if no_accel_curvature <= full_accel_curvature:
+            curvature_scale = 1.0 if abs_curvature <= full_accel_curvature else 0.0
+        elif abs_curvature <= full_accel_curvature:
+            curvature_scale = 1.0
+        elif abs_curvature >= no_accel_curvature:
+            curvature_scale = 0.0
+        else:
+            curvature_scale = (no_accel_curvature - abs_curvature) / (
+                no_accel_curvature - full_accel_curvature
+            )
+
+        return max(0.0, min(1.0, min(heading_scale, curvature_scale)))
 
     @staticmethod
     def _dist(ax: float, ay: float, bx: float, by: float) -> float:
@@ -4501,8 +4550,16 @@ class RPPControllerNode(Node):
 
         max_accel = float(self.get_parameter("max_linear_accel").value)
         speed_before_accel = speed
-        if max_accel > 0.0:
-            speed = min(speed, self._last_speed_cmd + max_accel * self._tick_dt)
+        if max_accel > 0.0 and speed > self._last_speed_cmd:
+            accel_scale = self._alignment_accel_scale(
+                theta_e,
+                0.0,
+                full_accel_heading_deg=float(self.get_parameter("accel_gate_heading_full_deg").value),
+                no_accel_heading_deg=float(self.get_parameter("accel_gate_heading_none_deg").value),
+                full_accel_curvature=float(self.get_parameter("accel_gate_curv_full").value),
+                no_accel_curvature=float(self.get_parameter("accel_gate_curv_none").value),
+            )
+            speed = min(speed, self._last_speed_cmd + max_accel * accel_scale * self._tick_dt)
 
         p4_floor = float(self.get_parameter("p4_zero_vel_threshold").value)
         if speed < p4_floor and speed_before_accel < p4_floor and self._last_speed_cmd > 0.0:
@@ -5188,16 +5245,28 @@ class RPPControllerNode(Node):
             speed = min(speed, approach_speed)
             state_code = StateCode.APPROACH
 
-        # ---- Step 6.5: Accel-UP ramp (mission-start motor-jerk guard) ----
+        # ---- Step 6.5: Accel-UP ramp (Straighten-Before-Sprint) ----
         # Cap how fast `speed` can RAMP UP relative to the previous cycle.
         # Decel is deliberately unbounded: the P4 floor relies on a clean
         # step-to-zero at the goal, and a symmetric decel limiter would
         # cause goal overshoot beyond the 2 cm xy_goal_tolerance.
         # Uses self._tick_dt from _control_loop (same value as segment ramp).
+        # Straighten-Before-Sprint: gate UPWARD acceleration behind heading
+        # and curvature alignment so rover does not accelerate out of turns
+        # while still rotated or actively curving.
         speed_before_accel = speed
-        max_accel = self.get_parameter("max_linear_accel").value
-        if max_accel > 0.0:
-            speed = min(speed, self._last_speed_cmd + max_accel * self._tick_dt)
+        max_accel = float(self.get_parameter("max_linear_accel").value)
+        if max_accel > 0.0 and speed > self._last_speed_cmd:
+            eff_curv = max(abs(kappa), kappa_speed)
+            accel_scale = self._alignment_accel_scale(
+                theta_e,
+                eff_curv,
+                full_accel_heading_deg=float(self.get_parameter("accel_gate_heading_full_deg").value),
+                no_accel_heading_deg=float(self.get_parameter("accel_gate_heading_none_deg").value),
+                full_accel_curvature=float(self.get_parameter("accel_gate_curv_full").value),
+                no_accel_curvature=float(self.get_parameter("accel_gate_curv_none").value),
+            )
+            speed = min(speed, self._last_speed_cmd + max_accel * accel_scale * self._tick_dt)
 
         # ---- Step 7: P4 floor — exact zero below threshold for clean stop ----
         # Apply the floor only when the intended target speed is below the
