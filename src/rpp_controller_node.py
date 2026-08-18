@@ -158,6 +158,11 @@ Topic:  /rpp/debug   (std_msgs/Float32MultiArray, layout encoded below)
         [44] segment_corner_acceptance_radius
         [45] segment_heading_tolerance_deg
         [46] segment_yaw_rate_gain
+        [47] speed_raw            (Patch 2: pre-slew curvature/approach target)
+        [48] v_lat_limit          (Patch 2: sqrt(a_lat_max/kappa_speed), or max_v)
+        [49] accel_scale          (Patch 2: SBS upward-accel gate 0..1)
+        [50] speed_mode           (Patch 2: 0 accel/SBS, 1 normal decel slew,
+                                   2 hard/legacy immediate decel, 3 approach/P4)
 Layout is append-only: indices [0..7] keep their meaning forever. Consumers
 that only read [0..7] continue to work.
 
@@ -975,6 +980,16 @@ class RPPControllerNode(Node):
         self.declare_parameter("accel_gate_curv_full",                0.05)  # 1/m: full accel allowed below this (R >= 20m)
         self.declare_parameter("accel_gate_curv_none",                0.15)  # 1/m: no accel allowed above this (R <= 6.7m)
 
+        # Patch 2 — smooth-profile downward speed slew. Accel-up stays SBS.
+        # 0.0 on speed_cmd_decel_m_s2 restores the old unbounded decel.
+        # Tight-curve (kappa >= enter) bypasses the slew immediately.
+        self.declare_parameter("speed_cmd_decel_m_s2",                0.30)  # m/s²
+        self.declare_parameter("kappa_hard_enter",                    0.25)  # 1/m
+        self.declare_parameter("kappa_hard_exit",                     0.15)  # 1/m
+        # Extra preview horizon in metres. 0 = use preview_curvature_n only.
+        # Field A/B: set 12.0 so the sweep is visible from the post-corner straight.
+        self.declare_parameter("preview_curvature_distance_m",        0.0)
+
         # ------------------------------------------------------------------
         # Internal state
         # ------------------------------------------------------------------
@@ -1088,6 +1103,8 @@ class RPPControllerNode(Node):
 
         # P0.1 — closed-loop L_d: persist last commanded speed
         self._last_speed_cmd: float = 0.0
+        # Patch 2 — hard-curvature latch for smooth-profile decel bypass.
+        self._kappa_hard_latched: bool = False
         # R2 — measured control-tick dt for accel ramps (ROS clock). None until
         # the first tick after a path load so that tick uses 1/CONTROL_HZ.
         self._last_tick: RclTime | None = None
@@ -1572,6 +1589,61 @@ class RPPControllerNode(Node):
             )
 
         return max(0.0, min(1.0, min(heading_scale, curvature_scale)))
+
+    @staticmethod
+    def _update_kappa_hard_latch(
+        hard_latched: bool,
+        kappa_now: float,
+        kappa_hard_enter: float,
+        kappa_hard_exit: float,
+    ) -> bool:
+        """Hysteresis latch: enter at/above enter, leave at/below exit."""
+        if kappa_hard_enter <= kappa_hard_exit:
+            return abs(kappa_now) >= kappa_hard_enter
+        if abs(kappa_now) >= kappa_hard_enter:
+            return True
+        if abs(kappa_now) <= kappa_hard_exit:
+            return False
+        return bool(hard_latched)
+
+    @staticmethod
+    def _apply_smooth_speed_slew(
+        speed_raw: float,
+        last_speed: float,
+        dt: float,
+        *,
+        hard_latched: bool,
+        speed_cmd_decel: float,
+        max_accel: float,
+        accel_scale: float,
+        approach_active: bool,
+        p4_floor: float,
+    ) -> tuple[float, int]:
+        """Apply SBS accel-up or Patch 2 downward slew.
+
+        Returns (speed, speed_mode) where speed_mode is:
+          0 accel/SBS, 1 normal decel slew, 2 hard/legacy immediate, 3 approach/P4.
+        """
+        if speed_raw > last_speed:
+            if max_accel > 0.0:
+                speed = min(
+                    speed_raw,
+                    last_speed + max_accel * max(0.0, accel_scale) * max(0.0, dt),
+                )
+            else:
+                speed = speed_raw
+            return speed, 0
+        if approach_active or speed_raw < p4_floor:
+            return speed_raw, 3
+        if hard_latched:
+            return speed_raw, 2
+        if speed_cmd_decel > 0.0:
+            return max(speed_raw, last_speed - speed_cmd_decel * max(0.0, dt)), 1
+        return speed_raw, 2
+
+    def _reset_kappa_hard_latch(self) -> None:
+        """Clear the Patch 2 hard-κ latch (new mission/run/idle/abort/reset)."""
+        self._kappa_hard_latched = False
 
     @staticmethod
     def _dist(ax: float, ay: float, bx: float, by: float) -> float:
@@ -2233,6 +2305,7 @@ class RPPControllerNode(Node):
         # Mission-level resets; per-run state is reset inside _apply_run.
         # P0.1 — reset last speed so L_d bootstraps cleanly on new path
         self._last_speed_cmd = 0.0
+        self._reset_kappa_hard_latch()
         # [STOP-LATCH] a new mission clears any captured stop
         self._stop_latched = False
         self._segment_endpoint_stop_active = False
@@ -2326,6 +2399,7 @@ class RPPControllerNode(Node):
         self._segment_endpoint_stop_active = False
         self._segment_endpoint_stop_start_ns = None
         self._path_travel_m = 0.0   # reset along-path progress per run
+        self._reset_kappa_hard_latch()
         # Length of the unpainted TAIL of this run, cached per run (the goal-
         # tolerance relaxation is evaluated every control tick and this is O(n)).
         self._run_tail_transit_m = self._measure_tail_transit_m()
@@ -5199,9 +5273,16 @@ class RPPControllerNode(Node):
         # along the path ahead (path-intrinsic Menger). This anticipates
         # corners — the rover slows BEFORE entering them, not as it enters.
         # If preview_curvature_n <= 1 this falls back to baseline behaviour.
-        if n_preview > 1:
+        # Patch 2: preview_curvature_distance_m (0 = n-only) can raise n so
+        # a far sweep is visible after a tight-corner exit. Default 0 is
+        # legacy-safe.
+        n_eff = n_preview
+        preview_dist_m = float(self.get_parameter("preview_curvature_distance_m").value)
+        if preview_dist_m > 0.0 and l_d > 1e-9:
+            n_eff = max(n_preview, int(math.ceil(preview_dist_m / l_d)))
+        if n_eff > 1:
             kappa_speed = self._max_preview_curvature(seg_idx, foot_n, foot_e,
-                                                      l_d, n_preview)
+                                                      l_d, n_eff)
         else:
             kappa_speed = abs(kappa)
 
@@ -5213,6 +5294,7 @@ class RPPControllerNode(Node):
             v_lat_limit = math.sqrt(a_lat_max / kappa_speed)
             speed = self._clamp(min(max_v, v_lat_limit), min_curv_v, max_v)
         else:
+            v_lat_limit = max_v
             speed = max_v
 
         # ---- Step 6: Approach scaling near goal ----
@@ -5245,28 +5327,42 @@ class RPPControllerNode(Node):
             speed = min(speed, approach_speed)
             state_code = StateCode.APPROACH
 
-        # ---- Step 6.5: Accel-UP ramp (Straighten-Before-Sprint) ----
-        # Cap how fast `speed` can RAMP UP relative to the previous cycle.
-        # Decel is deliberately unbounded: the P4 floor relies on a clean
-        # step-to-zero at the goal, and a symmetric decel limiter would
-        # cause goal overshoot beyond the 2 cm xy_goal_tolerance.
-        # Uses self._tick_dt from _control_loop (same value as segment ramp).
-        # Straighten-Before-Sprint: gate UPWARD acceleration behind heading
-        # and curvature alignment so rover does not accelerate out of turns
-        # while still rotated or actively curving.
-        speed_before_accel = speed
+        # ---- Step 6.5: Accel-UP (SBS) + Patch 2 downward slew ----
+        # Accel-up is unchanged: SBS gates the ramp behind heading/curvature.
+        # Downward speed_cmd used to be unbounded (needed for P4 snap-to-zero
+        # and tight-corner safety). Sweep flicker then stepped v_lat_limit
+        # 0.45↔0.89. Soft downward changes are now slewed; hard-κ, approach,
+        # and P4 still assign speed_raw immediately.
+        speed_raw = speed
+        speed_before_accel = speed_raw
         max_accel = float(self.get_parameter("max_linear_accel").value)
-        if max_accel > 0.0 and speed > self._last_speed_cmd:
-            eff_curv = max(abs(kappa), kappa_speed)
-            accel_scale = self._alignment_accel_scale(
-                theta_e,
-                eff_curv,
-                full_accel_heading_deg=float(self.get_parameter("accel_gate_heading_full_deg").value),
-                no_accel_heading_deg=float(self.get_parameter("accel_gate_heading_none_deg").value),
-                full_accel_curvature=float(self.get_parameter("accel_gate_curv_full").value),
-                no_accel_curvature=float(self.get_parameter("accel_gate_curv_none").value),
-            )
-            speed = min(speed, self._last_speed_cmd + max_accel * accel_scale * self._tick_dt)
+        kappa_now = max(abs(kappa), abs(kappa_speed))
+        accel_scale = self._alignment_accel_scale(
+            theta_e,
+            kappa_now,
+            full_accel_heading_deg=float(self.get_parameter("accel_gate_heading_full_deg").value),
+            no_accel_heading_deg=float(self.get_parameter("accel_gate_heading_none_deg").value),
+            full_accel_curvature=float(self.get_parameter("accel_gate_curv_full").value),
+            no_accel_curvature=float(self.get_parameter("accel_gate_curv_none").value),
+        )
+        self._kappa_hard_latched = self._update_kappa_hard_latch(
+            self._kappa_hard_latched,
+            kappa_now,
+            float(self.get_parameter("kappa_hard_enter").value),
+            float(self.get_parameter("kappa_hard_exit").value),
+        )
+        approach_active = (state_code == StateCode.APPROACH)
+        speed, speed_mode = self._apply_smooth_speed_slew(
+            speed_raw,
+            self._last_speed_cmd,
+            self._tick_dt,
+            hard_latched=self._kappa_hard_latched,
+            speed_cmd_decel=float(self.get_parameter("speed_cmd_decel_m_s2").value),
+            max_accel=max_accel,
+            accel_scale=accel_scale,
+            approach_active=approach_active,
+            p4_floor=p4_floor,
+        )
 
         # ---- Step 7: P4 floor — exact zero below threshold for clean stop ----
         # Apply the floor only when the intended target speed is below the
@@ -5275,6 +5371,7 @@ class RPPControllerNode(Node):
         # 0 -> delta_up -> 0 deadlock.
         if speed < p4_floor and speed_before_accel < p4_floor and self._last_speed_cmd > 0.0:
             speed = 0.0
+            speed_mode = 3
 
         # ---- P0.1: persist commanded speed for next cycle's L_d ----
         self._last_speed_cmd = speed
@@ -5353,6 +5450,10 @@ class RPPControllerNode(Node):
             kappa_speed=kappa_speed,           # B1
             yaw_rate=yaw_rate_body,            # P3.1
             spray_active=spray_active,
+            speed_raw=speed_raw,
+            v_lat_limit=v_lat_limit,
+            accel_scale=accel_scale,
+            speed_mode=speed_mode,
         )
 
         # B3(a): the smooth profile must ALSO publish /rpp/segment_debug with a
@@ -5711,6 +5812,7 @@ class RPPControllerNode(Node):
         # still reset.
         if state != StateCode.JUMP_SKIP:
             self._last_speed_cmd = 0.0
+            self._reset_kappa_hard_latch()
         self._publish_debug(
             cross_track=float("nan"),
             heading_err=float("nan"),
@@ -5975,6 +6077,10 @@ class RPPControllerNode(Node):
         kappa_speed: float = float("nan"),   # B1: predictive κ used for speed
         yaw_rate: float = 0.0,               # P3.1: final clamped body yaw rate cmd
         spray_active: bool = False,
+        speed_raw: float = float("nan"),     # Patch 2: pre-slew target
+        v_lat_limit: float = float("nan"),   # Patch 2: raw lateral speed cap
+        accel_scale: float = float("nan"),   # Patch 2: SBS gate
+        speed_mode: float = float("nan"),    # Patch 2: 0/1/2/3
     ):
         """Publish /rpp/debug Float32MultiArray.
 
@@ -5985,13 +6091,14 @@ class RPPControllerNode(Node):
         values with tracking performance without needing a separate param dump.
         Index [39]: spray_active.
         Indices [40..46]: active tracking profile and segment-mode params.
+        Indices [47..50]: Patch 2 speed-slew diagnostics (append-only).
         """
         # P3/P7 (2026-08-01): heading gates applied at the single choke point.
         spray_active = self._gate_spray(spray_active, heading_err)
         self._publish_spray_active(spray_active)
         msg = Float32MultiArray()
         msg.layout.dim.append(MultiArrayDimension(label="rpp_debug",
-                                                  size=47, stride=47))
+                                                  size=51, stride=51))
 
         # ---- Snapshot all parameters once for this cycle ----
         p_max_linear_vel = float(self.get_parameter("max_linear_vel").value)
@@ -6078,6 +6185,10 @@ class RPPControllerNode(Node):
             p_segment_acceptance,      # [44] segment_corner_acceptance_radius
             p_segment_heading_tol,     # [45] segment_heading_tolerance_deg
             p_segment_yaw_gain,        # [46] segment_yaw_rate_gain
+            float(speed_raw),          # [47] speed_raw (pre-slew)
+            float(v_lat_limit),        # [48] v_lat_limit
+            float(accel_scale),        # [49] accel_scale
+            float(speed_mode),         # [50] speed_mode
         ]
         self._dbg_pub.publish(msg)
 
