@@ -22,6 +22,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from mavros_msgs.msg import RTCM
 from sensor_msgs.msg import NavSatFix, NavSatStatus
+from ntrip_protocol import gga_position_is_usable, response_is_success
 
 # ---------------------------------------------------------------------------
 # Configuration via CLI arguments
@@ -31,6 +32,8 @@ NTRIP_PORT = 2101
 NTRIP_MOUNTPT = ""
 _NTRIP_USER = ""
 _NTRIP_PASS = ""
+_GGA_MAX_FIX_AGE_S = 5.0
+_STREAM_SOCKET_TIMEOUT_S = 10.0
 
 
 def parse_args(argv=None):
@@ -117,6 +120,7 @@ class NtripNode(Node):
             durability=DurabilityPolicy.VOLATILE,
         )
         self._gps_fix = None
+        self._gps_fix_recv_monotonic = None
         self._gps_lock = threading.Lock()
         self.create_subscription(
             NavSatFix,
@@ -135,6 +139,7 @@ class NtripNode(Node):
         self._last_data_time = self.get_clock().now()
         self._reconnect_count = 0
         self._stats_lock = threading.Lock()
+        self._status_write_lock = threading.Lock()
         self._frame_count = 0
         self._byte_count = 0
         self._total_frame_count = 0
@@ -146,8 +151,9 @@ class NtripNode(Node):
         # survives reconnects, so the health consumer (server/rtk_manager.py)
         # needs a per-connection anchor to judge a fresh reconnect fairly.
         self._connected_since_wall_time = None
+        self._source_state = "starting"
         self.create_timer(30.0, self._check_health)
-        self.create_timer(1.0, lambda: self._write_status("connected" if self._connected else "connecting"))
+        self.create_timer(1.0, self._write_status)
 
         # -- GGA back-feed timer (every 10 s) --
         self._gga_sock = None  # set after connect
@@ -189,13 +195,15 @@ class NtripNode(Node):
         except OSError:
             pass
 
-    def _write_status(self, state: str):
+    def _write_status(self, state: str | None = None):
         if self._status_file is None:
             return
         with self._stats_lock:
+            if state is not None:
+                self._source_state = state
             payload = {
                 "mode": "ntrip",
-                "state": state,
+                "state": self._source_state,
                 "connected": self._connected,
                 "frames": self._total_frame_count,
                 "bytes": self._total_byte_count,
@@ -205,11 +213,12 @@ class NtripNode(Node):
                 "updated_at": time.time(),
             }
         tmp_path = self._status_file.with_suffix(".tmp")
-        try:
-            tmp_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-            os.replace(tmp_path, self._status_file)
-        except Exception as exc:
-            self.get_logger().debug(f"Failed to write status file: {exc}")
+        with self._status_write_lock:
+            try:
+                tmp_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+                os.replace(tmp_path, self._status_file)
+            except Exception as exc:
+                self.get_logger().debug(f"Failed to write status file: {exc}")
 
     # ------------------------------------------------------------------
     # GPS callback — store latest fix for GGA sentence
@@ -217,21 +226,31 @@ class NtripNode(Node):
     def _gps_callback(self, msg: NavSatFix):
         with self._gps_lock:
             self._gps_fix = msg
+            self._gps_fix_recv_monotonic = time.monotonic()
 
     # ------------------------------------------------------------------
     # GGA formatting
     # ------------------------------------------------------------------
-    def _format_gga(self) -> str:
+    def _format_gga(self) -> str | None:
         """Build a NMEA GGA sentence from the latest GPS fix."""
         with self._gps_lock:
             fix = self._gps_fix
+            recv_monotonic = self._gps_fix_recv_monotonic
 
-        if fix is None:
+        if fix is None or recv_monotonic is None:
             return None
 
         lat = fix.latitude
         lon = fix.longitude
         alt = fix.altitude
+        if not gga_position_is_usable(
+            lat,
+            lon,
+            alt,
+            time.monotonic() - recv_monotonic,
+            max_age_s=_GGA_MAX_FIX_AGE_S,
+        ):
+            return None
 
         # Latitude: ddmm.mmmm
         lat_abs = abs(lat)
@@ -295,6 +314,11 @@ class NtripNode(Node):
                 self.get_logger().warn(
                     "GGA send failures suppressed (socket may be reconnecting)"
                 )
+            if self._gga_fail_count >= 3:
+                # A failed back-feed usually means a half-open TCP stream.
+                # Closing it unblocks recv() and lets the reconnect loop repair
+                # the session instead of waiting for another timeout.
+                self._close_active_socket()
 
     # ------------------------------------------------------------------
     # Health check timer callback
@@ -339,44 +363,59 @@ class NtripNode(Node):
 
         s = socket.socket()
         self._set_active_socket(s)
-        s.settimeout(10)
-        s.connect((NTRIP_HOST, NTRIP_PORT))
-        s.sendall(req.encode())
+        try:
+            s.settimeout(10)
+            s.connect((NTRIP_HOST, NTRIP_PORT))
+            s.sendall(req.encode())
 
-        # Read response — handle both HTTP and ICY headers
-        resp = b""
-        while True:
-            chunk = s.recv(256)
-            if not chunk:
-                raise ConnectionError("Caster closed connection during handshake")
-            resp += chunk
-            # Standard HTTP-style header end
-            if b"\r\n\r\n" in resp:
-                header, leftover = resp.split(b"\r\n\r\n", 1)
-                header = header.decode(errors="ignore")
-                break
-            # ICY casters: "ICY 200 OK\r\n" then binary, possibly in a later packet.
-            if resp.startswith(b"ICY 200 OK") and b"\r\n" in resp:
-                lines = resp.split(b"\r\n", 1)
-                header = lines[0].decode(errors="ignore")
-                leftover = lines[1] if len(lines) > 1 else b""
-                break
-            if len(resp) > 2048:
-                raise ConnectionError(f"Bad response: {resp[:80]}")
+            # Read response — handle both HTTP and ICY headers.
+            resp = b""
+            while True:
+                chunk = s.recv(256)
+                if not chunk:
+                    raise ConnectionError("Caster closed connection during handshake")
+                resp += chunk
+                if b"\r\n\r\n" in resp:
+                    header, leftover = resp.split(b"\r\n\r\n", 1)
+                    header = header.decode(errors="ignore")
+                    break
+                # ICY casters: status line then binary, possibly later.
+                if resp.startswith(b"ICY ") and b"\r\n" in resp:
+                    lines = resp.split(b"\r\n", 1)
+                    header = lines[0].decode(errors="ignore")
+                    leftover = lines[1] if len(lines) > 1 else b""
+                    break
+                if len(resp) > 2048:
+                    raise ConnectionError(f"Bad response: {resp[:80]}")
 
-        if "200" not in header:
-            raise ConnectionError(f"Caster rejected: {header}")
+            if not response_is_success(header):
+                first_line = header.splitlines()[0] if header.splitlines() else "empty response"
+                raise ConnectionError(f"Caster rejected: {first_line}")
 
-        self.get_logger().info("Connected — streaming RTCM3")
-        s.settimeout(30)
-        with self._gga_lock:
-            self._gga_sock = s
-        with self._stats_lock:
-            self._connected = True
-            self._last_error = None
-            self._connected_since_wall_time = time.time()
-        self._write_status("connected")
-        return s, leftover
+            self.get_logger().info("Connected — streaming RTCM3")
+            s.settimeout(_STREAM_SOCKET_TIMEOUT_S)
+            with self._gga_lock:
+                self._gga_sock = s
+            with self._stats_lock:
+                self._connected = True
+                self._last_error = None
+                self._connected_since_wall_time = time.time()
+            # VRS casters often withhold RTCM until the first rover position.
+            # Feed it immediately instead of waiting up to one 10 s timer
+            # period, while still retaining the periodic updates below.
+            initial_gga = self._format_gga()
+            if initial_gga is not None:
+                s.sendall(initial_gga.encode())
+                self._gga_fail_count = 0
+            self._write_status("connected")
+            return s, leftover
+        except Exception:
+            self._clear_active_socket(s)
+            try:
+                s.close()
+            except OSError:
+                pass
+            raise
 
     # ------------------------------------------------------------------
     # RTCM3 frame parser

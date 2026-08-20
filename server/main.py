@@ -44,6 +44,9 @@ from config import (
     format_gps_coord,
     MAX_ACTIVITY_LOG,
     MISSION_DIR,
+    NTRIP_AUTOSTART,
+    NTRIP_ENV_FILE,
+    NTRIP_PROFILES_FILE,
     POSE_STALE_MS,
     RPP_DEBUG_STALE_MS,
     ROVER_ID,
@@ -79,6 +82,7 @@ _safety_task: Optional[asyncio.Task] = None
 _safety_abort_q: Optional[asyncio.Queue] = None
 bridge_health: Optional["object"] = None
 rtk_manager: Optional["object"] = None
+ntrip_profile_store: Optional["object"] = None
 joystick_ctrl: Optional["object"] = None
 
 # Bounded, thread-safe ring buffer (deque maxlen). All log appends are atomic
@@ -109,7 +113,7 @@ socket_app = socketio.ASGIApp(sio)
 async def lifespan(app: FastAPI):
     global ros_node, offboard_ctrl, path_mgr, emergency_handler
     global _executor, _beacon, _listener, _telemetry_task, _safety_task
-    global _safety_abort_q, bridge_health, rtk_manager
+    global _safety_abort_q, bridge_health, rtk_manager, ntrip_profile_store
     global joystick_ctrl
 
     configure_logging()
@@ -136,6 +140,7 @@ async def lifespan(app: FastAPI):
     from emergency import EmergencyHandler
     from offboard_controller import OffboardController
     from path_manager import PathManager
+    from ntrip_profile_store import NtripProfileStore
     from rtk_manager import AsyncRTKManager
 
     path_mgr = PathManager(MISSION_DIR)
@@ -168,6 +173,49 @@ async def lifespan(app: FastAPI):
         ros_node, offboard_ctrl, activity_log, joystick_controller=joystick_ctrl
     )
     rtk_manager = AsyncRTKManager()
+    ntrip_profile_store = NtripProfileStore(NTRIP_PROFILES_FILE, NTRIP_ENV_FILE)
+    try:
+        migrated = ntrip_profile_store.initialize()
+    except Exception:
+        # A corrupt registry must fail closed: do not silently revert to the
+        # legacy credential file and connect to an unintended caster.
+        ntrip_profile_store = None
+        log.exception("NTRIP profile registry initialization failed")
+        _record(
+            "warning",
+            "NTRIP profile registry unavailable; inspect server logs",
+        )
+    else:
+        if migrated:
+            _record("info", "Legacy NTRIP configuration migrated to profile registry")
+        elif ntrip_profile_store.migration_warning:
+            log.warning("%s", ntrip_profile_store.migration_warning)
+            _record("warning", ntrip_profile_store.migration_warning)
+    if NTRIP_AUTOSTART:
+        try:
+            if ntrip_profile_store is None:
+                raise RuntimeError("NTRIP profile registry unavailable")
+            profile_id, profile_revision, ntrip_config = (
+                ntrip_profile_store.default_config()
+            )
+            ntrip_status = await rtk_manager.start_ntrip_profile(
+                ntrip_config,
+                profile_id=profile_id,
+                profile_revision=profile_revision,
+            )
+        except Exception as exc:
+            # RTK availability is safety-gated by the controllers. Keep the
+            # backend available so the operator can diagnose/fix credentials.
+            await rtk_manager.mark_ntrip_unavailable(str(exc))
+            log.exception("NTRIP autostart failed")
+            _record(
+                "warning",
+                "NTRIP autostart unavailable; check RTK status and server logs",
+            )
+        else:
+            _record("info", f"NTRIP autostarted pid={ntrip_status.pid}")
+    else:
+        _record("warning", "NTRIP autostart disabled by deployment configuration")
 
     # ── Register Socket.IO handlers ───────────────────────────────────────────
     from sockets.events import register_handlers

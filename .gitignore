@@ -22,6 +22,7 @@ baseline/**/bag/
 *.local
 secrets/
 config/*.env
+config/ntrip_profiles.json
 config/rover_password.json
 config/rover_machine_tokens.json
 config/bag_autorecord.token

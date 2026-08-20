@@ -13,10 +13,11 @@ import os
 import sys
 import types
 from pathlib import Path
+import asyncio
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from rtk_manager import AsyncRTKManager
+from rtk_manager import AsyncRTKManager, NtripConfig, RTKProcessError, load_ntrip_config
 
 NOW = 1_000_000.0
 GRACE = AsyncRTKManager._HEALTHY_MAX_AGE_S
@@ -132,3 +133,81 @@ def test_unhealthy_when_connection_never_streams_past_grace(tmp_path):
         },
     )
     assert mgr._status_locked().healthy is False
+
+
+# ── protected config loading ──────────────────────────────────────────────────
+
+
+def test_load_ntrip_config_supports_export_quotes_and_normalizes_mount(tmp_path):
+    path = tmp_path / "ntrip.env"
+    path.write_text(
+        "export NTRIP_HOST='caster.example.com'\n"
+        "NTRIP_PORT=2101\n"
+        "NTRIP_MOUNTPT=\"/ROVER\"\n"
+        "NTRIP_USER=field-user\n"
+        "NTRIP_PASS='secret with spaces'\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+    assert load_ntrip_config(path) == NtripConfig(
+        host="caster.example.com",
+        port=2101,
+        mountpoint="ROVER",
+        user="field-user",
+        password="secret with spaces",
+    )
+
+
+def test_load_ntrip_config_rejects_missing_keys_without_exposing_values(tmp_path):
+    path = tmp_path / "ntrip.env"
+    path.write_text("NTRIP_PASS=do-not-leak\n", encoding="utf-8")
+    try:
+        load_ntrip_config(path)
+    except RTKProcessError as exc:
+        assert "do-not-leak" not in str(exc)
+        assert "missing required keys" in str(exc)
+    else:
+        raise AssertionError("missing config keys must be rejected")
+
+
+def test_status_exposes_desired_restart_state():
+    mgr = AsyncRTKManager()
+    mgr._desired_mode = "ntrip"
+    mgr._desired_ntrip = NtripConfig("caster", 2101, "MOUNT", "user", "pass")
+    mgr._restart_task = types.SimpleNamespace(done=lambda: False)
+    status = mgr._status_locked()
+    assert status.running is False
+    assert status.desired_mode == "ntrip"
+    assert status.source_state == "restarting"
+
+
+def test_autostart_configuration_failure_is_visible_in_status():
+    async def scenario():
+        mgr = AsyncRTKManager()
+        status = await mgr.mark_ntrip_unavailable("config missing")
+        assert status.running is False
+        assert status.desired_mode == "ntrip"
+        assert status.source_state == "unavailable"
+        assert status.last_error == "config missing"
+
+    asyncio.run(scenario())
+
+
+def test_supervised_restart_retains_desired_config_and_counts_success():
+    async def scenario():
+        mgr = AsyncRTKManager()
+        config = NtripConfig("caster", 2101, "MOUNT", "user", "pass")
+        mgr._desired_mode = "ntrip"
+        mgr._desired_ntrip = config
+        seen = []
+
+        async def fake_start(received):
+            seen.append(received)
+
+        mgr._start_ntrip_locked = fake_start
+        await mgr._restart_ntrip_after(0.0)
+        assert seen == [config]
+        assert mgr._supervisor_restarts == 1
+        assert mgr._restart_attempt == 0
+
+    asyncio.run(scenario())

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import tempfile
 import sys
 import time
@@ -14,6 +15,101 @@ from pathlib import Path
 from typing import Any, Literal
 
 RTKMode = Literal["ntrip", "lora", "idle"]
+
+
+class RTKProcessError(RuntimeError):
+    """Raised when RTK configuration or a child process is invalid."""
+
+
+@dataclass(frozen=True)
+class NtripConfig:
+    host: str
+    port: int
+    mountpoint: str
+    user: str
+    password: str
+
+
+def load_ntrip_config(path: str | Path) -> NtripConfig:
+    """Load the gitignored NTRIP env file without executing shell code.
+
+    Accepted keys match ``tools/debug_ntrip_caster.py``. Values may be bare or
+    wrapped in matching single/double quotes; ``export KEY=...`` is accepted.
+    Passwords are never included in validation errors or logs.
+    """
+    config_path = Path(path)
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise RTKProcessError(f"NTRIP config not found: {config_path}") from exc
+    except OSError as exc:
+        raise RTKProcessError(f"cannot read NTRIP config {config_path}: {exc}") from exc
+
+    values: dict[str, str] = {}
+    accepted = {
+        "NTRIP_HOST",
+        "NTRIP_PORT",
+        "NTRIP_MOUNTPT",
+        "NTRIP_USER",
+        "NTRIP_PASS",
+    }
+    for line_no, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            raise RTKProcessError(
+                f"invalid NTRIP config line {line_no}: expected KEY=value"
+            )
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key not in accepted:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if "\x00" in value or "\n" in value or "\r" in value:
+            raise RTKProcessError(f"invalid value for {key} in NTRIP config")
+        values[key] = value
+
+    missing = [key for key in accepted if not values.get(key)]
+    if missing:
+        raise RTKProcessError(
+            "NTRIP config missing required keys: " + ", ".join(sorted(missing))
+        )
+    try:
+        port = int(values["NTRIP_PORT"])
+    except ValueError as exc:
+        raise RTKProcessError("NTRIP_PORT must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise RTKProcessError("NTRIP_PORT must be in 1..65535")
+    host = values["NTRIP_HOST"]
+    if any(char.isspace() for char in host) or "://" in host:
+        raise RTKProcessError("NTRIP_HOST must be a hostname or IP without a URL scheme")
+    mountpoint = values["NTRIP_MOUNTPT"].lstrip("/")
+    if not mountpoint or any(char.isspace() for char in mountpoint):
+        raise RTKProcessError("NTRIP_MOUNTPT must be a non-empty path component")
+
+    # Do not reject an existing field deployment solely on permissions, but
+    # surface the secret exposure loudly. deploy/preflight can enforce 0600.
+    try:
+        if os.stat(config_path).st_mode & 0o077:
+            logging.getLogger("server.rtk_manager").warning(
+                "NTRIP config %s is group/world accessible; set mode 0600",
+                config_path,
+            )
+    except OSError:
+        pass
+
+    return NtripConfig(
+        host=host,
+        port=port,
+        mountpoint=mountpoint,
+        user=values["NTRIP_USER"],
+        password=values["NTRIP_PASS"],
+    )
 
 
 @dataclass(frozen=True)
@@ -27,10 +123,10 @@ class RTKStatus:
     bytes: int
     last_frame_age_s: float | None
     last_error: str | None
-
-
-class RTKProcessError(RuntimeError):
-    """Raised when an RTK subprocess cannot be started cleanly."""
+    desired_mode: RTKMode
+    supervisor_restarts: int
+    active_profile_id: str | None
+    active_profile_revision: int | None
 
 
 class AsyncRTKManager:
@@ -62,6 +158,14 @@ class AsyncRTKManager:
         self._watch_task: asyncio.Task | None = None
         self._status_file: Path | None = None
         self._log = logging.getLogger("server.rtk_manager")
+        self._desired_mode: RTKMode = "idle"
+        self._desired_ntrip: NtripConfig | None = None
+        self._restart_task: asyncio.Task | None = None
+        self._restart_attempt = 0
+        self._supervisor_restarts = 0
+        self._last_supervisor_error: str | None = None
+        self._active_profile_id: str | None = None
+        self._active_profile_revision: int | None = None
 
     async def start_ntrip(
         self,
@@ -72,23 +176,44 @@ class AsyncRTKManager:
         user: str,
         password: str,
     ) -> RTKStatus:
-        args = [
-            "--host",
-            host,
-            "--port",
-            str(port),
-            "--mountpoint",
-            mountpoint,
-            "--user",
-            user,
-            "--pass-stdin",
-        ]
-        return await self._start(
-            "ntrip",
-            self._ntrip_script,
-            args,
-            stdin_payload=f"{password}\n",
+        return await self.start_ntrip_config(
+            NtripConfig(
+                host=host,
+                port=port,
+                mountpoint=mountpoint.lstrip("/"),
+                user=user,
+                password=password,
+            )
         )
+
+    async def start_ntrip_config(self, config: NtripConfig) -> RTKStatus:
+        """Start NTRIP and retain its config for supervised child restarts."""
+        return await self.start_ntrip_profile(config)
+
+    async def start_ntrip_profile(
+        self,
+        config: NtripConfig,
+        *,
+        profile_id: str | None = None,
+        profile_revision: int | None = None,
+    ) -> RTKStatus:
+        """Start NTRIP and retain both config and applied profile identity."""
+        async with self._lock:
+            self._cancel_restart_locked()
+            self._desired_mode = "ntrip"
+            self._desired_ntrip = config
+            self._active_profile_id = profile_id
+            self._active_profile_revision = profile_revision
+            self._restart_attempt = 0
+            self._last_supervisor_error = None
+            try:
+                return await self._start_ntrip_locked(config)
+            except Exception:
+                self._desired_mode = "idle"
+                self._desired_ntrip = None
+                self._active_profile_id = None
+                self._active_profile_revision = None
+                raise
 
     async def start_lora(self, *, baudrate: int, serial_port: str) -> RTKStatus:
         args = [
@@ -97,79 +222,133 @@ class AsyncRTKManager:
             "--serial-port",
             serial_port,
         ]
-        return await self._start("lora", self._lora_script, args)
+        async with self._lock:
+            self._cancel_restart_locked()
+            self._desired_mode = "lora"
+            self._desired_ntrip = None
+            self._active_profile_id = None
+            self._active_profile_revision = None
+            self._restart_attempt = 0
+            self._last_supervisor_error = None
+            try:
+                return await self._start_locked("lora", self._lora_script, args)
+            except Exception:
+                self._desired_mode = "idle"
+                raise
+
+    async def mark_ntrip_unavailable(self, error: str) -> RTKStatus:
+        """Expose an autostart configuration failure through the status API."""
+        async with self._lock:
+            self._cancel_restart_locked()
+            self._desired_mode = "ntrip"
+            self._desired_ntrip = None
+            self._active_profile_id = None
+            self._active_profile_revision = None
+            self._last_supervisor_error = str(error)
+            await self._stop_locked()
+            return self._status_locked()
 
     async def stop_all(self) -> RTKStatus:
         """Stop any active RTK child and return the resulting idle status."""
         async with self._lock:
+            self._desired_mode = "idle"
+            self._desired_ntrip = None
+            self._active_profile_id = None
+            self._active_profile_revision = None
+            self._restart_attempt = 0
+            self._last_supervisor_error = None
+            self._cancel_restart_locked()
             await self._stop_locked()
             return self._status_locked()
 
     async def status(self) -> RTKStatus:
         async with self._lock:
             if self._process is not None and self._process.returncode is not None:
+                self._last_supervisor_error = (
+                    f"{self._mode} subprocess exited with code {self._process.returncode}"
+                )
                 self._clear_process_locked()
+                self._schedule_ntrip_restart_locked()
             return self._status_locked()
 
-    async def _start(
+    async def _start_ntrip_locked(self, config: NtripConfig) -> RTKStatus:
+        args = [
+            "--host",
+            config.host,
+            "--port",
+            str(config.port),
+            "--mountpoint",
+            config.mountpoint,
+            "--user",
+            config.user,
+            "--pass-stdin",
+        ]
+        return await self._start_locked(
+            "ntrip",
+            self._ntrip_script,
+            args,
+            stdin_payload=f"{config.password}\n",
+        )
+
+    async def _start_locked(
         self,
         mode: Literal["ntrip", "lora"],
         script: Path,
         args: list[str],
         stdin_payload: str | None = None,
     ) -> RTKStatus:
-        async with self._lock:
-            if not script.exists():
-                raise RTKProcessError(f"{mode} script not found: {script}")
+        """Start one child. Caller must hold ``self._lock``."""
+        if not script.exists():
+            raise RTKProcessError(f"{mode} script not found: {script}")
 
-            await self._stop_locked()
+        await self._stop_locked()
 
-            status_file = self._new_status_file(mode)
-            args = [*args, "--status-file", str(status_file)]
-            safe_args = self._redact_args(args)
-            cmd = [self._python, str(script), *args]
-            self._log.info("starting %s RTK subprocess: %s %s", mode, self._python, safe_args)
+        status_file = self._new_status_file(mode)
+        args = [*args, "--status-file", str(status_file)]
+        safe_args = self._redact_args(args)
+        cmd = [self._python, str(script), *args]
+        self._log.info("starting %s RTK subprocess: %s %s", mode, self._python, safe_args)
 
-            process = None
-            try:
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    cwd=str(script.parent),
-                    stdin=asyncio.subprocess.PIPE if stdin_payload is not None else asyncio.subprocess.DEVNULL,
-                )
-                if stdin_payload is not None:
-                    assert process.stdin is not None
-                    process.stdin.write(stdin_payload.encode())
-                    await process.stdin.drain()
-                    process.stdin.close()
-            except Exception as exc:
-                if process is not None:
-                    try:
-                        process.kill()
-                    except ProcessLookupError:
-                        pass
-                    await process.wait()
-                self._log.exception("failed to start %s RTK subprocess", mode)
-                self._mode = "idle"
-                self._process = None
-                self._remove_status_file(status_file)
-                raise RTKProcessError(f"failed to start {mode} RTK subprocess: {exc}") from exc
-
-            self._process = process
-            self._mode = mode
-            self._status_file = status_file
-            self._watch_task = asyncio.create_task(
-                self._watch_process(process, mode), name=f"rtk-{mode}-watch"
+        process = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(script.parent),
+                stdin=asyncio.subprocess.PIPE if stdin_payload is not None else asyncio.subprocess.DEVNULL,
             )
+            if stdin_payload is not None:
+                assert process.stdin is not None
+                process.stdin.write(stdin_payload.encode())
+                await process.stdin.drain()
+                process.stdin.close()
+        except Exception as exc:
+            if process is not None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+            self._log.exception("failed to start %s RTK subprocess", mode)
+            self._mode = "idle"
+            self._process = None
+            self._remove_status_file(status_file)
+            raise RTKProcessError(f"failed to start {mode} RTK subprocess: {exc}") from exc
 
-            try:
-                await asyncio.wait_for(process.wait(), timeout=self._startup_grace_s)
-            except asyncio.TimeoutError:
-                return self._status_locked()
+        self._process = process
+        self._mode = mode
+        self._status_file = status_file
+        self._watch_task = asyncio.create_task(
+            self._watch_process(process, mode), name=f"rtk-{mode}-watch"
+        )
 
-            rc = process.returncode
-            self._clear_process_locked()
-            raise RTKProcessError(f"{mode} RTK subprocess exited immediately with code {rc}")
+        try:
+            await asyncio.wait_for(process.wait(), timeout=self._startup_grace_s)
+        except asyncio.TimeoutError:
+            return self._status_locked()
+
+        rc = process.returncode
+        self._clear_process_locked()
+        raise RTKProcessError(f"{mode} RTK subprocess exited immediately with code {rc}")
 
     async def _stop_locked(self) -> None:
         process = self._process
@@ -204,7 +383,53 @@ class AsyncRTKManager:
         async with self._lock:
             if self._process is process:
                 self._log.warning("%s RTK subprocess pid=%s exited rc=%s", mode, process.pid, rc)
+                self._last_supervisor_error = f"{mode} subprocess exited with code {rc}"
                 self._clear_process_locked()
+                self._schedule_ntrip_restart_locked()
+
+    def _cancel_restart_locked(self) -> None:
+        task = self._restart_task
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+        self._restart_task = None
+
+    def _schedule_ntrip_restart_locked(self) -> None:
+        if (
+            self._desired_mode != "ntrip"
+            or self._desired_ntrip is None
+            or self._process is not None
+            or (self._restart_task is not None and not self._restart_task.done())
+        ):
+            return
+        delay = min(30.0, 2.0 ** min(self._restart_attempt, 5))
+        self._restart_attempt += 1
+        self._log.warning("restarting NTRIP subprocess in %.1fs", delay)
+        self._restart_task = asyncio.create_task(
+            self._restart_ntrip_after(delay), name="rtk-ntrip-restart"
+        )
+
+    async def _restart_ntrip_after(self, delay_s: float) -> None:
+        try:
+            await asyncio.sleep(delay_s)
+            async with self._lock:
+                if asyncio.current_task() is self._restart_task:
+                    self._restart_task = None
+                config = self._desired_ntrip
+                if self._desired_mode != "ntrip" or config is None or self._process is not None:
+                    return
+                try:
+                    await self._start_ntrip_locked(config)
+                except Exception as exc:
+                    self._last_supervisor_error = str(exc)
+                    self._log.error("supervised NTRIP restart failed: %s", exc)
+                    self._schedule_ntrip_restart_locked()
+                else:
+                    self._supervisor_restarts += 1
+                    self._restart_attempt = 0
+                    self._last_supervisor_error = None
+                    self._log.info("supervised NTRIP restart succeeded")
+        except asyncio.CancelledError:
+            raise
 
     def _clear_process_locked(self) -> None:
         self._process = None
@@ -259,7 +484,15 @@ class AsyncRTKManager:
             else None
         )
         anchor_age_s = self._health_anchor_age_s(child_status, now)
-        source_state = str(child_status.get("state") or ("running" if running else "idle"))
+        if running:
+            fallback_state = "running"
+        elif self._desired_mode == "ntrip" and self._restart_task is not None:
+            fallback_state = "restarting"
+        elif self._desired_mode == "ntrip":
+            fallback_state = "unavailable"
+        else:
+            fallback_state = "idle"
+        source_state = str(child_status.get("state") or fallback_state)
         healthy = bool(
             running
             and child_status.get("connected", False)
@@ -275,7 +508,11 @@ class AsyncRTKManager:
             frames=int(child_status.get("frames", 0) or 0),
             bytes=int(child_status.get("bytes", 0) or 0),
             last_frame_age_s=last_frame_age_s,
-            last_error=child_status.get("last_error"),
+            last_error=child_status.get("last_error") or self._last_supervisor_error,
+            desired_mode=self._desired_mode,
+            supervisor_restarts=self._supervisor_restarts,
+            active_profile_id=self._active_profile_id,
+            active_profile_revision=self._active_profile_revision,
         )
 
     @staticmethod

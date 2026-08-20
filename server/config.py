@@ -102,6 +102,26 @@ MISSION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "missions
 # Aligned-DXF missions are staged here before the operator confirms a load.
 STAGING_DIR = os.path.join(MISSION_DIR, "staging")
 
+# NTRIP is desired runtime state, not a one-shot API action. On server startup
+# the manager loads the default backend-owned profile and restores the child;
+# it then supervises unexpected child exits. The legacy env file is imported
+# once when no registry exists. Missing/invalid config degrades RTK only and is
+# surfaced in the activity log rather than preventing the backend from starting.
+# Set ROVER_NTRIP_AUTOSTART=0 only for bench/SITL or LoRa use.
+NTRIP_AUTOSTART = os.environ.get("ROVER_NTRIP_AUTOSTART", "1") == "1"
+NTRIP_ENV_FILE = os.environ.get(
+    "ROVER_NTRIP_ENV_FILE",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "ntrip.env"),
+)
+NTRIP_PROFILES_FILE = os.environ.get(
+    "ROVER_NTRIP_PROFILES_FILE",
+    os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "config",
+        "ntrip_profiles.json",
+    ),
+)
+
 # ── DXF alignment / mission-handoff ───────────────────────────────────────────
 # Max allowable least-squares RMSE (metres) for multi-point DXF→NED alignment.
 # Plans whose residual exceeds this are rejected (422) and never staged.

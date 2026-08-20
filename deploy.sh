@@ -83,6 +83,22 @@ chmod +x "${SCRIPT_DIR}/rpp_start.sh" 2>/dev/null || true
 chmod +x "${SCRIPT_DIR}/server/run.sh" 2>/dev/null || true
 chmod +x "${SCRIPT_DIR}/tools/bag_autorecord.sh" 2>/dev/null || true
 
+# NTRIP autostart is production-default. The backend-owned profile registry is
+# authoritative once it exists; ntrip.env is the one-time migration source for
+# older deployments. Never print either file because both contain credentials.
+NTRIP_PROFILES_PATH="${SCRIPT_DIR}/config/ntrip_profiles.json"
+NTRIP_ENV_PATH="${SCRIPT_DIR}/config/ntrip.env"
+if [[ -f "$NTRIP_PROFILES_PATH" ]]; then
+    chmod 600 "$NTRIP_PROFILES_PATH"
+    log "ntrip: profile registry present with mode 0600"
+elif [[ -f "$NTRIP_ENV_PATH" ]]; then
+    chmod 600 "$NTRIP_ENV_PATH"
+    log "ntrip: legacy credential file ready for profile migration with mode 0600"
+else
+    log "WARNING: no NTRIP profiles or legacy credentials are configured"
+    log "         add a profile from the authenticated tablet RTK settings"
+fi
+
 # ── 2. Keep manual ROS shells on the same Fast DDS profile ─────────
 DDS_PROFILE_EXPORT="export FASTRTPS_DEFAULT_PROFILES_FILE=${SCRIPT_DIR}/config/fastdds_no_shm.xml"
 
