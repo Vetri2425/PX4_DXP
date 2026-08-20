@@ -1,12 +1,17 @@
-# Firmware Patch & Flash Plan — 2026-08-06 (10:30 start)
+# Field + Firmware Plan — 2026-08-05 (live from 11:10 IST)
 
 > **LAST DEVELOPMENT DAY.** After today: **test + param tuning only**, no new firmware.
 > Scope is therefore deliberately narrow. Everything below is either (a) verified in
-> source, or (b) explicitly marked as unverified/deferred. Nothing is speculative.
+> source, (b) verified against the **live FCU today**, or (c) explicitly marked
+> unverified/deferred. Nothing is speculative.
 >
-> Firmware repo: `/Users/dyx_a1/Vetri/PX4-Autopilot` @ `d62f42fed0` (== `origin/main`).
+> Firmware repo: `/Users/dyx_a1/Vetri/PX4-Autopilot` @ `d62f42fed0` (== `origin/main`, verified).
 > Build base: **stock v1.16.2 + 26-file overlay** via `.github/workflows/build_rover.yml`.
 > There is **no local build script** — CI is the only build path.
+>
+> **The day runs on two tracks in parallel.** The rover is up and RTK-fixed *now*, and CI
+> takes ~30 min. Doing the flash-independent field work while the firmware builds is what
+> makes both fit in one day — and it keeps one variable per measurement.
 
 ---
 
@@ -15,15 +20,53 @@
 The rover's straight-line error is a **yaw limit cycle**, not a path-following error.
 It has exactly two drivers, both measured:
 
-| Driver | Evidence | Fix |
-|---|---|---|
-| Heading **noise** injected by the estimator | `gnss_heading_noise` hardcoded 0.1 rad (5.73°) discards the UM982's real 0.77–1.10° | **F2** (firmware) |
-| Yaw loop at **marginal phase margin** | steady yaw gain **1.119 ± 0.011**, plant A **4.826 ± 0.090**, n=9 runs on the current config | **`RD_MAX_THR_YAW_R`** 0.95 → **1.134** (§6a) |
+| Driver | Evidence | Fix | Available |
+|---|---|---|---|
+| Heading **noise** injected by the estimator | `gnss_heading_noise` hardcoded 0.1 rad (5.73°) discards the UM982's real 0.77–1.10° | **F2** (firmware) | after flash |
+| Yaw loop at **marginal phase margin** | steady yaw gain **1.121 ± 0.008**, plant A **4.843 ± 0.063**, verified from firmware source (§6d) | **`RD_MAX_THR_YAW_R`** 0.95 → **1.14** ✅ **DONE 08-05** | applied |
 
 Leverage order is settled: **F2 > `RD_MAX_THR_YAW_R` > pivot release.**
 Sim (calibrated at 0.35 m/s): F2 collapses band 4.5 → 1.4 cm, steady RMS 0.86 → 0.30.
 
 ⚠ The sim **diverges at 0.5 m/s**, which is the speed we care about. Treat as direction, not prediction.
+
+**Sequencing consequence:** the FF calibration is flash-independent, F2 is not. Land the
+calibration **first, in the field, while CI builds**. Then the post-flash F2 A/B runs on an
+already-correct loop and its effect is attributable to F2 alone. Do not change both into
+the same wobble measurement.
+
+---
+
+## 0b. Boot state — DONE at 11:05 IST
+
+| | |
+|---|---|
+| Companion | mac == origin == Jetson @ **`2cdf78b`** (branch `field/spray-d15`) |
+| Restarted | `rpp-pipeline`, `rover-server` (disarmed, MANUAL) — 0 tracebacks, `/api/ping` ok |
+| RTK | **RTK_FIXED** (`fix_type: 6`, 27 sats), NTRIP live on `caster.emlid.com:2101` / MP23960 |
+| Live runtime params | `stop_latch_enabled` **False** (A/B knob), `min_lookahead_dist` 0.52, `mission_speed` 0.50 |
+
+⚠ If `rover-server` is restarted again, NTRIP dies **silently** — `POST /api/rtk/ntrip/start` + re-login.
+⚠ Runtime params (`stop_latch_enabled`, `mission_speed`) do **not** survive an `rpp-pipeline` restart.
+
+### Live FCU readings taken today (11:05) — these correct the plan
+
+| Param | Live value | Consequence for this plan |
+|---|---|---|
+| `RD_MAX_THR_YAW_R` | 0.95 | step 1 stands |
+| `RO_YAW_RATE_P` / `RO_YAW_RATE_I` | 0.13 / 0.01 | model inputs confirmed |
+| `RO_YAW_P` | 1.5 | — |
+| `RD_WHEEL_TRACK` | 0.470 | `R_opt` input confirmed |
+| `EKF2_IMU_POS_X` | 0.100 | remount confirmed; **sign still owed** |
+| `RO_SPEED_TH` | 0.10 | stop-latch threshold matches |
+| `RD_TRANS_TRN_DRV` | 0.0349 rad = 2.0° | pivot-release pair input |
+| `RO_MAX_THR_SPEED` | 1.28 | HOLD (§6b) |
+| `GPS_YAW_OFFSET` | 180.0 | gated on the 4-leg split |
+| `RO_YAW_RATE_TH` | 1.0 | (fw default is 3.0 — already lowered) |
+| **`EKF2_GPS_YAW_N`** | **`Parameter not set`** | **confirms F2 needs the flash. Cannot be tuned before it.** |
+| **`EKF2_GPS_P_NOISE`** | **0.015** | **already at target — struck from §6** |
+| **`EKF2_GPS_V_NOISE`** | **0.05** | **already at target — struck from §6** |
+| **`EKF2_WENC_CTRL`** | **0** | §7 correct. **CLAUDE.md says 1 — CLAUDE.md is stale, fix it.** |
 
 ---
 
@@ -31,23 +74,20 @@ Sim (calibrated at 0.35 m/s): F2 collapses band 4.5 → 1.4 cm, steady RMS 0.86 
 
 | ID | Item | Verdict | Reason |
 |---|---|---|---|
-| **F2** | `EKF2_GPS_YAW_N` param binding | ✅ **SHIP** | The hard blocker. Small, contained. |
+| **F2** | `EKF2_GPS_YAW_N` param binding | ✅ **SHIP** | The hard blocker. Small, contained. Param confirmed absent today. |
 | **A1** | RoboClaw `tcflush` resync | ✅ **SHIP** | Root cause of the encoder no-op. Highest value/line in the backlog. |
 | **A2** | Decouple encoder reads from mixer rate | ✅ **SHIP** | Same file as A1, ~1/3 less bus traffic. |
 | **F5** | `at_rest` gate on real speed | ✅ **SHIP** | Stops gyro-bias corruption while crawling. Contained to EKF2.cpp. |
-| **F8** | `-m config` pin 30/50 Hz | 🟡 **OPTIONAL** | Robustness only, not accuracy. New ROMFS overlay. Ship only if 1–4 are clean by 14:00. |
-| **F7** | `s_variance_m_s` units bug | ⛔ **DROP** | **`nmea.cpp` lives in the `src/drivers/gps/devices` submodule** (`PX4-GPSDrivers`), pinned by the v1.16.2 checkout. The 26-file `cp` overlay **cannot reach it.** Would need a submodule fork or a CI patch step — not a last-day change. |
-| **A5** | WENC lever arm | ⛔ **DEFER** | WENC stays OFF (§6). No value today. |
-| **A9** | WENC own fuse timestamp | ⛔ **DEFER** | Only matters if WENC is enabled. See §6. |
-
-**F7 is the notable change from the earlier plan.** It was listed in the F2 batch; it is
-not deliverable through the overlay mechanism. Recorded, not attempted.
+| **F8** | `-m config` pin 30/50 Hz | 🟡 **OPTIONAL** | Robustness only, not accuracy. New ROMFS overlay. Ship only if 1–4 are clean by the CI push. |
+| **F7** | `s_variance_m_s` units bug | ⛔ **DROP** | **VERIFIED TODAY:** `.gitmodules:13` — `src/drivers/gps/devices` is the `PX4-GPSDrivers` submodule. The 26-file `cp` overlay **cannot reach `nmea.cpp`.** Would need a submodule fork or a CI patch step — not a last-day change. |
+| **A5** | WENC lever arm | ⛔ **DEFER** | WENC stays OFF (§7). No value today. |
+| **A9** | WENC own fuse timestamp | ⛔ **DEFER** | Only matters if WENC is enabled. See §7. |
 
 ---
 
 ## 2. Patches — verified against v1.16.2 stock
 
-All line numbers below are from `git show v1.16.2:<path>` and were checked today.
+All line numbers below are from `git show v1.16.2:<path>`.
 **Base-discipline rule applies:** any file not already in the overlay must be re-anchored
 on v1.16.2 stock before editing:
 
@@ -59,7 +99,7 @@ git show v1.16.2:<path> > <path>          # then verify `git diff v1.16.2 -- <pa
 
 ### F2 — bind GNSS heading noise to a parameter
 
-**The defect** (verified today):
+**The defect:**
 
 ```
 EKF/common.h:349            float gnss_heading_noise{0.1f};   // 5.73°, no param binding
@@ -129,7 +169,7 @@ are separable failures.
 
 ### F5 — stop `at_rest` latching true while the rover crawls
 
-**The defect** (traced today, three hops):
+**The defect** (three hops):
 
 ```
 RoverLandDetector.cpp:67    return true;   // rovers are ALWAYS landed (our overlay)
@@ -164,7 +204,7 @@ Because `landDetected` is unconditionally true for us, `at_rest` collapses to a
 ⚠ **Not fixed by this:** `flags.in_air` remains permanently false, which is the
 separate C1 GNSS-dropout chain (heading dropout → `yaw_align` cleared →
 `vehicle_global_position` stops). That is coupled to `mission_block` waypoint acceptance
-and is **not** a last-day change. Recorded as open (§7).
+and is **not** a last-day change. Recorded as open (§8).
 
 ---
 
@@ -268,8 +308,9 @@ existing alphabetical-ish grouping:
              src/modules/ekf2/params_gnss.yaml
 ```
 
-Overlay count **26 → 27**. Update the count in `CLAUDE.md` ("Patch domains") and in
-`.claude/memory/build.md` in the same commit that adds the `cp` line, so they cannot drift.
+Overlay count **26 → 27** (26 confirmed today by `grep -c "^ *cp fork_patches"`).
+Update the count in `CLAUDE.md` ("Patch domains") and in `.claude/memory/build.md` in the
+same commit that adds the `cp` line, so they cannot drift.
 
 Files touched that are **already** overlaid (no yml change): `EKF2.cpp`, `EKF2.hpp`,
 `EKF/common.h`, `src/drivers/roboclaw/Roboclaw.cpp`, `src/drivers/roboclaw/Roboclaw.hpp`.
@@ -331,32 +372,37 @@ Run `make format` on all changed C/C++ before each commit (CI enforces `check_fo
 
 ---
 
-## 5. Timeline — 10:30 start
+## 5. Timeline — TWO TRACKS, 11:10 start
 
-| Time | Step | Gate to proceed |
+**FIELD** = at the rover, needs nobody at the Mac. **BENCH** = at the Mac, needs nobody at the rover.
+They run concurrently until the flash.
+
+| Time | FIELD track (rover, RTK up) | BENCH track (Mac, CI) |
 |---|---|---|
-| **10:30** | Branch `git checkout -b fw/heading-stability-20260806`. Re-anchor `params_gnss.yaml` on v1.16.2 stock. | `git diff v1.16.2 -- <file>` clean |
-| **10:45** | Commits 1–2 (EKF2). `make format`. | compiles locally or straight to CI |
-| **11:15** | Commits 3–4 (RoboClaw). `make format`. | — |
-| **11:30** | Commit 5 (overlay + doc counts). Push → CI auto-triggers. | — |
-| **11:40** | `gh run watch <id> --repo Vetri2425/PX4-Autopilot --exit-status` | **CI green.** If red, fix and re-push — do not flash a local build. |
-| **12:00** | Download artifact, flash CubeOrangePlus via QGC. | `board_id` + sha256 recorded |
-| **12:15** | **Sanity pass, params UNCHANGED.** Arm, drive one 0.35 line. | Behaviour identical to yesterday — proves the flash is neutral |
-| **12:30** | Pivot sign check (**still owed** post-remount): slow ~180° in-place pivot, watch `/mavros/local_position/pose`. | <1 cm wander ✓ / ~20 cm circle ⇒ flip `EKF2_IMU_POS_X` |
-| **13:00** | **Param session** — §6 order. Restart `px4-dxp` after *every* QGC write. | ULog every run |
-| **15:00** | 4-leg direction split (gates `GPS_YAW_OFFSET` 180.72) | — |
-| **16:00** | Day-close gate: 0.5 m/s straight ≤2 cm **+ physical tape check** | no log substitutes for tape |
+| ~~11:10~~ | ✅ **Pivot sign check CLOSED — offline, no rover.** Every square corner is an in-place rotation; fitting a body-fixed lever arm to 08-04 bags gives \|L\| = 1.34 / 1.51 cm (need ≥120° arc — short arcs give spurious 40 cm). **Sign CORRECT.** | Branch `fw/heading-stability-20260805`. Re-anchor `params_gnss.yaml` on v1.16.2 stock. |
+| ~~11:10~~ | ⚠️ **UNPLANNED: RC dead — virtual joystick was holding PX4's manual-control lock** at 48 Hz (`server/manual_control_gateway.py:384` streams NEUTRAL forever when released; app toggle is a no-op). Fixed by `COM_RC_IN_MODE` 2 → **0**. See §8. | — |
+| **11:40** | ✅ **Baseline block @ 0.95 — 12 bundles, 11 ULogs.** 4 @ 0.50 + 4 @ 0.35, both directions. Gave the gain measurement (§6a), the direction split (§6 row 4), and §6c. | Commits 1–2 (EKF2). `make format`. |
+| **12:00** | ✅ QGC write `RD_MAX_THR_YAW_R` 0.95 → **1.14**. **No `px4-dxp` restart** — verify in QGC + the ULog snapshot, so RTK survives. | Commits 3–4 (RoboClaw). `make format`. |
+| **12:15** | **Post block @ 1.14** — same 8 runs. **Gate: steady gain 1.00 ± 0.02, saturation-filtered.** | Commit 5 (overlay + doc counts). Push → CI auto-triggers. |
+| **12:45** | **Stop-latch A/B** — `stop_latch_enabled true`, 2×2 square + short-entry line. Watch rest point vs corner-advance tolerance, creep past stops, corner dead time (was 2–6 s). | `gh run watch <id> --repo Vetri2425/PX4-Autopilot --exit-status`. **CI green.** If red, fix and re-push — do not flash a local build. |
+| **13:30** | **4-leg direction split** — Aug-II both directions × both speeds. Gates `GPS_YAW_OFFSET` 180.72. | Download artifact, record `board_id` + sha256. |
+| **14:15** | — | **FLASH** CubeOrangePlus via QGC. |
+| **14:30** | **Flash sanity, params UNCHANGED.** One 0.35 line. **Gate: behaviour identical to the 1.134 post pair — proves the flash is neutral.** | — |
+| **14:45** | **F2 tune:** `EKF2_GPS_YAW_N` 0.1 → **0.01**, restart `px4-dxp`. Re-run the same line pair. **Gate: wobble ±4° → ~±1°, EKF−receiver σ → <1°.** | — |
+| **15:30** | `RO_YAW_RATE_TH` 1.0 → 0.5 (**only after F2 lands**). Re-run pair. | — |
+| **16:00** | Optional: pivot-release pair; full-throttle MANUAL run to settle `RO_MAX_THR_SPEED` (§6b). | — |
+| **16:30** | **Day-close gate: 0.5 m/s straight ≤2 cm RMS + PHYSICAL TAPE CHECK** (budget 4 runs — no log substitutes). | — |
 
-**Boot checklist before anything** (Jetson was offline):
-```sh
-git pull origin field/spray-d15 && sudo systemctl restart rpp-pipeline
-# if rover-server restarted, NTRIP is silently dead:
-POST /api/rtk/ntrip/start   # + re-login
-```
+**Standing rules for the whole day:**
+- ULog **every** run. `tools/analyze_bag_ulog.py --ulog` is the authoritative param + gain source.
+- After **any** QGC write, restart `px4-dxp` before verifying — the `/mavros/param` mirror
+  freezes at MAVROS init (stale-mirror trap).
+- Check `armed` + mission state before **any** `rpp-pipeline` restart. Dropping setpoints in
+  OFFBOARD trips the failsafe, and `NAV_RCL_ACT`/`NAV_DLL_ACT` are both **Disarm**.
 
 ---
 
-## 6. Param tuning order — after the flash
+## 6. Param tuning order — corrected against the live FCU
 
 PX4's own rover tuning guide gives the canonical sequence, and it matters here because
 **tuning feedforward with the feedback loop live is not identifiable**:
@@ -365,18 +411,28 @@ PX4's own rover tuning guide gives the canonical sequence, and it matters here b
 > to zero. This way the yaw rate is only controlled by the feed-forward term."
 > — [PX4 Rate Tuning](https://docs.px4.io/main/en/config_rover/rate_tuning)
 
-| # | Param | change | Why | Gate |
+We do **not** follow that literally — `analyze_bag_ulog.py` identifies the plant from
+closed-loop data with Kp in the model (§6a), which is why zeroing the gains is unnecessary.
+
+| # | Param | change | Needs flash? | Gate |
 |---|---|---|---|---|
-| 1 | `RD_MAX_THR_YAW_R` | 0.95 → **1.134** | see below — fitted, not scaled | post-change ulog steady gain **1.00 ± 0.02** |
-| 2 | `EKF2_GPS_YAW_N` | 0.1 → **0.01** | the F2 payoff | wobble ±4° → ~±1° |
-| 3 | `EKF2_GPS_P_NOISE` | → **0.015** | it is a FLOOR over hacc (`gps_control.cpp:257`); RTK 1.5 cm was inflated to 5 cm | — |
-| 4 | `EKF2_GPS_V_NOISE` | → **0.05** | same floor mechanism | — |
-| 5 | `RO_YAW_RATE_TH` | 1.0 → **0.5** | deadband = `TH/RO_YAW_P` = 0.67° eats 2/3 of a 1° budget | **ONLY after step 2** |
-| 6 | `GPS_YAW_OFFSET` | 180 → 180.72 | **GATED** on the 4-leg split | EKF−receiver mean flips sign with direction (+1.10 / −1.85) |
-| — | `RO_MAX_THR_SPEED` | **HOLD at 1.28** | see §6b — tool and field measurement disagree | do not change today |
+| 1 | `RD_MAX_THR_YAW_R` | 0.95 → **1.14** ✅ **APPLIED 08-05** | no | ulog steady gain **1.00 ± 0.02** — post-change block running |
+| 2 | `EKF2_GPS_YAW_N` | (created by F2) → **0.01** | **YES** | wobble ±4° → ~±1° |
+| 3 | `RO_YAW_RATE_TH` | 1.0 → **0.5** | after #2 | deadband = `TH/RO_YAW_P` = 0.67° eats 2/3 of a 1° budget |
+| 4 | `GPS_YAW_OFFSET` | 180 → 180.72 | no — ✅ **GATE SATISFIED 08-05** | 4-leg split gives body-fixed 0.60–0.93°, brackets +0.72° ± 0.17 |
+| 5 | `RO_YAW_RATE_LIM` | 22 → ? | no — **DO NOT TOUCH YET** | §6c — new 0.5 m/s blocker, needs its own A/B |
+| ~~—~~ | ~~`EKF2_GPS_P_NOISE` → 0.015~~ | **ALREADY 0.015** | — | **struck — verified live 08-05** |
+| ~~—~~ | ~~`EKF2_GPS_V_NOISE` → 0.05~~ | **ALREADY 0.05** | — | **struck — verified live 08-05** |
+| — | `RO_MAX_THR_SPEED` | **HOLD at 1.28** | — | see §6b — tool and field measurement disagree |
 
 **Do not touch** `RO_YAW_RATE_I` (0.01 → 0.05) until step 1 lands — single integrator in
 the rate loop, never before FF calibration.
+
+**`RO_YAW_RATE_TH` semantics verified today** in v1.16.2 source: it is a genuine deadband
+on **both** ends — `DifferentialRateControl.cpp:72` zeroes the *measured* yaw rate below
+threshold, `:149` zeroes the *setpoint*. Firmware default is 3.0°/s
+(`rovercontrol_params.c:65`); we are already at 1.0. Gating the drop to 0.5 behind F2 is
+correct: at σψ 1.45–2.88° a tighter deadband only lets more heading noise into the rate loop.
 
 ### 6a. Why 1.134 and not 1.06 — `RD_MAX_THR_YAW_R`
 
@@ -385,11 +441,11 @@ the rate loop, never before FF calibration.
 assumes the loop is **pure feedforward**, so that a 11% excess in the output implies an
 11% excess in the FF gain.
 
-It isn't. `RO_YAW_RATE_P = 0.13` is live, and the proportional term **already claws back
-part of the error** — the measured gain of 1.119 is the closed-loop result *after* Kp has
-acted, not the raw FF error. Correcting the FF alone therefore needs a **larger** move
-than the naive ratio suggests, because part of the correction you observe is being
-supplied by feedback that will keep supplying it afterwards.
+It isn't. `RO_YAW_RATE_P = 0.13` is live (**confirmed on the FCU today**), and the
+proportional term **already claws back part of the error** — the measured gain of 1.119 is
+the closed-loop result *after* Kp has acted, not the raw FF error. Correcting the FF alone
+therefore needs a **larger** move than the naive ratio suggests, because part of the
+correction you observe is being supplied by feedback that will keep supplying it afterwards.
 
 The correct relation, fitted per run by `tools/analyze_bag_ulog.py`:
 
@@ -397,9 +453,14 @@ The correct relation, fitted per run by `tools/analyze_bag_ulog.py`:
 G = A(WT/2R + Kp) / (1 + A·Kp)          →   G = 1  gives   R_opt = A·WT/2
 ```
 
-where `A` is the identified plant gain and `WT` = `RD_WHEEL_TRACK` = 0.47.
+where `A` is the identified plant gain and `WT` = `RD_WHEEL_TRACK` = 0.47 (**confirmed live**).
 This is licensed by **R3 residual = 0.00000** on all 9 logs — the firmware rate/FF model
 reproduces the logged `normalized_speed_diff` exactly, so `R_opt` is *derived*, not guessed.
+
+**Independently re-derived 2026-08-05 and self-consistent:** substituting `R = A·WT/2`
+collapses `G` to exactly 1 algebraically; and evaluating the forward direction at the
+*current* `R = 0.95` with A=4.826, Kp=0.13, WT=0.47 predicts **G = 1.1192** against a
+measured **1.119 ± 0.011**. The model reproduces the observation, it does not merely fit it.
 
 Cross-run result over the 9 runs flown on the current config:
 
@@ -418,17 +479,17 @@ Reproduce with:
     --sweep --ulog-dir ~/Documents/QGroundControl\ Daily/Logs \
     --emit-params rec.params
 
-# after the flash, the acceptance check on the first A/B ulog:
+# after each A/B, the acceptance check:
 /opt/homebrew/bin/python3 tools/analyze_bag_ulog.py \
     --ulog <new.ulg> --json post.json
 # then read post.json: plant.G must be 1.00 +- 0.02
 ```
 
-The tool is committed at **`fceb96b`** (`tools/analyze_bag_ulog.py` +
-`tools/test_analyze_bag_ulog.py`, 53 tests). `--json` emits the whole result set —
-reconstruction verdicts, plant fit, dead-band occupancy, geometry, recommendations with
-their confidence — so the acceptance check can be read programmatically instead of parsed
-out of the text report.
+The tool is committed at **`fceb96b`** in `PX4_DXP` (`tools/analyze_bag_ulog.py` +
+`tools/test_analyze_bag_ulog.py`, 53 tests) and is now on the Jetson too (@`2cdf78b`).
+`--json` emits the whole result set — reconstruction verdicts, plant fit, dead-band
+occupancy, geometry, recommendations with their confidence — so the acceptance check can be
+read programmatically instead of parsed out of the text report.
 
 The sweep keeps only the **most recent parameter configuration** (9 runs) and sets aside
 24 runs flown with 6 older configs — a gain is a property of the config it flew with, so
@@ -437,6 +498,83 @@ mixing them produces a meaningless aggregate.
 ⚠ `1.134` is a **fitted mean with a real spread** (±0.021). Treat the first A/B as
 confirming the direction and magnitude, not as a final value. The acceptance criterion is
 unchanged and is what actually decides: **post-change steady gain 1.00 ± 0.02.**
+
+### ✅ MEASURED IN THE FIELD 2026-08-05 — 1.140 ± 0.013, scrub caveat CLOSED
+
+11 fresh ULogs + 12 bags, same day, post-remount, all at `RD_MAX_THR_YAW_R` = 0.95.
+The raw `--sweep` aggregate (G 1.067 ± 0.080, R_opt 1.035 ± 0.155) is **NOT actionable** —
+it averages runs where the measurement is invalid. Filter on **`RO_YAW_RATE_LIM`
+saturation** and the data is perfectly bimodal:
+
+| | n | G | R_opt | A cross-check | wheel/gyro |
+|---|---|---|---|---|---|
+| **clean (0 % sat)** | 7 | **1.1200 ± 0.0086** | **1.140 ± 0.013** | ≤4 % | 0.999–1.016 |
+| saturated (8–29 %) | 4 | 0.9731 ± 0.0711 | 0.705–0.968 | **26–61 %** | 0.887–1.076 |
+
+Once the limiter clips the setpoint, measured/commanded is the **limiter**, not the
+feedforward, so G reads low. Always filter on `§9 RO_YAW_RATE_LIM ... hit X%` before
+quoting G; the tool's own A cross-check (§10) independently flags the same four runs.
+
+⇒ **1.140 ± 0.013 (n=7, today) vs 1.134 ± 0.021 (n=9, yesterday) — within 0.3σ.**
+Two separate days, separate flights, same answer. **Applied: 0.95 → 1.14.**
+
+**The scrub caveat is CLOSED — a scalar is correct, no gain schedule needed:**
+
+```
+0.50 m/s (n=3):  G 1.1213   R_opt 1.141
+0.35 m/s (n=4):  G 1.1191   R_opt 1.139     difference 0.20 % of G
+```
+
+`A` is not turn-rate dependent in the unsaturated regime.
+
+### 6c. `RO_YAW_RATE_LIM` — a measurement FILTER, not a failure cause
+
+⚠ **Earlier claim RETRACTED.** The pre block showed saturation correlating 4/4 with
+failures, which read as causal. The post block **saturates on 9 of 9 runs and every one
+completed**, with tracking improving. Saturation was a *symptom* of a rover already off
+track and correcting hard, not the mechanism.
+
+It stays essential for **measurement**: above 14.7° heading error the setpoint is clipped
+at 22 °/s, and measured/commanded then reports the LIMITER, not the feedforward. Filter on
+it before quoting any gain. **Do not raise `RO_YAW_RATE_LIM`** — it was deliberately
+lowered 90 → 22 in the retune that fixed physical repeatability, and tracking is now
+*better* with it binding ~20 % of the time.
+
+### 6d. POST-CHANGE VERIFICATION 08-05 — derived from the firmware source
+
+Re-derived independently of `analyze_bag_ulog.py`, transcribing `RoverControl.cpp
+rateControl()` and `DifferentialRateControl.cpp` at v1.16.2:
+
+```
+u = clamp( clamp(adj·WT/2R, ±1) + Kp·(adj − ω) + I , ±1 )
+```
+`math::interpolate` CLAMPS (`Functions.hpp`); `pid_yaw_rate_integral` is added **raw**,
+not I-scaled. **Reconstruction vs logged `normalized_speed_diff`: RMS 0.00000.**
+
+| | PRE R=0.95 | POST R=1.14 |
+|---|---|---|
+| usable runs | 7 of 11 (sat<0.5 %) | 9 of 9 |
+| **plant gain A** | **4.843 ± 0.063** | **4.888 ± 0.214** |
+| steady gain G | 1.1206 ± 0.0084 | **1.0346 ± 0.0246** |
+| R_opt = A·WT/2 | 1.138 ± 0.015 | 1.148 ± 0.050 |
+
+⭐ **`A` is INVARIANT across the change** — a physical drivetrain property that must not
+move when a control gain does. It didn't, while `G` moved as designed. That is the check
+proving the identification measures the plant and not itself.
+
+Inverse-variance pooled **A = 4.847 ⇒ R_opt = 1.139 ⇒ the applied 1.14 is correct to
+0.1 %. KEEP IT.**
+
+⚠ Gate (`G` = 1.00 ± 0.02) **marginally missed**: 1.0346 ± 0.0246; over-rotation 12.1 % →
+3.5 %. The A-derived model predicts 0.999 at R = 1.14, so the direct `G` fit and the A
+prediction disagree by ~3.5 % — **unexplained**. Integral wind-up was the obvious
+candidate and is ruled out (I-share 17.9 % → 5.8 %). Suspect scatter in a through-origin
+fit on 35–87 surviving samples vs 111–186 pre.
+🚫 **Do not chase it with 1.14 × 1.035 ≈ 1.18** — that is the same closed-loop error that
+produced the discarded 1.06. `R_opt = A·WT/2` contains no `G`.
+
+**Only 2 of 880 params differed between blocks** (`RD_MAX_THR_YAW_R`, `COM_FLIGHT_UUID`),
+confirmed by diffing the two ULog snapshots. Do that before attributing any A/B result.
 
 ### 6b. `RO_MAX_THR_SPEED` — HOLD, do not change today
 
@@ -467,8 +605,10 @@ Reasons to hold:
   and the normalised infeasibility clamp across the entire speed range.
 - `R_opt` is fitted from data and **does not depend on it**, so holding costs step 1 nothing.
 
-Resolve it later with a proper full-throttle run (not a marking-speed fit), which is a
-test-day activity, not a last-dev-day change.
+**Cheap way to close it today (16:00 slot, optional):** a full-throttle straight run in
+MANUAL is a ~10 s test and gives the top of the range directly, which is exactly the
+evidence the fit lacks. That is a *measurement*, not a tuning change — it settles §6b
+without touching the param.
 
 **v1.16.2 trap:** the PX4 guide tells you to adjust `RO_YAW_RATE_CORR`. **That param does
 not exist in v1.16.2** — it is v1.17+. On our firmware the FF knob is `RD_MAX_THR_YAW_R`
@@ -485,27 +625,12 @@ heuristic is only a seed.
 act in OFFBOARD** — `speed_body_x_setpoint` is identically zero; speed is open-loop
 feedforward with a real −0.05 m/s rolling-resistance intercept.
 
-**Stale-mirror trap:** after ANY QGC write, restart `px4-dxp` before verifying — the
-`/mavros/param` mirror freezes at MAVROS init. The ULog's 880-param snapshot is the
-authoritative source (§15 of the tool's report):
-
-```sh
-/opt/homebrew/bin/python3 tools/analyze_bag_ulog.py --ulog <f.ulg>
-```
-
-⚠ **Interpreter matters.** `pyulog` is installed **only** in `/opt/homebrew/bin/python3`.
-The `ros-replay` micromamba env runs the tool's 48 tests but **cannot run the tool**
-(`ModuleNotFoundError: pyulog`). Verified 2026-08-05.
-
-⚠ The tool is currently **untracked** in `PX4_DXP` (`?? tools/analyze_bag_ulog.py`,
-`?? tools/test_analyze_bag_ulog.py`). Tomorrow's acceptance criterion depends on it —
-commit it before the field session.
-
 ---
 
 ## 7. WENC — stays OFF today
 
-`EKF2_WENC_CTRL = 0` on the vehicle. **Do not enable it today.** Reasoning:
+`EKF2_WENC_CTRL = 0` on the vehicle (**re-verified live 08-05**). **Do not enable it today.**
+⚠ `CLAUDE.md` still documents `EKF2_WENC_CTRL = 1` — that row is **stale and must be fixed.**
 
 - 07-27 A/B, straight 3.07 m line: **WENC=1 walks left 1.27–1.51 cm/m, ends 3–4.5 cm off**,
   persistent and one-sided. WENC=0 error is *transient* — an 8.4 cm start error decays to 0.5 cm.
@@ -520,7 +645,7 @@ today. Enabling it before F2 lands takes the worst term and hard-couples it into
 WENC becomes worth re-testing only after: **A1** (else it fuses nothing) → **A9** (else the
 EKF-GSF yaw rescue can never fire — `fuseBodyFrameVelocity` refreshes the *global*
 `_time_last_hor_vel_fuse`) → **F2 + heading bias measured** → **A12 params**
-(`LAT_N`→0.35, `GATE`→5, `GPS_P_NOISE`→0.015). A1 ships today; the rest do not.
+(`LAT_N`→0.35, `GATE`→5). A1 ships today; the rest do not.
 
 It is a **margin** tool, not an accuracy tool: at 5 Hz RTK there is 200 ms between fixes —
 10 cm of travel at 0.5 m/s with no position update. That is what WENC is for, and the
@@ -533,7 +658,7 @@ audit calls it required for a *durable* 1 cm. Not for reaching 1 cm.
 ### Firmware, not shipping today
 | ID | Item | Why open |
 |---|---|---|
-| **F7** | `s_variance_m_s` variance-vs-σ units bug; silently disables `EKF2_REQ_SACC` | **submodule** — overlay can't reach it |
+| **F7** | `s_variance_m_s` variance-vs-σ units bug; silently disables `EKF2_REQ_SACC` | **submodule** — overlay can't reach it (verified `.gitmodules:13`) |
 | **F8** | `-m config` to pin 30/50 Hz; today 30 Hz exists only because MAVROS asks | optional, new ROMFS overlay |
 | **C1** | `in_air` permanently false → heading dropout clears `yaw_align` → `vehicle_global_position` **stops** | coupled to `mission_block`; not a last-day change |
 | **C2** | NMEA driver restart on 500 ms quiet → multi-second `sensor_gps` blackouts | submodule |
@@ -554,11 +679,17 @@ audit calls it required for a *durable* 1 cm. Not for reaching 1 cm.
 - **Circles at 0.5 m/s saturate the yaw envelope** (0.45 rad/s clamp hit on 49–57% of ticks
   at R=1.5 m). Needs a κ→yaw-rate speed cap, companion-side. **Keep circles at 0.35.**
 
-### Companion (not today)
-D3 latency bias (`pose_latency_bias_s=0`, should be ~0.03–0.05), D4 crab integrator,
-D6 `use_feedforward_yaw_rate` A/B, D10 simplifier tol 0.01 → 0.003, stop-latch A/B
-(`stop_latch_enabled`, default OFF), pivot-release pair (`RD_TRANS_TRN_DRV` 2°→1° **and**
-companion tol 3°→2° — must stay ~1° above the firmware stop angle; equal = deadlock, 6/6 on 07-30).
+### Companion — deployed but unproven
+- **Stop-latch** (`8ee84cd`, deployed @`2cdf78b`, `stop_latch_enabled` default **False**) —
+  **A/B is on today's field track, 12:45.** Replay says the `…200723` PRE_CORNER strand is
+  eliminated and good runs are byte-identical; the field decides the default.
+  ⚠ Watch: rest point must land **inside** the corner-advance tolerance. If the rover strands
+  latched-at-zero 2–3 cm short, the 0.10 nudge is not firing — knob is `stop_latch_capture_dist_m`.
+- **Pivot-release pair** — `RD_TRANS_TRN_DRV` 2°→1° **and** companion tol 3°→2° (must stay
+  ~1° above the firmware stop angle; equal = deadlock, 6/6 on 07-30). Judge on release
+  **xtrack**, not exit angle: the 08-03 A/B halved exit error and marked 57% worse.
+- Not today: D3 latency bias (`pose_latency_bias_s=0`, should be ~0.03–0.05), D4 crab
+  integrator, D6 `use_feedforward_yaw_rate` A/B, D10 simplifier tol 0.01 → 0.003.
 
 ---
 
@@ -566,12 +697,37 @@ companion tol 3°→2° — must stay ~1° above the firmware stop angle; equal 
 
 | Check | Pass |
 |---|---|
-| CI build | green; artifact sha256 + `board_id` recorded |
-| Flash sanity (params unchanged) | behaviour identical to 08-04 — flash is neutral |
 | Pivot sign | <1 cm wander during in-place 180° pivot |
-| `RD_MAX_THR_YAW_R` 0.95 → 1.134 | ulog steady gain **1.00 ± 0.02** (this decides, not the fitted value) |
+| `RD_MAX_THR_YAW_R` 0.95 → 1.14 | ⚠️ **marginal** — G 1.0346 ± 0.0246 vs gate 1.00 ± 0.02. KEEP: A-invariance + R_opt = 1.139 carry it (§6d) |
+| **Day gate on p95** | ❌ **NOT met** — p95 3.0–3.6 cm, max ~5 cm. RMS spec met, tail spec not. |
+| Stop-latch | no creep past stops; rest inside corner-advance tolerance; corner dead time < previous 2–6 s |
+| CI build | green; artifact sha256 + `board_id` recorded |
+| Flash sanity (params unchanged) | behaviour identical to the pre-flash 1.134 pair — flash is neutral |
 | F2 effect | yaw wobble ±4° → **~±1°**; EKF−receiver σ 1.45–2.88° → <1° |
 | **Day gate** | **0.5 m/s straight ≤2 cm RMS + physical tape check** (budget 4 runs) |
+
+### Measured result of the day — FULL-MISSION, 9 completed runs per block
+
+⚠ **Report `analysis.tracking.overall`, not `marking_only` and NEVER
+`geometry.xtrack_vs_planned`.** The latter's sample count collapses to n = 12–54 on some
+runs (manufacturing 0.08–0.46 cm scores against n = 1576 on others) and produced a bogus
+"−50 %" headline. Always print `n` beside an xtrack figure.
+
+| | R = 0.95 | R = 1.14 | Δ |
+|---|---|---|---|
+| **full-mission RMS** | **1.91 cm** | **1.69 cm** | −12 % |
+| median / worst run | 1.96 / 2.64 | 1.65 / 2.08 | −16 / −21 % |
+| spread across runs | 1.45–2.64 | 1.19–2.08 | tighter |
+| p95 (mean) | 3.45 | 3.00 | −13 % |
+| **max excursion** (mean / worst) | 4.66 / 5.96 | **3.80 / 4.95** | −18 % |
+| marking-only RMS | 1.89 | 1.66 | −12 % |
+| aborts + runaways | 3 + 1 | **0** | — |
+| worst coast | 29.8 cm | 2.4 cm | — |
+
+**The tail is the remaining problem, not the RMS.** p95 sits at 3.0–3.6 cm and single
+excursions still reach ~5 cm. **The 1–2 cm whole-mission spec is met on RMS but NOT on
+p95.** F2 is the next lever — it targets exactly the noise-excited swing that produces
+those excursions.
 
 **Reference point:** square is already **1.01–1.17 cm** across seven runs at 0.35, circle
 **1.55 cm**. The 1–2 cm target is met at 0.35 today. The job is holding it at **0.5**.
@@ -588,6 +744,9 @@ Every commit is independent and revertable. If the flash regresses:
    (this is why the default is 0.1).
 2. `RD_MAX_THR_YAW_R` → 0.95.
 3. Full rollback: reflash the `06309e41a7` artifact from CI run #27.
+
+Companion-side: `stop_latch_enabled false` reverts the stop behaviour with no restart of
+anything, and it is already the default.
 
 ⚠ Firmware built locally vs in CI is functionally equivalent but **not bit-identical**
 (different toolchains). **Flash CI artifacts only.**
