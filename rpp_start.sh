@@ -1,11 +1,12 @@
 #!/bin/bash
-# RPP Pipeline startup — runs the four always-on controller nodes.
+# RPP Pipeline startup — runs the five always-on controller/safety nodes.
 #
 # Nodes started:
 #   1. twist_to_setpoint_node.py  — 50 Hz OFFBOARD heartbeat (must start first)
 #   2. rpp_controller_node.py     — Regulated Pure Pursuit path follower
-#   3. spray_controller_node.py   — MARK actuator via MAV_CMD_DO_SET_ACTUATOR
-#   4. xtrack_logger_node.py      — CSV telemetry capture for tuning
+#   3. spray_safety_watchdog_node.py — independently forces stale spray OFF
+#   4. spray_controller_node.py   — MARK actuator via MAV_CMD_DO_SET_ACTUATOR
+#   5. xtrack_logger_node.py      — CSV telemetry capture for tuning
 #
 # NOT started here (server-driven):
 #   - path_publisher_node.py      — server publishes /path directly
@@ -133,14 +134,18 @@ start_node() {
 # record_fail and can trip the full-pipeline exit 1 (systemd restart),
 # unchanged from prior behavior.
 #
+# SAFETY WATCHDOG: spray_safety_watchdog is deliberately separate from the
+# spray controller. The controller publishes a short-lived ON lease; this node
+# sends OFF when the lease is false/stale. If the watchdog itself dies, the
+# supervisor kills the spray controller first and immediately restarts the
+# watchdog, so no process may continue issuing ON without its fail-closed peer.
+#
 # AUXILIARY: spray_controller, xtrack_logger. Neither is in the OFFBOARD
-# setpoint loop. While spray_controller is down the actuator fails safe
-# OFF by construction: MAVROS simply stops receiving
-# MAV_CMD_DO_SET_ACTUATOR commands, and PX4 does not hold a stale ON
-# state absent a repeated command — so isolating its failures from the
-# critical watchdog is safe. Auxiliary deaths NEVER call record_fail and
-# NEVER trip exit 1; they respawn on their own per-node exponential
-# backoff (2s -> AUX_BACKOFF_CAP_S), tracked in AUX_FAIL_COUNT.
+# setpoint loop. Auxiliary deaths NEVER call record_fail and NEVER trip exit 1;
+# they respawn on isolated per-node exponential backoff (2s -> cap). A dead or
+# frozen spray controller is forced OFF by spray_safety_watchdog within its
+# lease timeout; the old, unsupported assumption that PX4 expires command 187
+# is no longer part of the safety case.
 is_critical_node() {
     case "$1" in
         twist_to_setpoint|rpp_controller) return 0 ;;
@@ -183,17 +188,23 @@ record_fail() {
 pkill -f "twist_to_setpoint_node" 2>/dev/null || true
 pkill -f "rpp_controller_node" 2>/dev/null || true
 pkill -f "spray_controller_node" 2>/dev/null || true
+pkill -f "spray_safety_watchdog_node" 2>/dev/null || true
 pkill -f "xtrack_logger_node" 2>/dev/null || true
 sleep 1
 
 # ── Start nodes in order ──────────────────────────────────────────────────────
 log "====================================================="
 log " RPP Pipeline Starting"
-log " Nodes: twist_to_setpoint, rpp_controller, spray_controller, xtrack_logger"
+log " Nodes: twist_to_setpoint, rpp_controller, spray_safety_watchdog, spray_controller, xtrack_logger"
 log "====================================================="
 
 start_node "twist_to_setpoint" "${SRC_DIR}/twist_to_setpoint_node.py"
 start_node "rpp_controller" "${SRC_DIR}/rpp_controller_node.py"
+start_node "spray_safety_watchdog" "${SRC_DIR}/spray_safety_watchdog_node.py"
+# Give the independent OFF authority a head start before any process capable
+# of issuing ON exists. MAVROS is already healthy (systemd ExecStartPre), so
+# its normal startup is well below this bound.
+sleep 0.5
 start_node "spray_controller" "${SRC_DIR}/spray_controller_node.py"
 start_node "xtrack_logger" "${SRC_DIR}/xtrack_logger_node.py"
 
@@ -205,10 +216,27 @@ while true; do
     # If a shutdown signal arrived during the sleep, stop — never resurrect
     # nodes that cleanup() is tearing down.
     [[ "$SHUTTING_DOWN" -eq 1 ]] && break
-    for name in "twist_to_setpoint" "rpp_controller" "spray_controller" "xtrack_logger"; do
+    for name in "twist_to_setpoint" "rpp_controller" "spray_safety_watchdog" "spray_controller" "xtrack_logger"; do
         local_pid="${NODE_PIDS[$name]:-}"
         if [[ -z "$local_pid" ]] || ! kill -0 "$local_pid" 2>/dev/null; then
-            if is_critical_node "$name"; then
+            if [[ "$name" == "spray_safety_watchdog" ]]; then
+                # The watchdog is safety-critical but not OFFBOARD-critical.
+                # Never restart the whole drive pipeline for its failure (that
+                # caused the 2026-06-25 path excursion). Instead, revoke the
+                # producer: stop spray_controller, restart the OFF authority
+                # immediately, then let the normal auxiliary path restore the
+                # controller on its isolated backoff.
+                log "ERROR: spray_safety_watchdog died — stopping spray controller before immediate watchdog restart"
+                spray_pid="${NODE_PIDS[spray_controller]:-}"
+                if [[ -n "$spray_pid" ]] && kill -0 "$spray_pid" 2>/dev/null; then
+                    kill -TERM "$spray_pid" 2>/dev/null || true
+                    sleep 0.2
+                    kill -KILL "$spray_pid" 2>/dev/null || true
+                fi
+                NODE_PIDS["spray_controller"]=""
+                AUX_NEXT_RESTART["spray_controller"]=0
+                start_node "spray_safety_watchdog" "${SRC_DIR}/spray_safety_watchdog_node.py"
+            elif is_critical_node "$name"; then
                 # Critical path: unchanged from prior behavior — counts
                 # toward the global failure window and can give up the
                 # whole pipeline (record_fail may exit 1).

@@ -65,6 +65,8 @@ async def telemetry_latest():
         gps_sat         = s.get("gps_sat"),
         hrms            = s.get("hrms"),
         vrms            = s.get("vrms"),
+        gps_h_acc_m     = s.get("gps_h_acc_m"),
+        gps_h_acc_known = s.get("gps_h_acc_m") is not None,
         lat             = format_gps_coord(s.get("lat")),
         lon             = format_gps_coord(s.get("lon")),
         alt             = format_gps_coord(s.get("alt")),

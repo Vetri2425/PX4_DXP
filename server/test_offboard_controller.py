@@ -143,7 +143,10 @@ def test_surveyed_start_rejects_auto_origin():
         run(ctrl.start_async(auto_origin=True))
 
 
-def test_surveyed_start_publishes_live_ekf_points():
+def test_surveyed_start_publishes_live_ekf_points(monkeypatch):
+    # This test covers the optional aligned-entry geometry, so opt in
+    # explicitly now that production defaults fail closed.
+    monkeypatch.setattr(offboard_module, "ENTRY_STAGING_ENABLED", True)
     old_grace = offboard_module.SETPOINT_STREAM_GRACE_S
     offboard_module.SETPOINT_STREAM_GRACE_S = 0.0
     try:
@@ -246,7 +249,8 @@ _E1_STAGING = (5.0 - offboard_module.ENTRY_STAGING_DIST_M, -1.0)  # (3.8, -1.0)
         (3.0, 1.5),     # behind but well off-axis (~37 deg > 20 deg skip cone)
     ],
 )
-def test_entry_leg_routes_via_staging(live):
+def test_entry_leg_routes_via_staging(live, monkeypatch):
+    monkeypatch.setattr(offboard_module, "ENTRY_STAGING_ENABLED", True)
     pts = offboard_module._entry_leg_points(live, _E1_PATH)
     assert len(pts) == 3
     assert pts[0] == live
@@ -254,20 +258,23 @@ def test_entry_leg_routes_via_staging(live):
     assert pts[2] == (5.0, -1.0)
 
 
-def test_entry_leg_skips_staging_when_chord_arrives_aligned():
+def test_entry_leg_skips_staging_when_chord_arrives_aligned(monkeypatch):
+    monkeypatch.setattr(offboard_module, "ENTRY_STAGING_ENABLED", True)
     # Parked 3 m behind the start, 0.5 m off-axis: chord bearing ~9.5 deg off
     # the mark direction — inside the 20 deg cone, so the plain chord is used.
     pts = offboard_module._entry_leg_points((2.0, -0.5), _E1_PATH)
     assert pts == [(2.0, -0.5), (5.0, -1.0)]
 
 
-def test_entry_leg_skips_staging_when_parked_at_staging_point():
+def test_entry_leg_skips_staging_when_parked_at_staging_point(monkeypatch):
+    monkeypatch.setattr(offboard_module, "ENTRY_STAGING_ENABLED", True)
     live = (_E1_STAGING[0] + 0.1, _E1_STAGING[1] + 0.3)
     pts = offboard_module._entry_leg_points(live, _E1_PATH)
     assert pts == [live, (5.0, -1.0)]
 
 
-def test_entry_leg_degenerate_path_falls_back_to_chord():
+def test_entry_leg_degenerate_path_falls_back_to_chord(monkeypatch):
+    monkeypatch.setattr(offboard_module, "ENTRY_STAGING_ENABLED", True)
     # All placed points within 1 cm of wp0 → no direction → plain chord.
     degenerate = [(5.0, -1.0), (5.004, -1.0), (5.0, -1.004)]
     pts = offboard_module._entry_leg_points((8.0, 2.0), degenerate)
@@ -278,6 +285,11 @@ def test_entry_leg_off_switch_restores_plain_chord(monkeypatch):
     monkeypatch.setattr(offboard_module, "ENTRY_STAGING_ENABLED", False)
     pts = offboard_module._entry_leg_points((7.5, -1.0), _E1_PATH)
     assert pts == [(7.5, -1.0), (5.0, -1.0)]
+
+
+def test_entry_staging_is_fail_closed_by_default():
+    """A clean deployment must not re-enable the incident-disabled manoeuvre."""
+    assert offboard_module.ENTRY_STAGING_ENABLED is False
 
 
 def test_clear_mission_resets_resident_state():

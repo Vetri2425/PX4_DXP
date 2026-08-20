@@ -28,9 +28,10 @@ def _enable_gate(node):
     node._params["spray_require_rtk_fix"] = _Param(True)
 
 
-def _set_fix(node, fix_type):
+def _set_fix(node, fix_type, h_acc_mm=15):
     msg = GPSRAW()
     msg.fix_type = fix_type
+    msg.h_acc = h_acc_mm
     node._gps_cb(msg)
 
 
@@ -57,7 +58,7 @@ def test_stale_after_timeout():
     node = make_node()
     _enable_gate(node)
     _set_fix(node, 6)          # good, fresh
-    _advance(node, 2.5)        # > gps_fix_timeout_s (2.0)
+    _advance(node, 0.6)        # > gps_fix_timeout_s (0.5)
     fresh, fix_ok, _ = node._gps_health()
     assert fresh is False
     ok, reason = node._gps_gate()
@@ -80,10 +81,15 @@ def test_recover_hold_delays_reenable():
     _set_fix(node, 6)
     ok, reason = node._gps_gate()               # first good sample
     assert ok is False and "recovering" in reason
-    _advance(node, 0.5)                         # still inside 1.0 s hold
+    _advance(node, 0.4)                         # fresh sample, still in hold
+    _set_fix(node, 6)
     ok, _ = node._gps_gate()
     assert ok is False
-    _advance(node, 0.6)                         # total 1.1 s ≥ hold
+    _advance(node, 0.4)
+    _set_fix(node, 6)
+    assert node._gps_gate()[0] is False
+    _advance(node, 0.3)                         # total 1.1 s ≥ hold
+    _set_fix(node, 6)
     ok, reason = node._gps_gate()
     assert ok is True and reason == ""
 
@@ -94,7 +100,10 @@ def test_drop_is_instant_and_resets_recovery():
     _enable_gate(node)
     _set_fix(node, 6)
     node._gps_gate()
-    _advance(node, 1.2)
+    for _ in range(3):
+        _advance(node, 0.4)
+        _set_fix(node, 6)
+        node._gps_gate()
     assert node._gps_gate()[0] is True          # recovered
     _set_fix(node, 5)                           # instant drop to FLOAT
     ok, reason = node._gps_gate()
@@ -128,8 +137,12 @@ def test_gate_ordering_in_auto_safety():
     _set_fix(node, 6)
     ok, _ = node._auto_safety_status(pose_fresh=True, speed=0.3, velocity_fresh=True)
     assert ok is False  # recovering, hold not yet elapsed
-    _advance(node, 1.2)
-    ok, reason = node._auto_safety_status(pose_fresh=True, speed=0.3, velocity_fresh=True)
+    for _ in range(3):
+        _advance(node, 0.4)
+        _set_fix(node, 6)
+        ok, reason = node._auto_safety_status(
+            pose_fresh=True, speed=0.3, velocity_fresh=True
+        )
     assert ok is True and reason == ""  # no pivot active in the fixture
 
 
@@ -145,12 +158,10 @@ if __name__ == "__main__":
 #
 # Until A14, `_gps_health` compared fix_type and nothing else — GPSRAW.h_acc
 # arrived on the same message and was discarded. An RTK_FIXED claim opened the
-# valve at any reported error. These tests pin the FALLBACK contract:
+# valve at any reported error. Production now pins a fail-closed contract:
 #   accuracy reported  -> enforce it
-#   accuracy missing   -> behave exactly as before (h_acc == 0 is the driver's
-#                         "unknown" sentinel, latched per boot on ~half of
-#                         boots on this hardware; refusing on it would ground
-#                         the rover for a reason unrelated to safety)
+#   accuracy missing   -> refuse AUTO spray unless an operator explicitly
+#                         selects the bench/driver escape hatch
 
 def _set_fix_acc(node, fix_type, h_acc_mm):
     msg = GPSRAW()
@@ -185,18 +196,22 @@ def test_good_fix_with_good_accuracy_sprays():
     assert node._gps_health()[1] is True
 
 
-def test_unreported_accuracy_falls_back_to_pre_a14_behaviour():
-    """h_acc == 0 is 'unknown', NOT 'perfect' — but it must not block either.
-
-    This is the whole reason the gate ships enabled: on boots where the driver
-    supplies no accuracy (about half of them, latched per boot) the rover keeps
-    working exactly as it did before A14. If this test fails, the fix has
-    grounded the rover on the sentinel and must not be deployed.
-    """
+def test_unreported_accuracy_fails_closed():
+    """h_acc == 0 is unknown, never perfect, and blocks production AUTO spray."""
     node = make_node()
     _enable_gate(node)
     _set_fix_acc(node, 6, 0)
     assert node._gps_h_acc_m is None, "0 mm must be read as unknown, never 0.0 m"
+    assert node._gps_health()[1] is False
+    ok, reason = node._gps_gate()
+    assert ok is False and reason == "gps horizontal accuracy unknown"
+
+
+def test_unknown_accuracy_has_explicit_escape_hatch():
+    node = make_node()
+    _enable_gate(node)
+    node._params["spray_require_accuracy"] = _Param(False)
+    _set_fix_acc(node, 6, 0)
     assert node._gps_health()[1] is True
 
 
@@ -210,9 +225,8 @@ def test_a_bad_fix_still_fails_regardless_of_accuracy():
     assert node._gps_health()[1] is False
 
 
-def test_accuracy_half_can_be_disabled_with_zero():
-    """Escape hatch: spray_max_hrms_m = 0 restores pre-A14 behaviour exactly,
-    for a site where the receiver's accuracy is known to be unreliable."""
+def test_zero_limit_disables_upper_bound_for_known_accuracy():
+    """Zero disables the upper bound but does not disable known-data policy."""
     node = make_node()
     _enable_gate(node)
     node._params["spray_max_hrms_m"] = _Param(0.0)

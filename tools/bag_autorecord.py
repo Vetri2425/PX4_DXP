@@ -168,6 +168,8 @@ TOPICS = [
     "/spray/debug",                       # spray timing / boundary metrics
     # ── added 2026-07-22: verified present on Upgrade_Spray (grep create_publisher)
     "/spray/status",                      # Spray V2 Phase A typed status (std_msgs/String JSON)
+    "/spray/safety_lease",                # controller ON lease (stale => independent OFF)
+    "/spray/safety_watchdog_status",      # fail-closed reason / lease age / OFF state
     "/spray/manual_state",                # manual-override state (POST /api/spray/test)
     "/dyx/mission/progress",              # 0.0→1.0 completion @1Hz (path_publisher)
     # ── added 2026-07-24: RPP↔spray progress handshake (G1–G5), needed to

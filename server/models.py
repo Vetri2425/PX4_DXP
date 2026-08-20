@@ -118,6 +118,9 @@ class TelemetryData(BaseModel):
     # accuracy", NOT "zero error". This flag says which, so a client never has
     # to infer it from a magnitude.
     gps_accuracy_known: Optional[bool] = None
+    # Exact MAVLink GPSRAW.h_acc used by controller gates, converted mm -> m.
+    gps_h_acc_m: Optional[float] = None
+    gps_h_acc_known: Optional[bool] = None
     lat: Optional[float] = None
     lon: Optional[float] = None
     alt: Optional[float] = None

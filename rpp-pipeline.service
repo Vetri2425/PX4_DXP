@@ -1,5 +1,5 @@
 [Unit]
-Description=RPP Controller Pipeline (twist_to_setpoint + rpp_controller + xtrack_logger)
+Description=RPP Controller Pipeline (drive + independent spray safety watchdog)
 After=px4-dxp.service
 Wants=px4-dxp.service
 # PartOf: if px4-dxp is stopped/restarted, this service stops too.

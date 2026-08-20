@@ -4,10 +4,11 @@
 Brings up:
   1. twist_to_setpoint_node   — streams /mavros/setpoint_raw/local at 50 Hz
   2. rpp_controller_node      — computes /rpp/velocity_ned at 50 Hz
-  3. spray_controller_node    — drives PX4 actuator-set AUX output from /spray/active
-  4. xtrack_logger_node       — captures CSV for offline tuning analysis
-  5. path_publisher_node      — optional requested test path publisher
-  6. mission_runner_node      — drives OFFBOARD lifecycle (off by default)
+  3. spray_safety_watchdog    — independently forces AUX OFF on stale controller lease
+  4. spray_controller_node    — drives PX4 actuator-set AUX output from /spray/active
+  5. xtrack_logger_node       — captures CSV for offline tuning analysis
+  6. path_publisher_node      — optional requested test path publisher
+  7. mission_runner_node      — drives OFFBOARD lifecycle (off by default)
 
 This launch file uses ExecuteProcess directly because the repo is not yet
 packaged as a colcon ament_python package. When you create a package later,
@@ -107,6 +108,8 @@ def _build(context, *args, **kwargs):
         "segment_stop_yaw_rate_threshold", "segment_stop_dwell_s",
         "segment_brake_velocity_cap_m_s", "segment_align_settle_s",
         "segment_align_speed_threshold",
+        "require_rtk_fix", "rtk_fix_timeout_s", "rtk_require_accuracy",
+        "rtk_max_hrms_m", "rtk_recover_hold_s",
     ):
         val = LaunchConfiguration(name).perform(context)
         if val != "__unset__":
@@ -158,6 +161,16 @@ def _build(context, *args, **kwargs):
         emulate_tty=True,
     )
 
+    spray_watchdog_proc = ExecuteProcess(
+        cmd=_node_cmd(
+            os.path.join(src_dir, "spray_safety_watchdog_node.py"),
+            log_level,
+        ),
+        name="spray_safety_watchdog",
+        output="screen",
+        emulate_tty=True,
+    )
+
     path_proc = ExecuteProcess(
         cmd=_node_cmd(
             os.path.join(src_dir, "path_publisher_node.py"),
@@ -187,7 +200,10 @@ def _build(context, *args, **kwargs):
         # Phase 1: streamer + controller + logger come up together
         twist_proc,
         rpp_proc,
-        spray_proc,
+        spray_watchdog_proc,
+        # Never start the ON-capable controller before the independent OFF
+        # authority has had time to initialize and publish its heartbeat.
+        TimerAction(period=0.5, actions=[spray_proc]),
         xtrack_proc,
     ]
 
@@ -250,5 +266,10 @@ def generate_launch_description():
         DeclareLaunchArgument("segment_brake_velocity_cap_m_s",        default_value="__unset__"),
         DeclareLaunchArgument("segment_align_settle_s",                default_value="__unset__"),
         DeclareLaunchArgument("segment_align_speed_threshold",         default_value="__unset__"),
+        DeclareLaunchArgument("require_rtk_fix",                       default_value="__unset__"),
+        DeclareLaunchArgument("rtk_fix_timeout_s",                     default_value="__unset__"),
+        DeclareLaunchArgument("rtk_require_accuracy",                  default_value="__unset__"),
+        DeclareLaunchArgument("rtk_max_hrms_m",                        default_value="__unset__"),
+        DeclareLaunchArgument("rtk_recover_hold_s",                    default_value="__unset__"),
         OpaqueFunction(function=_build),
     ])

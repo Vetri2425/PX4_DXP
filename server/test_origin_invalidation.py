@@ -104,6 +104,17 @@ def _bare_node():
     return node
 
 
+def test_gpsraw_horizontal_accuracy_is_exposed_in_metres_and_unknown_is_none():
+    node = _bare_node()
+    msg = types.SimpleNamespace(fix_type=6, satellites_visible=29, h_acc=15)
+    node._cb_gps_raw(msg)
+    assert node._state["gps_h_acc_m"] == 0.015
+
+    msg.h_acc = 0
+    node._cb_gps_raw(msg)
+    assert node._state["gps_h_acc_m"] is None
+
+
 ORIGIN_A = (13.0720437, 80.2619664)   # the 14:39 EKF session (from the bags)
 ORIGIN_B = (13.0720521, 80.2619705)   # the post-reboot session (15:10 declared)
 

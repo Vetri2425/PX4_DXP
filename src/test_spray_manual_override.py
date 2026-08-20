@@ -276,6 +276,10 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "require_offboard": _Param(require_offboard),
         "active_timeout_s": _Param(0.5),
         "manual_override_timeout_s": _Param(10.0),
+        # Most unit tests exercise controller-local logic without starting the
+        # independent process. Dedicated lease tests turn this gate on.
+        "spray_watchdog_required": _Param(False),
+        "spray_watchdog_timeout_s": _Param(1.0),
         "use_distance_aware_spray": _Param(False),
         "nozzle_forward_offset_m": _Param(0.0),
         "nozzle_lateral_offset_m": _Param(0.0),
@@ -307,7 +311,8 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
         "spray_require_rtk_fix": _Param(False),
         "spray_min_fix_type": _Param(6),
         "spray_max_hrms_m": _Param(0.10),
-        "gps_fix_timeout_s": _Param(2.0),
+        "spray_require_accuracy": _Param(True),
+        "gps_fix_timeout_s": _Param(0.5),
         "gps_recover_hold_s": _Param(1.0),
         "point_arrival_max_speed_mps": _Param(0.05),
         "point_arrival_timeout_s": _Param(60.0),
@@ -346,6 +351,7 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._debug_pub = _Pub()
     node._manual_state_pub = _Pub()
     node._status_pub = _StringPub()
+    node._safety_lease_pub = _StringPub()
     node._desired_raw = False
     # Last path station for the projection-continuity window; None = acquire
     # globally, which is what a freshly-built node must do.
@@ -361,6 +367,8 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._armed = armed
     node._mode = mode
     node._service_ready = True
+    node._spray_watchdog_recv_time = None
+    node._spray_watchdog_service_ready = False
     # Actuator FSM (Spray Controller V2 §4), pre-advanced past the startup
     # OFF handshake so tests start from a known-confirmed-off baseline —
     # replaces the old _commanded/_off_confirmed/_cmd_seq bookkeeping.
@@ -390,6 +398,7 @@ def make_node(armed=True, mode="OFFBOARD", require_offboard=True):
     node._flow_source = "n/a"
     # Phase B RTK gate state.
     node._gps_fix_type = 0
+    node._gps_h_acc_m = None
     node._gps_recv_time = None
     node._gps_recover_since = None
     node._last_decision = None

@@ -199,6 +199,10 @@ class RosBridgeNode(Node):
         "alt": 0.0,
         "gps_fix": 0,
         "gps_sat": 0,
+        # GPSRAW.h_acc converted from mm. This is the exact accuracy source
+        # used by RPP/spray safety gates; None means the receiver reported 0
+        # (unknown) or the field was unavailable.
+        "gps_h_acc_m": None,
         # A14: None = "not reported yet / not trustworthy", never 0.0. A zero
         # here is indistinguishable from a perfect fix.
         "hrms": None,
@@ -733,10 +737,16 @@ class RosBridgeNode(Node):
         if health.status == INCONSISTENT:
             log.warning("origin re-request reason: %s", health.detail)
     def _cb_gps_raw(self, msg) -> None:
+        try:
+            h_acc_mm = int(msg.h_acc)
+            h_acc_m = h_acc_mm * 1e-3 if h_acc_mm > 0 else None
+        except (AttributeError, TypeError, ValueError):
+            h_acc_m = None
         with self._lock:
             self._gps_fix_recv_time = time.monotonic()
             self._state["gps_fix"] = msg.fix_type
             self._state["gps_sat"] = msg.satellites_visible
+            self._state["gps_h_acc_m"] = h_acc_m
             self._state["gps_fix_received"] = True
 
     def _cb_rpp_debug(self, msg: Float32MultiArray) -> None:

@@ -85,13 +85,16 @@
   - `After=network.target network-online.target dev-ttyACM0.device`
   - FIFO scheduling on CPU core 4 (latency reduction)
   - `ROS_DOMAIN_ID=0`
-  - Loads NTRIP credentials from `config/ntrip.env`
   - `Restart=always`, `RestartSec=10`
   - `PartOf=rpp-pipeline.service` (cascading restart)
 
 ### `px4_start_service.sh`
 - **Path:** `px4_start_service.sh`
 - **Role:** Launches MAVROS with a watchdog (auto-restart on crash)
+
+NTRIP is intentionally owned by `rover-server`, not `px4-dxp`. The backend
+loads `config/ntrip.env`, autostarts `ntrip_rtcm_node.py`, and supervises child
+exits without dropping MAVROS or the QGC bridge.
 - **Key MAVROS launch command (line 91-100):**
   ```bash
   ros2 launch mavros node.launch \

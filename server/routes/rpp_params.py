@@ -198,7 +198,37 @@ RPP_PARAM_SCHEMA: dict[str, dict] = {
         "type": "bool",
         "default": True,
         "group": "Safety",
-        "description": "Gate: refuse non-zero velocity unless GPS fix_type = 6 (RTK_FIXED). Set false for SITL",
+        "description": "Master RTK quality gate. Refuse non-zero velocity unless GPS is fresh, RTK_FIXED, and accurate. Set false only for SITL/bench",
+    },
+    "rtk_fix_timeout_s": {
+        "type": "float",
+        "default": 0.5,
+        "group": "Safety",
+        "description": "Maximum age of the latest GPSRAW sample before driving stops",
+        "min": 0.1,
+        "max": 5.0,
+    },
+    "rtk_require_accuracy": {
+        "type": "bool",
+        "default": True,
+        "group": "Safety",
+        "description": "Fail closed when GPSRAW horizontal accuracy is unavailable",
+    },
+    "rtk_max_hrms_m": {
+        "type": "float",
+        "default": 0.10,
+        "group": "Safety",
+        "description": "Maximum reported GPS horizontal accuracy for driving (m); 0 disables only the upper limit",
+        "min": 0.0,
+        "max": 2.0,
+    },
+    "rtk_recover_hold_s": {
+        "type": "float",
+        "default": 1.0,
+        "group": "Safety",
+        "description": "Continuous good-RTK hold time required before driving resumes",
+        "min": 0.0,
+        "max": 10.0,
     },
     # ── Predictive Curvature (P1.1) ───────────────────────────────────────────
     "preview_curvature_n": {

@@ -54,7 +54,10 @@ ENTRY_SKIP_DIST_M = 0.20
 # direction, so any large turn happens in free space and the final leg arrives
 # collinear with the mark. Field baseline without it: the rover arrives
 # 140-180 deg wrong and pivots 7-13 s ON the start point, walking 0.6-4.8 cm.
-ENTRY_STAGING_ENABLED = os.environ.get("ROVER_ENTRY_STAGING", "1").lower() not in (
+# Fail closed: this manoeuvre was disabled after the 2026-08-03 field incident.
+# A clean install/reimage must never silently re-enable it; a reviewed field
+# trial may opt in explicitly with ROVER_ENTRY_STAGING=1.
+ENTRY_STAGING_ENABLED = os.environ.get("ROVER_ENTRY_STAGING", "0").lower() not in (
     "0", "false", "no",
 )
 ENTRY_STAGING_DIST_M = float(os.environ.get("ROVER_ENTRY_STAGING_DIST_M", "1.2"))

@@ -24,9 +24,9 @@ Sprint 1 upgrades vs baseline
         is now live (was dead constant before).
   P0.2  EKF / RTK jump detection: position jumps > physically-possible motion
         pause one control cycle and do not inject a spike into the controller.
-  P0.3  RTK FIX gate: refuses to command non-zero velocity unless GPS
-        fix_type = 6 (RTK_FIXED). Gated by `require_rtk_fix` parameter so
-        SITL / non-RTK testing still works.
+  P0.3  RTK quality gate: refuses non-zero velocity unless GPSRAW is fresh,
+        fix_type = 6 (RTK_FIXED), and reported horizontal accuracy is within
+        limit. Gated by `require_rtk_fix` for SITL / non-RTK testing.
   P1.4  Segment search hint (_closest_seg_hint): projection search starts from
         the previous closest segment instead of i=0 every cycle. O(1) in
         steady state instead of O(n).
@@ -163,6 +163,10 @@ Topic:  /rpp/debug   (std_msgs/Float32MultiArray, layout encoded below)
         [49] accel_scale          (Patch 2: SBS upward-accel gate 0..1)
         [50] speed_mode           (Patch 2: 0 accel/SBS, 1 normal decel slew,
                                    2 hard/legacy immediate decel, 3 approach/P4)
+        [51] rtk_fix_timeout_s
+        [52] rtk_require_accuracy (param — 0/1 boolean)
+        [53] rtk_max_hrms_m
+        [54] rtk_recover_hold_s
 Layout is append-only: indices [0..7] keep their meaning forever. Consumers
 that only read [0..7] continue to work.
 
@@ -204,6 +208,7 @@ from mission_progress import (
     ProgressMsg,
 )
 from mission_progress_ros import qos_profile
+from rtk_quality import GPS_FIX_NAMES, evaluate_rtk_quality
 
 
 # ---------------------------------------------------------------------------
@@ -476,8 +481,13 @@ class RPPControllerNode(Node):
         self.declare_parameter("ekf_reset_max_absorb_m",             0.30)
 
         # P0.3 — RTK FIX gate
-        # fix_type = 6 → RTK_FIXED.  Set false for SITL or non-RTK testing.
+        # Fresh fix_type=6 plus known, bounded h_acc is required. Set the
+        # master false only for SITL/non-RTK bench testing.
         self.declare_parameter("require_rtk_fix",                     True)
+        self.declare_parameter("rtk_fix_timeout_s",                   0.5)
+        self.declare_parameter("rtk_require_accuracy",                True)
+        self.declare_parameter("rtk_max_hrms_m",                      0.10)
+        self.declare_parameter("rtk_recover_hold_s",                  1.0)
 
         # P1.1 — Predictive curvature regulation
         # Number of look-ahead probe points used to find the worst κ in front
@@ -1149,6 +1159,9 @@ class RPPControllerNode(Node):
 
         # P0.3 — RTK fix tracking
         self._gps_fix_type: int = 0  # 0 = no fix; 6 = RTK_FIXED
+        self._gps_h_acc_m: float | None = None
+        self._gps_recv_time: RclTime | None = None
+        self._rtk_recover_since: RclTime | None = None
 
         # ------------------------------------------------------------------
         # QoS profiles
@@ -1425,16 +1438,51 @@ class RPPControllerNode(Node):
 
     # P0.3 — RTK fix gate callback
     def _gps_cb(self, msg: GPSRAW):
-        """Track GPS fix type. fix_type=6 → RTK_FIXED (required for marking)."""
+        """Track GPS fix, receive freshness, and GPSRAW h_acc (millimetres)."""
         prev = self._gps_fix_type
-        self._gps_fix_type = msg.fix_type
-        if prev != msg.fix_type:
-            fix_names = {0: "NO_FIX", 1: "NO_FIX", 2: "2D", 3: "3D",
-                         4: "DGPS", 5: "RTK_FLOAT", 6: "RTK_FIXED"}
+        self._gps_fix_type = int(msg.fix_type)
+        self._gps_recv_time = self.get_clock().now()
+        try:
+            h_acc_mm = int(msg.h_acc)
+            self._gps_h_acc_m = h_acc_mm * 1e-3 if h_acc_mm > 0 else None
+        except (AttributeError, TypeError, ValueError):
+            self._gps_h_acc_m = None
+        if prev != self._gps_fix_type:
             self.get_logger().info(
-                f"GPS fix changed: {fix_names.get(prev,'?')} → "
-                f"{fix_names.get(msg.fix_type,'?')} (fix_type={msg.fix_type})"
+                f"GPS fix changed: {GPS_FIX_NAMES.get(prev,'?')} → "
+                f"{GPS_FIX_NAMES.get(self._gps_fix_type,'?')} "
+                f"(fix_type={self._gps_fix_type})"
             )
+
+    def _rtk_gate(self) -> tuple[bool, str]:
+        """Fail-safe RTK quality gate with immediate drop and slow recovery."""
+        age_s = None
+        now = self.get_clock().now()
+        if self._gps_recv_time is not None:
+            age_s = (now - self._gps_recv_time).nanoseconds * 1e-9
+        quality = evaluate_rtk_quality(
+            fix_type=self._gps_fix_type,
+            h_acc_m=self._gps_h_acc_m,
+            sample_age_s=age_s,
+            timeout_s=float(self.get_parameter("rtk_fix_timeout_s").value),
+            min_fix_type=6,
+            max_h_acc_m=float(self.get_parameter("rtk_max_hrms_m").value),
+            require_accuracy=bool(self.get_parameter("rtk_require_accuracy").value),
+        )
+        if not quality.acceptable:
+            self._rtk_recover_since = None
+            return False, quality.reason
+
+        hold_s = max(0.0, float(self.get_parameter("rtk_recover_hold_s").value))
+        if self._rtk_recover_since is None:
+            self._rtk_recover_since = now
+        held_s = (now - self._rtk_recover_since).nanoseconds * 1e-9
+        if held_s < 0.0:
+            self._rtk_recover_since = now
+            held_s = 0.0
+        if held_s < hold_s:
+            return False, f"gps recovering ({held_s:.1f}/{hold_s:.1f}s)"
+        return True, ""
 
     # P2.4 — Velocity callback for pose extrapolation
     def _vel_cb(self, msg):
@@ -4969,11 +5017,17 @@ class RPPControllerNode(Node):
                     f"Δned=({d_n*100:+.2f},{d_e*100:+.2f}) cm"
                 )
 
-        # ---- P0.3: RTK FIX gate ----
-        if req_rtk and self._gps_fix_type < 6:
+        # ---- P0.3: RTK quality gate ----
+        if req_rtk:
+            rtk_ok, rtk_reason = self._rtk_gate()
+        else:
+            # Re-enabling the production gate must earn a new recovery hold.
+            self._rtk_recover_since = None
+            rtk_ok, rtk_reason = True, ""
+        if not rtk_ok:
             self.get_logger().warn(
-                f"GPS fix_type={self._gps_fix_type} (need 6=RTK_FIXED) — "
-                "refusing to drive. Set require_rtk_fix:=false for SITL.",
+                f"RTK gate: {rtk_reason} — refusing to drive. "
+                "Set require_rtk_fix:=false only for SITL/bench.",
                 throttle_duration_sec=2.0,
             )
             # B2: emit RTK_WAIT (4) so observers can distinguish "no GPS fix"
@@ -6098,7 +6152,7 @@ class RPPControllerNode(Node):
         self._publish_spray_active(spray_active)
         msg = Float32MultiArray()
         msg.layout.dim.append(MultiArrayDimension(label="rpp_debug",
-                                                  size=51, stride=51))
+                                                  size=55, stride=55))
 
         # ---- Snapshot all parameters once for this cycle ----
         p_max_linear_vel = float(self.get_parameter("max_linear_vel").value)
@@ -6136,6 +6190,10 @@ class RPPControllerNode(Node):
         p_segment_acceptance = float(self.get_parameter("segment_corner_acceptance_radius").value)
         p_segment_heading_tol = float(self.get_parameter("segment_heading_tolerance_deg").value)
         p_segment_yaw_gain = float(self.get_parameter("segment_yaw_rate_gain").value)
+        p_rtk_timeout = float(self.get_parameter("rtk_fix_timeout_s").value)
+        p_rtk_require_accuracy = 1.0 if self.get_parameter("rtk_require_accuracy").value else 0.0
+        p_rtk_max_hrms = float(self.get_parameter("rtk_max_hrms_m").value)
+        p_rtk_recover_hold = float(self.get_parameter("rtk_recover_hold_s").value)
 
         msg.data = [
             float(cross_track),        # [0]  cross_track_error_m, signed
@@ -6189,6 +6247,10 @@ class RPPControllerNode(Node):
             float(v_lat_limit),        # [48] v_lat_limit
             float(accel_scale),        # [49] accel_scale
             float(speed_mode),         # [50] speed_mode
+            p_rtk_timeout,             # [51] rtk_fix_timeout_s
+            p_rtk_require_accuracy,    # [52] rtk_require_accuracy
+            p_rtk_max_hrms,            # [53] rtk_max_hrms_m
+            p_rtk_recover_hold,        # [54] rtk_recover_hold_s
         ]
         self._dbg_pub.publish(msg)
 

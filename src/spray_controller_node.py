@@ -68,6 +68,8 @@ from spray_session_config import (
     parse_session_config,
 )
 from spray_status import make_status, status_to_json_safe
+from spray_safety_lease import SpraySafetyLease, lease_to_json
+from rtk_quality import GPS_FIX_NAMES, evaluate_rtk_quality
 
 
 MAV_CMD_DO_SET_ACTUATOR = 187
@@ -125,10 +127,7 @@ _RPP_IN_MARK_PHASES = frozenset({MissionPhase.MARK_TRACKING, MissionPhase.MARK_E
 
 # GPSRAW.fix_type → human name (Phase B RTK gate, §7.6). Same mapping the RPP
 # node's P0.3 gate uses. 6 = RTK_FIXED (the marking bar), 5 = RTK_FLOAT.
-_GPS_FIX_NAMES = {
-    0: "NO_FIX", 1: "NO_FIX", 2: "2D", 3: "3D",
-    4: "DGPS", 5: "RTK_FLOAT", 6: "RTK_FIXED",
-}
+_GPS_FIX_NAMES = GPS_FIX_NAMES
 
 
 def _best_effort_qos(depth: int = 1) -> QoSProfile:
@@ -844,6 +843,12 @@ class SprayControllerNode(Node):
         self.declare_parameter("active_timeout_s", 0.5)
         self.declare_parameter("manual_override_timeout_s", 10.0)
         self.declare_parameter("command_service", "/mavros/cmd/command")
+        # Reciprocal half of the independent fail-closed contract. The
+        # controller may lease ON only while the separate watchdog proves it is
+        # alive and can reach MAVROS. This covers a frozen watchdog process,
+        # which a PID-only shell supervisor cannot detect.
+        self.declare_parameter("spray_watchdog_required", True)
+        self.declare_parameter("spray_watchdog_timeout_s", 1.0)
         self.declare_parameter("use_distance_aware_spray", True)
         self.declare_parameter("nozzle_forward_offset_m", 0.0)
         self.declare_parameter("nozzle_lateral_offset_m", 0.0)
@@ -977,8 +982,8 @@ class SprayControllerNode(Node):
         # the driving controller uses. Lower to 5 for RTK_FLOAT sites.
         self.declare_parameter("spray_min_fix_type", 6)
         # A missing GPSRAW is a FAIL ("gps stale"), never "fix ok, just quiet".
-        # Looser than the 0.5 s pose/velocity gates because GPSRAW is slower.
-        self.declare_parameter("gps_fix_timeout_s", 2.0)
+        # Keep this aligned with the 0.5 s drive/pose safety gates.
+        self.declare_parameter("gps_fix_timeout_s", 0.5)
         # Asymmetric hysteresis: drop is instant (unsafe edge, no debounce);
         # re-enable only after fix has been continuously good this long.
         self.declare_parameter("gps_recover_hold_s", 1.0)
@@ -987,13 +992,10 @@ class SprayControllerNode(Node):
         # it was discarded — so an RTK_FIXED claim opened the valve regardless
         # of the reported error. This is the accuracy half of the gate.
         #
-        # FALLBACK BY DESIGN, which is why it ships ON: h_acc == 0 is the
-        # driver's "unknown" sentinel (~half of boots on this hardware report
-        # it, latched per boot — see A14), and refusing on unknown would ground
-        # the rover for reasons unrelated to safety. So: when accuracy IS
-        # reported, enforce it; when it is NOT, behave exactly as before. That
-        # is strictly safer than today on every boot that reports, and
-        # byte-identical on every boot that does not.
+        # Production fails closed when h_acc is unknown. The explicit escape
+        # hatch exists for SITL/bench or a confirmed driver limitation; it must
+        # never be silently inferred from h_acc == 0.
+        self.declare_parameter("spray_require_accuracy", True)
         # Default 0.10 m ≈ 6x the 1.4–1.6 cm an RTK_FIXED solution measures on
         # this rig, so it only trips on a genuinely degraded fix that is still
         # claiming fix_type 6. Set 0 to disable the accuracy half entirely.
@@ -1040,6 +1042,8 @@ class SprayControllerNode(Node):
         self._armed = False
         self._mode = "UNKNOWN"
         self._service_ready = False
+        self._spray_watchdog_recv_time = None
+        self._spray_watchdog_service_ready = False
         # Actuator command state machine (Spray Controller V2 §4). Replaces
         # the scattered _commanded/_off_confirmed/_cmd_seq booleans and the
         # old flat-500ms retry throttle in _maybe_retry_off/_force_off — the
@@ -1175,6 +1179,18 @@ class SprayControllerNode(Node):
         # removed or renamed.
         self._status_pub = self.create_publisher(
             String, "/spray/status", _best_effort_qos()
+        )
+        # Independent-process fail-closed contract.  This is VOLATILE on
+        # purpose: a restarted watchdog must never receive a latched old ON.
+        self._safety_lease_pub = self.create_publisher(
+            String, "/spray/safety_lease", _best_effort_qos()
+        )
+        self.create_subscription(
+            String,
+            "/spray/safety_watchdog_status",
+            self._spray_watchdog_status_cb,
+            _best_effort_qos(),
+            callback_group=self._group,
         )
         # G4 — point-handshake completion (spray → RPP). RELIABLE VOLATILE depth 10
         # (mp.POINT_DONE_QOS): must arrive so the RPP advances, but never
@@ -1341,7 +1357,42 @@ class SprayControllerNode(Node):
             # cannot resume ON without a fresh, safety-gated manual command.
             self._manual_active = False
             self._manual_deadline_ns = None
-        self._drive_fsm_tick("state changed")
+            self._drive_fsm_tick("state changed")
+
+    def _spray_watchdog_status_cb(self, msg: String) -> None:
+        """Accept only an explicit healthy heartbeat from the OFF authority."""
+        was_ok, _ = self._spray_watchdog_peer_status()
+        try:
+            data = json.loads(msg.data)
+            if not isinstance(data, dict):
+                raise ValueError("status must be a JSON object")
+            alive = data.get("watchdog_alive") is True
+            service_ready = data.get("command_service_ready") is True
+            off_authority_ready = data.get("off_authority_ready") is True
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.get_logger().error(
+                f"invalid spray watchdog status: {exc}",
+                throttle_duration_sec=1.0,
+            )
+            self._spray_watchdog_recv_time = self.get_clock().now()
+            self._spray_watchdog_service_ready = False
+            if was_ok:
+                self._drive_fsm_tick("invalid spray watchdog heartbeat")
+            return
+        if not alive:
+            self._spray_watchdog_recv_time = self.get_clock().now()
+            self._spray_watchdog_service_ready = False
+            if was_ok:
+                self._drive_fsm_tick("spray watchdog reports not alive")
+            return
+        self._spray_watchdog_recv_time = self.get_clock().now()
+        self._spray_watchdog_service_ready = bool(
+            service_ready and off_authority_ready
+        )
+        now_ok, reason = self._spray_watchdog_peer_status()
+        if was_ok and not now_ok:
+            self.get_logger().warn(f"spray watchdog became unsafe: {reason}")
+            self._drive_fsm_tick("spray watchdog unhealthy")
 
     def _active_cb(self, msg: Bool) -> None:
         now = self.get_clock().now()
@@ -2093,6 +2144,25 @@ class SprayControllerNode(Node):
                 f"(fix_type={self._gps_fix_type})"
             )
 
+    def _gps_quality(self):
+        """Return the shared, ROS-independent verdict for the latest sample."""
+        age_s = None
+        if self._gps_recv_time is not None:
+            age_s = (
+                self.get_clock().now() - self._gps_recv_time
+            ).nanoseconds * 1e-9
+        return evaluate_rtk_quality(
+            fix_type=self._gps_fix_type,
+            h_acc_m=self._gps_h_acc_m,
+            sample_age_s=age_s,
+            timeout_s=float(self.get_parameter("gps_fix_timeout_s").value),
+            min_fix_type=int(self.get_parameter("spray_min_fix_type").value),
+            max_h_acc_m=float(self.get_parameter("spray_max_hrms_m").value),
+            require_accuracy=bool(
+                self.get_parameter("spray_require_accuracy").value
+            ),
+        )
+
     def _gps_health(self) -> tuple[bool, bool, str]:
         """Pure read of GPS health: (fresh, fix_ok, name). No state mutation.
 
@@ -2100,23 +2170,13 @@ class SprayControllerNode(Node):
         recover-hold timer. `fix_ok` is the instantaneous "fix_type >= min AND
         fresh" check; the recover-hold delay lives only in _gps_gate().
         """
-        name = _GPS_FIX_NAMES.get(self._gps_fix_type, f"fix_{self._gps_fix_type}")
-        if self._gps_recv_time is None:
-            return False, False, "no_data"
-        age_s = (self.get_clock().now() - self._gps_recv_time).nanoseconds * 1e-9
-        timeout_s = max(0.0, float(self.get_parameter("gps_fix_timeout_s").value))
-        if age_s > timeout_s:
-            return False, False, name
-        min_fix = int(self.get_parameter("spray_min_fix_type").value)
-        if self._gps_fix_type < min_fix:
-            return True, False, name
-        # A14 accuracy half. Only enforced when the receiver actually reported
-        # an accuracy; an unreported one leaves the pre-A14 behaviour intact.
-        max_hrms = float(self.get_parameter("spray_max_hrms_m").value)
-        h_acc = self._gps_h_acc_m
-        if max_hrms > 0.0 and h_acc is not None and h_acc > max_hrms:
-            return True, False, f"{name}_hacc_{h_acc:.3f}m"
-        return True, True, name
+        quality = self._gps_quality()
+        name = quality.fix_name if quality.fresh else (
+            "no_data" if self._gps_recv_time is None else quality.fix_name
+        )
+        if quality.fresh and not quality.acceptable and "accuracy" in quality.reason:
+            name = f"{name}_hacc_invalid"
+        return quality.fresh, quality.acceptable, name
 
     def _gps_gate(self) -> tuple[bool, str]:
         """RTK gate with asymmetric hysteresis (§7.6). Mutates the recover timer.
@@ -2127,15 +2187,16 @@ class SprayControllerNode(Node):
         re-open spray. Call exactly once per control tick.
         """
         if not bool(self.get_parameter("spray_require_rtk_fix").value):
+            # Re-enabling the production gate must earn a new recovery hold.
+            self._gps_recover_since = None
             return True, ""
-        fresh, fix_ok, _name = self._gps_health()
-        if not fresh:
+        quality = self._gps_quality()
+        if not quality.fresh:
             self._gps_recover_since = None  # any stale sample resets recovery
             return False, "gps stale"
-        if not fix_ok:
+        if not quality.acceptable:
             self._gps_recover_since = None  # any bad fix resets recovery
-            min_fix = int(self.get_parameter("spray_min_fix_type").value)
-            return False, f"gps fix {self._gps_fix_type} < required {min_fix}"
+            return False, quality.reason
         # Fix is good this sample — apply the slow re-enable.
         now = self.get_clock().now()
         if self._gps_recover_since is None:
@@ -2258,6 +2319,9 @@ class SprayControllerNode(Node):
             return False
         if not self._armed:
             return False
+        watchdog_ok, _ = self._spray_watchdog_peer_status()
+        if not watchdog_ok:
+            return False
         if self._manual_active:
             # Manual bench-test: armed is sufficient. OFFBOARD is enforced for
             # autonomous spray only — cmd 187 is accepted in any armed mode.
@@ -2281,6 +2345,9 @@ class SprayControllerNode(Node):
         """
         if not self._armed:
             return False, "disarmed"
+        watchdog_ok, watchdog_reason = self._spray_watchdog_peer_status()
+        if not watchdog_ok:
+            return False, watchdog_reason
         if self._manual_active:
             return True, ""
         if bool(self.get_parameter("use_distance_aware_spray").value):
@@ -2290,6 +2357,23 @@ class SprayControllerNode(Node):
         require_offboard = bool(self.get_parameter("require_offboard").value)
         if require_offboard and self._mode != "OFFBOARD":
             return False, "not OFFBOARD"
+        return True, ""
+
+    def _spray_watchdog_peer_status(self) -> tuple[bool, str]:
+        if not bool(self.get_parameter("spray_watchdog_required").value):
+            return True, ""
+        if self._spray_watchdog_recv_time is None:
+            return False, "spray safety watchdog heartbeat missing"
+        timeout_s = max(
+            0.1, float(self.get_parameter("spray_watchdog_timeout_s").value)
+        )
+        age_s = (
+            self.get_clock().now() - self._spray_watchdog_recv_time
+        ).nanoseconds * 1e-9
+        if age_s > timeout_s:
+            return False, f"spray safety watchdog stale ({age_s:.2f}s)"
+        if not self._spray_watchdog_service_ready:
+            return False, "spray safety watchdog has not confirmed OFF authority"
         return True, ""
 
     def _drive_fsm_tick(self, reason: str) -> None:
@@ -2309,6 +2393,42 @@ class SprayControllerNode(Node):
         self._publish_actuator_state()
         self._publish_desired_state(desired)
         self._publish_status(desired, safety_ok, safety_reason)
+        self._publish_safety_lease(desired, safety_ok, enabled)
+
+    def _publish_safety_lease(
+        self, desired: bool, safety_ok: bool, enabled: bool
+    ) -> None:
+        """Lease ON only while this process is alive and its full gate is valid.
+
+        The separate spray_safety_watchdog process sends OFF when this stream is
+        false or stale.  ON_PENDING is included so an OFF watchdog command does
+        not race the controller's freshly-dispatched ON while MAVROS returns its
+        acknowledgement.
+        """
+        set_index = int(self.get_parameter("actuator_set_index").value)
+        if not 1 <= set_index <= 6:
+            set_index = 1  # exactly matches _build_actuator_request fallback
+        backend = str(self.get_parameter("actuator_backend").value)
+        if backend not in ("mavlink_actuator", "mavlink_servo_pwm"):
+            # The controller's unknown-backend fallback sends servo OFF. Never
+            # grant an ON lease for a configuration that cannot be interpreted.
+            backend = "mavlink_servo_pwm"
+            desired = False
+            safety_ok = False
+        lease = SpraySafetyLease(
+            allow_on=bool(
+                desired and safety_ok and enabled and self._fsm.commanded
+            ),
+            command_seq=int(self._fsm.cmd_seq),
+            backend=backend,
+            actuator_set_index=set_index,
+            off_value=float(self.get_parameter("off_value").value),
+            servo_instance=int(self.get_parameter("servo_instance").value),
+            off_pwm_us=int(self.get_parameter("off_pwm_us").value),
+        )
+        msg = String()
+        msg.data = lease_to_json(lease)
+        self._safety_lease_pub.publish(msg)
 
     def _dispatch_command(self, cmd: Optional[SprayCommand], reason: str) -> None:
         """Send an FSM-issued SprayCommand to MAVROS.
@@ -2618,6 +2738,8 @@ class SprayControllerNode(Node):
         self._candidate_count = 0
         self._manual_active = False
         self._manual_deadline_ns = None
+        # Revoke the external ON lease before dispatching the shutdown OFF.
+        self._publish_safety_lease(False, False, False)
         # Reset any RECOVERY backoff so the shutdown OFF is retried
         # immediately: without this, if the FSM is mid-RECOVERY (a prior OFF
         # ack failed) its backoff deadline (up to backoff_max_s = 5 s) can

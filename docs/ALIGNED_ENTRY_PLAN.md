@@ -18,8 +18,11 @@ rover was about to drive anyway." **False when parked down-line** — exactly th
 anti-parallel case the feature was built for. The maneuver needs ground clearance
 the system cannot see and the operator was never asked about.
 
-Disabled via systemd drop-in `/etc/systemd/system/rover-server.service.d/entry-staging.conf`
-(`ROVER_ENTRY_STAGING=0`). Code stays in tree; unit tests keep it honest.
+Disabled in source by default (`ROVER_ENTRY_STAGING` defaults to `0`) and also
+disabled by the existing systemd drop-in
+`/etc/systemd/system/rover-server.service.d/entry-staging.conf`. Code stays in
+tree for controlled testing; re-enable only with an explicit
+`ROVER_ENTRY_STAGING=1` override after the plan's field gate passes.
 
 **Re-enable requires ALL of:**
 1. App draws the full entry route (including the staging detour) BEFORE start, and

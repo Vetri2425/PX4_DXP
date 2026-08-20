@@ -160,9 +160,11 @@ Auto-off layers (all independent): server timer (≤10 s) → node
 3. **Fail-safe checks** (each must drop spray OFF immediately):
    - Disarm mid-test (QGC or RC).
    - `{"on": false}` mid-test.
-   - `ssh flash@192.168.1.102 'pkill -f spray_controller_node'` mid-test — watchdog in
-     `rpp_start.sh` restarts it; pin falls to OFF (node shutdown sends OFF; restarted
-     node never replays the stale override — volatile QoS).
+   - `ssh flash@192.168.1.102 'pkill -9 -f spray_controller_node'` mid-test — the
+     independent `spray_safety_watchdog_node` must force the pin OFF within the
+     0.35 s lease timeout even though the controller cannot run shutdown cleanup;
+     `rpp_start.sh` then restarts the controller without replaying the stale
+     override (volatile QoS).
 4. **Mission-path check:** load a path with mixed MARK/TRANSIT flags, run it, and
    verify `marking_state` flips at segment boundaries; confirm
    `POST /spray/test {"on": true}` returns 409 while RUNNING.
@@ -181,6 +183,7 @@ Auto-off layers (all independent): server timer (≤10 s) → node
 | **Firmware** | DISARMED/FAILSAFE PWM = OFF — disarm kills spray in every mode, no software needed |
 | **Node fail-safes** | Disarm or mode ≠ OFFBOARD (`require_offboard`, default true) → force OFF and **clear any manual override**; node shutdown sends a final OFF |
 | **Node watchdogs** | `/spray/active` stale > `active_timeout_s` (0.5 s) → auto desire OFF (manual has its own clock); manual expiry `manual_override_timeout_s` (10 s) — an override can never latch |
+| **Independent actuator watchdog** | `/spray/safety_lease` must stay fresh while ON; false/malformed/missing/stale > 0.35 s causes a separate process to send OFF. Safety edges request a 20 Hz OFF burst for 1.5 s (actual rate is bounded by MAVROS acknowledgements), then retry at 2 Hz. |
 | **Server gates** | Manual ON refused while mission RUNNING or disarmed; duration clamped ≤ 10 s with auto-off task |
 | **Data fail-safe** | Unknown/legacy paths (no z-flags) read as all-OFF at the controller; flag length mismatches force OFF |
 
@@ -200,4 +203,5 @@ Auto-off layers (all independent): server timer (≤10 s) → node
 | ON but drops after ~0.5 s during a mission | `/spray/active` stale — is `rpp_controller_node` alive? |
 | ON but drops after 10 s on bench | Expected — node-side manual expiry; re-issue the test |
 | `manual_override` stays false after POST 200 | `/spray/manual_state` not reaching server — check both nodes share `ROS_DOMAIN_ID=0` |
+| Spray drops while controller reports ON | Check `ros2 topic echo /spray/safety_watchdog_status --once`; stale/invalid lease always wins and forces OFF |
 | Spray inverted | Swap MIN/MAX in QGC or set `on_value`/`off_value` to ∓1.0 |

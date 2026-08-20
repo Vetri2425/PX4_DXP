@@ -639,6 +639,10 @@ async def _telemetry_loop() -> None:
                     "hrms": s.get("hrms"),
                     "vrms": s.get("vrms"),
                     "gps_accuracy_known": s.get("gps_accuracy_known"),
+                    # Exact GPSRAW accuracy used by the drive/spray gates.
+                    # This is distinct from NavSatFix covariance-derived hrms.
+                    "gps_h_acc_m": s.get("gps_h_acc_m"),
+                    "gps_h_acc_known": s.get("gps_h_acc_m") is not None,
                     "lat": format_gps_coord(s.get("lat")),
                     "lon": format_gps_coord(s.get("lon")),
                     "alt": format_gps_coord(s.get("alt")),
